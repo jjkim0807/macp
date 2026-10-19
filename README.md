@@ -112,9 +112,13 @@ while sleep 300; do uv run --project ~/macp python -m todo_system.orchestrator.o
 uv run --project ~/macp python ~/macp/scripts/macp_dashboard.py      # http://127.0.0.1:8787
 ```
 
-`scripts/systemd/gen_units.py --print` renders the author's full unit set (Linux) and
-`scripts/install_*_launchagent.sh` the macOS equivalents. They still assume the
-author's layout (see below): review the `--print` output before writing anything, and
+`scripts/systemd/gen_units.py --print` renders the **engine-core units** (Linux) —
+runner, orchestrator, planner, maintenance, todo-sync, dashboard, brief, health —
+resolving each engine script from the install location (`MACP_ENGINE_ROOT`, default:
+the checkout), so every rendered `ExecStart` points at a script that ships in this
+repository. The vault root (logs/, Todo/, Worker/) comes from `MACP_VAULT_ROOT`
+(`MAESTRO_VAULT_DIR` is kept as a backward-compat alias). `scripts/install_*_launchagent.sh`
+are the macOS equivalents. Review the `--print` output before writing anything, and
 note that `--only` filters which units are *enabled*, not which files are written.
 
 The dashboard binds to loopback. It refuses to start on any other address — or, when
@@ -163,11 +167,8 @@ cp scripts/macp-anthropic-usage ~/.local/bin/macp-anthropic-usage && chmod +x ~/
 ## Known limitations
 
 - **Author-specific integrations ship in the tree**: KakaoTalk/Slack notifications
-  (without credentials they are a silent no-op), stock-trading and `mailroom` units in
-  `gen_units.py`, an app-beta publishing sweep, and an `advote` bridge. None run
-  unless configured, but they add noise.
-- `gen_units.py` defaults to `~/Projects/MaestroACP` (override with
-  `MAESTRO_VAULT_DIR`) and renders units for scripts that are not in this repository.
+  (without credentials they are a silent no-op), an app-beta publishing sweep, and an
+  `advote` bridge. None run unless configured, but they add noise.
 - Parts of the worker prompts (`.claude/commands/`) and some docs are in Korean, and
   calendar sync uses the `Asia/Seoul` time zone.
 - External repositories are cloned under `~/Worker/`.
