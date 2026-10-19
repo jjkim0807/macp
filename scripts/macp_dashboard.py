@@ -1379,16 +1379,18 @@ flex:0 1 auto;min-width:0;flex-wrap:wrap}
 .age{color:var(--mut);font-size:12px;white-space:nowrap}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .badge{padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
-/* Badges: tint = semantic token at ~15% over --card, text = the token itself, so
-   both themes derive from the 11 tokens (no hardcoded badge hex — parity §2). */
-.b-done{background:color-mix(in srgb,var(--grn) 15%,var(--card));color:var(--grn)}
-.b-fail{background:color-mix(in srgb,var(--red) 15%,var(--card));color:var(--red)}
-.b-run{background:color-mix(in srgb,var(--blu) 15%,var(--card));color:var(--blu)}
-.b-wait{background:color-mix(in srgb,var(--yel) 15%,var(--card));color:var(--yel)}
-.b-gray{background:color-mix(in srgb,var(--mut) 15%,var(--card));color:var(--mut)}
-.b-def{background:color-mix(in srgb,var(--mut) 15%,var(--card));color:var(--mut)}
-.b-pur{background:color-mix(in srgb,var(--pur) 15%,var(--card));color:var(--pur)}
-.b-blu{background:color-mix(in srgb,var(--blu) 15%,var(--card));color:var(--blu)}
+/* Badges: tint = semantic token at 15% over --card, text = the token darkened 25%
+   toward --fg. Both derive only from the 11 tokens (no hardcoded badge hex, parity
+   §2); the --fg nudge lifts the token's own ~4.9:1-on-white to ≥5.4:1 on the tint
+   in both themes (yellow alone can't clear 4.5:1 undarkened — see run contrast table). */
+.b-done{background:color-mix(in srgb,var(--grn) 15%,var(--card));color:color-mix(in srgb,var(--grn) 75%,var(--fg))}
+.b-fail{background:color-mix(in srgb,var(--red) 15%,var(--card));color:color-mix(in srgb,var(--red) 75%,var(--fg))}
+.b-run{background:color-mix(in srgb,var(--blu) 15%,var(--card));color:color-mix(in srgb,var(--blu) 75%,var(--fg))}
+.b-wait{background:color-mix(in srgb,var(--yel) 15%,var(--card));color:color-mix(in srgb,var(--yel) 75%,var(--fg))}
+.b-gray{background:color-mix(in srgb,var(--mut) 15%,var(--card));color:color-mix(in srgb,var(--mut) 75%,var(--fg))}
+.b-def{background:color-mix(in srgb,var(--mut) 15%,var(--card));color:color-mix(in srgb,var(--mut) 75%,var(--fg))}
+.b-pur{background:color-mix(in srgb,var(--pur) 15%,var(--card));color:color-mix(in srgb,var(--pur) 75%,var(--fg))}
+.b-blu{background:color-mix(in srgb,var(--blu) 15%,var(--card));color:color-mix(in srgb,var(--blu) 75%,var(--fg))}
 .pchip{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px;
 font-weight:600;margin-right:5px;border:1px solid var(--bd)}
 .cp{background:color-mix(in srgb,var(--card),var(--bd));border:1px solid var(--bd);color:var(--mut);border-radius:6px;
@@ -1396,7 +1398,7 @@ cursor:pointer;font-size:12px;line-height:1;padding:2px 6px;margin-left:5px;whit
 .cp:hover{color:var(--fg);border-color:var(--blu)}.cp.ok{color:var(--grn);border-color:var(--grn)}
 .stg{display:inline-block;min-width:16px;height:16px;border-radius:4px;font-size:10px;
 text-align:center;line-height:16px;font-weight:700;margin-right:2px}
-.s-ok{background:color-mix(in srgb,var(--grn) 15%,var(--card));color:var(--grn)}.s-bad{background:color-mix(in srgb,var(--red) 15%,var(--card));color:var(--red)}
+.s-ok{background:color-mix(in srgb,var(--grn) 15%,var(--card));color:color-mix(in srgb,var(--grn) 75%,var(--fg))}.s-bad{background:color-mix(in srgb,var(--red) 15%,var(--card));color:color-mix(in srgb,var(--red) 75%,var(--fg))}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chips span{background:color-mix(in srgb,var(--card),var(--bd));border-radius:6px;padding:3px 9px;font-size:13px;color:var(--fg)}
 details>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--fg);
