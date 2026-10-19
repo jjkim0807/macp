@@ -239,3 +239,122 @@ CREATE TABLE planner_kv (
 - `queue.json`·`runs/`·`sweep_state`·heartbeat 는 **호스트 로컬 런타임**이고 SoT 가
   아니므로 1차 external 백엔드의 이관 대상이 아니다(ledger 에서 재생성되는 파생 뷰거나
   순수 로컬 스크래치). 공유가 필요해지면 leaf ⑦(Cloud SQL)에서 재검토.
+
+---
+
+## ④ git → external 1회 이관 + external → `Worker/assignments/` 스냅샷 export
+
+### 4.1 git → external 1회 import (멱등·재실행 가능)
+
+external 모드로 처음 전환할 때 트리/호스트의 현재 상태를 SQLite 로 끌어올린다:
+
+1. **ledger** — `Worker/assignments/*.json` 전부를 `Ledger.all()`(assignment.py:264)
+   모양으로 읽어 `ledger` 테이블에 upsert(`task_id` PK). 스칼라→열, `history`/`payload`/
+   flags→JSON 열.
+2. **mailbox** — `Worker/agents/<agent>/inbox/*.json` 전부를 `mailbox` 테이블에,
+   `Worker/agents/_state/<agent>/cursor.json`(seen+acked)을 `mailbox_cursor` 로.
+   커서의 ack 틈브스톤도 그대로 옮겨 이관 직후 재수신이 없게 한다.
+3. **planner kv** — `planner_state.json`(worker.py:111)을 평탄화해 `planner_kv` 로.
+4. **todo 캐시** — 건너뜀(파생; `todo.db` 유지).
+
+멱등 요건: PK upsert 라 두 번 돌려도 같은 결과. 부분 실패 시 재실행으로 이어붙는다.
+`meta.schema_version` 를 세워 이후 스키마 변경의 발판으로 삼는다.
+
+### 4.2 external → `Worker/assignments/` 읽기 전용 스냅샷 export
+
+클라우드 본부 인수·대시보드는 **git-추적 ledger**(`Worker/assignments/*.json`)를
+읽도록 설계돼 있다([[Decisions/2026-09-10-macp-cloud-hq-vault-sot]]). external 모드에서
+권위 사본이 SQLite 로 가더라도 이 소비자들을 깨지 않으려면, 주기적으로(또는 ledger
+변경 틱마다) SQLite `ledger` 를 git-추적 `Worker/assignments/<task_id>.json` 으로
+**단방향 덤프**한다.
+
+- 스냅샷은 **읽기 전용 / 권위 사본은 SQLite** 라고 명시한다 — write-back 루프 방지.
+  즉 export 는 SQLite→파일 한 방향만; 파일을 손으로 고쳐도 다음 export 가 덮어쓴다.
+- **자가 치유**: §⑤의 git 조작이 스냅샷 파일을 되돌리거나 지워도, 다음 export 틱이
+  SQLite(권위 사본)에서 다시 쓴다. 그래서 external 모드에서는 스냅샷조차 git-조작에
+  견딘다(권위 상태가 트리 밖이므로).
+- git 모드에서는 이 export 가 no-op(파일이 이미 권위 사본).
+
+---
+
+## ⑤ git 조작 회귀 테스트 시나리오 3종
+
+공통 축: **external 모드**에서는 볼트 git 조작이 권위 상태(SQLite)를 **건드리지
+못한다**(이 태스크의 동기이자 승리). **git 모드**에서는 기존 틈브스톤/at-least-once
+방어(`mailbox.py:47-55`)가 **여전히 유효**해야 한다(회귀 가드). 세 시나리오는 그대로
+leaf ⑥의 자동화 스위트(`test_state_store_git_ops.py`)가 된다.
+
+> 정밀 주의(§①의 관찰): git 조작이 되살리거나 롤백할 수 있는 건 **추적** 상태뿐이다 —
+> ledger(`.gitignore:122`)·mailbox 메시지(`:114`). queue/planner/커서는 비추적이라
+> 두 모드 다 git 이 손대지 않는다. 그래서 아래 불변식은 추적 상태(ledger·mailbox)를
+> 1차 대상으로 둔다.
+
+### 5.1 옛 워커 브랜치 checkout → 복귀
+- **Setup**: external 모드. `ledger` 에 과제 A(`state=in_progress`). orchestrator inbox 에
+  방금 ack 로 삭제된 메시지 M 과 미처리 N. (M 은 옛 브랜치 HEAD 트리에는 아직 존재.)
+- **Op**: `git checkout worker/<old>` → `git checkout main`.
+- **기대(external)**: SQLite 의 ledger/mailbox **불변**. `receive("orchestrator")` 는 N 만
+  반환, M 은 영구 소비(행 삭제)라 재수신 없음 — 틈브스톤 불필요.
+- **기대(git, 현행 유지)**: 옛 브랜치 체크아웃이 `M.json` 을 트리에 부활시키지만 커서
+  틈브스톤(`mailbox.py:47-55`)이 M 을 억제해 파이프라인 재실행을 막는다. 이 방어가
+  깨지지 않아야 함(핵심 회귀 가드).
+
+### 5.2 `git reset --hard`
+- **Setup**: external 모드. `ledger` A(`in_progress`) + 방금 ack 로 지운 M.
+- **Op**: stage 에이전트의 사고성 `git reset --hard HEAD~1`.
+- **기대(external)**: reset 은 트리만 되돌린다 → SQLite ledger/mailbox **불변**, A 의
+  진행 상태 유지. (스냅샷 파일이 롤백돼도 §4.2 export 가 복원.)
+- **기대(git, 현행)**: reset 이 커밋된 ledger/inbox 를 HEAD 커밋 버전으로 되돌려 **트리내
+  상태가 손실·되살림될 수 있음** — 바로 external 이 제거하는 취약성. 삭제 메시지 부활은
+  틈브스톤이 방어하나 ledger 롤백 자체는 git 모드의 알려진 한계.
+
+### 5.3 `git stash` / autostash
+- **Setup**: external 모드. dirty tree(stage 작업 중), ledger A 갱신 진행.
+- **Op**: `git stash push -u -m <tag>` → `git stash apply`(또는 `pull --rebase` 의
+  autostash 실패 경로 — `mailbox.py:50` 주석이 명시한 사례).
+- **기대(external)**: stash 는 트리 변경만 치운다 → SQLite **불변**.
+- **기대(git, 현행)**: autostash 실패가 inbox 메시지를 부활시킬 수 있고, 틈브스톤이
+  재실행을 막는다. (주의: 이 리포는 공유 stash 스택이므로 테스트는 bare `stash pop`
+  대신 태그 기반 `push -u`/`apply` 로 격리한다.)
+
+---
+
+## ⑥ 후속 leaf 지도 (②~⑥, +⑦ 선택)
+
+각 leaf = 범위 한 줄 + touches 후보. ②~⑥은 **필수**, ⑦은 **선택**(다중 호스트 공유가
+필요해질 때). 순서는 직렬 의존(앞이 머지돼야 뒤가 안전):
+
+- **② `StateStore` ABC + `GitStateStore` 현상유지 어댑터** — 네 영역을 하위 표면으로 묶고
+  git 백엔드가 현행 `Ledger`/`open_mailbox`/planner_state/todo.db 를 **그대로** 감싼다.
+  동작 변화 0(기본 경로). *touches*: `todo_system/orchestrator/state_store.py`(신규) +
+  `todo_system/orchestrator/tests/test_state_store.py`(신규).
+- **③ 설정 배선** — `MACP_STATE_BACKEND`(기본 git) + `paths.py` 리졸버(`repo_slug` 패턴
+  복제) + `state_sqlite_path`. *touches*: `todo_system/paths.py` + `todo_system/tests/test_paths.py`.
+- **④ `ExternalStateStore` SQLite 백엔드** — §③ 스키마를 세우고 ledger/mailbox/planner_kv 를
+  SQLite 로. SQLite 기반 `Mailbox` 하위클래스(전송 훅 오버라이드). *touches*:
+  `todo_system/orchestrator/state_store_sqlite.py`(신규) + 테스트(신규).
+- **⑤ 1회 이관 + 스냅샷 export** — §④의 git→external import 와 external→assignments
+  읽기 전용 export. *touches*: `todo_system/orchestrator/state_migrate.py`(신규) 또는
+  `cli`/`worker` 하위명령 + 테스트(신규).
+- **⑥ git-조작 회귀 스위트 + 호출부 라우팅** — §⑤ 3종을 자동화하고, 현행 직접 접근부
+  (`worker.py`의 QUEUE/PLANNER·`metrics.py`의 LEDGER/DB·orchestrator)를 `StateStore`
+  경유로 돌린다. *touches*: `todo_system/tests/test_state_store_git_ops.py`(신규) +
+  `worker.py`·`metrics.py`·orchestrator 호출부.
+- **⑦ (선택, 다중 호스트 공유 필요 시) Cloud SQL(Postgres) 백엔드** — external 축을
+  네트워크 공유 DB 로 확장. **Supabase·Neon 금지**([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]);
+  **GCP Cloud SQL 만** 각주 확장. *touches*: 신규 백엔드 모듈 + 테스트.
+
+> 열림 질문 해소: 부모 분해는 ②~⑦이지만 이 leaf 의 수용 기준은 ②~⑥을 필수로 본다.
+> 위처럼 ②~⑥을 필수, ⑦을 선택으로 적어 양쪽을 만족한다.
+
+---
+
+### 부록: 이 노트가 확정한 설계 결정 요약
+
+1. Mailbox 관계 = **구성(composition)**, 흡수 아님(§②).
+2. 기본 백엔드 = **git(무변경)**, external = 볼트 밖 호스트 SQLite(§③).
+3. ledger 는 external 모드에서도 git-추적 `Worker/assignments/` 로 **읽기 전용 스냅샷**
+   export(권위 사본은 SQLite) — 본부/대시보드 호환 유지(§④).
+4. todo.db 는 **비이관**(md 의 파생 캐시)(§②§③).
+5. 상시 외부 SaaS DB(Supabase/Neon) **배제**; Cloud SQL 은 선택 각주(§⑥⑦)
+   ([[Decisions/2026-10-13-macp-task-store]], [[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]).
