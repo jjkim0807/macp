@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from todo_system.macp import __main__ as M
+from todo_system.macp import accounts as ACC
 from todo_system.macp import config as C
 from todo_system.macp import deps as D
 
@@ -212,6 +213,28 @@ class MacpCliTest(unittest.TestCase):
         rc, out = self.cli("account", "add", "--profile", "work")
         self.assertEqual(rc, 2)
         self.assertIn("usage: macp account add", out)
+
+    def test_account_env_exports_only_a_non_legacy_dir(self):
+        # `eval "$(macp account env)"` in claude_remote_control.sh: the legacy
+        # single dir must produce NO export (an explicit CLAUDE_CONFIG_DIR, even
+        # '~/.claude' spelled out, makes the CLI skip its Keychain login —
+        # 2026-10-19 remote-control outage). Mirrors accounts.claude_env_for.
+        self.cli("profile", "add", "work")
+        self.cli("account", "add", "legacy", "--profile", "work",
+                 "--config-dir", ACC.LEGACY_CONFIG_DIR)
+        rc, out = self.cli("account", "env", "--profile", "work")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+
+        cfg_dir = self.tmp / "cfg"
+        self.cli("account", "add", "a1", "--profile", "work", "--config-dir", str(cfg_dir))
+        rc, out = self.cli("account", "env", "a1", "--profile", "work")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, f"export CLAUDE_CONFIG_DIR='{cfg_dir}'\n")
+
+        rc, out = self.cli("account", "env", "nope", "--profile", "work")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")   # errors go to stderr only — never eval'd
 
     # ---- memory -----------------------------------------------------------
 

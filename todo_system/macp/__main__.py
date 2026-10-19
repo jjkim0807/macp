@@ -252,7 +252,9 @@ def _cmd_account(a) -> int:
 
 
 def _cmd_account_env(a) -> int:
-    """stdout = exactly one line `export CLAUDE_CONFIG_DIR='<dir>'` for `eval`.
+    """stdout = exactly one line `export CLAUDE_CONFIG_DIR='<dir>'` for `eval`,
+    or NOTHING (rc 0) when the account lives in the legacy single dir — the
+    CLI must then keep its default config dir and Keychain login.
     Everything else (errors) goes to stderr so an eval never executes it."""
     prof = C.load_profile(a.profile)
     if not prof:
@@ -268,6 +270,15 @@ def _cmd_account_env(a) -> int:
         print(f"error: no {what} in profile '{a.profile}' to export", file=sys.stderr)
         return 2
     d = os.path.expanduser(acct.claude_config_dir or ACC.LEGACY_CONFIG_DIR)
+    if ACC.is_legacy_config_dir(d):
+        # Same rule as accounts.claude_env_for: the legacy single dir is left
+        # UNSET. An explicit CLAUDE_CONFIG_DIR — even one spelling the default
+        # path — makes the CLI key its credential store differently and skip
+        # the macOS Keychain login. 2026-10-19 16:40 the remote-control wrapper
+        # eval'd `export CLAUDE_CONFIG_DIR='/Users/jjkim/.claude'` from here and
+        # the daemon died with "You must be logged in to use Remote Control"
+        # every 30 s although `claude auth status` (no env) said logged in.
+        return 0
     print("export CLAUDE_CONFIG_DIR='" + d.replace("'", "'\\''") + "'")
     return 0
 

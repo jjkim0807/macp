@@ -61,6 +61,8 @@ def test_permanent_rc_errors_are_the_relogin_class():
     assert A.is_permanent_rc_error("Remote Control environments are not available for your account.")
     assert A.is_permanent_rc_error(
         "Error: Remote Control requires a full-scope login token. Long-lived tokens ...")
+    # 2.1.303, 2026-10-19: no credential in the store the CLI was pointed at.
+    assert A.is_permanent_rc_error("Error: You must be logged in to use Remote Control.")
 
 
 def test_transient_rc_errors_keep_the_keepalive_loop():

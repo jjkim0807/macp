@@ -668,6 +668,7 @@ RC_RELOGIN_HINT = "해결: claude auth logout && claude auth login (브라우저
 # absent: "Couldn't verify Remote Control eligibility — the feature-flag service
 # was unreachable" (network, transient — the 30 s KeepAlive loop is right there).
 PERMANENT_RC_ERROR_MARKERS = (
+    "You must be logged in to use Remote Control",
     "Remote Control isn't enabled for this account",
     "environments are not available for your account",
     "requires a full-scope login token",
