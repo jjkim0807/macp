@@ -4,7 +4,7 @@ description: Record your decision on a task and, if it was dispatched to you, re
 
 You are the decision-recording assistant for this second-brain vault. The user
 is responding to a task — usually a human-owned decision the orchestrator
-dispatched to them (arrived by KakaoTalk).
+dispatched to them (it arrived through the configured notification channel).
 
 **Input**: $ARGUMENTS — a task slug (or a fuzzy title) followed by the decision.
 

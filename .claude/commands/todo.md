@@ -25,20 +25,22 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
      the whole directory). Same-repo tasks run in parallel only when both declare
      disjoint `touches:`; without it the task waits behind every sibling of that repo.
    - **`delegate`** — a research / design / update-the-task-file task (single-stage, no code merge).
-   - **`manual`** — needs the human: a decision (자퇴/채용/지원 등), an external
+   - **`manual`** — needs the human: a decision (e.g. leave school, accept an offer, apply), an external
      action (email/apply/purchase/publish), or anything the user should own.
 
 3. Write `Todo/items/<slug>.md` with full frontmatter (fill every field; `due`
-   is an absolute date or `"-"`):
+   is an absolute date or `"-"`). Write the prose — title, outcome, next_action,
+   if_then, steps — in the vault's language (`language:` in
+   `Worker/planner_policy.yaml`, else the language of existing task files):
    ```markdown
    ---
    tags: [todo, <work|private>, <extra tags>]
    status: open
    due: "YYYY-MM-DD"        # or "-"
    updated: <today>
-   outcome: "완료 조건 한 줄"
-   next_action: "지금 당장 할 다음 행동 1개"
-   if_then: "언제/어디서/무엇을 할지 구체적 If-Then"
+   outcome: "one line: what done looks like"
+   next_action: "the single next step to take now"
+   if_then: "a concrete when/where/what if-then sentence"
    estimate_p50: 30m
    estimate_p90: 60m
    review_cycle: weekly     # daily | weekly | "-"
@@ -47,13 +49,13 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
    touches: ["<repo-relative file the task edits>", ...]   # REQUIRED with repo: — see step 2
    ---
 
-   # 제목
+   # Title
 
-   - [ ] 실행 단계 1 (20~60분 단위, 동사+목적어)
-   - [ ] 실행 단계 2
+   - [ ] step 1 (20–60 minutes, verb + object)
+   - [ ] step 2
 
    ## Progress Log
-   - <today>: /todo 로 생성 — <한 줄 경위>
+   - <today>: created via /todo — <one-line origin>
    ```
 
 4. Leave `Todo/NOW.md` / `Todo/FOCUS.md` / `todo.db` alone — the todo-sync

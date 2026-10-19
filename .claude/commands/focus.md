@@ -9,7 +9,7 @@ conflicts, wasted runs). Manual work must still be **recorded** so the memory
 graph stays continuous.
 
 **Input**: $ARGUMENTS — `start <project>` or `end <project>`.
-`<project>` is a slug prefix (e.g. `worldgraph`, `ai-stock-trading`, `armchair-commander`).
+`<project>` is a slug prefix (e.g. `my-app`, `website`, `thesis`).
 
 ## `start <project>`
 
