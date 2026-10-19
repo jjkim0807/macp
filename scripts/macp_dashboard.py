@@ -1311,7 +1311,12 @@ FAVICON_HREF = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("
 HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MaestroACP · live</title>
+<meta name="color-scheme" content="dark light">
 <link rel="icon" type="image/svg+xml" href="__FAVICON__">
+<script>/* pre-paint: apply saved theme to <html data-theme> before first paint so an
+   explicit light choice never flashes the dark default. auto/unknown = no attr
+   (falls back to :root dark + prefers-color-scheme light). No external ref. */
+try{var _t=localStorage.getItem('mdash.theme');if(_t==='light'||_t==='dark')document.documentElement.dataset.theme=_t}catch(_e){}</script>
 <style>
 /* Mobile-first single column. Dark theme; body text (--fg 16:1, --mut ~7.6:1 on
    --bg) meets WCAG AA 4.5:1, base font 14px. No external URL / font / script. */
