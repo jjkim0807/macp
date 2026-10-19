@@ -928,6 +928,64 @@ class DashboardShellTests(unittest.TestCase):
             self.assertIn(key, d, key)
 
 
+class ThemeShellTests(unittest.TestCase):
+    """Light/dark theme (docs/dashboard-parity.md §"테마"): default auto follows
+    prefers-color-scheme, a header button cycles auto→light→dark, the choice is
+    stored under localStorage['mdash.theme'] and applied pre-paint to
+    <html data-theme> so an explicit light choice never flashes the dark default."""
+
+    HTML = M.HTML
+
+    # Contract §2 light palette — 11 tokens, exact hex.
+    LIGHT_HEX = ("#f6f8fa", "#ffffff", "#d0d7de", "#eaeef2", "#1f2328",
+                 "#59636e", "#1a7f37", "#cf222e", "#9a6700", "#0969da", "#8250df")
+
+    def test_theme_plumbing_strings_present(self):
+        # storage key, the data-theme attribute selector, the auto media query,
+        # and the color-scheme meta all exist.
+        self.assertIn("mdash.theme", self.HTML)
+        self.assertIn("data-theme", self.HTML)
+        self.assertIn("prefers-color-scheme", self.HTML)
+        self.assertIn('<meta name="color-scheme"', self.HTML)
+
+    def test_prepaint_script_runs_before_css(self):
+        # AC: the saved theme is applied before first paint — the inline <script>
+        # that reads mdash.theme must precede <style> (and have no src: offline).
+        style_at = self.HTML.index("<style>")
+        head = self.HTML[:style_at]
+        self.assertIn("mdash.theme", head)
+        self.assertIn("dataset.theme", head)
+        self.assertIn("<script>", head)
+        self.assertNotIn("<script src", head)
+
+    def test_light_palette_hex_present(self):
+        for hexv in self.LIGHT_HEX:
+            self.assertIn(hexv, self.HTML, hexv)
+
+    def test_dark_palette_preserved(self):
+        # the dark :root defaults stay byte-for-byte (contract §2 다크 현행).
+        for hexv in ("#0d1117", "#161b22", "#30363d", "#242b34", "#e6edf3",
+                     "#9ba5b0", "#3fb950", "#f85149", "#d29922", "#58a6ff", "#bc8cff"):
+            self.assertIn(hexv, self.HTML, hexv)
+
+    def test_hardcoded_surface_hex_removed(self):
+        # the dark-only hardcoded surfaces/badge hex are gone (replaced by tokens /
+        # color-mix) so light has no black-background residue (parity §2 하드코딩 금지).
+        for stale in ("#21262d", "#1c2129", "#12321f", "#56d364", "#3d1a1a",
+                      "#ff9a92", "#122b40", "#79c0ff", "#3a2d10", "#e3b341",
+                      "#262c34", "#1f2a36", "#a5b4c7", "#2a2140", "#d2b4ff", "#132a3d"):
+            self.assertNotIn(stale, self.HTML, stale)
+
+    def test_header_toggle_button(self):
+        # one header button, cyclable, with an aria-label and the 3 state labels.
+        self.assertIn('id="theme"', self.HTML)
+        m = re.search(r'<button id="theme"[^>]*aria-label="[^"]+"', self.HTML)
+        self.assertIsNotNone(m, "header #theme button with aria-label not found")
+        self.assertIn("'auto','light','dark'", self.HTML)
+        for lbl in ("자동", "라이트", "다크"):
+            self.assertIn(lbl, self.HTML, lbl)
+
+
 def _local(tag):
     return tag.rsplit("}", 1)[-1]
 
