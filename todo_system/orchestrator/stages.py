@@ -418,6 +418,14 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             f"`{BROWSER_CLI} lease release` when done; exit 75 = someone else "
             "holds it — wait (`--wait <sec>`) or stop, never delete lease.json. "
             "Touch only tabs you opened.\n")
+        meta.append(
+            f"- **Login-less browser work → scratch instance ({BROWSER_CLI})**: for "
+            "work that needs no logged-in profile (public page reads, consoles with "
+            f"no login) prefer `{BROWSER_CLI} scratch acquire --owner "
+            f'"${BROWSER_OWNER_ENV}" --purpose \'<why>\'` — a throwaway instance '
+            "that never waits on the default lease — and `scratch release` when done. "
+            "Reserve the default (logged-in) profile lease for work that needs the "
+            "logged-in cookies.\n")
     if stage in REMOTE_GATE_TOOL_STAGES:
         # A gate command too heavy for one stage (overruns the cap, or won't finish
         # inside the runner cgroup's memory — e.g. a full Robolectric/Gradle suite)
