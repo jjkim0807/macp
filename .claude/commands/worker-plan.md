@@ -58,7 +58,7 @@ finished data. State the command and the expected runtime here, and write the
 phases as if the data already exists. If the task file needs a `long_job:` and
 does not have one, say so plainly: proposing it is a legitimate plan output.
 
-Write "없음" when nothing here is long-running.
+Write "없음" (the engine's "none" sentinel) when nothing here is long-running.
 
 ## Parallelizable subtasks
 

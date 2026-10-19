@@ -49,11 +49,11 @@ task. -->
 
 ## TL;DR (한 줄)
 
-<한 줄 요약>
+<one-line summary>
 
 ## 무엇을 했는가
 
-- bullet 3~6개
+- 3–6 bullets: what was done
 
 ## Verify 결과
 
@@ -63,16 +63,21 @@ task. -->
 
 ## 변경 파일
 
-- `path/to/file` — 1줄 설명
+- `path/to/file` — one-line description
 
 ## 사람이 검토해야 할 부분
 
-- bullet (없으면 "없음")
+- bullet (write "없음" if nothing)
 
 ## 다음 단계
 
-- bullet (PR merge 외 추가 작업이 필요한가)
+- bullet (is any work needed beyond merging the PR?)
 ```
+
+> The `##` headings in the template above and the "없음" (none) sentinel are a wire format: the engine
+> parses `사람이 검토해야 할 부분` (needs human review) and `다음 단계` (next steps) to route
+> alerts and carry follow-ups. Copy the headings exactly; write the prose under them in
+> the vault's language.
 
 #### `merged: no` requires a reason, and there are two kinds
 
@@ -95,8 +100,8 @@ frontmatter (the runner reads the first match, so write only the one that applie
 
 `review` makes the runner report a deliberate hold instead of a failure, and stops
 it burning a retry on something that is not broken. Explain the reason in
-"사람이 검토해야 할 부분" either way — the field routes the alert, the prose
-justifies it.
+"사람이 검토해야 할 부분" (needs human review) either way — the field routes the alert, the
+prose justifies it.
 
 ### 2. `<vault_root>/Memory/episodes/<YYYY-MM-DD>-worker-<slug>.md`
 
@@ -124,26 +129,26 @@ status: pass | fail
 
 ## 요약
 
-<2~4문장>
+<2–4 sentences: summary>
 
 ## 학습 / 메모
 
-<있으면 bullet 으로>
+<lessons / notes as bullets, if any>
 ```
 
-#### 교훈에 `[[이름]]`을 붙일 거면 그 파일을 만들어라
+#### If a lesson gets a `[[name]]` link, create the file it points to
 
-에피소드의 학습 항목에 `[[worker-…]]` 링크를 다는 관행이 있다. 그 이름이
-`Memory/entities/<name>.md`로 존재하지 않으면 링크가 아니라 장식이고, 가리키는 문서가
-없으니 매 런이 같은 교훈을 처음부터 다시 유도하게 된다 (한 감사에서 이런 dangling 링크가
-158종, 가장 많이 인용된 것은 59회였다).
+Episodes often tag lessons with `[[worker-…]]` links. When `Memory/entities/<name>.md`
+does not exist the link is decoration: there is no document behind it, so every run
+re-derives the same lesson from scratch (one audit found 158 such dangling links, the
+most-cited used 59 times).
 
-그러니 둘 중 하나만 한다:
+So do exactly one of:
 
-- 여러 런에 걸쳐 재사용될 교훈이면 `Memory/entities/<name>.md`를 같이 만든다
-  (`Memory/templates/entity-template.md` 형식. 이미 있으면 "사실 누적 로그"에 append하고
-  새로 쓰지 않는다).
-- 이번 런에만 해당하는 이야기면 링크 문법을 쓰지 말고 평문으로 쓴다.
+- For a lesson that will matter across runs, also create `Memory/entities/<name>.md`
+  (format: `Memory/templates/entity-template.md`; if it already exists, append to its
+  fact log instead of rewriting it).
+- For something that only concerns this run, write plain text without link syntax.
 
 ### 3. Leave `Worker/queue.json` alone
 

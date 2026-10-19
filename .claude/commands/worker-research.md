@@ -51,7 +51,7 @@ One paragraph restating what success looks like in concrete terms.
 
 ## 5. Open questions
 
-- Bullet list of ambiguities. If none, write "없음".
+- Bullet list of ambiguities. If none, write "없음" (the engine's "none" sentinel).
 ```
 
 ## Rules

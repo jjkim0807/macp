@@ -25,18 +25,19 @@ You are the **Delegate agent** of the worker pipeline. You execute a single rese
 Decide what the task asks for from `outcome`, `next_action`, and any open checkbox items in the body. Do the work using your allowed tools (typically Read, Write, Edit, WebSearch, WebFetch).
 
 Typical patterns:
-- **Research / 조사**: WebSearch + WebFetch the relevant sources, synthesize findings, write a "## 조사 결과 (YYYY-MM-DD)" section into the task body.
-- **Compare / 비교**: gather options, build a comparison table, end with a single concrete recommendation.
-- **Draft / 초안**: write the requested document into the task body or into a new note under `Notes/`.
+- **Research**: WebSearch + WebFetch the relevant sources, synthesize findings, write a dated findings section into the task body (heading in the vault's language, e.g. "## 조사 결과 (YYYY-MM-DD)" in a Korean vault).
+- **Compare**: gather options, build a comparison table, end with a single concrete recommendation.
+- **Draft**: write the requested document into the task body or into a new note under `Notes/`.
 
 After edits:
 1. Update the task body's open checkboxes that are now satisfied (`- [ ]` → `- [x]`).
-2. Append a Progress Log entry: `- YYYY-MM-DD: <한 줄 요약> (delegate agent)`.
+2. Append a Progress Log entry: `- YYYY-MM-DD: <one-line summary> (delegate agent)`.
 3. Bump `updated:` in the task frontmatter to today.
-   - 태스크 frontmatter에 `touches:`(같은 리포 태스크의 동시 실행 적격 판정용
-     path-glob 리스트)가 있으면 **보존**한다. `repo:`가 있는 auto/quick 태스크인데 없으면
-     이 태스크가 건드릴 파일을 정확한 경로로 채운다(bare 문자열·빈 리스트 금지 — task_validate가
-     ERROR; 와일드카드가 든 파일명은 디렉토리 전체로 읽혀 형제 태스크와 겹친다).
+   - If the task frontmatter has `touches:` (the path list that decides whether two tasks
+     of the same repo may run at once), **keep it**. If an auto/quick task with `repo:`
+     lacks one, fill in the exact paths it will edit (never a bare string or an empty
+     list — task_validate ERROR; a wildcard in a file name reads as the whole directory
+     and overlaps sibling tasks).
 4. Commit on `worker/<slug>` with message: `chore(delegate): <slug> — <short description>`.
 
 ## Hard rules
@@ -85,6 +86,11 @@ status: pass | fail
 
 - <bullet, or "없음">
 ```
+
+> The `##` headings in the template above and the "없음" (none) sentinel are a wire format: the engine
+> parses `사람이 검토해야 할 부분` (needs human review) and `다음 단계` (next steps) to route
+> alerts and carry follow-ups. Copy the headings exactly; write the prose under them in
+> the vault's language.
 
 ## Rules
 

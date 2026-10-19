@@ -89,8 +89,10 @@ file is `Todo/items/<slug>.md`; its frontmatter `discover_repo:` is the repo url
 
 **A. Episode report** — `Memory/episodes/<YYYY-MM-DD-HHmm>-discovery-<name>.md`
 (`name` lower-case, non-alphanumerics as `-`). This is what the planner reads;
-the `## 후보 태스크` bullets are parsed by machine, so keep them **top-level
-bullets, one candidate per bullet**, in this shape:
+the `## 후보 태스크` (candidate tasks) bullets are parsed by machine, so keep them
+**top-level bullets, one candidate per bullet**, in this shape. Copy the headings and the
+bullet labels exactly (근거 = evidence, 왜 = why, 규모 = size, 모드 = mode, 등급 = tier);
+`실행 결과` = run results, `관찰` = observations, `제외한 것` = dropped:
 
 ```markdown
 ---
@@ -113,7 +115,7 @@ candidates: <N>
 
 ## 후보 태스크
 
-- **<제목>** — 근거: `<file:line>` 또는 `<command → output>` · 왜: <one clause> · 규모: <~30m|~1h|~2h> · 모드: <quick|auto> · 등급: <light|standard|heavy>
+- **<title>** — 근거: `<file:line>` or `<command → output>` · 왜: <one clause> · 규모: <~30m|~1h|~2h> · 모드: <quick|auto> · 등급: <light|standard|heavy>
 - ...
 
 ## 관찰 (후보로 만들지 않은 것 포함)
@@ -145,7 +147,7 @@ report: Memory/episodes/<file>.md
 - notes: <anything the planner or a human should know>
 ```
 
-`overall_status: pass` when the report exists with at least the 실행 결과
+`overall_status: pass` when the report exists with at least the `실행 결과` (run results)
 section filled (zero candidates is still a pass — an honest "this project is in
 good shape" is useful); `fail` when you could not clone or could not run
 anything at all; `skip` if the task named no repo. Then print one line:
@@ -161,4 +163,4 @@ anything at all; `skip` if the task named no repo. Then print one line:
 - Don't spawn subagents or call other slash commands — this stage runs headless
   inside a fixed turn/time budget.
 - Evidence or it did not happen: every candidate names a file:line or a command
-  and its output. A candidate without evidence is an opinion — leave it in 관찰.
+  and its output. A candidate without evidence is an opinion — leave it in `관찰` (observations).
