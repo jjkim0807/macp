@@ -6,7 +6,8 @@
 # 도는가")를 한 줄로 재검증할 수 있게 고정한 스크립트다. 하는 일:
 #
 #   1. 엔진 트리(todo_system/ · scripts/ · .claude/commands/ + pyproject.toml
-#      · uv.lock)만 `git archive HEAD`로 격리 temp dir(ENGINE_TMP)에 떼어낸다.
+#      · uv.lock · README.md · LICENSE — pyproject 의 readme/license 메타데이터가 빌드에 필요)만
+#      `git archive HEAD`로 격리 temp dir(ENGINE_TMP)에 떼어낸다.
 #   2. 별도 throwaway 볼트(VAULT_TMP)를 만들어 Todo/items/에 샘플 태스크,
 #      Memory/·Notes/·Decisions/·Worker/ 빈 골격을 둔다.
 #   3. MACP_VAULT_ROOT=VAULT_TMP 로 가리킨 채, cwd=ENGINE_TMP(엔진 archive) 에서
@@ -56,7 +57,7 @@ echo
 # git archive 는 커밋된 트리만 반영하므로 이 스크립트 자신의 최신 편집은
 # 검증 대상이 아니다(검증 대상 = HEAD 의 엔진 모듈). 대상 경로는 전부 tracked.
 echo "[phase1] archiving engine tree -> $ENGINE_TMP"
-git -C "$REPO" archive HEAD todo_system scripts .claude/commands pyproject.toml uv.lock \
+git -C "$REPO" archive HEAD todo_system scripts .claude/commands pyproject.toml uv.lock README.md LICENSE \
   | tar -x -C "$ENGINE_TMP"
 echo "[phase1] engine files extracted: $(find "$ENGINE_TMP" -type f | wc -l)"
 echo
