@@ -26,9 +26,8 @@ and the checks stayed green, because the missing data was gitignored.
   so `run_in_background` executes in the foreground. Give slow commands the Bash
   `timeout` parameter instead — the runner raises the cap to `3600000` ms (60 min;
   a call with no `timeout` gets 20 min). Pass `timeout: 3600000` to every
-  `./gradlew` call: builds on this host can take 10–30 min under memory
-  contention, and the user chose "finish, even if slow" (2026-10-18) over
-  splitting or skipping. If a Gradle command times out anyway, run
+  `./gradlew` call: builds on a busy host can take 10–30 min under memory
+  contention, and a slow complete run beats splitting or skipping. If a Gradle command times out anyway, run
   `./gradlew --stop` (this run's own daemon registry only) before retrying once.
 
 ## When the task is too big for one stage — leave a machine-readable split plan (`rescope.json`)
@@ -113,7 +112,7 @@ Your Bash whitelist is `git`, `uv`, `npm`, `pnpm`, `node`, `npx`, `pytest` (the 
 
 **Running an external repo's build/tests** (`./gradlew`, `npm test`, … when the task whitelists them): the stage's cwd is the vault root, and the whitelist matches the literal `./gradlew`, so `<working_dir>/gradlew -p <working_dir>` is denied. Issue `cd <working_dir>` as its **own** Bash call (no `&&`) — the cwd persists — then run `./gradlew …` in later calls. Try this before concluding the build is unreachable.
 
-**Run every test you write before committing it.** If the build still cannot run after that, never write a result you did not observe (e.g. "통과", a claimed RED sha) into a project doc or commit message, say in run.log that the branch is unexecuted, and give Verify the exact commands. A never-run test that turns out red fails Verify and costs a whole retry (edge-to-edge-insets-pairent, 2026-09-25).
+**Run every test you write before committing it.** If the build still cannot run after that, never write a result you did not observe (e.g. "passed", a claimed RED sha) into a project doc or commit message, say in run.log that the branch is unexecuted, and give Verify the exact commands. A never-run test that turns out red fails Verify and costs a whole retry.
 
 ## Setup (before any edits)
 

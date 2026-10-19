@@ -24,10 +24,10 @@ verdict: error tasks=0 reason="source-of-truth unreachable: <one-line error>"
 
 Do **NOT** investigate connectivity — no `curl`, no DNS lookups, no log grepping,
 no reading other projects' credentials. Diagnosing infrastructure is not the
-planner's job and it burns the whole turn budget (observed 2026-07-20: 16 turns +
-$0.40 spent probing a deleted Supabase project before hitting max-turns). One
+planner's job and it burns the whole turn budget (one run spent 16 turns probing a
+deleted database before hitting max-turns). One
 fast `error` verdict — deduplicated per the repeated-error rule below so it does
-not spam episodes — then follow `kakao_on_error` and exit. That is the correct,
+not spam episodes — then follow the `notifications` policy for errors and exit. That is the correct,
 cheap behavior.
 
 ## CRITICAL: Branch pin — never commit off the default branch
@@ -38,20 +38,21 @@ default branch (`main`). If you then follow CLAUDE.md §10.1 ("uncommitted vault
 files stall the queue") and commit, your commit lands on that worker branch and
 the next branch prep rewinds it into a dangling commit (observed `ed395e1b`).
 
-**하드 룰 — 어떤 `git commit`(또는 커밋을 위한 `git add`)보다 먼저 확인한다:**
+**Hard rule — check this before any `git commit` (or a `git add` meant for one):**
 
 ```bash
 [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = main ] || echo "branch-pin: HEAD is not main — do NOT commit"
 ```
 
-- `git symbolic-ref --short HEAD`가 **기본 브랜치(`main`)가 아니면, 커밋하지 말고**
-  스테이징도 하지 말 것. 당신이 쓴 `Todo/items/*.md` 파일들은 워킹 트리에 **그대로 둔다** —
-  `todo-sync` 데몬이 다음 틱에 `main`에서 수거한다(플래너 산출물의 정상 경로다).
-- 그 사실을 출력 한 줄로 남겨라(예: `branch-pin: HEAD on <branch> — left N file(s)
-  uncommitted for todo-sync`), 그래야 런 기록에 핀이 걸렸음이 남는다.
-- 이건 안전 핀이지 워크플로가 아니다. 당신의 일은 여전히 태스크 파일을 **쓰는 것**뿐이고,
-  그것을 커밋하는 것은 절대 필수가 아니다 — markdown→`main` 동기화는 데몬의 몫이다. 이걸
-  우회하려고 **스스로 `git checkout main` 하지 말 것**: 스테이지가 그 브랜치를 쥐고 있을 수 있다.
+- If `git symbolic-ref --short HEAD` is **not the default branch (`main`), do not commit
+  and do not stage**. Leave the `Todo/items/*.md` files you wrote **in the working tree** —
+  the `todo-sync` daemon picks them up from `main` on its next tick (that is the normal
+  path for planner output).
+- Say so in one output line (e.g. `branch-pin: HEAD on <branch> — left N file(s)
+  uncommitted for todo-sync`) so the run record shows the pin fired.
+- This is a safety pin, not a workflow. Your job is still only to **write** task files;
+  committing them is never required — markdown → `main` sync is the daemon's job. Do
+  **not** run `git checkout main` yourself to get around it: a stage may own that branch.
 
 
 ## Required reading
@@ -65,7 +66,10 @@ the next branch prep rewinds it into a dangling commit (observed `ed395e1b`).
 
 ## Guardrail Policy (from config)
 
-Apply the rules in `Worker/planner_policy.yaml`; they override the defaults below.
+Apply the rules in `Worker/planner_policy.yaml`; they override the defaults below. That includes
+the optional `host_rules:` list — free-text rules specific to this host's projects
+(e.g. a repo whose PRs must or must not auto-merge, a project kept outside `~/Worker`) —
+and `language:`.
 
 The policy file defines:
 - `allowed_patterns` — patterns of tasks safe to auto-create (✅)
@@ -90,7 +94,7 @@ If `Worker/planner_policy.yaml` cannot be read, use these built-in defaults:
 - **Destructive/hard-to-reverse**: deletion, schema-breaking migrations
 - **User-decision-bound**: dropout/leave decisions, which job to apply, blocked items where blocker is user choice
 - **Costs money**: new paid accounts, new credentials
-- **Explicitly deferred**: leaves user marked as blocked or "나중에"
+- **Explicitly deferred**: items the user marked as blocked or "later" (in the vault's language, e.g. "나중에")
 - **Direct implementation**: You only CREATE TASK FILES. Worker pipeline does implementation.
 - **Un-mergeable deliverables (git-ignored targets)**: a task whose
   acceptance/deliverable is a git-ignored file — e.g. `Todo/Todo.md`, `Todo/NOW.md`,
@@ -123,18 +127,18 @@ priority: 50
 worker_mode: auto  # or delegate
 parent: "[[parent-slug]]"  # if this is a leaf of a parent task
 from_followup: <id>  # OPTIONAL — only when acting on a durable report follow-up; followups reconcile reads it
-outcome: "한 줄로 완료 조건"
-next_action: "첫 번째 할 행동"
-if_then: "구체적 조건-행동 문장"
+outcome: "one line: what done looks like"
+next_action: "the first concrete step"
+if_then: "a concrete when/where/what trigger sentence"
 estimate_p50: 30m
 estimate_p90: 60m
 # model_tier: heavy | standard | light — optional; see "Model tier" below
 model_tier: standard
 review_cycle: "-"
-# touches: OPTIONAL — 같은 리포(= 같은 체크아웃) 태스크의 동시 실행 적격 판정용
-#   path-glob 리스트. 서로소로 적는다(아래 "External-repo fields" 참고). bare
-#   문자열·빈 리스트 금지(task_validate가 ERROR). 와일드카드가 든 컴포넌트부터는
-#   정적 접두(디렉토리)만 비교하므로 같은 디렉토리의 파일은 정확한 파일명으로 적는다:
+# touches: list of repo-relative paths this task edits, used to decide whether two
+#   tasks of the same repo may run at once (see "External-repo fields" below). Never a
+#   bare string or an empty list (task_validate ERROR). Only the static prefix before
+#   the first wildcard is compared, so name files in a shared directory exactly:
 # touches:
 #   - "shared/src/commonMain/kotlin/com/example/ui/App.kt"
 ---
@@ -210,15 +214,14 @@ it is the single highest-leverage safe auto task (internal, reversible, zero-cos
 fits the guardrails and the `"CI fix"` allowed example), because it unblocks the
 entire project.
 
-**GitHub Actions is not used in any project** (user decision —
-`Decisions/2026-09-11-no-github-actions-local-release-lane.md`).
-Never judge health from `gh run list`: every repo's Actions is switched off, so a
-red, cancelled or missing run there says nothing about the code.
+**Do not rely on GitHub Actions.** Verification is local: never judge health from
+`gh run list` — Actions may be switched off, so a red, cancelled or missing run there
+says nothing about the code.
 
 **Before proposing any normal next-step task, self-heal the default branch:**
 1. Collect active project repos = the `repo:` field of open, non-cancelled Todo
-   items. **Skip `status: cancelled` projects.** (worldgraph is a vault-internal
-   project whose source is the repo editable-installed at `~/Worker/worldgraph`.)
+   items. **Skip `status: cancelled` projects.** (Host-specific project locations, if
+   any, are listed under `host_rules` in `Worker/planner_policy.yaml`.)
 2. For each repo, look for **local** evidence that the default branch is red:
    - a recent `Worker/runs/*/verify.md` for that repo recording a
      "pre-existing red on `<default>`" (the Verify stage checks this explicitly);
@@ -235,7 +238,7 @@ red, cancelled or missing run there says nothing about the code.
 
 **Never create a task that adds, re-enables or repairs a GitHub Actions workflow**
 (`.github/workflows/`), and never write an acceptance criterion that depends on
-Actions ("CI green", "CI에서 생성") — name the local command instead. The exception
+Actions ("CI green", "built in CI") — name the local command instead. The exception
 is a project where the user has explicitly asked for Actions; such a task carries
 `ci: actions` in its frontmatter.
 
@@ -277,7 +280,8 @@ safe exists, output the `exhausted` verdict; idle is better than low-value churn
 
 ## Discovery reports (a project that was actually run and re-read)
 
-When your input carries a **"미소비 discovery 리포트"** block, a `discover` worker
+When your input carries an **unconsumed discovery reports** block (its heading is the
+literal `## 미소비 discovery 리포트 …` emitted by the engine), a `discover` worker
 run has already cloned a project, run its tests/lint/build and a smoke launch,
 and swept the entire tree — its report (`Memory/episodes/*-discovery-<name>.md`)
 lists candidate tasks with evidence (`file:line` or a command and its output).
@@ -286,7 +290,8 @@ so treat those candidates as the best source after main-fix and the next leaf:
 
 1. `Read` each listed report (the injected block shows only the first bullets).
 2. Pick the candidates that fit the guardrails and are concrete enough to be one
-   task each; carry the report's evidence into the task's `## 배경/근거`, and use
+   task each; carry the report's evidence into the task's background section
+   (`## 배경/근거` in the template — keep that heading as is), and use
    its suggested `worker_mode` (`quick` for one-file fixes) and `model_tier`.
 3. Stamp every task you create from a report with `from_discovery: <report stem>`
    in frontmatter — that is what `discovery reconcile` reads to retire the report.
@@ -309,7 +314,8 @@ a task with `worker_mode: discover` — that would loop the cadence on itself.
 4. Read `Worker/queue.json` to check current pending auto tasks count
 5. If pending auto/delegate count >= limit from policy, output `verdict: exhausted tasks=0 reason="auto queue depth limit reached"` and stop
 6. Read `Memory/index.md` for active project context
-6b. **Durable report follow-ups:** if the prompt contains a `## 미처리 report 후속` block
+6b. **Durable report follow-ups:** if the prompt contains a pending-follow-ups block (literal
+    heading `## 미처리 report 후속 …`, emitted by the engine)
     (or run `uv run python -m todo_system.orchestrator.followups emit-context`), treat each
     `- [<id>] …` line as a candidate alongside the next leaf / discovery candidates in step 7.
     For each, EITHER create a task (step 10) stamped `from_followup: <id>`, OR append
@@ -332,9 +338,14 @@ Before creating any task file, validate it against CLAUDE.md format requirements
 
 ### Required fields (must be non-empty)
 From `Worker/planner_policy.yaml` → `required_fields`:
-- **outcome**: 완료 조건을 한 줄로 명확하게 (What does "done" look like?)
-- **next_action**: 지금 당장 할 다음 행동 1개 (Concrete first step)
-- **if_then**: 언제/어디서/무엇을 할지 구체적 If-Then 문장 (Implementation intent)
+- **outcome**: one clear line — what does "done" look like?
+- **next_action**: the single concrete next step
+- **if_then**: a concrete when/where/what if-then sentence (implementation intent)
+
+**Language:** write task prose (title, outcome, next_action, if_then, body) in the
+vault's language — `language:` in `Worker/planner_policy.yaml` if set, otherwise the
+language of the existing `Todo/items/*.md` files. Field names and enum values stay
+English.
 
 ### External-repo fields (auto tasks that touch a project repo)
 A task whose work happens in a project repo (not the vault) MUST carry:
@@ -347,29 +358,28 @@ A task whose work happens in a project repo (not the vault) MUST carry:
   gate) live in the vault's `ops/` and are human-maintained, not worker targets.
 - `allowed_tools:` — including the project's build/test runner (e.g. `Bash(./gradlew:*)`).
 - `auto_merge: true` — unless the task genuinely needs human review.
-- `touches:` — REQUIRED for every `repo:` auto/quick task you create (2026-10-17 user decision:
-  without it the task is serialised behind every other task of the same repo, and on
-  2026-10-17 that held 5 if-then-habits tasks in line while the usage guard had 4 idle slots).
-  Two same-repo tasks run concurrently only when BOTH declare a **disjoint** path-glob list
-  and neither `depends_on` the other (`max_parallel_per_repo`, HQ = 2). Write a non-empty
+- `touches:` — REQUIRED for every `repo:` auto/quick task you create: without it the task
+  is serialised behind every other task of the same repo, which leaves granted worker
+  slots idle. Two same-repo tasks run concurrently only when BOTH declare a **disjoint**
+  path-glob list and neither `depends_on` the other (cap: `max_parallel_per_repo`). Write a non-empty
   YAML list of the files the task will edit, repo-relative; never a bare string or an empty
   list (task_validate flags both as ERROR — the inverse of `allowed_tools`, which must be a
   string). The overlap test compares only the static prefix before the first wildcard, so a
   wildcard in the file name collapses to its directory and overlaps every sibling — name
   existing files exactly (e.g. `.../ui/care/CareViewModel.kt`), and list new files only when
-  you know their exact path. Example: `touches: ["shared/src/commonMain/kotlin/com/ifthenhabits/app/ui/App.kt"]`.
+  you know their exact path. Example: `touches: ["shared/src/commonMain/kotlin/com/example/app/ui/App.kt"]`.
 
 For a followup (`from_followup:`) or leaf, copy these three fields from the source
 task / a sibling task of the same repo (`grep -l "repo: .*<project>" Todo/items/*.md`).
-Do NOT copy `auto_merge: false` from a sibling — most older task files carry it from the
-template default, so copying it re-creates the human gate the user removed. Write
-`auto_merge: true`. This includes ai-stock-trading (live-account code): the user decided on
-2026-09-29 that its PRs auto-merge without asking them. On 2026-10-02 five finished PASS PRs
-(#112–#116) sat in awaiting_human because of copied `false`. Safety ACs still get Verify Step 8b.
+Do NOT copy `auto_merge: false` from a sibling — older task files often carry it from the
+template default, and copying it re-creates a human gate nobody asked for (finished PASS PRs
+then sit in `awaiting_human`). Write `auto_merge: true` unless the task genuinely needs
+review or `host_rules` in `Worker/planner_policy.yaml` says otherwise for that repo.
+Safety acceptance criteria still get Verify Step 8b.
 
 ### Subtask validation
 - Each subtask is a 20-60 minute actionable chunk
-- Use "동사 + 목적어" form (action verb + object)
+- Use verb + object form (an action verb and what it acts on)
 - If any subtask > 60 min estimated, decompose further
 
 ### Estimate validation
@@ -387,9 +397,9 @@ If a task candidate fails validation:
 
 ```markdown
 ---
-outcome: "worker-planner가 policy config를 읽고 적용하는 것을 로그로 확인"
-next_action: "Worker/planner_policy.yaml 읽어서 limits 값 로깅"
-if_then: "planner invoke 시 policy 파일 존재 여부 체크 후 fallback 적용"
+outcome: "the planner's log shows it read and applied the policy config"
+next_action: "read Worker/planner_policy.yaml and log the limits values"
+if_then: "when the planner is invoked, check the policy file exists and fall back to defaults if not"
 ---
 ```
 
@@ -423,8 +433,8 @@ unreachable DB), do **NOT** create a new episode — the audit trail already
 lives in `planner_state.json` (`last_error`) and `worker.out.log`. Only the
 FIRST occurrence of a distinct error gets an episode. (A single multi-day
 outage once produced 143 near-identical `planner-error` episodes — pure log
-spam in the memory graph; this rule prevents that.) Kakao escalation still
-follows the `kakao_on_error` policy below regardless of episode creation.
+spam in the memory graph; this rule prevents that.) Error notification still
+follows the `notifications` policy below regardless of episode creation.
 
 When required, create the episode at:
 ```
@@ -455,14 +465,17 @@ tasks_created: <N>
 <any relevant context or decisions made>
 ```
 
-### Kakao notification (conditional)
+### Notification (conditional)
 
-Check `Worker/planner_policy.yaml` → `notifications` section:
+`scripts/kakao_send.sh` is the engine's notification entry point: it routes to whichever
+channel the host configured (Slack, KakaoTalk) and is a harmless no-op when none is.
+Check `Worker/planner_policy.yaml` → `notifications` (the key names are historical):
 
 - **`kakao_on_tasks_created: true`** → If `verdict: tasks_created`, run:
   ```bash
-  KAKAO_LEVEL=digest KAKAO_EVENT_KEY=planner-loaded scripts/kakao_send.sh "[Planner] 태스크 N개 적재: <slugs>"
+  KAKAO_LEVEL=digest KAKAO_EVENT_KEY=planner-loaded scripts/kakao_send.sh "[Planner] <N> task(s) queued: <slugs>"
   ```
+  (write the message in the vault's language)
 
 - **`kakao_on_error: true`** → If `verdict: error`, run:
   ```bash
@@ -471,7 +484,7 @@ Check `Worker/planner_policy.yaml` → `notifications` section:
 
 - **`kakao_on_exhausted: false`** → Do NOT send notification for exhausted verdicts (noise reduction)
 
-**Note**: `kakao_send.sh` handles failures gracefully (non-fatal). If the script fails, continue with the rest of the planner flow.
+**Note**: the script handles failures gracefully (non-fatal). If it fails, continue with the rest of the planner flow.
 
 ## Edge Cases (graceful handling)
 
@@ -497,7 +510,7 @@ Update `planner_state.json` with `verdict: exhausted`. Idle exit — no error.
 verdict: exhausted tasks=0 reason="all actionable tasks are blocked or awaiting user decision"
 ```
 
-This is normal operation, not an error: no episode (it is `exhausted`), no kakao notification.
+This is normal operation, not an error: no episode (it is `exhausted`), no notification.
 
 ### Dedup collision
 
@@ -527,7 +540,7 @@ verdict: error tasks=0 reason="<specific error: e.g., 'cannot read planner_state
     "last_run": "<timestamp>"
   }
   ```
-- Send kakao notification (if `kakao_on_error: true`)
+- Send the error notification (if `kakao_on_error: true`)
 - Create an episode with error details only if the error is new (see "Repeated-error de-duplication")
 - Exit to idle state (do not retry)
 
@@ -550,7 +563,7 @@ verdict: error tasks=0 reason="unexpected error: <brief description>"
 ```
 
 - Record `last_error` in `planner_state.json`
-- Send kakao notification
+- Send the error notification (if `kakao_on_error: true`)
 - Create an episode with error details only if the error is new (see "Repeated-error de-duplication")
 - Exit without retrying
 

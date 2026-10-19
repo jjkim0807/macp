@@ -23,10 +23,10 @@ The runner starts this stage with background tasks switched off
 (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`), so `run_in_background` just runs in the
 foreground. A slow build needs the Bash `timeout` parameter — the runner raises
 the cap to `3600000` ms (60 min; a call with no `timeout` gets 20 min), and the
-stage itself has 2 h (3 h for heavy-tier tasks). Gradle on this host can take
+stage itself has 2 h (3 h for heavy-tier tasks). Gradle on a busy host can take
 10–30 min per task under memory contention, so pass `timeout: 3600000` to every
 `./gradlew` call and let it finish; do not split the suite, drop lanes, or stop
-early to fit a smaller budget (user decision 2026-10-18: finish, even if slow).
+early to fit a smaller budget — a slow, complete check beats a skipped one.
 Use a scoped `--rerun` on the one task you need re-executed, not `--rerun-tasks`,
 which rebuilds the whole graph from scratch (a past run ended its turn waiting on
 exactly that). If a Gradle command does time out, its daemon may still hold the
@@ -37,10 +37,8 @@ Only if a check still cannot finish inside the 60-minute cap, write
 
 ## Policy: local verification — GitHub Actions is not used
 
-User decision (`Decisions/2026-09-11-no-github-actions-local-release-lane.md`):
-**GitHub Actions is not used in any project, existing or new, unless the user has
-explicitly said otherwise for that project.** Actions is switched off at the repo
-level. Therefore:
+**This pipeline does not use GitHub Actions** unless the task frontmatter says
+`ci: actions`. Actions may be switched off at the repo level. Therefore:
 
 - Verification = the project's own test / lint / build commands, **run here**. This
   is the normal path and a full-strength verdict — not a degraded fallback.
@@ -133,9 +131,9 @@ the project's standard test + lint gates (and a build when it is cheap enough).
 - **Green by irrelevance is not evidence.** `NO-SOURCE`, `SKIPPED`,
   `0 tests collected`, or `UP-TO-DATE` on a task whose inputs changed proves
   nothing — force it (`--rerun`) or name the substitute execution that does cover
-  the change (e.g. if-then-habits' `:app:testDebugUnitTest` is NO-SOURCE; the real
-  `:app` gate is `:app:compileDebugKotlin --rerun`).
-- Budget the stage (60-minute cap by default, 90 on heavy tasks). Run the AC-named gates first. If you are running
+  the change (e.g. an Android app module whose `:app:testDebugUnitTest` is NO-SOURCE;
+  the real `:app` gate is `:app:compileDebugKotlin --rerun`).
+- Budget the stage (2 h by default, 3 h on heavy-tier tasks, 1 h on light; 60 min per command). Run the AC-named gates first. If you are running
   out of time or turns with checks still pending, write `verify.md` with
   `overall_status: skip` and name exactly what did not run.
 - If a required toolchain is missing on this host or its command is gated, don't
@@ -220,8 +218,8 @@ Applies when the task is a safety/finance path — `auto_merge: false`, or a spe
 names a real account, an order path, a kill switch, a liquidation, or a liveness
 alarm. For every acceptance criterion of that kind, a green test suite is NOT
 evidence. A suite can be green because no test ever reaches the failure the AC is
-about. That is how two real defects reached a human gate on 2026-09-16 with all ACs
-marked PASS (see below). Do this instead:
+about. That is how real defects have reached a human gate with every AC marked PASS
+(two examples below). Do this instead:
 
 **1. Name the test.** For each safety AC, find the specific test that exercises it and
 cite it `file:line` in verify.md. No test → the AC is **FAIL**, not SKIP, with
@@ -257,13 +255,12 @@ and retry bounds are where this bites:
 **4. Say what you could not reach.** List any safety AC you could not tie to an
 executed test. Do not round that up to PASS.
 
-Both 2026-09-16 escapes would have been caught here: `ai-stock-trading-real-watchdog`
-moved a crash-loop check behind a `heartbeat.json` existence test, so a loop that dies
-before its first heartbeat — the real account's day-one failure — is silently skipped,
-and both existing tests wrote a heartbeat first (step 1/3).
-`ai-stock-trading-liquidation-fill-confirmation` confirmed fills against a 5-second
-window while its primary caller liquidates at 15:20 into a close that fills at 15:30,
-so every final liquidation would report 100% failed forever (step 3).
+Two escapes this procedure would have caught: a trading watchdog moved its crash-loop
+check behind a `heartbeat.json` existence test, so a loop that dies before its first
+heartbeat — the day-one failure on a fresh install — is silently skipped, and both
+existing tests wrote a heartbeat first (steps 1 and 3). A fill-confirmation helper
+waited 5 seconds while its main caller places orders into a closing auction that fills
+ten minutes later, so every such order would be reported as failed (step 3).
 
 ### Step 8c: A "needs re-scoping" FAIL should carry a machine-readable split plan
 
@@ -333,7 +330,7 @@ Last 30 lines of output:
 |---|-----------|-------|--------|----------|
 | 1 | "tests pass" | #1 | PASS | 1268 passed |
 | 2 | "README updated" | diff | PASS | README.md L40-52 |
-| 3 | "실기기에서 확인" | - | UNVERIFIED | device-only; left for a human |
+| 3 | "verified on a real device" | - | UNVERIFIED | device-only; left for a human |
 
 ## Branch State
 
@@ -347,7 +344,7 @@ Omit this section only when no acceptance criterion is a safety/finance path (St
 
 | # | Safety AC | Test (file:line) | RED control | Call-site trace |
 |---|-----------|------------------|-------------|-----------------|
-| 2 | "미체결은 failed로 반환" | tests/test_x.py:115 | run.log L220 (pre-fix FAIL) | caller passes 15:20, test passes instant fill — MISMATCH |
+| 2 | "unfilled orders are reported as failed" | tests/test_x.py:115 | run.log L220 (pre-fix FAIL) | caller passes a closing-auction time, test passes an instant fill — MISMATCH |
 
 - unreached safety ACs: <none | list them; never round these up to PASS>
 
