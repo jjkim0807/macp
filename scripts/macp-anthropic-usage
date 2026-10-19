@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# macp-anthropic-usage — query Anthropic Admin usage/cost
+# (`python -m todo_system.anthropic_usage`) from ANY directory. Worker stages run
+# in other repos' checkouts and their tool whitelist splits on spaces, so a rule
+# like `Bash(python3 -m todo_system.anthropic_usage:*)` can never match; this
+# wrapper gives the whitelist a single space-free name:
+# `Bash(macp-anthropic-usage:*)`.
+# Install: copy to a dir on PATH, e.g.
+# `cp scripts/macp-anthropic-usage ~/.local/bin/macp-anthropic-usage && chmod +x ~/.local/bin/macp-anthropic-usage`.
+# todo_system.anthropic_usage is stdlib-only, so the python3 fallback is always enough.
+MACP_REPO="${MACP_REPO:-$HOME/Projects/MaestroACP}"
+PY="$MACP_REPO/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+exec env PYTHONPATH="$MACP_REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m todo_system.anthropic_usage "$@"

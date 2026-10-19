@@ -133,6 +133,33 @@ The dashboard binds to loopback. It refuses to start on any other address — or
 Profiles and Claude accounts (`python -m todo_system.macp profile|account …`) live in
 `~/.macp/`.
 
+## Anthropic usage & cost
+
+`todo_system.anthropic_usage` queries the Anthropic **Admin** API (no browser
+console) for token counts and billed dollars:
+
+```bash
+# tokens per model/key + list-price cost, one-minute buckets
+uv run python -m todo_system.anthropic_usage usage \
+    --since 2026-10-16T00:30Z --until 2026-10-16T00:40Z --bucket 1m
+# the amounts Anthropic billed, in USD (cents in the API)
+uv run python -m todo_system.anthropic_usage cost --day 2026-10-16
+```
+
+Add `--json` for machine-readable output. The key is read from
+`ANTHROPIC_ADMIN_KEY`, else `<vault>/.secrets/anthropic-admin-key`, and is never
+printed. Report data lags live traffic by ~5 minutes. A **personal** account's
+key gets 403 — the Admin API needs an organization (switch the account first);
+the CLI then prints a one-line hint and exits 2.
+
+Stdlib-only, so it also runs from a bare clone (`python3 -m
+todo_system.anthropic_usage …`). For worker stages in other checkouts, install
+the space-free wrapper and allow `Bash(macp-anthropic-usage:*)`:
+
+```bash
+cp scripts/macp-anthropic-usage ~/.local/bin/macp-anthropic-usage && chmod +x ~/.local/bin/macp-anthropic-usage
+```
+
 ## Known limitations
 
 - **Author-specific integrations ship in the tree**: KakaoTalk/Slack notifications
