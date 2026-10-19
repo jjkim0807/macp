@@ -340,6 +340,11 @@ From `Worker/planner_policy.yaml` → `required_fields`:
 A task whose work happens in a project repo (not the vault) MUST carry:
 - `repo:` — the project's clone URL. Without it the runner dispatches the task as a
   vault task: no working_dir, no build, and it parks as `awaiting_human`.
+  **macp engine (self-improvement) tasks MUST carry `repo: "https://github.com/jjkim0807/macp.git"`** —
+  since 2026-10-19 (public split 15) the vault MaestroACP has no `todo_system/`, `scripts/` or
+  `.claude/commands/`; the engine is the public repo. A macp task without `repo:` dispatches as a
+  vault task and finds nothing to edit. Vault-only ops scripts (remote-control stack, identifier
+  gate) live in the vault's `ops/` and are human-maintained, not worker targets.
 - `allowed_tools:` — including the project's build/test runner (e.g. `Bash(./gradlew:*)`).
 - `auto_merge: true` — unless the task genuinely needs human review.
 - `touches:` — REQUIRED for every `repo:` auto/quick task you create (2026-10-17 user decision:

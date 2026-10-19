@@ -15,7 +15,10 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
    - **`auto`** — a concrete, *reversible*, internal/code task an AI can finish
      end-to-end with **no external side effects and no human decision**
      (implement a feature, fix a bug, refactor, write tests/docs). If it targets
-     an external project, add its git URL as `repo:`.
+     an external project, add its git URL as `repo:`. macp engine work (anything under
+     `todo_system/`, `scripts/`, `.claude/commands/`) lives in
+     `https://github.com/jjkim0807/macp.git` since 2026-10-19 — always set that as `repo:`
+     for macp self-improvement tasks; the vault has no engine code any more.
      With `repo:`, also add `touches:` — a non-empty YAML list of the repo-relative
      files the task will edit (exact paths; a wildcard in the file name collapses to
      the whole directory). Same-repo tasks run in parallel only when both declare
