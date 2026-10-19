@@ -986,6 +986,9 @@ MAX_SCANNED_WORKTREES = 50
 # calls made before the loop. Real worst case is ~70-90s, not 30s.
 STALE_WORKTREE_BUDGET_S = 30
 _GIT_TIMEOUT_S = 10
+# `uv sync` resolves + links an environment; far slower than a git read, so it
+# gets its own ceiling rather than the 10s git timeout.
+_UV_SYNC_TIMEOUT_S = 300
 # Injection seam for the budget tests. Patching `time.monotonic` itself would not
 # do: `subprocess.run(timeout=…)` reads the same function, so a fake clock turns
 # real git calls into bogus `TimeoutExpired` that the fail-open path swallows,
@@ -1032,6 +1035,86 @@ def _git_read(repo_root: Path, *args: str,
         check=False,
         timeout=timeout,
     )
+
+
+def pull_engine_checkout(
+    *,
+    engine: Path | None = None,
+    vault: Path | None = None,
+    run: Callable = subprocess.run,
+) -> list[str]:
+    """Best-effort ff-only pull of a *separate* engine checkout, inside the tick.
+
+    When the engine runs from an installed layout — ``engine_root()`` is a git
+    checkout (``~/Projects/macp``) distinct from the vault — a self-improvement
+    PR merged into macp never reaches the resident HQ daemons unless that
+    checkout is pulled. This ports the temporary ``ops/macp_engine_pull.sh``
+    wiring into the maintenance tick so it runs right before
+    :func:`restart_stale_daemons`: new code lands in the checkout and the same
+    tick kickstarts the daemons onto it.
+
+    Safety mirrors the ops script: no pull when HEAD is not ``main`` or the tree
+    is dirty (excluding ``Worker/`` scratch), and ``--ff-only`` so a local commit
+    fails loudly and retries next tick rather than merging/rebasing. A dependency
+    change (``pyproject.toml`` / ``uv.lock``) triggers ``uv sync``.
+
+    No-op (empty list) for the combined layout (``engine == vault``), a wheel
+    install, or any non-checkout — anything without an ``engine/.git``.
+
+    Returns the list of failure reasons: empty when nothing went wrong
+    (including every skip / no-op), non-empty only when a git/uv command exited
+    non-zero. The caller raises the tick rc on a non-empty list; subprocess
+    failures do not raise, so a return value — not try/except alone — is what
+    signals them.
+
+    ``engine`` / ``vault`` / ``run`` are test seams; runtime calls pass nothing.
+    """
+    engine = Path(engine) if engine else paths.engine_root()
+    vault = Path(vault) if vault else ROOT
+    if engine == vault or not (engine / ".git").exists():
+        return []
+
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return run(
+            ["git", "-C", str(engine), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_S,
+        )
+
+    if _git("branch", "--show-current").stdout.strip() != "main":
+        print("engine-pull: skip — HEAD가 main이 아님")
+        return []
+    if _git("status", "--porcelain", "--", ".", ":!Worker").stdout.strip():
+        print("engine-pull: skip — 체크아웃 dirty")
+        return []
+
+    before = _git("rev-parse", "--short", "HEAD").stdout.strip()
+    if _git("fetch", "origin", "main").returncode != 0:
+        return ["engine-pull: fetch 실패"]
+    if _git("pull", "--ff-only", "origin", "main").returncode != 0:
+        return ["engine-pull: ff-only pull 실패 (로컬 커밋?)"]
+    after = _git("rev-parse", "--short", "HEAD").stdout.strip()
+    if before == after:
+        return []
+
+    # `diff --quiet` exits 0 when pyproject/uv.lock are unchanged, 1 when they
+    # differ — only then does the environment need resyncing.
+    if _git("diff", "--quiet", before, after, "--", "pyproject.toml", "uv.lock").returncode == 0:
+        print(f"engine-pull: pulled {before} -> {after}")
+        return []
+    if run(
+        ["uv", "sync", "-q"],
+        cwd=str(engine),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_UV_SYNC_TIMEOUT_S,
+    ).returncode != 0:
+        return ["engine-pull: uv sync 실패"]
+    print(f"engine-pull: pulled {before} -> {after} + uv sync")
+    return []
 
 
 def _resolve_base_ref(repo_root: Path) -> str | None:
@@ -1679,6 +1762,15 @@ def cmd_maintenance() -> int:
                     pass
         except Exception as exc:
             print(f"migration-drift: error — {exc}")
+            rc = 1
+        # Pull macp's own merged PRs into the engine checkout *before* the
+        # restart below, so the daemons kickstart onto the new code in one tick.
+        try:
+            for reason in pull_engine_checkout():
+                print(reason)
+                rc = 1
+        except Exception as exc:
+            print(f"engine-pull: error — {exc}")
             rc = 1
         # macp edits its own source; the daemons executing those edits are
         # resident and would otherwise never load them.
