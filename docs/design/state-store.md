@@ -76,3 +76,166 @@ HEAD 기준 `파일:줄`.
 - **`planner_state.json`은 리더가 최소 넷**(worker 두 상수 + discovery + project_stall).
   kv 표면은 이들을 전부 거쳐가게 하거나, 최소한 전부가 같은 백엔드를 읽도록 배선해야
   한다(§6 leaf ③의 범위).
+
+---
+
+## ② `StateStore` 인터페이스 초안
+
+네 영역(ledger CRUD · mailbox put/take/ack · todo 캐시 · planner kv)을 하나의
+`StateStore` 아래 **하위 표면(sub-surface)으로 노출**한다. 시그니처는 전부 현행
+구현을 거울상으로 베낀 **초안**이다 — 확정 API 가 아니라 leaf ②가 실제로 쓸 때의
+출발점. 각 표면 옆에 거울상이 된 현행 코드 앵커를 달았다.
+
+```python
+# docs/design: draft signatures only — leaf ②가 구현.
+from abc import ABC, abstractmethod
+
+class StateStore(ABC):
+    """오케스트레이터 지속 상태의 단일 진입점. 네 영역을 하위 표면으로 돌려준다."""
+
+    @abstractmethod
+    def ledger(self) -> "Ledger": ...          # assignment.py:245 모양 그대로
+    @abstractmethod
+    def mailbox(self) -> "Mailbox": ...         # mailbox.py:81 ABC — git 모드는 그대로 재사용
+    @abstractmethod
+    def planner_kv(self) -> "PlannerKV": ...    # worker.py planner_state 모양
+    @abstractmethod
+    def todo_cache(self) -> "TodoCacheReader": ...  # 파생 — 소유는 선택
+
+# --- 영역 1: ledger CRUD (거울상: assignment.py:245 Ledger) ---
+#   save(a: Assignment) -> None        # assignment.py:252
+#   load(task_id: str) -> Assignment | None   # :255
+#   all() -> list[Assignment]          # :264
+#   active(task_id: str) -> Assignment | None # :275
+# Assignment 데이터클래스(assignment.py:93, 필드 95–193)와 상태머신(:18-27)은
+# 백엔드와 무관한 값 타입이라 그대로 재사용. git 백엔드는 현행 Ledger 를 감싸기만 한다.
+
+# --- 영역 2: mailbox put/take/ack (거울상: mailbox.py:81 Mailbox ABC) ---
+#   init_agent(agent_id: str) -> None  # mailbox.py:94
+#   send(msg: Envelope) -> Path        # :145   (put)
+#   receive(agent_id: str) -> list[Envelope]   # :154   (take, at-least-once)
+#   ack(agent_id, msgs) -> None        # :172   (소비)
+# ↑ 이미 Mailbox ABC 가 정확히 이 네 메서드 + 틈브스톤/커서 로직을 담고 있고,
+#   전송 훅(_before_receive:138 / _after_send:141 / _after_ack:193)이 하위클래스
+#   확장점으로 열려 있다. → 아래 '재사용/흡수 결정' 참조.
+
+class PlannerKV(ABC):   # 거울상: worker.py load/save_planner_state (:364/:377)
+    @abstractmethod
+    def get(self, key: str) -> "Any | None": ...
+    @abstractmethod
+    def put(self, key: str, value: "Any") -> None: ...
+    @abstractmethod
+    def all(self) -> dict: ...
+# 주의: 현행 save_planner_state(:377)는 dict 전체를 통째로 쓰고(verdict[+queue]),
+#   리더가 넷(§①의 관찰)이다. kv 표면은 이 coarse write 를 get/put 로 감싸되,
+#   네 리더가 전부 같은 PlannerKV 인스턴스를 거치게 배선하는 게 leaf ③의 일.
+
+class TodoCacheReader(ABC):   # 거울상: metrics._db_counts(:45-55) + cli.DB_PATH(:27)
+    @abstractmethod
+    def counts(self) -> dict: ...          # done/auto_done/cancelled 등 파생 집계
+    # (확장) query(sql, params) 같은 읽기 전용 표면
+# todo.db 는 md 의 **파생 캐시**(SoT 아님)다. 따라서 external 백엔드도 todo.db 를
+# 그대로 두고(= cli import-md 가 계속 생성) 읽기만 위임할 수 있다 — SQLite state.sqlite
+# 로 복사할 필요 없음. 소유 이전은 비목표.
+```
+
+### 재사용/흡수 결정 — **구성(composition)을 택한다**
+
+| 선택지 | 내용 | 트레이드오프 |
+|---|---|---|
+| **구성 (채택)** | `StateStore.mailbox()`가 `Mailbox`(mailbox.py:81)를 돌려준다. git 모드는 `open_mailbox("git://Worker/agents")`(:341)로 **현행 `GitMailbox`(:226)·`FileMailbox`(:217)를 그대로** 쓴다. external 모드는 SQLite 기반 `Mailbox` 하위클래스가 전송 훅(`_before_receive`:138 / `_after_send`:141 / `_after_ack`:193)과 커서 영속만 오버라이드한다. | 검증된 커서/틈브스톤 정합성(`mailbox.py:47-55`, 99–209)을 **다시 안 짠다**. 표면이 하나 더 생기지만(`StateStore.mailbox()`) 이미 `Mailbox` ABC 가 하위클래스 확장점을 갖고 있어 자연스럽다. |
+| 흡수 | 평평한 `StateStore` 하나가 `send`/`receive`/`ack`를 직접 노출(별도 Mailbox 없음). | 표면은 작아지지만 틈브스톤/at-least-once 로직을 **모든 백엔드가 재구현**해야 하고, leaf ②~⑥의 폭발 반경이 커진다. GitMailbox 의 pull/push·rebase 재시도(`mailbox.py:295-333`)를 StateStore 로 끌어올려야 해 레이어가 뒤섞인다. |
+
+**결정 근거**: `Mailbox` ABC 는 이미 (a) put/take/ack 대칭 네 메서드, (b) 전송
+훅 세 개(`_before_receive`/`_after_send`/`_after_ack`)라는 백엔드 확장 seam 을
+갖고 있다. 새 백엔드는 "재작성"이 아니라 "하위클래스"로 끝난다 — 구성을 가리키는
+결정적 증거다. 흡수의 유일한 장점(표면 축소)은 틈브스톤 재구현 비용을 넘지 못한다.
+따라서 **ledger·planner_kv·todo_cache 도 같은 원칙**으로 간다: `StateStore` 는
+각 영역의 기존 구현(또는 그 하위클래스)을 **보유(has-a)**하고, 호출부는
+`StateStore`를 통해 그 영역에 닿는다.
+
+---
+
+## ③ 모드 전환 설정 + external SQLite 스키마 초안
+
+### 모드 전환 키
+
+- **환경변수** `MACP_STATE_BACKEND` ∈ `{git, external}`, **기본 `git`**.
+- **설정 파일** `.macp/config.toml` 최상위 문자열 키 `state_backend`.
+- **리졸버**는 `paths.py`의 기존 3종 패턴을 그대로 복제한다:
+  `label_prefix`(paths.py:238) · `primary_calendar_id`(:277) · `repo_slug`(:312)
+  — 셋 다 `env MACP_* → 상향 탐색한 가장 가까운 .macp/config.toml 의 키(`_read_config_key`:83,
+  tomllib 없으면 minimal 폴백 :103) → 중립 기본값` 순서다. 신규 `state_backend` 리졸버도
+  동일하게:
+  1. `os.environ.get("MACP_STATE_BACKEND")` 가 있으면 그 값(검증: `{git, external}` 외는 거부).
+  2. 없으면 상향 탐색한 `.macp/config.toml` 의 `state_backend` 키.
+  3. 없으면 중립 기본 `"git"` — 기존 설치는 아무 설정 없이 **현행 동작 그대로**.
+  > 이 리졸버 함수의 **정확한 이름/시그니처는 여기서 확정하지 않는다**(leaf ③의 일).
+  > 본 노트는 "`repo_slug` 를 닮은 리졸버 하나"라고만 규정한다 — 지어낸 시그니처가
+  > leaf ③과 어긋나지 않게.
+- **external SQLite 경로**: 기본 `~/.local/share/macp/state.sqlite`(XDG `$XDG_DATA_HOME`
+  존중, 볼트 **밖** — git 트리에 없음이 핵심). 재정의: `MACP_STATE_SQLITE_PATH` env /
+  `state_sqlite_path` config 키(같은 리졸버 패턴).
+
+### external SQLite 스키마 초안
+
+①의 전수 목록을 그대로 테이블로 투영한다(초안 — leaf ④가 확정·마이그레이션):
+
+```sql
+-- 메타/버전 (마이그레이션 발판)
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);          -- schema_version 등
+
+-- ledger: Assignment(assignment.py:93, 필드 95–193) 1행=1과제
+CREATE TABLE ledger (
+  task_id      TEXT PRIMARY KEY,
+  agent_id     TEXT NOT NULL,
+  corr_id      TEXT NOT NULL,
+  state        TEXT NOT NULL,          -- assignment.py:18-27 상수
+  kind         TEXT,
+  attempts     INTEGER,
+  refail_count INTEGER,
+  created_ts   TEXT,
+  updated_ts   TEXT,
+  -- 스칼라 필드는 열로; 가변/중첩은 JSON 텍스트로(SQLite JSON1):
+  flags_json   TEXT,                   -- capacity_limited/job_running/checkout_busy/… 묶음
+  history_json TEXT,                   -- history: list[dict] (assignment.py:192)
+  payload_json TEXT                    -- payload: dict (:193)
+);
+CREATE INDEX ledger_state ON ledger(state);
+
+-- mailbox: inbox 메시지 (Envelope)
+CREATE TABLE mailbox (
+  msg_id      TEXT PRIMARY KEY,        -- ULID (시간순)
+  to_agent    TEXT NOT NULL,
+  frm         TEXT,
+  type        TEXT NOT NULL,
+  task_id     TEXT,
+  corr_id     TEXT,
+  payload_json TEXT,
+  created_ts  TEXT NOT NULL
+);
+CREATE INDEX mailbox_to ON mailbox(to_agent, msg_id);
+
+-- mailbox 커서 + ack 틈브스톤 (mailbox.py:47-55 의 at-least-once/틈브스톤을 열로 보존)
+CREATE TABLE mailbox_cursor (
+  agent_id TEXT NOT NULL,
+  msg_id   TEXT NOT NULL,
+  status   TEXT NOT NULL,              -- 'seen' | 'acked'
+  acked_at REAL,                       -- 틈브스톤 타임스탬프(TTL/캡 적용 대상)
+  PRIMARY KEY (agent_id, msg_id)
+);
+-- external 모드에서는 소비=행 삭제가 곧 영구 소비라 git-restore 부활이 원천적으로
+-- 없음 — 틈브스톤은 git 모드 호환/이관 보존용으로만 유지(§⑤ 참조).
+
+-- planner kv (worker.py:364/:377) — 통짜 dict 를 key/value 로 평탄화
+CREATE TABLE planner_kv (
+  key        TEXT PRIMARY KEY,         -- verdict / todo_state_hash / …
+  value_json TEXT,
+  updated_ts TEXT
+);
+```
+
+- **todo 캐시는 SQLite 로 복사하지 않는다** — md 의 파생이라 `todo.db` 를 그대로 둔다(§②).
+- `queue.json`·`runs/`·`sweep_state`·heartbeat 는 **호스트 로컬 런타임**이고 SoT 가
+  아니므로 1차 external 백엔드의 이관 대상이 아니다(ledger 에서 재생성되는 파생 뷰거나
+  순수 로컬 스크래치). 공유가 필요해지면 leaf ⑦(Cloud SQL)에서 재검토.
