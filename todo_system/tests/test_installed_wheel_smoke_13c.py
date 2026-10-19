@@ -54,21 +54,23 @@ _SCRUB = (
     "MACP_PYTHON",
     "MACP_REPO_SLUG",
 )
-# gen_units knobs that would make the rendered units depend on the host.
+# gen_units knobs that would make the rendered units depend on the host. Includes
+# the vault-root vars: the fixture pins the vault explicitly below, and the stage
+# runs with an ambient MACP_VAULT_ROOT (now gen_units' primary) pointing at the real
+# vault, which would otherwise leak into the rendered units.
 _GEN_UNITS_SCRUB = ("MACP_ENGINE_PYTHON", "MACP_CALENDAR_ID", "MACP_LABEL_PREFIX",
-                    "MACP_HOST_ID", "MACP_CLAUDE_RC_NAME")
+                    "MACP_HOST_ID", "MACP_CLAUDE_RC_NAME", "MACP_VAULT_ROOT",
+                    "MAESTRO_VAULT_DIR", "MACP_ENGINE_ROOT")
 # Same classification as scripts/systemd/test_gen_units.py (not importable from here).
+# Engine-core only: the author-only engine-script units (kakao-refresh/digest,
+# claude-auth-watch) and the vault-only units (Remote Control stack, usage monitor)
+# were dropped from gen_units, so only these four engine-script units remain.
 CONVERTED = {
     "macp-orchestrator": "orchestrator_tick.sh",
     "macp-planner": "planner_tick.sh",
     "macp-brief": "brief.sh",
-    "macp-kakao-refresh": "kakao_token_refresh.sh",
     "macp-health": "health_report.py",
-    "macp-kakao-digest": "kakao_digest_send.py",
-    "claude-auth-watch": "claude_auth_watch.py",
 }
-VAULT_ONLY = ("claude-upgrade", "claude-remote-control", "claude-remote-control-watchdog",
-              "macp-monitor")
 _DECOY_EXIT = 3
 _DECOY = f"""print("DECOY engine_script from the cwd checkout")
 raise SystemExit({_DECOY_EXIT})
@@ -138,7 +140,8 @@ def decoy_vault(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def decoy_home(tmp_path_factory) -> Path:
-    """HOME for gen_units; claude-auth-watch runs from here, so it gets the decoy too."""
+    """HOME for gen_units (so VAULT/ENGINE_ROOT defaults resolve under tmp, not the
+    real home); carries the decoy todo_system as a belt-and-suspenders guard."""
     root = tmp_path_factory.mktemp("smoke-home-13c")
     _write_decoy(root)
     return root
@@ -150,7 +153,7 @@ def gen_units(decoy_vault, decoy_home):
         for key in _GEN_UNITS_SCRUB:
             os.environ.pop(key, None)
         os.environ["HOME"] = str(decoy_home)
-        os.environ["MAESTRO_VAULT_DIR"] = str(decoy_vault)
+        os.environ["MACP_VAULT_ROOT"] = str(decoy_vault)
         spec = importlib.util.spec_from_file_location(
             "gen_units_13c", REPO / "scripts" / "systemd" / "gen_units.py")
         mod = importlib.util.module_from_spec(spec)
@@ -206,11 +209,5 @@ def test_without_dash_P_the_vault_checkout_would_shadow_the_wheel(units, install
     assert proc.returncode == _DECOY_EXIT, (proc.returncode, proc.stdout, proc.stderr)
     assert "DECOY" in proc.stdout, proc.stdout
 
-
-def test_vault_only_units_are_not_routed_through_the_wheel(units, decoy_vault):
-    for stem in VAULT_ONLY:
-        text = units[f"{stem}.service"]
-        exec_start, _, unit_env = _unit_fields(text)
-        assert "engine_script" not in text, stem
-        assert f"{decoy_vault}/" in exec_start, (stem, exec_start)
-        assert "MACP_VAULT_ROOT" not in unit_env, stem
+# NB: the vault-only-units smoke was removed — the engine-core set has no vault-only
+# unit left (the Remote Control stack and usage monitor were author-only, now dropped).

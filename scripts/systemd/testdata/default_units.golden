@@ -27,7 +27,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/srv/neutral-vault
 EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/zsh /srv/neutral-vault/scripts/orchestrator_tick.sh
+ExecStart=/bin/zsh /srv/neutral-engine/scripts/orchestrator_tick.sh
 StandardOutput=append:/srv/neutral-vault/logs/macp-orchestrator.out.log
 StandardError=append:/srv/neutral-vault/logs/macp-orchestrator.err.log
 TimeoutStartSec=1800
@@ -52,7 +52,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/srv/neutral-vault
 EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/bash /srv/neutral-vault/scripts/planner_tick.sh
+ExecStart=/bin/bash /srv/neutral-engine/scripts/planner_tick.sh
 StandardOutput=append:/srv/neutral-vault/logs/macp-planner.out.log
 StandardError=append:/srv/neutral-vault/logs/macp-planner.err.log
 TimeoutStartSec=1800
@@ -92,31 +92,6 @@ Unit=macp-maintenance.service
 
 [Install]
 WantedBy=timers.target
-##### macp-monitor.service
-[Unit]
-Description=macp usage monitor (sensor)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-vault
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/Worker/_state/macp_monitor/monitor.py scan --daemon
-StandardOutput=append:/srv/neutral-vault/logs/macp-monitor.out.log
-StandardError=append:/srv/neutral-vault/logs/macp-monitor.err.log
-TimeoutStartSec=1800
-##### macp-monitor.timer
-[Unit]
-Description=macp usage monitor (timer)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=30min
-Unit=macp-monitor.service
-
-[Install]
-WantedBy=timers.target
 ##### macp-todo-sync.service
 [Unit]
 Description=macp todo-sync daemon (md -> todo.db, calendar)
@@ -146,7 +121,7 @@ Type=simple
 WorkingDirectory=/srv/neutral-vault
 EnvironmentFile=/srv/neutral-home/.config/macp/env
 EnvironmentFile=/srv/neutral-home/.config/macp/dashboard.env
-ExecStart=/srv/neutral-home/.local/bin/uv run python -u scripts/macp_dashboard.py --host 127.0.0.1 --port 8787 --no-open
+ExecStart=/srv/neutral-home/.local/bin/uv run python -u /srv/neutral-engine/scripts/macp_dashboard.py --host 127.0.0.1 --port 8787 --no-open
 StandardOutput=append:/srv/neutral-vault/logs/macp-dashboard.out.log
 StandardError=append:/srv/neutral-vault/logs/macp-dashboard.err.log
 Restart=always
@@ -164,7 +139,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/srv/neutral-vault
 EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/zsh /srv/neutral-vault/scripts/brief.sh
+ExecStart=/bin/zsh /srv/neutral-engine/scripts/brief.sh
 StandardOutput=append:/srv/neutral-vault/logs/macp-brief.out.log
 StandardError=append:/srv/neutral-vault/logs/macp-brief.err.log
 TimeoutStartSec=1800
@@ -179,31 +154,6 @@ Unit=macp-brief.service
 
 [Install]
 WantedBy=timers.target
-##### macp-kakao-refresh.service
-[Unit]
-Description=Kakao token refresh
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-vault
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/zsh /srv/neutral-vault/scripts/kakao_token_refresh.sh
-StandardOutput=append:/srv/neutral-vault/logs/macp-kakao-refresh.out.log
-StandardError=append:/srv/neutral-vault/logs/macp-kakao-refresh.err.log
-TimeoutStartSec=1800
-##### macp-kakao-refresh.timer
-[Unit]
-Description=Kakao token refresh (timer)
-
-[Timer]
-OnCalendar=*-*-* 00,04,08,12,16,20:30:00
-Persistent=true
-Unit=macp-kakao-refresh.service
-
-[Install]
-WantedBy=timers.target
 ##### macp-health.service
 [Unit]
 Description=macp weekly health report
@@ -214,7 +164,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/srv/neutral-vault
 EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/scripts/health_report.py
+ExecStart=/usr/bin/python3 /srv/neutral-engine/scripts/health_report.py
 StandardOutput=append:/srv/neutral-vault/logs/macp-health.out.log
 StandardError=append:/srv/neutral-vault/logs/macp-health.err.log
 TimeoutStartSec=1800
@@ -226,271 +176,6 @@ Description=macp weekly health report (timer)
 OnCalendar=Sun *-*-* 08:30:00
 Persistent=true
 Unit=macp-health.service
-
-[Install]
-WantedBy=timers.target
-##### macp-kakao-digest.service
-[Unit]
-Description=macp kakao digest flush (queued FYI alerts → one daily memo)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-vault
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/scripts/kakao_digest_send.py
-StandardOutput=append:/srv/neutral-vault/logs/macp-kakao-digest.out.log
-StandardError=append:/srv/neutral-vault/logs/macp-kakao-digest.err.log
-TimeoutStartSec=1800
-##### macp-kakao-digest.timer
-[Unit]
-Description=macp kakao digest flush (timer)
-
-[Timer]
-OnCalendar=*-*-* 08:35:00
-Persistent=true
-Unit=macp-kakao-digest.service
-
-[Install]
-WantedBy=timers.target
-##### claude-auth-watch.service
-[Unit]
-Description=Claude CLI credential watch
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/scripts/claude_auth_watch.py
-StandardOutput=append:/srv/neutral-vault/logs/claude-auth-watch.out.log
-StandardError=append:/srv/neutral-vault/logs/claude-auth-watch.err.log
-TimeoutStartSec=1800
-##### claude-auth-watch.timer
-[Unit]
-Description=Claude CLI credential watch (timer)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=6h
-Unit=claude-auth-watch.service
-
-[Install]
-WantedBy=timers.target
-##### claude-upgrade.service
-[Unit]
-Description=Claude CLI upgrade + remote-control restart
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/scripts/claude_upgrade.py
-StandardOutput=append:/srv/neutral-vault/logs/claude-upgrade.out.log
-StandardError=append:/srv/neutral-vault/logs/claude-upgrade.err.log
-TimeoutStartSec=1800
-##### claude-upgrade.timer
-[Unit]
-Description=Claude CLI upgrade (timer)
-
-[Timer]
-OnCalendar=*-*-* 04,10,16,22:40:00
-Persistent=true
-Unit=claude-upgrade.service
-
-[Install]
-WantedBy=timers.target
-##### claude-remote-control.service
-[Unit]
-Description=Claude Code Remote Control daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/srv/neutral-vault
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/zsh /srv/neutral-vault/scripts/claude_remote_control.sh
-StandardOutput=append:/srv/neutral-vault/logs/claude-remote-control.out.log
-StandardError=append:/srv/neutral-vault/logs/claude-remote-control.err.log
-Restart=always
-RestartSec=30
-StandardInput=data
-StandardInputText=y\n
-
-[Install]
-WantedBy=default.target
-##### claude-remote-control-watchdog.service
-[Unit]
-Description=Claude Remote Control poll-loop watchdog
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/usr/bin/python3 /srv/neutral-vault/scripts/claude_remote_control_watchdog.py
-StandardOutput=append:/srv/neutral-vault/logs/claude-remote-control-watchdog.out.log
-StandardError=append:/srv/neutral-vault/logs/claude-remote-control-watchdog.err.log
-TimeoutStartSec=1800
-##### claude-remote-control-watchdog.timer
-[Unit]
-Description=Claude Remote Control poll-loop watchdog (timer)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-Unit=claude-remote-control-watchdog.service
-
-[Install]
-WantedBy=timers.target
-##### macp-browser.service
-[Unit]
-Description=macp-browser logged-in Chrome (Xvfb :77, CDP 127.0.0.1:9277) at boot
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/srv/neutral-home/.config/macp-browser/browser.sh
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home/.config/macp-browser
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/bin/bash /srv/neutral-home/.config/macp-browser/browser.sh up
-StandardOutput=append:/srv/neutral-vault/logs/macp-browser.out.log
-StandardError=append:/srv/neutral-vault/logs/macp-browser.err.log
-TimeoutStartSec=1800
-RemainAfterExit=yes
-ExecStop=/bin/bash /srv/neutral-home/.config/macp-browser/browser.sh stop
-KillMode=process
-# Chrome is stopped only via ExecStop (browser.sh stop, SIGTERM): setsid
-# does not leave this cgroup, so KillMode=process + RemainAfterExit keep
-# systemd from killing the logged-in profile on stop/restart.
-
-[Install]
-WantedBy=default.target
-##### mailroom-tick.service
-[Unit]
-Description=mailroom tick
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home/Projects/mailroom
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/srv/neutral-home/.local/bin/uv run --directory /srv/neutral-home/Projects/mailroom mailroom tick
-StandardOutput=append:/srv/neutral-vault/logs/mailroom-tick.out.log
-StandardError=append:/srv/neutral-vault/logs/mailroom-tick.err.log
-TimeoutStartSec=1800
-##### mailroom-tick.timer
-[Unit]
-Description=mailroom tick (timer)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=15min
-Unit=mailroom-tick.service
-
-[Install]
-WantedBy=timers.target
-##### kis-trading.service
-[Unit]
-Description=KIS trading loop (paper)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/srv/neutral-home/Trading/ai-stock-trading
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-EnvironmentFile=/srv/neutral-home/.config/macp/kis.env
-ExecStart=/srv/neutral-home/.local/bin/uv run python trading_loop.py
-StandardOutput=append:/srv/neutral-vault/logs/kis-trading.out.log
-StandardError=append:/srv/neutral-vault/logs/kis-trading.err.log
-Restart=on-failure
-RestartSec=60
-
-[Install]
-WantedBy=default.target
-##### kis-trading-real.service
-[Unit]
-Description=KIS trading loop (real account — install-only, human-enabled)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/srv/neutral-home/Trading/ai-stock-trading-real
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-ExecStart=/srv/neutral-home/Trading/ai-stock-trading-real/.venv/bin/python trading_loop.py
-StandardOutput=append:/srv/neutral-vault/logs/kis-trading-real.out.log
-StandardError=append:/srv/neutral-vault/logs/kis-trading-real.err.log
-Restart=on-failure
-RestartSec=60
-Environment=KIS_ENV=real
-Environment=BUY_AND_HOLD=1
-Environment=KIS_UNIVERSE=etf
-Environment=KIS_MAX_DEPLOY_KRW=3000000
-Environment=KIS_ALERT_SCRIPT=/srv/neutral-vault/scripts/kakao_send.sh
-Environment=NOTIFY_CHANNEL_KEY=kis
-
-[Install]
-WantedBy=default.target
-##### kis-trading-livesync.service
-[Unit]
-Description=KIS live sync
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home/Trading/ai-stock-trading
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-EnvironmentFile=/srv/neutral-home/.config/macp/kis.env
-ExecStart=/srv/neutral-home/.local/bin/uv run python scripts/live_sync.py
-StandardOutput=append:/srv/neutral-vault/logs/kis-trading-livesync.out.log
-StandardError=append:/srv/neutral-vault/logs/kis-trading-livesync.err.log
-TimeoutStartSec=1800
-##### kis-trading-livesync.timer
-[Unit]
-Description=KIS live sync (timer)
-
-[Timer]
-OnCalendar=*-*-* 16:10:00
-OnCalendar=*-*-* 21:10:00
-Persistent=true
-Unit=kis-trading-livesync.service
-
-[Install]
-WantedBy=timers.target
-##### kis-trading-watchdog.service
-[Unit]
-Description=KIS trading watchdog
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/neutral-home/Trading/ai-stock-trading
-EnvironmentFile=/srv/neutral-home/.config/macp/env
-EnvironmentFile=/srv/neutral-home/.config/macp/kis.env
-ExecStart=/srv/neutral-home/.local/bin/uv run python watchdog.py
-StandardOutput=append:/srv/neutral-vault/logs/kis-trading-watchdog.out.log
-StandardError=append:/srv/neutral-vault/logs/kis-trading-watchdog.err.log
-TimeoutStartSec=1800
-##### kis-trading-watchdog.timer
-[Unit]
-Description=KIS trading watchdog (timer)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=2min
-Unit=kis-trading-watchdog.service
 
 [Install]
 WantedBy=timers.target
@@ -510,17 +195,3 @@ CLAUDE_RC_NAME=macp-host
 # falls through to its neutral default, which is harmless.
 MACP_LABEL_PREFIX=
 MACP_CALENDAR_ID=
-# kakao_token_refresh.sh (was inline in the host's kakao-refresh LaunchAgent)
-KAKAO_REST_API_KEY=FILL_ME
-KAKAO_CLIENT_SECRET=FILL_ME
-##### KIS_ENV_TEMPLATE
-# kis-trading units (was inline in the host's kis-trading LaunchAgent). 0600.
-KIS_UNIVERSE=etf
-BUY_AND_HOLD=1
-KIS_MAX_DEPLOY_KRW=1000000
-# kakao_send.sh lives in this vault (the code's default is the legacy second-brain path)
-KIS_ALERT_SCRIPT=/srv/neutral-vault/scripts/kakao_send.sh
-# Route the Slack sibling-send (slack_send.py, via kakao_send.sh) to the dedicated
-# kis channel. slack_send._channel_key() reads NOTIFY_CHANNEL_KEY first; without it
-# ast alerts fall to the "default" channel. KAKAO_PROFILE is untouched (Kakao path).
-NOTIFY_CHANNEL_KEY=kis

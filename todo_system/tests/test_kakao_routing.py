@@ -286,7 +286,6 @@ def _load_script(name: str, rel: str):
 
 
 digest_send = _load_script("kakao_digest_send", "scripts/kakao_digest_send.py")
-gen_units = _load_script("gen_units", "scripts/systemd/gen_units.py")
 
 
 def _queue(tmp_path, entries) -> Path:
@@ -352,13 +351,6 @@ def test_flush_keeps_entries_that_arrive_during_the_send(tmp_path):
     assert q.read_text(encoding="utf-8") == late_line       # kept for tomorrow
     assert "발송분" in (tmp_path / "sent.jsonl").read_text(encoding="utf-8")
 
-
-def test_gen_units_wires_the_daily_digest_timer():
-    units = gen_units.build()
-    assert "macp-kakao-digest.service" in units
-    assert "macp-kakao-digest.timer" in units
-    assert "/usr/bin/python3" in units["macp-kakao-digest.service"]     # bare python, no uv
-    assert "kakao_digest_send.py" in units["macp-kakao-digest.service"]
-    assert "OnCalendar=*-*-* 08:35:00" in units["macp-kakao-digest.timer"]
-    # the timer is a real enable target (not INSTALL_ONLY-gated)
-    assert "macp-kakao-digest.timer" in gen_units.enable_targets(units, None)
+# NB: the gen_units macp-kakao-digest *unit* wiring test was removed when gen_units
+# dropped to engine-core units only (the digest is an author-only vault unit). The
+# kakao_digest_send.py *script* and its flush() behavior above are unaffected.

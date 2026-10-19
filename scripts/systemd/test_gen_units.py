@@ -73,130 +73,30 @@ class OneshotTimeoutStartSecTest(unittest.TestCase):
             self.assertNotIn("TimeoutStartSec", text, name)
 
 
-class RealUnitContentTest(unittest.TestCase):
-    """The real-account trading loop must run from its OWN clone with its OWN venv
-    and supply the four trading params INLINE. The clone's .secrets/kis.env carries
-    KIS_ENV/creds but NOT BUY_AND_HOLD/KIS_MAX_DEPLOY_KRW, so without these inline
-    the live account would trade on momentum at unbounded size. Credentials are
-    never wired via EnvironmentFile. Lifecycle mirrors the paper unit (simple /
-    on-failure / 60s, no OOMPolicy)."""
-
-    def setUp(self):
-        self.real = gen_units.build()["kis-trading-real.service"]
-
-    def test_working_directory_is_the_real_clone(self):
-        # Exact line (references the module constant) — a bare substring
-        # "ai-stock-trading" would also match the PAPER clone's path prefix.
-        self.assertIn(f"WorkingDirectory={gen_units.TRADING_REAL}\n", self.real)
-
-    def test_runs_the_clones_dedicated_venv_interpreter(self):
-        self.assertIn(
-            f"ExecStart={gen_units.TRADING_REAL}/.venv/bin/python trading_loop.py\n",
-            self.real)
-        # NOT the paper loop's `uv run python` form.
-        self.assertNotIn("uv run", self.real)
-
-    def test_supplies_the_four_trading_params_inline_in_service_section(self):
-        _, after_service = self.real.split("[Service]", 1)
-        service_section = after_service.split("[Install]", 1)[0]
-        for env in ("Environment=KIS_ENV=real", "Environment=BUY_AND_HOLD=1",
-                    "Environment=KIS_UNIVERSE=etf",
-                    "Environment=KIS_MAX_DEPLOY_KRW=3000000"):
-            self.assertIn(env, service_section, env)
-
-    def test_alert_script_points_at_the_vault(self):
-        # config.py defaults to ~/Projects/second-brain (pre-rename) → rc=127.
-        self.assertIn(
-            f"Environment=KIS_ALERT_SCRIPT={gen_units.VAULT}/scripts/kakao_send.sh\n",
-            self.real)
-
-    def test_notify_channel_key_routes_slack_to_kis_channel(self):
-        # slack_send._channel_key() reads NOTIFY_CHANNEL_KEY first; without it this
-        # unit's Slack sibling-send would fall to the "default" channel. The real
-        # account skips kis.env, so it can't inherit this line — it must be inline,
-        # in [Service] alongside KIS_ALERT_SCRIPT.
-        _, after_service = self.real.split("[Service]", 1)
-        service_section = after_service.split("[Install]", 1)[0]
-        self.assertIn("Environment=NOTIFY_CHANNEL_KEY=kis", service_section)
-
-    def test_lifecycle_mirrors_paper_no_oom_policy(self):
-        self.assertIn("Type=simple", self.real)
-        self.assertIn("Restart=on-failure", self.real)
-        self.assertIn("RestartSec=60", self.real)
-        self.assertNotIn("OOMPolicy", self.real)
-
-    def test_credentials_not_wired_via_environment_file(self):
-        # Only the shared ~/.config/macp/env EnvironmentFile — never the clone's
-        # kis.env. (The paper unit, by contrast, wires kis.env → count == 2.)
-        self.assertNotIn("kis.env", self.real)
-        self.assertEqual(self.real.count("EnvironmentFile="), 1)
-
-
-class NotifyChannelScopingTest(unittest.TestCase):
-    """NOTIFY_CHANNEL_KEY=kis routes the ai-stock-trading Slack sibling-send to the
-    dedicated kis channel, and must stay scoped to the ast units only. The paper
-    units (kis-trading / livesync / watchdog) inherit it via kis.env (rendered from
-    KIS_ENV_TEMPLATE), so it lives there — NOT inline in each unit — while the real
-    account, which skips kis.env, carries it inline. No other unit (todo-sync,
-    worker, orchestrator, …) and not the shared ENV_TEMPLATE may carry it, or every
-    daemon's Slack alerts would get rerouted."""
+class EnableTargetsCoreTest(unittest.TestCase):
+    """--enable targets are exactly the engine-core timers + timerless daemons. With
+    the author-only install-only units (kis-trading-real, macp-kakao-refresh) gone,
+    there is no stem for enable_targets() to suppress; the `--only` filter narrows to
+    named stems."""
 
     def setUp(self):
         self.units = gen_units.build()
 
-    def test_kis_env_template_covers_the_paper_units(self):
-        # The three paper units share kis.env (EnvironmentFile=KIS_ENV_FILE), so one
-        # line in KIS_ENV_TEMPLATE covers all of them — no per-unit duplication.
-        self.assertIn("\nNOTIFY_CHANNEL_KEY=kis\n", gen_units.KIS_ENV_TEMPLATE)
+    def test_targets_are_the_core_timers_and_simple_daemons(self):
+        self.assertEqual(sorted(gen_units.enable_targets(self.units, None)), sorted([
+            "macp-orchestrator.timer", "macp-planner.timer", "macp-maintenance.timer",
+            "macp-brief.timer", "macp-health.timer",
+            "macp-runner-worker-default.service", "macp-todo-sync.service",
+            "macp-dashboard.service"]))
 
-    def test_only_the_real_unit_carries_it_inline(self):
-        # The real account is the only unit whose rendered text holds the key inline;
-        # the paper units inherit it from kis.env (so it is absent from their text).
-        with_key = [n for n, t in self.units.items() if "NOTIFY_CHANNEL_KEY" in t]
-        self.assertEqual(with_key, ["kis-trading-real.service"])
-
-    def test_not_in_shared_env_template(self):
-        # The shared env (every unit's EnvironmentFile) must not carry it, else all
-        # daemons' Slack sends would reroute to the kis channel.
-        self.assertNotIn("NOTIFY_CHANNEL_KEY", gen_units.ENV_TEMPLATE)
-
-
-class EnableTargetsTest(unittest.TestCase):
-    """`--enable` must NEVER start the real-account loop. The exclusion is
-    unconditional and sits ABOVE the `--only` filter, so not even
-    `--enable --only kis-trading-real` is a backdoor to start it (install to disk
-    only; a human runs `systemctl --user enable --now kis-trading-real.service`)."""
-
-    def setUp(self):
-        self.units = gen_units.build()
-
-    def test_real_unit_excluded_from_default_enable(self):
-        targets = gen_units.enable_targets(self.units, None)
-        self.assertNotIn("kis-trading-real.service", targets)
-        # Surgical: the paper loop (a sibling simple daemon with no timer) is
-        # still enabled — the exclusion touches only the install-only stem.
-        self.assertIn("kis-trading.service", targets)
-
-    def test_real_unit_cannot_be_enabled_even_via_only(self):
-        targets = gen_units.enable_targets(self.units, ["kis-trading-real"])
-        self.assertNotIn("kis-trading-real.service", targets)
-        self.assertEqual(targets, [])
-
-    def test_kakao_refresh_timer_excluded_from_default_enable(self):
-        # Slack-only cutover: the Kakao token refresh is default-OFF. Its timer is
-        # still written to disk (so a human rollback is one `enable --now`), but
-        # `--enable` must not start it.
-        targets = gen_units.enable_targets(self.units, None)
-        self.assertNotIn("macp-kakao-refresh.timer", targets)
-        self.assertNotIn("macp-kakao-refresh.service", targets)
-        # Surgical: a sibling kakao timer (the once-a-day digest) is still enabled —
-        # the exclusion touches only the refresh stem, not every kakao unit.
-        self.assertIn("macp-kakao-digest.timer", targets)
-
-    def test_kakao_refresh_cannot_be_enabled_even_via_only(self):
-        targets = gen_units.enable_targets(self.units, ["macp-kakao-refresh"])
-        self.assertNotIn("macp-kakao-refresh.timer", targets)
-        self.assertEqual(targets, [])
+    def test_only_filter_narrows_to_named_stems(self):
+        # A service with a timer is enabled via its timer, so --only on a timer stem
+        # yields the timer; --only on a timerless daemon yields its service.
+        self.assertEqual(gen_units.enable_targets(self.units, ["macp-dashboard"]),
+                         ["macp-dashboard.service"])
+        self.assertEqual(gen_units.enable_targets(self.units, ["macp-orchestrator"]),
+                         ["macp-orchestrator.timer"])
+        self.assertEqual(gen_units.enable_targets(self.units, ["nope"]), [])
 
 
 class ParameterizationTest(unittest.TestCase):
@@ -259,10 +159,13 @@ class CalendarIdResolutionTest(unittest.TestCase):
     @staticmethod
     def _reload_with_vault(vault, **env):
         # patch.dict snapshots os.environ on enter and restores it on exit, so the
-        # MAESTRO_VAULT_DIR + knob writes below never leak into other tests. Keys
+        # MACP_VAULT_ROOT + knob writes below never leak into other tests. Keys
         # mapped to None are removed (exercising env-absent), the rest are set.
+        # MACP_VAULT_ROOT is now primary; pop the alias so the ambient gate value
+        # (MACP_VAULT_ROOT=vault-template) can't win over this throwaway vault.
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ["MAESTRO_VAULT_DIR"] = str(vault)
+            os.environ["MACP_VAULT_ROOT"] = str(vault)
+            os.environ.pop("MAESTRO_VAULT_DIR", None)
             for k, v in env.items():
                 if v is None:
                     os.environ.pop(k, None)
@@ -360,13 +263,14 @@ GOLDEN = Path(__file__).with_name("testdata") / "default_units.golden"
 # calendar id and label prefix resolve to "". None = removed from the env.
 NEUTRAL_ENV = {
     "HOME": "/srv/neutral-home",
-    "MAESTRO_VAULT_DIR": "/srv/neutral-vault",
+    "MACP_VAULT_ROOT": "/srv/neutral-vault",
+    "MAESTRO_VAULT_DIR": None,
+    "MACP_ENGINE_ROOT": "/srv/neutral-engine",
     "MACP_HOST_ID": None,
     "MACP_CLAUDE_RC_NAME": None,
     "MACP_CALENDAR_ID": None,
     "MACP_LABEL_PREFIX": None,
     "MACP_ENGINE_PYTHON": None,
-    "MACP_BROWSER_DIR": None,
 }
 
 
@@ -402,11 +306,10 @@ def _default_build(mod):
 
 
 def _render(mod, units=None):
-    """Every unit (``--print`` framing), then both env templates, as one string."""
+    """Every unit (``--print`` framing), then the env template, as one string."""
     units = _default_build(mod) if units is None else units
     return ("".join(f"##### {n}\n{t}" for n, t in units.items())
-            + "##### ENV_TEMPLATE\n" + mod.ENV_TEMPLATE
-            + "##### KIS_ENV_TEMPLATE\n" + mod.KIS_ENV_TEMPLATE)
+            + "##### ENV_TEMPLATE\n" + mod.ENV_TEMPLATE)
 
 
 class DefaultModeGoldenTest(unittest.TestCase):
@@ -422,18 +325,16 @@ class DefaultModeGoldenTest(unittest.TestCase):
 
 REPO = Path(__file__).resolve().parents[2]
 ENGINE_PY = "/opt/macp-engine/bin/python"
-# Units whose script ships with the engine (unit stem → script name).
+# Units whose script ships with the engine (unit stem → script name). Default mode
+# resolves them under ENGINE_ROOT/scripts/; installed mode through engine_script.
 CONVERTED = {
     "macp-orchestrator": "orchestrator_tick.sh",
     "macp-planner": "planner_tick.sh",
     "macp-brief": "brief.sh",
-    "macp-kakao-refresh": "kakao_token_refresh.sh",
     "macp-health": "health_report.py",
-    "macp-kakao-digest": "kakao_digest_send.py",
-    "claude-auth-watch": "claude_auth_watch.py",
 }
-# Units that ran ``uv run python -m ...`` in the vault (public split 14): installed
-# mode runs the same module/arguments from the installed interpreter with -P.
+# Units that ran ``uv run python -m ...`` (public split 14): installed mode runs the
+# same module/arguments from the installed interpreter with -P.
 MODULE_UNITS = {
     "macp-runner-worker-default": "-m todo_system.orchestrator.runner --agent worker-default "
                                   "--mode live-staged --uri file://Worker/agents --daemon",
@@ -442,9 +343,9 @@ MODULE_UNITS = {
     "macp-dashboard": "-u -m todo_system.engine_script macp_dashboard.py "
                       "--host 127.0.0.1 --port 8787 --no-open",
 }
-# Units whose file stays in the vault: their path survives installed mode.
-VAULT_ONLY = ("claude-upgrade", "claude-remote-control", "claude-remote-control-watchdog",
-              "macp-monitor")
+# No vault-only units survive in the engine-core set (the Remote Control stack and
+# usage monitor were author-only and are dropped).
+VAULT_ONLY: tuple[str, ...] = ()
 
 
 def _service_section(text):
@@ -496,14 +397,6 @@ class InstalledModeTest(unittest.TestCase):
         for stem in CONVERTED:
             name = f"{stem}.service"
             self.assertEqual(strip(self.inst[name]), strip(self.default[name]), stem)
-        self.assertIn("WorkingDirectory=/srv/neutral-home\n", self.inst["claude-auth-watch.service"])
-
-    def test_vault_only_units_keep_vault_paths(self):
-        for stem in VAULT_ONLY:
-            name = f"{stem}.service"
-            self.assertEqual(self.inst[name], self.default[name], stem)
-            self.assertIn(f"{self.mod.VAULT}/", _exec_start(self.inst[name]), stem)
-            self.assertNotIn("engine_script", self.inst[name], stem)
 
     def test_module_units_run_from_installed_interpreter(self):
         env_line = f"Environment=MACP_VAULT_ROOT={self.mod.VAULT}"
@@ -532,8 +425,6 @@ class InstalledModeTest(unittest.TestCase):
         for name, text in self.inst.items():
             if not name.startswith("macp-") or not name.endswith(".service"):
                 continue
-            if name == "macp-monitor.service":
-                continue  # vault-only Worker/_state script
             exec_start = _exec_start(text)
             self.assertNotIn(f"{self.mod.UV} run", exec_start, name)
             self.assertNotIn(f"{self.mod.VAULT}/scripts/", exec_start, name)
@@ -595,102 +486,109 @@ class ClassificationMatchesExportExcludeTest(unittest.TestCase):
         for stem, name in CONVERTED.items():
             self.assertNotIn(f"scripts/{name}", self.excluded, stem)
             self.assertTrue((REPO / "scripts" / name).is_file(), name)
-            self.assertIn(f"{self.mod.VAULT}/scripts/{name}",
+            # Default mode now resolves the engine script from ENGINE_ROOT, not VAULT.
+            self.assertIn(f"{self.mod.ENGINE_ROOT}/scripts/{name}",
                           _exec_start(self.default[f"{stem}.service"]), stem)
 
-    def test_vault_only_units_point_at_excluded_or_non_engine_files(self):
-        for stem in VAULT_ONLY:
-            exec_start = _exec_start(self.default[f"{stem}.service"])
-            prefix = f"{self.mod.VAULT}/scripts/"
-            if prefix in exec_start:
-                name = exec_start.split(prefix, 1)[1].split()[0]
-                self.assertIn(f"scripts/{name}", self.excluded, stem)
-            else:
-                self.assertIn(f"{self.mod.VAULT}/Worker/", exec_start, stem)
-
-    def test_every_vault_script_unit_is_classified(self):
-        classified = set(CONVERTED) | set(VAULT_ONLY)
+    def test_every_engine_script_unit_is_classified(self):
+        # Any default-mode unit that execs a script under ENGINE_ROOT/scripts/ must be
+        # a known engine-script (CONVERTED) or module (dashboard) unit — a guard that
+        # no new unused engine-script unit sneaks in unclassified.
+        classified = set(CONVERTED) | set(MODULE_UNITS)
         for name, text in self.default.items():
-            if name.endswith(".service") and f"{self.mod.VAULT}/scripts/" in _exec_start(text):
+            if name.endswith(".service") and f"{self.mod.ENGINE_ROOT}/scripts/" in _exec_start(text):
                 self.assertIn(name.rsplit(".", 1)[0], classified, name)
 
 
-class BrowserUnitTest(unittest.TestCase):
-    """macp-browser.service starts the logged-in Chrome (Xvfb + CDP) at boot, and
-    systemd must never be the thing that kills it: `browser.sh up` backgrounds
-    Chrome with setsid, which does not leave the unit's cgroup, so the default
-    KillMode=control-group would SIGKILL the profile on any stop/restart. Chrome
-    is stopped only through ExecStop = `browser.sh stop` (SIGTERM)."""
+# --- outsider-safe criteria (볼트 경로·코어 유닛만) ------------------------------
 
-    def setUp(self):
-        self.mod = _neutral_gen_units()
-        self.units = _default_build(self.mod)
-        self.unit = self.units["macp-browser.service"]
-        self.dir = self.mod.BROWSER_DIR
+AUTHOR_ONLY_STEMS = (
+    "kis-trading", "kis-trading-real", "kis-trading-livesync", "kis-trading-watchdog",
+    "mailroom-tick", "claude-remote-control", "claude-remote-control-watchdog",
+    "claude-upgrade", "claude-auth-watch", "macp-kakao-refresh", "macp-kakao-digest",
+    "macp-browser", "macp-monitor",
+)
+CORE_STEMS = frozenset({
+    "macp-runner-worker-default", "macp-orchestrator", "macp-planner",
+    "macp-maintenance", "macp-todo-sync", "macp-dashboard", "macp-brief", "macp-health",
+})
 
-    def test_browser_dir_defaults_under_home(self):
-        self.assertEqual(self.dir, Path("/srv/neutral-home/.config/macp-browser"))
 
-    def test_exec_start_runs_browser_sh_up(self):
-        self.assertEqual(_exec_start(self.unit), f"/bin/bash {self.dir}/browser.sh up")
-        self.assertIn(f"WorkingDirectory={self.dir}\n", self.unit)
+def _reload_vault(**env):
+    """A fresh gen_units loaded under ``env`` (keys mapped to None are removed, the
+    rest set; os.environ restored on exit) — for exercising path resolution."""
+    with _env(**env):
+        spec = importlib.util.spec_from_file_location(
+            "gen_units_vault", Path(__file__).with_name("gen_units.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
-    def test_stop_goes_through_browser_sh_stop_only(self):
-        section = _service_section(self.unit)
-        self.assertIn(f"ExecStop=/bin/bash {self.dir}/browser.sh stop\n", section)
-        lines = [ln for ln in self.unit.splitlines() if not ln.startswith("#")]
-        self.assertEqual(sum(ln.startswith("ExecStop=") for ln in lines), 1)
-        for key in ("Restart=", "ExecStartPre=", "ExecStartPost=", "ExecStopPost=", "ExecReload="):
-            self.assertFalse(any(ln.startswith(key) for ln in lines), key)
-        self.assertFalse(any("pkill" in ln or "kill " in ln for ln in lines))
 
-    def test_oneshot_remains_after_exit_with_killmode_process(self):
-        section = _service_section(self.unit)
-        for line in ("Type=oneshot", "RemainAfterExit=yes", "KillMode=process",
-                     "TimeoutStartSec=1800"):
-            self.assertIn(f"{line}\n", section, line)
-        directives = [ln for ln in section.splitlines() if not ln.startswith("#")]
-        self.assertEqual(sum(ln.startswith("KillMode=") for ln in directives), 1)
-        self.assertNotIn("KillMode=none", self.unit)
-        self.assertNotIn("KillMode=control-group", self.unit)
+class VaultRootResolutionTest(unittest.TestCase):
+    """AC: ``MACP_VAULT_ROOT=/tmp/v`` relocates every vault path — WorkingDirectory,
+    the log append targets, and the installed-mode ``Environment=MACP_VAULT_ROOT=``
+    line — under ``/tmp/v``. ``MAESTRO_VAULT_DIR`` stays a working backward-compat
+    alias when the primary var is absent."""
 
-    def test_unit_section_after_network_and_condition(self):
-        head = self.unit.split("[Service]", 1)[0]
-        self.assertIn("After=network-online.target\n", head)
-        self.assertIn(f"ConditionPathExists={self.dir}/browser.sh\n", head)
+    @staticmethod
+    def _vault_tokens(units):
+        for name, text in units.items():
+            for line in text.splitlines():
+                for prefix in ("WorkingDirectory=", "StandardOutput=append:",
+                               "StandardError=append:", "Environment=MACP_VAULT_ROOT="):
+                    if line.startswith(prefix):
+                        yield name, line[len(prefix):]
 
-    def test_installed_at_boot(self):
-        self.assertTrue(self.unit.endswith("[Install]\nWantedBy=default.target\n"))
-        self.assertNotIn("macp-browser.timer", self.units)
-        self.assertIn("macp-browser.service", self.mod.enable_targets(self.units, None))
-        self.assertEqual(self.mod.enable_targets(self.units, ["macp-browser"]),
-                         ["macp-browser.service"])
+    def test_every_vault_path_sits_under_macp_vault_root(self):
+        mod = _reload_vault(MACP_VAULT_ROOT="/tmp/v", MAESTRO_VAULT_DIR=None,
+                            MACP_ENGINE_ROOT="/srv/neutral-engine")
+        self.assertEqual(mod.VAULT, Path("/tmp/v"))
+        both = {**mod.build(), **{f"inst-{k}": v for k, v in mod.build(ENGINE_PY).items()}}
+        checked = 0
+        for name, tok in self._vault_tokens(both):
+            self.assertTrue(tok.startswith("/tmp/v"), f"{name}: {tok}")
+            checked += 1
+        self.assertGreater(checked, 0)  # guard: the extraction isn't a no-op
 
-    def test_unit_carries_design_rationale_comment(self):
-        comments = [ln for ln in self.unit.splitlines() if ln.startswith("#")]
-        self.assertTrue(any("browser.sh stop" in ln for ln in comments), comments)
-        # Comments live inside [Service], never on a directive line.
-        self.assertTrue(all(c in _service_section(self.unit) for c in comments))
+    def test_maestro_vault_dir_alias_resolves_when_primary_absent(self):
+        mod = _reload_vault(MACP_VAULT_ROOT=None, MAESTRO_VAULT_DIR="/tmp/alias",
+                            MACP_ENGINE_ROOT="/srv/neutral-engine")
+        self.assertEqual(mod.VAULT, Path("/tmp/alias"))
 
-    def test_env_knob_overrides_dir(self):
-        alt = _neutral_gen_units(MACP_BROWSER_DIR="/srv/alt-browser")
-        unit = _default_build(alt)["macp-browser.service"]
-        self.assertEqual(_exec_start(unit), "/bin/bash /srv/alt-browser/browser.sh up")
-        self.assertIn("ExecStop=/bin/bash /srv/alt-browser/browser.sh stop\n", unit)
-        self.assertIn("ConditionPathExists=/srv/alt-browser/browser.sh\n", unit)
-        # Empty knob falls back to the home default (same as browser_watch).
-        empty = _neutral_gen_units(MACP_BROWSER_DIR="")
-        self.assertEqual(empty.BROWSER_DIR, self.dir)
 
-    def test_same_in_installed_mode(self):
-        self.assertEqual(self.mod.build(ENGINE_PY)["macp-browser.service"], self.unit)
+class ExecStartPathsExistTest(unittest.TestCase):
+    """AC: every rendered ExecStart script path must exist (engine repo or vault).
+    Built with the module's real ENGINE_ROOT / VAULT (unpatched), so a dropped or
+    moved script surfaces as a missing file here instead of a crash-looping unit on
+    someone else's host. ``uv``/module invocations with no script path are skipped."""
 
-    def test_not_restarted_on_code_change(self):
-        # Maintenance restarts LONG_LIVED_LABELS units when code changes; listing
-        # this unit there (or giving it a daemonctl label) would bounce Chrome.
-        from todo_system import daemonctl, worker
+    def test_every_exec_start_script_file_exists(self):
+        units = gen_units.build()
+        checked = 0
+        for name, text in units.items():
+            if not name.endswith(".service"):
+                continue
+            for tok in _exec_start(text).split():
+                if "/" in tok and (tok.endswith(".sh") or tok.endswith(".py")):
+                    self.assertTrue(Path(tok).is_file(), f"{name}: {tok}")
+                    checked += 1
+        self.assertGreater(checked, 0)  # guard: the extraction isn't a no-op
 
-        self.assertNotIn("macp-browser", set(daemonctl.UNITS.values()))
-        restarted = {daemonctl.unit_name(label) for label in worker.LONG_LIVED_LABELS}
-        self.assertNotIn("macp-browser", restarted)
-        self.assertFalse(any("browser" in label for label in worker.LONG_LIVED_LABELS))
+
+class AuthorOnlyUnitsAbsentTest(unittest.TestCase):
+    """AC: author-only unit names (trading, mailroom, Remote Control, Kakao, browser,
+    usage monitor) must be absent from ``build()`` in both default and installed mode
+    — a third party running ``--enable`` would otherwise start crash-looping units
+    whose scripts shipped out to the author's vault."""
+
+    def test_no_author_only_stem_in_default_or_installed_build(self):
+        for units in (gen_units.build(), gen_units.build(ENGINE_PY)):
+            keys = set(units)
+            for stem in AUTHOR_ONLY_STEMS:
+                self.assertNotIn(f"{stem}.service", keys, stem)
+                self.assertNotIn(f"{stem}.timer", keys, stem)
+
+    def test_exactly_the_eight_core_stems_render(self):
+        stems = {name.rsplit(".", 1)[0] for name in gen_units.build()}
+        self.assertEqual(stems, set(CORE_STEMS))
