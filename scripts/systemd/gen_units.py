@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
-"""Generate the systemd --user units that replace the Mac LaunchAgents on the
-cloud HQ (Ubuntu). One unit per launchd label in ``todo_system.daemonctl.UNITS``;
-schedules and commands mirror ``~/Library/LaunchAgents/*.plist`` as inventoried
-on 2026-09-10 (``Todo/items/macp-cloud-hq-migration.md``). The exception is
-``macp-browser`` (boot-time start of the logged-in Chrome; env ``MACP_BROWSER_DIR``),
-which has no launchd label and is deliberately not a daemonctl unit.
+"""Generate the systemd --user units for the MaestroACP engine control plane on a
+Linux host (Ubuntu). Renders only the engine-core units — runner, orchestrator,
+planner, maintenance, todo-sync, dashboard, brief, health — so a third party can
+run gen_units.py from a bare engine checkout and every rendered ``ExecStart``
+resolves to a script that ships in this repository (or a data path under their
+vault). Author-only units (stock trading, mailroom, Remote Control, Kakao token
+refresh / digest, the logged-in browser, the usage monitor) live in the author's
+vault, not in the engine, and are deliberately NOT rendered here.
 
     python3 scripts/systemd/gen_units.py            # write ~/.config/systemd/user/*
     python3 scripts/systemd/gen_units.py --print    # dry run to stdout
     python3 scripts/systemd/gen_units.py --enable   # write + daemon-reload + enable --now
     python3 scripts/systemd/gen_units.py --engine-python /path/to/venv/bin/python  # installed mode (env: MACP_ENGINE_PYTHON)
 
+Paths: the vault root (data — logs/, Todo/, Worker/, git refs) comes from
+``MACP_VAULT_ROOT`` (``MAESTRO_VAULT_DIR`` kept as a backward-compat alias),
+defaulting to ``~/Projects/MaestroACP``. Engine-shipped scripts (brief.sh,
+orchestrator_tick.sh, …) resolve from the engine checkout (``MACP_ENGINE_ROOT``,
+default: this repo), so a rendered default-mode unit never points at a script that
+is not on disk.
+
 Installed mode (public split 13c): units whose script ships with the engine run
 ``<python> -P -m todo_system.engine_script <name>`` with ``MACP_VAULT_ROOT`` set,
-so they resolve the script from the installed wheel; vault-only files keep their
-vault path. The units that ran ``uv run python -m todo_system...`` in the vault
-(runner, maintenance, todo-sync, dashboard — public split 14) run the same module
-as ``<python> -P -m ...``, so no macp unit imports the vault's own todo_system/.
-Without the knob every unit is exactly what it was before.
+so they resolve the script from the installed wheel. The units that ran
+``uv run python -m todo_system...`` (runner, maintenance, todo-sync, dashboard —
+public split 14) run the same module as ``<python> -P -m ...``, so no macp unit
+imports the vault's own todo_system/. Without the knob every unit runs from the
+engine checkout via ``uv run`` / the interpreter it already used.
 
 Env: units read ``~/.config/macp/env`` (0600) — PATH/JAVA_HOME/ANDROID_HOME plus the
-Kakao app secret the kakao-refresh plist carried inline. The trading units add
-``~/.config/macp/kis.env``. Both files are written by ``--write-env`` from
-templates below when missing (secrets left as placeholders to fill by hand).
+host-identity knobs — written by ``--write-env`` from the template below when
+missing. The dashboard also reads ``~/.config/macp/dashboard.env`` (its token).
 
-Logs go to ``<vault>/logs/<unit>.out.log`` like the plists did, so health_report
-and the monitor keep reading the same files. Stdlib-only.
+Logs go to ``<vault>/logs/<unit>.out.log``, so health_report keeps reading the same
+files. Stdlib-only.
 """
 
 from __future__ import annotations
@@ -38,31 +46,21 @@ import sys
 from pathlib import Path
 
 HOME = Path.home()
-VAULT = Path(os.environ.get("MAESTRO_VAULT_DIR", HOME / "Projects" / "MaestroACP"))
-MAILROOM = HOME / "Projects" / "mailroom"
-TRADING = HOME / "Trading" / "ai-stock-trading"
-TRADING_REAL = HOME / "Trading" / "ai-stock-trading-real"
+# Vault root (data: logs/, Todo/, Worker/, git refs). MACP_VAULT_ROOT is primary;
+# MAESTRO_VAULT_DIR is a backward-compat alias kept for hosts that still set it.
+VAULT = Path(os.environ.get("MACP_VAULT_ROOT") or os.environ.get("MAESTRO_VAULT_DIR")
+             or HOME / "Projects" / "MaestroACP")
+# Engine checkout (code: the engine-shipped scripts a default-mode unit execs).
+# Defaults to this repo so a bare checkout renders runnable units; MACP_ENGINE_ROOT
+# overrides it (the golden/tests pin a neutral root rather than baking the worktree
+# path into the identifier-gate's scanned tree).
+ENGINE_ROOT = Path(os.environ.get("MACP_ENGINE_ROOT") or Path(__file__).resolve().parents[2])
 UV = HOME / ".local" / "bin" / "uv"
 ENV_FILE = HOME / ".config" / "macp" / "env"
-KIS_ENV_FILE = HOME / ".config" / "macp" / "kis.env"
 # Shared secret for the live dashboard; generated once by --write-env (0600).
 DASHBOARD_ENV_FILE = ENV_FILE.parent / "dashboard.env"
 UNIT_DIR = HOME / ".config" / "systemd" / "user"
 LOGS = VAULT / "logs"
-# The macp-browser checkout (browser.sh + Chrome profile). Same env knob and
-# home-relative default as todo_system/browser_watch.py; never a literal path.
-BROWSER_DIR = Path(os.environ.get("MACP_BROWSER_DIR") or HOME / ".config" / "macp-browser")
-
-# Unit stems that gen_units WRITES to disk but must NEVER enable/start — not via
-# ``--enable``, not via ``--enable --only <stem>``. enable_targets() drops these
-# before any other filter; the unit text itself is unchanged, so a human can
-# arm one by hand (``systemctl --user enable --now <stem>.timer``).
-#   * kis-trading-real: trades a live brokerage account — armed by a human exactly
-#     once, never by this generator.
-#   * macp-kakao-refresh: since the Slack-only cutover Kakao is a rollback-only
-#     backend, so its token refresh is default-OFF. The unit is still written so
-#     rollback is a one-line ``systemctl --user enable --now macp-kakao-refresh.timer``.
-INSTALL_ONLY: frozenset[str] = frozenset({"kis-trading-real", "macp-kakao-refresh"})
 
 # Host-identity knobs. Neutral defaults: a live host pins its real name in
 # ~/.config/macp/env (MACP_HOST_ID / CLAUDE_RC_NAME), which write_env() never
@@ -115,21 +113,6 @@ CLAUDE_RC_NAME={CLAUDE_RC_NAME}
 # falls through to its neutral default, which is harmless.
 MACP_LABEL_PREFIX={LABEL_PREFIX}
 MACP_CALENDAR_ID={CALENDAR_ID}
-# kakao_token_refresh.sh (was inline in the host's kakao-refresh LaunchAgent)
-KAKAO_REST_API_KEY=FILL_ME
-KAKAO_CLIENT_SECRET=FILL_ME
-"""
-
-KIS_ENV_TEMPLATE = f"""# kis-trading units (was inline in the host's kis-trading LaunchAgent). 0600.
-KIS_UNIVERSE=etf
-BUY_AND_HOLD=1
-KIS_MAX_DEPLOY_KRW=1000000
-# kakao_send.sh lives in this vault (the code's default is the legacy second-brain path)
-KIS_ALERT_SCRIPT={VAULT}/scripts/kakao_send.sh
-# Route the Slack sibling-send (slack_send.py, via kakao_send.sh) to the dedicated
-# kis channel. slack_send._channel_key() reads NOTIFY_CHANNEL_KEY first; without it
-# ast alerts fall to the "default" channel. KAKAO_PROFILE is untouched (Kakao path).
-NOTIFY_CHANNEL_KEY=kis
 """
 
 
@@ -221,20 +204,16 @@ def build(engine_python: str | None = None) -> dict[str, str]:
         kind="simple", restart="always", extra_lines=["OOMPolicy=continue"])
     u["macp-orchestrator.service"] = script(
         "macp-orchestrator", "macp orchestrator tick (dispatch/collect/dashboard)",
-        f"/bin/zsh {VAULT}/scripts/orchestrator_tick.sh", "orchestrator_tick.sh")
+        f"/bin/zsh {ENGINE_ROOT}/scripts/orchestrator_tick.sh", "orchestrator_tick.sh")
     u["macp-orchestrator.timer"] = timer("macp-orchestrator", "macp orchestrator", every="5min")
     u["macp-planner.service"] = script(
-        "macp-planner", "macp planner tick", f"/bin/bash {VAULT}/scripts/planner_tick.sh",
+        "macp-planner", "macp planner tick", f"/bin/bash {ENGINE_ROOT}/scripts/planner_tick.sh",
         "planner_tick.sh")
     u["macp-planner.timer"] = timer("macp-planner", "macp planner", every="30min", boot_delay="5min")
     u["macp-maintenance.service"] = module(
         "macp-maintenance", "macp maintenance (vault sync, daemon restart, upkeep)",
         f"{py} -m todo_system.worker maintenance", "-m todo_system.worker maintenance")
     u["macp-maintenance.timer"] = timer("macp-maintenance", "macp maintenance", every="5min")
-    u["macp-monitor.service"] = service(
-        "macp-monitor", "macp usage monitor (sensor)",
-        f"/usr/bin/python3 {VAULT}/Worker/_state/macp_monitor/monitor.py scan --daemon")
-    u["macp-monitor.timer"] = timer("macp-monitor", "macp usage monitor", every="30min")
     cal_arg = f" --calendar-id {CALENDAR_ID}" if CALENDAR_ID else ""
     sync_args = f"daemon --interval 3 --calendar-sync{cal_arg}"
     u["macp-todo-sync.service"] = module(
@@ -247,131 +226,16 @@ def build(engine_python: str | None = None) -> dict[str, str]:
     dash_args = "--host 127.0.0.1 --port 8787 --no-open"
     u["macp-dashboard.service"] = module(
         "macp-dashboard", "macp live dashboard (loopback :8787; tailscale serve fronts it)",
-        f"{py} -u scripts/macp_dashboard.py {dash_args}",
+        f"{py} -u {ENGINE_ROOT}/scripts/macp_dashboard.py {dash_args}",
         f"-u -m todo_system.engine_script macp_dashboard.py {dash_args}",
         kind="simple", restart="always", restart_sec=10, extra_env=DASHBOARD_ENV_FILE)
-    u["macp-brief.service"] = script("macp-brief", "macp morning brief", f"/bin/zsh {VAULT}/scripts/brief.sh",
+    u["macp-brief.service"] = script("macp-brief", "macp morning brief", f"/bin/zsh {ENGINE_ROOT}/scripts/brief.sh",
                                      "brief.sh")
     u["macp-brief.timer"] = timer("macp-brief", "macp morning brief", calendar=["*-*-* 08:30:00"])
-    u["macp-kakao-refresh.service"] = script(
-        "macp-kakao-refresh", "Kakao token refresh", f"/bin/zsh {VAULT}/scripts/kakao_token_refresh.sh",
-        "kakao_token_refresh.sh")
-    u["macp-kakao-refresh.timer"] = timer(
-        "macp-kakao-refresh", "Kakao token refresh", calendar=["*-*-* 00,04,08,12,16,20:30:00"])
     u["macp-health.service"] = script(
-        "macp-health", "macp weekly health report", f"/usr/bin/python3 {VAULT}/scripts/health_report.py",
+        "macp-health", "macp weekly health report", f"/usr/bin/python3 {ENGINE_ROOT}/scripts/health_report.py",
         "health_report.py")
     u["macp-health.timer"] = timer("macp-health", "macp weekly health report", calendar=["Sun *-*-* 08:30:00"])
-    # Digest-tier kakao alerts (scripts/KAKAO_ALERTS.md) queue all day and go out
-    # as ONE memo just after the morning brief. Not folded into brief.sh: the
-    # brief's Claude call has died to quota exhaustion before, and the digest's
-    # no-loss contract must not depend on it.
-    u["macp-kakao-digest.service"] = script(
-        "macp-kakao-digest", "macp kakao digest flush (queued FYI alerts → one daily memo)",
-        f"/usr/bin/python3 {VAULT}/scripts/kakao_digest_send.py", "kakao_digest_send.py")
-    u["macp-kakao-digest.timer"] = timer(
-        "macp-kakao-digest", "macp kakao digest flush", calendar=["*-*-* 08:35:00"])
-
-    # -- Claude CLI upkeep + Remote Control --
-    # claude_auth_watch.py ships with the engine (not in public_export_exclude.txt),
-    # so it goes through engine_script; MACP_VAULT_ROOT matters here (cwd is $HOME).
-    u["claude-auth-watch.service"] = script(
-        "claude-auth-watch", "Claude CLI credential watch",
-        f"/usr/bin/python3 {VAULT}/scripts/claude_auth_watch.py", "claude_auth_watch.py", cwd=HOME)
-    u["claude-auth-watch.timer"] = timer("claude-auth-watch", "Claude CLI credential watch", every="6h")
-    # Vault-only from here on (the Remote Control stack, listed in
-    # scripts/public_export_exclude.txt — the classifier): vault path in both modes.
-    u["claude-upgrade.service"] = service(
-        "claude-upgrade", "Claude CLI upgrade + remote-control restart",
-        f"/usr/bin/python3 {VAULT}/scripts/claude_upgrade.py", cwd=HOME)
-    u["claude-upgrade.timer"] = timer(
-        "claude-upgrade", "Claude CLI upgrade", calendar=["*-*-* 04,10,16,22:40:00"])
-    # First run asks "Enable Remote Control? (y/n)" on stdin and hangs forever
-    # under systemd's null stdin (observed 2026-09-11; the answer is not persisted
-    # in ~/.claude.json on Linux). Feed the "y" through systemd instead.
-    u["claude-remote-control.service"] = service(
-        "claude-remote-control", "Claude Code Remote Control daemon",
-        f"/bin/zsh {VAULT}/scripts/claude_remote_control.sh",
-        kind="simple", restart="always", restart_sec=30,
-        extra_lines=["StandardInput=data", "StandardInputText=y\\n"])
-    # Alive-but-dead-poll-loop guard (2026-09-12, CLI 2.1.268): an archived session
-    # leaves the daemon "returning to idle" and never polling again — process up,
-    # host offline. See scripts/claude_remote_control_watchdog.py.
-    u["claude-remote-control-watchdog.service"] = service(
-        "claude-remote-control-watchdog", "Claude Remote Control poll-loop watchdog",
-        f"/usr/bin/python3 {VAULT}/scripts/claude_remote_control_watchdog.py", cwd=HOME)
-    u["claude-remote-control-watchdog.timer"] = timer(
-        "claude-remote-control-watchdog", "Claude Remote Control poll-loop watchdog", every="5min")
-
-    # -- macp-browser: the logged-in Chrome that console automation attaches to (CDP) --
-    # Boot-time start only; Chrome must never be killed by systemd, only by
-    # `browser.sh stop` (SIGTERM, so the profile's cookie DB closes cleanly).
-    #   * `browser.sh up` starts Xvfb + Chrome with `setsid nohup ... &` and returns.
-    #     setsid does NOT leave the unit's cgroup, so under the default
-    #     KillMode=control-group a stop/restart would SIGTERM+SIGKILL Chrome along
-    #     with the cgroup (the same trap that killed long_jobs on runner restarts).
-    #   * RemainAfterExit=yes keeps the unit active after `up` exits, so its exit
-    #     does not trigger a cgroup cleanup.
-    #   * KillMode=process (not control-group, not the deprecated `none`): on
-    #     stop/restart systemd signals only the already-exited main process, so the
-    #     only path that ends Chrome is ExecStop = `browser.sh stop` (VM shutdown too).
-    #   * No Restart=, no timer, and deliberately absent from daemonctl.UNITS and
-    #     worker.LONG_LIVED_LABELS: maintenance's code-change restarts never touch it.
-    #     A Chrome dying mid-day is browser_watch's job to report.
-    #   * ConditionPathExists: `--enable` is a clean skip on hosts without macp-browser.
-    #   * If a Chrome started by hand is already up, `up` leaves it alone (pgrep), but
-    #     a later stop of this unit still stops it through `browser.sh stop`.
-    u["macp-browser.service"] = service(
-        "macp-browser", "macp-browser logged-in Chrome (Xvfb :77, CDP 127.0.0.1:9277) at boot",
-        f"/bin/bash {BROWSER_DIR}/browser.sh up", cwd=BROWSER_DIR,
-        unit_lines=[f"ConditionPathExists={BROWSER_DIR}/browser.sh"], install=True,
-        extra_lines=["RemainAfterExit=yes", f"ExecStop=/bin/bash {BROWSER_DIR}/browser.sh stop",
-                     "KillMode=process",
-                     "# Chrome is stopped only via ExecStop (browser.sh stop, SIGTERM): setsid",
-                     "# does not leave this cgroup, so KillMode=process + RemainAfterExit keep",
-                     "# systemd from killing the logged-in profile on stop/restart."])
-
-    # -- mailroom --
-    u["mailroom-tick.service"] = service(
-        "mailroom-tick", "mailroom tick", f"{UV} run --directory {MAILROOM} mailroom tick", cwd=MAILROOM)
-    u["mailroom-tick.timer"] = timer("mailroom-tick", "mailroom tick", every="15min")
-    # No digest unit: the 21:30 kakao digest was retired 2026-09-11 — brief.sh
-    # now embeds `mailroom digest --out` into the 08:30 morning brief.
-
-    # -- KIS paper trading (모의, BUY_AND_HOLD) --
-    u["kis-trading.service"] = service(
-        "kis-trading", "KIS trading loop (paper)", f"{py} trading_loop.py",
-        cwd=TRADING, kind="simple", restart="on-failure", restart_sec=60, extra_env=KIS_ENV_FILE)
-    # -- KIS real trading (실계좌) — INSTALL-ONLY, never auto-enabled (see INSTALL_ONLY) --
-    # Same lifecycle as the paper loop (simple / on-failure / 60s, no OOMPolicy) but
-    # runs from its own clone + dedicated venv, and supplies the four trading params
-    # INLINE. Credentials live in that clone's .secrets/kis.env (loaded by the code,
-    # NOT wired here as an EnvironmentFile). That kis.env carries KIS_ENV/creds but
-    # NOT BUY_AND_HOLD/KIS_MAX_DEPLOY_KRW — so without these inline the live account
-    # would run on momentum at unbounded size. A human arms this unit by hand once.
-    u["kis-trading-real.service"] = service(
-        "kis-trading-real",
-        "KIS trading loop (real account — install-only, human-enabled)",
-        f"{TRADING_REAL}/.venv/bin/python trading_loop.py",
-        cwd=TRADING_REAL, kind="simple", restart="on-failure", restart_sec=60,
-        extra_lines=["Environment=KIS_ENV=real", "Environment=BUY_AND_HOLD=1",
-                     "Environment=KIS_UNIVERSE=etf", "Environment=KIS_MAX_DEPLOY_KRW=3000000",
-                     # The code's default alert path is the pre-rename second-brain vault;
-                     # without this the real loop's Kakao alerts fail rc=127 (paper gets it
-                     # from ~/.config/macp/kis.env, which this unit deliberately skips).
-                     f"Environment=KIS_ALERT_SCRIPT={VAULT}/scripts/kakao_send.sh",
-                     # Route this unit's Slack sibling-send to the dedicated kis channel
-                     # (real account skips kis.env, so it can't inherit this line).
-                     "Environment=NOTIFY_CHANNEL_KEY=kis"])
-    u["kis-trading-livesync.service"] = service(
-        "kis-trading-livesync", "KIS live sync", f"{py} scripts/live_sync.py",
-        cwd=TRADING, extra_env=KIS_ENV_FILE)
-    u["kis-trading-livesync.timer"] = timer(
-        "kis-trading-livesync", "KIS live sync", calendar=["*-*-* 16:10:00", "*-*-* 21:10:00"])
-    u["kis-trading-watchdog.service"] = service(
-        "kis-trading-watchdog", "KIS trading watchdog", f"{py} watchdog.py",
-        cwd=TRADING, extra_env=KIS_ENV_FILE)
-    u["kis-trading-watchdog.timer"] = timer("kis-trading-watchdog", "KIS trading watchdog", every="2min")
     return u
 
 
@@ -397,15 +261,13 @@ def _backfill_identity(path: Path) -> None:
 
 def write_env() -> None:
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    for path, text in ((ENV_FILE, ENV_TEMPLATE), (KIS_ENV_FILE, KIS_ENV_TEMPLATE)):
-        if path.exists():
-            print(f"keep {path}")
-            if path == ENV_FILE:
-                _backfill_identity(path)
-            continue
-        path.write_text(text)
-        path.chmod(0o600)
-        print(f"wrote {path} (fill FILL_ME values)")
+    if ENV_FILE.exists():
+        print(f"keep {ENV_FILE}")
+        _backfill_identity(ENV_FILE)
+    else:
+        ENV_FILE.write_text(ENV_TEMPLATE)
+        ENV_FILE.chmod(0o600)
+        print(f"wrote {ENV_FILE} (0600)")
     if DASHBOARD_ENV_FILE.exists():
         print(f"keep {DASHBOARD_ENV_FILE}")
     else:
@@ -416,14 +278,11 @@ def write_env() -> None:
 
 def enable_targets(units: dict[str, str], only: list[str] | None) -> list[str]:
     """Unit file names to ``systemctl enable --now`` for, given an optional
-    ``--only`` stem filter. INSTALL_ONLY stems are dropped FIRST — before the
-    ``--only`` filter — so no invocation (not even ``--enable --only
-    kis-trading-real``) can start them; those are armed by a human by hand."""
+    ``--only`` stem filter: every timer, and every timerless service (the simple
+    daemons). All rendered units are engine-core, so there is nothing to suppress."""
     targets: list[str] = []
     for name in units:
         stem, kind = name.rsplit(".", 1)
-        if stem in INSTALL_ONLY:
-            continue
         if only is not None and stem not in only:
             continue
         if kind == "timer" or f"{stem}.timer" not in units:
