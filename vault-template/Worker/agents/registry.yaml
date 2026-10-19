@@ -1,0 +1,25 @@
+# Agent registry — who owns which tasks. Read by the orchestrator (dispatch) and
+# the runner (`--agent <id>`). Copy this vault-template and edit to taste.
+#
+#   kind: human     — tasks routed here are parked for a person (brief, dashboard,
+#                     optional notification); nothing is executed.
+#   kind: ai-local  — a runner on this host executes them with headless Claude Code
+#                     (`claude -p`). See SECURITY.md before enabling one.
+#
+# Routing: the first agent whose `projects` matches a task slug wins; an exact slug
+# beats a glob, and `"*"` is the catch-all. Keep `worker-default` last.
+agents:
+  - id: me
+    kind: human
+    projects: []          # e.g. [taxes-*, job-search] — tasks only a human can do
+    mailbox: file://Worker/agents
+    notify: []            # [kakao] / [slack] once configured; empty = brief + dashboard only
+    sla: none
+  - id: worker-default
+    kind: ai-local
+    projects: ["*"]
+    mailbox: file://Worker/agents
+    repo: null            # per task, from the task file's `repo:` field
+    wake: claude
+    concurrency: 1        # parallel runs; the usage guard may lower it further
+    capabilities: [general]

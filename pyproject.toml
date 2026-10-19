@@ -7,6 +7,8 @@ name = "macp"
 version = "0.1.0"
 description = "MaestroACP engine — SQLite-backed todo management with markdown sync, worker pipeline and orchestrator"
 requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "MIT" }
 dependencies = [
 	"google-api-python-client>=2.170.0",
 	"google-auth>=2.40.0",
@@ -14,15 +16,20 @@ dependencies = [
 	"pyyaml>=6.0",   # orchestrator registry (Mac-side; transport stays stdlib-only)
 ]
 
+[project.urls]
+Repository = "https://github.com/jjkim0807/macp"
+Issues = "https://github.com/jjkim0807/macp/issues"
+
 [project.scripts]
-# Console script `macp` = the todo CLI (todo_system.cli:main). The bash wrapper
+# Console script `macp` = the todo CLI (todo_system.cli:main, reached through
+# todo_system._entry:main so a missing vault prints a fix instead of a traceback). The bash wrapper
 # scripts/macp has the same name but is a DIFFERENT program — it runs
 # `python -m todo_system.macp` (the project/profile CLI) from a development
 # checkout and exists only there (public split 13a, coexistence decision).
 # An installed wheel puts only this console script on PATH: the wrapper ships
 # inside todo_system/_engine/scripts/, which is never on PATH, and the project
 # CLI is reached as `<venv>/bin/python -m todo_system.macp`.
-macp = "todo_system.cli:main"
+macp = "todo_system._entry:main"
 
 [tool.uv]
 # Installable engine (public split, P1): `uv run` installs this project editable

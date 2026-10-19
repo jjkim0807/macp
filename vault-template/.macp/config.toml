@@ -1,0 +1,12 @@
+# Vault configuration. Its presence also marks this directory as a vault, so
+# commands run from inside it find the vault without MACP_VAULT_ROOT.
+# Every key is optional; the matching MACP_* environment variable wins.
+
+# Prefix for launchd/systemd daemon labels (MACP_LABEL_PREFIX).
+# label_prefix = "com.example."
+
+# Google Calendar id that `cli calendar-sync` writes due tasks to (MACP_CALENDAR_ID).
+# calendar_id = "primary"
+
+# owner/repo of THIS vault's git remote, used in links and PR bodies (MACP_REPO_SLUG).
+# repo_slug = "you/my-vault"

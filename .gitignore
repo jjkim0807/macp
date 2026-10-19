@@ -25,3 +25,5 @@ Worker/_state/
 .env
 *.env
 .macp/
+# ...but the empty vault skeleton ships its (all-commented) config as an example.
+!vault-template/.macp/

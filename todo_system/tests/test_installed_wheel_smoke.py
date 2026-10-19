@@ -163,7 +163,7 @@ def test_wheel_declares_the_macp_console_script(installed):
     assert len(entry_points) == 1, installed.names
     text = zipfile.ZipFile(installed.wheel).read(entry_points[0]).decode("utf-8")
     assert "[console_scripts]" in text, text
-    assert "macp = todo_system.cli:main" in text, text
+    assert "macp = todo_system._entry:main" in text, text
 
 
 # --- positive control: the children run the INSTALLED package ----------------
