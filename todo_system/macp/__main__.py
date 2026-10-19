@@ -275,7 +275,8 @@ def _cmd_account_env(a) -> int:
         # UNSET. An explicit CLAUDE_CONFIG_DIR — even one spelling the default
         # path — makes the CLI key its credential store differently and skip
         # the macOS Keychain login. 2026-10-19 16:40 the remote-control wrapper
-        # eval'd `export CLAUDE_CONFIG_DIR='/Users/jjkim/.claude'` from here and
+        # eval'd `export CLAUDE_CONFIG_DIR='$HOME/.claude'` (the legacy default
+        # dir, spelled out) from here and
         # the daemon died with "You must be logged in to use Remote Control"
         # every 30 s although `claude auth status` (no env) said logged in.
         return 0
