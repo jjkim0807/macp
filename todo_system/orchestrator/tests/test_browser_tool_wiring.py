@@ -114,11 +114,13 @@ class BrowserToolWiringTest(unittest.TestCase):
                     text = prompt(stage)
                     for needle in (f"{stages.BROWSER_CLI} lease acquire",
                                    f"{stages.BROWSER_CLI} lease release",
+                                   f"{stages.BROWSER_CLI} scratch acquire",
                                    f"`{OWNER_ENV}` is already `RUNID-x`", "exit 75"):
                         self.assertIn(needle, text)
             for stage in ("research", "plan", "report"):
                 with self.subTest(stage=stage):
                     self.assertNotIn("lease acquire", prompt(stage))
+                    self.assertNotIn("scratch acquire", prompt(stage))
 
     def test_engine_code_does_not_hardcode_the_folder(self):
         source = Path(stages.__file__).read_text(encoding="utf-8")
