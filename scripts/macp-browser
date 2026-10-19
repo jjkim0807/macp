@@ -29,24 +29,41 @@
 DIR="${MACP_BROWSER_DIR:-$HOME/.config/macp-browser}"
 DIR="${DIR/#\~/$HOME}"
 NODE="${MACP_BROWSER_NODE:-node}"
-LEASE="$DIR/lease.json"
-LOCK="$DIR/lease.lock"
 OWNER="${MACP_BROWSER_OWNER:-}"
+# Which Chrome instance this call drives. `default` (unset too) is the ONE
+# logged-in profile: it keeps the historic $DIR/lease.json + $DIR/lease.lock and
+# CDP 9277, so every existing caller is byte-identical. A named/scratch instance
+# gets its own lease.<name>.json / lease.<name>.lock and its CDP port from that
+# instance's ports.env (resolve_instance), so two sessions on different
+# instances never wait on each other. `--instance <name>` (before the command)
+# overrides MACP_BROWSER_INSTANCE. LEASE/LOCK/CDP_URL are set by resolve_instance
+# after the leading-flag loop — never hardcoded here.
+INSTANCE="${MACP_BROWSER_INSTANCE:-default}"
+LEASE=""
+LOCK=""
+CDP_URL=""
 
 usage() {
   cat >&2 <<'EOF'
-usage: macp-browser [--owner <id>] <command>
+usage: macp-browser [--owner <id>] [--instance <name>] <command>
   status                    is the logged-in Chrome up?
   up                        start Xvfb + Chrome if not running (no VNC)
-  login-check               one JSON line; exit 0 logged_in / 1 logged_out / 2 no_chrome / 3 unknown
+  login-check               one JSON line; exit 0 logged_in / 1 logged_out / 2 no_chrome / 3 unknown (default instance only)
   probe <url>               dump visible inputs/buttons + last.png
   steps <url> '<json>'      run click/fill/fillEmpty steps in order
   text <url> [wait-ms]      innerText of the main frame and every iframe
-  lease status              one JSON line: state free|held, owner, purpose, expires_at
+  lease status [--all]      one JSON line (or one per instance with --all)
   lease acquire --owner <id> [--purpose <text>] [--ttl <min,30>] [--wait <sec,0>]
   lease release --owner <id>
-probe/steps/text exit 75 when someone else holds the lease; the owner is
---owner or MACP_BROWSER_OWNER (characters A-Za-z0-9._:@-).
+  scratch acquire --owner <id> [--purpose <text>] [--ttl <min,30>]
+                            spin up a throwaway login-less instance, lease it, print {instance,cdp,expires_at}
+  scratch release --owner <id> | --instance <name>
+                            release the lease and tear the throwaway instance down
+  scratch gc                tear down every expired throwaway instance
+probe/steps/text exit 75 when someone else holds that instance's lease; the owner
+is --owner or MACP_BROWSER_OWNER (characters A-Za-z0-9._:@-). `--instance <name>`
+(or MACP_BROWSER_INSTANCE) drives a named/scratch instance; default keeps the one
+logged-in profile. login-check is the default instance only.
 start/stop/reset-vnc and other scripts are human-only (CLAUDE.md §12).
 EOF
   exit "${1:-64}"
@@ -62,6 +79,55 @@ need() {
 valid_owner() {
   local re='^[A-Za-z0-9._:@-]{1,128}$'
   [[ $1 =~ $re ]]
+}
+
+# Instance names share the owner charset.
+valid_instance() { valid_owner "$1"; }
+
+# Set LEASE / LOCK / CDP_URL from $INSTANCE. `default` is byte-frozen: the
+# historic lease.json/lease.lock and NO CDP injection (the .mjs tools fall back
+# to 9277). Any other name gets its own lease.<name>.json / lease.<name>.lock,
+# and its CDP address from ports.env under instances/<name>/ or scratch/<name>/
+# (leaf 1 / browser.sh writes it). ports.env may name the address either as a
+# full MACP_BROWSER_CDP= line or as a CDP_PORT= entry in the assignment table;
+# prefer the explicit URL, else build one from the port. A missing ports.env
+# leaves CDP_URL empty (lease-only ops don't need it).
+resolve_instance() {
+  if [ "$INSTANCE" = "default" ]; then
+    LEASE="$DIR/lease.json"
+    LOCK="$DIR/lease.lock"
+    CDP_URL=""
+    return 0
+  fi
+  LEASE="$DIR/lease.$INSTANCE.json"
+  LOCK="$DIR/lease.$INSTANCE.lock"
+  CDP_URL=""
+  local pe=""
+  if [ -f "$DIR/instances/$INSTANCE/ports.env" ]; then
+    pe="$DIR/instances/$INSTANCE/ports.env"
+  elif [ -f "$DIR/scratch/$INSTANCE/ports.env" ]; then
+    pe="$DIR/scratch/$INSTANCE/ports.env"
+  fi
+  [ -n "$pe" ] || return 0
+  CDP_URL=$(
+    # shellcheck disable=SC1090
+    . "$pe" >/dev/null 2>&1
+    if [ -n "${MACP_BROWSER_CDP:-}" ]; then
+      printf '%s' "$MACP_BROWSER_CDP"
+    elif [ -n "${CDP_PORT:-}" ]; then
+      printf 'http://127.0.0.1:%s' "$CDP_PORT"
+    fi
+  )
+}
+
+# exec a .mjs node tool. For a non-default instance with a resolved CDP address
+# we inject MACP_BROWSER_CDP so the tool attaches to that instance's Chrome; the
+# default path execs with no env wrapper so it stays byte-identical to before.
+node_exec() {
+  if [ -n "$CDP_URL" ]; then
+    exec env MACP_BROWSER_CDP="$CDP_URL" "$NODE" "$@"
+  fi
+  exec "$NODE" "$@"
 }
 
 now() { date -u +%s; }
@@ -131,6 +197,30 @@ status_json() {
   fi
 }
 
+# One JSON line per instance that has a lease file (default = lease.json,
+# <name> = lease.<name>.json). Sets LEASE per file; read_lease decides held/free.
+status_all() {
+  local f name
+  for f in "$DIR"/lease.json "$DIR"/lease.*.json; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f")
+    if [ "$name" = "lease.json" ]; then
+      name="default"
+    else
+      name=${name#lease.}
+      name=${name%.json}
+    fi
+    LEASE="$f"
+    if read_lease; then
+      printf '{"instance":"%s","state":"held","owner":"%s","purpose":"%s","expires_at":"%s"}\n' \
+        "$name" "$L_OWNER" "$L_PURPOSE" "$L_EXPIRES"
+    else
+      printf '{"instance":"%s","state":"free","owner":null,"purpose":null,"expires_at":null}\n' \
+        "$name"
+    fi
+  done
+}
+
 lock() {
   command -v flock >/dev/null 2>&1 || {
     echo "macp-browser: flock not found (needed for lease acquire/release)" >&2
@@ -153,28 +243,34 @@ write_lease() {
 }
 
 lease() {
-  local sub="${1:-}" seen='' purpose='' purpose_set='' deadline acquired
+  local sub="${1:-}" seen='' purpose='' purpose_set='' deadline acquired all=''
   TTL=30 WAIT=0
   [ $# -gt 0 ] && shift
   while [ $# -gt 0 ]; do
-    [ $# -ge 2 ] || usage
     case "$1" in
-      --owner) OWNER=$2 ;;
-      --purpose) purpose=$2; purpose_set=1 ;;
-      --ttl) TTL=$2 ;;
-      --wait) WAIT=$2 ;;
+      --all) all=1; seen="$seen --all"; shift ;;
+      --owner|--purpose|--ttl|--wait)
+        [ $# -ge 2 ] || usage
+        case "$1" in
+          --owner) OWNER=$2 ;;
+          --purpose) purpose=$2; purpose_set=1 ;;
+          --ttl) TTL=$2 ;;
+          --wait) WAIT=$2 ;;
+        esac
+        seen="$seen $1"
+        shift 2 ;;
       *) usage ;;
     esac
-    seen="$seen $1"
-    shift 2
   done
   case "$sub" in
     status)
-      [ -z "$seen" ] || usage ;;
+      # --all is the only flag status accepts.
+      case "$seen" in *--owner*|*--purpose*|*--ttl*|*--wait*) usage ;; esac ;;
     release)
-      case "$seen" in *--purpose*|*--ttl*|*--wait*) usage ;; esac
+      case "$seen" in *--purpose*|*--ttl*|*--wait*|*--all*) usage ;; esac
       valid_owner "$OWNER" || usage ;;
     acquire)
+      case "$seen" in *--all*) usage ;; esac
       valid_owner "$OWNER" || usage
       [[ $TTL =~ ^[0-9]{1,5}$ ]] && [ $((10#$TTL)) -ge 1 ] && [ $((10#$TTL)) -le 1440 ] || usage
       [[ $WAIT =~ ^[0-9]{1,5}$ ]] && [ $((10#$WAIT)) -le 3600 ] || usage ;;
@@ -187,7 +283,7 @@ lease() {
   }
   case "$sub" in
     status)
-      status_json
+      if [ -n "$all" ]; then status_all; else status_json; fi
       exit 0 ;;
     release)
       lock
@@ -222,12 +318,123 @@ lease() {
   esac
 }
 
-if [ "${1:-}" = "--owner" ]; then
+# Throwaway login-less instances. acquire auto-names one (s-<owner>-<utc>), spins
+# it up via browser.sh scratch-up, leases it (always succeeds — fresh instance),
+# and prints one JSON line. release drops the lease and tears the instance down.
+# gc tears down every scratch instance whose lease is gone or expired. Never acts
+# on `default` (browser.sh refuses scratch-down default as a second guard).
+scratch() {
+  local sub="${1:-}" seen='' purpose='' purpose_set='' name='' acquired
+  TTL=30
+  [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || usage
+    case "$1" in
+      --owner) OWNER=$2 ;;
+      --purpose) purpose=$2; purpose_set=1 ;;
+      --ttl) TTL=$2 ;;
+      --instance) name=$2 ;;
+      *) usage ;;
+    esac
+    seen="$seen $1"
+    shift 2
+  done
+  [ -d "$DIR" ] || {
+    echo "macp-browser: $DIR not found (no logged-in browser on this host?)" >&2
+    exit 69
+  }
+  need browser.sh
+  case "$sub" in
+    acquire)
+      case "$seen" in *--instance*) usage ;; esac
+      valid_owner "$OWNER" || usage
+      [[ $TTL =~ ^[0-9]{1,5}$ ]] && [ $((10#$TTL)) -ge 1 ] && [ $((10#$TTL)) -le 1440 ] || usage
+      scratch_acquire ;;
+    release)
+      case "$seen" in *--purpose*|*--ttl*) usage ;; esac
+      scratch_release ;;
+    gc)
+      [ -z "$seen" ] || usage
+      scratch_gc ;;
+    *)
+      usage ;;
+  esac
+}
+
+scratch_acquire() {
+  INSTANCE="s-$OWNER-$(date -u +%Y%m%dT%H%M%SZ)"
+  valid_instance "$INSTANCE" || usage
+  command -v flock >/dev/null 2>&1 || {
+    echo "macp-browser: flock not found (needed for lease acquire/release)" >&2
+    exit 69
+  }
+  bash "$DIR/browser.sh" scratch-up "$INSTANCE" >&2 || {
+    echo "macp-browser: browser.sh scratch-up $INSTANCE failed" >&2
+    exit 1
+  }
+  resolve_instance
+  acquired=$(iso "$(now)")
+  if [ -n "$purpose_set" ]; then purpose=$(json_escape "$purpose"); else purpose=''; fi
+  lock
+  write_lease "$acquired" "$purpose"
+  read_lease
+  unlock
+  printf '{"instance":"%s","cdp":"%s","expires_at":"%s"}\n' \
+    "$INSTANCE" "$CDP_URL" "$L_EXPIRES"
+}
+
+scratch_release() {
+  local n='' f base nm
+  if [ -n "$name" ]; then
+    valid_instance "$name" || usage
+    n="$name"
+  else
+    valid_owner "$OWNER" || usage
+    for f in "$DIR"/lease.*.json; do
+      [ -e "$f" ] || continue
+      base=$(basename "$f")
+      nm=${base#lease.}
+      nm=${nm%.json}
+      [ -d "$DIR/scratch/$nm" ] || continue
+      LEASE="$f"
+      if read_lease && [ "$L_OWNER" = "$OWNER" ]; then n="$nm"; break; fi
+    done
+  fi
+  # Releasing nothing is fine; never touch the default profile.
+  { [ -z "$n" ] || [ "$n" = "default" ]; } && exit 0
+  INSTANCE="$n"
+  resolve_instance
+  rm -f "$LEASE"
+  bash "$DIR/browser.sh" scratch-down "$n" >&2 || {
+    echo "macp-browser: browser.sh scratch-down $n failed" >&2
+    exit 1
+  }
+}
+
+scratch_gc() {
+  local d nm
+  for d in "$DIR"/scratch/*/; do
+    [ -d "$d" ] || continue
+    nm=$(basename "$d")
+    [ "$nm" = "default" ] && continue
+    INSTANCE="$nm"
+    resolve_instance
+    read_lease && continue   # live lease: leave it
+    rm -f "$LEASE"
+    bash "$DIR/browser.sh" scratch-down "$nm" >&2 || true
+  done
+}
+
+# Leading flags (any order, both optional): --owner <id> / --instance <name>.
+while [ "${1:-}" = "--owner" ] || [ "${1:-}" = "--instance" ]; do
   [ $# -ge 2 ] || usage
-  OWNER=$2
+  case "$1" in
+    --owner) OWNER=$2; valid_owner "$OWNER" || usage ;;
+    --instance) INSTANCE=$2; valid_instance "$INSTANCE" || usage ;;
+  esac
   shift 2
-  valid_owner "$OWNER" || usage
-fi
+done
+resolve_instance
 
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
@@ -240,21 +447,29 @@ case "$cmd" in
     [ $# -eq 1 ] || usage
     need console.mjs
     leased_by_other && refuse
-    exec "$NODE" "$DIR/console.mjs" probe "$1" ;;
+    node_exec "$DIR/console.mjs" probe "$1" ;;
   steps)
     [ $# -eq 2 ] || usage
     need console.mjs
     leased_by_other && refuse
-    exec "$NODE" "$DIR/console.mjs" steps "$1" "$2" ;;
+    node_exec "$DIR/console.mjs" steps "$1" "$2" ;;
   text)
     { [ $# -eq 1 ] || { [ $# -eq 2 ] && [[ $2 =~ ^[0-9]+$ ]]; }; } || usage
     need text.mjs
     leased_by_other && refuse
-    exec "$NODE" "$DIR/text.mjs" "$@" ;;
+    node_exec "$DIR/text.mjs" "$@" ;;
   lease)
     lease "$@" ;;
+  scratch)
+    scratch "$@" ;;
   login-check)
     [ $# -eq 0 ] || usage
+    # login-check is the browser_watch alert path and must stay on the one
+    # logged-in profile; other instances have no login to check.
+    if [ "$INSTANCE" != "default" ]; then
+      echo "macp-browser: login-check is the default instance only (got --instance $INSTANCE)" >&2
+      exit 64
+    fi
     need login-check.mjs
     exec "$NODE" "$DIR/login-check.mjs" ;;
   -h|--help|help)
