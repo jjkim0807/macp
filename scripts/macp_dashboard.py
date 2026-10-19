@@ -1323,6 +1323,18 @@ try{var _t=localStorage.getItem('mdash.theme');if(_t==='light'||_t==='dark')docu
 :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--bd2:#242b34;
 --fg:#e6edf3;--mut:#9ba5b0;
 --grn:#3fb950;--red:#f85149;--yel:#d29922;--blu:#58a6ff;--pur:#bc8cff}
+/* Light palette (docs/dashboard-parity.md §2, 11 tokens). Applied for OS light
+   under auto (no explicit data-theme), and for an explicit data-theme="light".
+   A media query and an attribute selector can't share one declaration block, so
+   the same token list is written twice — keep both in sync if the contract moves. */
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+--bg:#f6f8fa;--card:#ffffff;--bd:#d0d7de;--bd2:#eaeef2;
+--fg:#1f2328;--mut:#59636e;
+--grn:#1a7f37;--red:#cf222e;--yel:#9a6700;--blu:#0969da;--pur:#8250df}}
+:root[data-theme="light"]{
+--bg:#f6f8fa;--card:#ffffff;--bd:#d0d7de;--bd2:#eaeef2;
+--fg:#1f2328;--mut:#59636e;
+--grn:#1a7f37;--red:#cf222e;--yel:#9a6700;--blu:#0969da;--pur:#8250df}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);
