@@ -746,6 +746,32 @@ def save_queue(queue: dict[str, Any]) -> None:
 # latter for the whole suite). Engine file, so _ENGINE_ROOT, not the vault.
 KAKAO_SEND_SCRIPT = _ENGINE_ROOT / "scripts" / "kakao_send.sh"
 
+# Notifications are an author-only opt-in. A channel is "configured" iff the
+# vault holds a Slack secret (slack backend) OR the default Kakao token — the
+# exact two files scripts/kakao_send.sh resolves a backend from. With neither,
+# every send is a silent no-op after a single process-lifetime warning, so a
+# bare checkout does not emit one WARN line per alert. This once-flag is
+# module-level (reset by tests): the daemon is tick-per-process, so a disk
+# marker would be wrong-scoped and would touch runtime files the tests block.
+_notify_disabled_warned = False
+
+
+def _notify_channel_configured() -> bool:
+    """True iff a notification channel is set up in the vault. Mirrors
+    scripts/kakao_send.sh's own vault-dir precedence
+    (``KAKAO_VAULT_DIR`` → ``MACP_VAULT_ROOT`` → engine root) so the test seam's
+    redirect is honoured, and its backend files (``.secrets/notify-slack.json``,
+    ``.secrets/kakao-token.json``). Never raises — any OSError means "no channel"."""
+    try:
+        vault = Path(os.environ.get("KAKAO_VAULT_DIR")
+                     or os.environ.get("MACP_VAULT_ROOT")
+                     or str(ROOT))
+        secrets = vault / ".secrets"
+        return (secrets / "notify-slack.json").exists() or \
+               (secrets / "kakao-token.json").exists()
+    except OSError:
+        return False
+
 
 def kakao_notify(message: str, link: str | None = None, *,
                  level: str | None = None, event_key: str | None = None) -> None:
@@ -761,6 +787,13 @@ def kakao_notify(message: str, link: str | None = None, *,
     touching any routing state. digest/silent are handled in-process (no spawn);
     an immediate send with an event_key may be suppressed into the window's next
     delivery ("외 N건"). Routing fails open to a plain send.
+
+    Notifications themselves are an author-only opt-in: with no channel
+    configured in the vault (neither a Slack secret nor a Kakao token) the send
+    is a silent no-op after exactly one "notifications disabled" warning per
+    process. The noise-tier routing above still runs first so a digest/silent
+    entry is recorded even without a channel; only the immediate spawn is
+    short-circuited. With a channel present, behaviour is byte-identical.
     """
     if level or event_key:
         try:
@@ -770,6 +803,14 @@ def kakao_notify(message: str, link: str | None = None, *,
         if verdict != "send":
             return
         message = final if final is not None else message
+    if not _notify_channel_configured():
+        global _notify_disabled_warned
+        if not _notify_disabled_warned:
+            _notify_disabled_warned = True
+            print("notifications disabled: no Slack secret or Kakao token in "
+                  "<vault>/.secrets — suppressing sends for this process",
+                  file=sys.stderr)
+        return
     if not KAKAO_SEND_SCRIPT.exists():
         return
     try:

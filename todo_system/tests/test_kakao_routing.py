@@ -206,11 +206,38 @@ def _recorder_script(tmp_path) -> tuple[Path, Path]:
     return script, rec
 
 
+def _configure_channel(monkeypatch) -> None:
+    """Make the author-configured path active: drop a dummy Kakao token in the
+    KAKAO_VAULT_DIR the autouse fixture already points at, so kakao_notify's
+    opt-in channel gate sees a channel and still spawns the send script."""
+    import os as _os
+
+    secrets = Path(_os.environ["KAKAO_VAULT_DIR"]) / ".secrets"
+    secrets.mkdir(parents=True, exist_ok=True)
+    (secrets / "kakao-token.json").write_text('{"access_token": "x"}', encoding="utf-8")
+
+
 def test_kakao_notify_without_level_reaches_the_send_script(tmp_path, monkeypatch):
     script, rec = _recorder_script(tmp_path)
     monkeypatch.setattr(worker, "KAKAO_SEND_SCRIPT", script)
+    _configure_channel(monkeypatch)               # author path: a channel is configured
     worker.kakao_notify("기존 호출 그대로")
     assert rec.read_text(encoding="utf-8").strip() == "기존 호출 그대로"
+
+
+def test_kakao_notify_no_channel_warns_once_and_noops(tmp_path, monkeypatch, capsys):
+    """Author-only opt-in: with no Slack secret and no Kakao token, two sends
+    spawn nothing and warn exactly once per process, without raising."""
+    script, rec = _recorder_script(tmp_path)
+    monkeypatch.setattr(worker, "KAKAO_SEND_SCRIPT", script)
+    # The autouse fixture points KAKAO_VAULT_DIR at an empty tmp dir (no .secrets).
+    monkeypatch.setattr(worker, "_notify_disabled_warned", False)
+    worker.kakao_notify("첫 번째")
+    worker.kakao_notify("두 번째")
+    assert not rec.exists()                        # zero spawns
+    warnings = [ln for ln in capsys.readouterr().err.splitlines()
+                if "notifications disabled" in ln]
+    assert len(warnings) == 1                      # warned exactly once
 
 
 def test_kakao_notify_digest_never_spawns_and_lands_in_the_queue(tmp_path, monkeypatch):
