@@ -40,6 +40,7 @@ from . import lease as lease_mod
 from . import message as m
 from . import repos
 from . import screen_check
+from . import solar_stage
 from . import stages
 from . import worktree_sweep
 from .assignment import DONE, Ledger
@@ -233,6 +234,21 @@ def _stop_build_daemons(repo: Path, progress: ProgressFn) -> None:
         progress(f"build daemon cleanup skipped ({type(e).__name__})")
 
 
+def _solar_task_prompt(payload: dict) -> str:
+    """The user prompt handed to the Solar harness — the task's summary, outcome
+    and next_action, the same fields a claude stage reads from the metadata. No
+    secrets, no account data; `solar_stage.run` wraps it with the tool-use
+    system prompt."""
+    parts = []
+    if payload.get("summary"):
+        parts.append(f"Task: {payload['summary']}")
+    if payload.get("outcome"):
+        parts.append(f"Done when: {payload['outcome']}")
+    if payload.get("next_action"):
+        parts.append(f"Next action: {payload['next_action']}")
+    return "\n\n".join(parts) or "Complete the task using the file tools."
+
+
 class StagedExecutor(ClaudeCodeExecutor):
     """live-staged: run the legacy 5-stage pipeline (research → plan → implement
     → verify → report) via the existing stage prompts, in an isolated worktree,
@@ -324,6 +340,31 @@ class StagedExecutor(ClaudeCodeExecutor):
         except Exception:
             pass
         return None, None
+
+    @staticmethod
+    def _solar_account(payload: dict, repo: Path | None, task_id: str = ""):
+        """The upstage `Account` a quick/delegate stage should route to Solar, or
+        None. Returns an account ONLY when the task's payload carries
+        `agent: upstage` (repos.task_agent_from_fm wired it from frontmatter) AND
+        the resolved profile actually has an upstage account — `config.account_for`
+        with `agent="upstage"`, the vendor filter that keeps the claude
+        round-robin stable (accounts.py). Anchored at the repo like `_account_env`.
+
+        Best-effort: anything other than a configured upstage task — no `agent`,
+        a claude task, no upstage account, or any resolution error — returns None,
+        so the `use_solar` branch simply never engages and the claude path is
+        byte-identical. Never raises, never reads the key (that is deferred to
+        `solar_stage.run`); the key never touches this resolution."""
+        if (payload.get("agent") or "").lower() != "upstage":
+            return None
+        try:
+            from todo_system import macp
+            start = str(repo) if repo else str(stages._VAULT_DATA_ROOT)
+            ctx = macp.resolve(start)
+            return macp.account_for(ctx.get("profile"), ctx.get("project"),
+                                    task_id, agent="upstage")
+        except Exception:
+            return None
 
     @staticmethod
     def _maybe_rotate_account(acct: str | None, repo: Path | None, text: str,
@@ -972,6 +1013,16 @@ class StagedExecutor(ClaudeCodeExecutor):
         stage_timeout = max(self.stage_timeout, stages.stage_timeout_for(payload))
         if stage_timeout != self.stage_timeout:
             progress(f"stage timeout: {stage_timeout}s (tier {tier})")
+        # Vendor routing (macp-solar-run-single-stage-task): resolve the upstage
+        # account ONCE, before the loop. None for every task without
+        # `agent: upstage` AND an upstage account configured — which is every
+        # task today — so `use_solar` below is False and the claude argv/env is
+        # byte-identical. When set, a quick/delegate stage runs via solar_stage
+        # instead of `claude -p` (stages.route_to_solar gates the stage).
+        solar_acct = self._solar_account(payload, repo, msg.task_id)
+        if solar_acct is not None:
+            progress(f"solar account: {getattr(solar_acct, 'name', '?')} "
+                     f"(upstage — quick/delegate stages route to Solar)")
         completed: list[str] = []
         # Set True only on the single terminal success below. The `finally` reads
         # it to decide the external worktree's fate: removed on success (its
@@ -991,91 +1042,113 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # the longest legitimate gap between two touches is one
                 # run_stage_subprocess(timeout=self.stage_timeout) below, not the sum.
                 _worker.runner_heartbeat_start()
-                argv = stages.build_stage_argv(
-                    stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
-                    branch=branch, repo=repo_url, working_dir=working_dir,
-                    auto_merge=auto_merge, project_context=project_ctx,
-                    allowed_tools=payload.get("allowed_tools"), tier=tier,
-                    retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""))
-                # Token usage → stages.json `usage.<stage>`. argv carries a fresh
-                # --session-id unless MACP_STAGE_USAGE=0, and record_stage_usage
-                # reads that session's transcript back once the process is gone —
-                # ahead of every early return below, so a failed stage still gets
-                # its row. It never raises and changes nothing this loop reads:
-                # r.returncode, r.stdout and r.stderr reach run.log, the model-cache
-                # hook, the capacity check and the artifact check exactly as they
-                # did before (why not --output-format json: the comment above
-                # stages.USAGE_ENV).
-                stage_started = time.monotonic()
-                try:
-                    # run_stage_subprocess, not subprocess.run: the stage leads its
-                    # own session, so the timeout below reaps the WHOLE tree
-                    # (`claude -p` → Bash → `./gradlew` → a 2~8G Gradle/Kotlin JVM).
-                    # subprocess.run kills only the direct child and then blocks in a
-                    # second, unbounded communicate() on the pipes those grandchildren
-                    # still hold — so it left the JVM in the runner cgroup above
-                    # `memory.high` AND waited on it (2026-09-25). Capture/text/encoding
-                    # are fixed inside the helper; cwd/env/timeout stay keywords so the
-                    # returned CompletedProcess and the raised TimeoutExpired are
-                    # shape-identical to what this call site read before.
-                    r = stages.run_stage_subprocess(
-                        argv, cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
-                        # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
-                        # is built before run_id exists, so the browser lease owner
-                        # (= run_id, browser stages only) is layered on here.
-                        env=stages.with_browser_owner(stage, stage_env, run_id),
-                        timeout=stage_timeout, progress=progress)
-                except subprocess.TimeoutExpired as e:
-                    # The stage cap fired. BEFORE this catch, TimeoutExpired escaped
-                    # the whole try/finally: the finally's restore_main walked HEAD
-                    # back to main and the NEXT dispatch's branch prep rewound the
-                    # stage's unpushed commits — the work was cut AND erased
-                    # (mulkko-32, 2026-09-13). Capture it: (1) log the timeout in
-                    # run.log's own `=== stage … ===` idiom, (2) checkpoint the
-                    # external branch to origin so the commits survive the rewind,
-                    # and (3) return timed_out=True so the orchestrator's streak
-                    # guard can park a task that keeps timing out and the retry
-                    # resumes on origin/<branch> rather than restarting from scratch.
-                    stages.record_stage_usage(run_dir, stage, argv, timed_out=True)
-                    partial = getattr(e, "stdout", None) or ""
-                    if isinstance(partial, bytes):
-                        partial = partial.decode("utf-8", "replace")
+                use_solar = (solar_acct is not None
+                             and stages.route_to_solar(payload.get("agent"), stage))
+                if use_solar:
+                    # Solar (upstage) single-stage path — an in-engine read/write/
+                    # finish tool loop, NOT `claude -p`. No argv, no subprocess, no
+                    # per-stage token transcript: usage_rec=None keeps the rc==0
+                    # capacity arm inert (usage_shows_no_api_work(None) is False),
+                    # and the key is read inside solar_stage.run and used only in
+                    # the request header. `r` is CompletedProcess-shaped so the
+                    # shared tail below reads r.returncode/r.stdout unchanged, and
+                    # solar_stage writes the stage artifact (delegate.md) itself.
+                    # The deadline doubles as the loop's wall-clock bound; a Solar
+                    # run cannot TimeoutExpired, so there is no timeout arm here.
+                    r = solar_stage.run(
+                        stage, task_prompt=_solar_task_prompt(payload),
+                        working_dir=working_dir, account=solar_acct, tier=tier,
+                        artifact_path=run_dir / stages.STAGE_ARTIFACT[stage],
+                        env=stage_env, deadline_s=stage_timeout, progress=progress)
+                    usage_rec = None
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
-                        f.write(f"\n=== {stage} (timeout after {stage_timeout}s) ===\n"
-                                f"{partial[-2000:]}\n")
-                    # Stop this clone's Gradle daemons BEFORE the push below. The
-                    # group kill above cannot reach a daemon that put itself in its
-                    # own session, and a 2~8G JVM left running holds the runner
-                    # cgroup over `memory.high` — where the very next git call sits
-                    # in `__mem_cgroup_handle_over_high` for tens of minutes
-                    # (2026-09-25; the git half of that incident is the `_run_git`
-                    # ceilings in stages.py). So: reap, then checkpoint.
-                    _stop_build_daemons(repo, progress)
-                    cp: dict = {}
-                    # `report` runs only AFTER a squash-merge deleted origin/<branch>,
-                    # so it holds no unpushed worker commits; a checkpoint there would
-                    # base off origin/<default> (remote_branch_exists False), count the
-                    # already-merged commits as ahead, and re-push the merged branch as
-                    # a duplicate-PR shape (defect B, 2026-09-20). Skip it — implement
-                    # (:844) and quick still checkpoint, plan/research/verify are no-ops.
-                    if repo_url and repo is not None and stage != "report":
-                        cp = stages.checkpoint_push(repo, branch)
-                        if cp.get("note"):
-                            progress(f"timeout checkpoint: {cp['note']}")
-                    stages.record_timeout(run_dir, stage, cp.get("tip"))
-                    note = cp.get("note") if cp else "vault task — no external branch pushed"
-                    return ExecOutcome(
-                        False,
-                        f"stage {stage}: timed out after {stage_timeout}s — {note}",
-                        {"branch": branch, "run_dir": str(run_dir),
-                         "stages": completed, "timed_out": True,
-                         "timeout_stage": stage, "checkpoint_sha": cp.get("tip"),
-                         "repo": repo_url})
-                usage_rec = stages.record_stage_usage(
-                    run_dir, stage, argv, env=stage_env, returncode=r.returncode,
-                    duration_ms=int((time.monotonic() - stage_started) * 1000))
-                with (run_dir / "run.log").open("a", encoding="utf-8") as f:
-                    f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
+                        f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
+                else:
+                    argv = stages.build_stage_argv(
+                        stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
+                        branch=branch, repo=repo_url, working_dir=working_dir,
+                        auto_merge=auto_merge, project_context=project_ctx,
+                        allowed_tools=payload.get("allowed_tools"), tier=tier,
+                        retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""))
+                    # Token usage → stages.json `usage.<stage>`. argv carries a fresh
+                    # --session-id unless MACP_STAGE_USAGE=0, and record_stage_usage
+                    # reads that session's transcript back once the process is gone —
+                    # ahead of every early return below, so a failed stage still gets
+                    # its row. It never raises and changes nothing this loop reads:
+                    # r.returncode, r.stdout and r.stderr reach run.log, the model-cache
+                    # hook, the capacity check and the artifact check exactly as they
+                    # did before (why not --output-format json: the comment above
+                    # stages.USAGE_ENV).
+                    stage_started = time.monotonic()
+                    try:
+                        # run_stage_subprocess, not subprocess.run: the stage leads its
+                        # own session, so the timeout below reaps the WHOLE tree
+                        # (`claude -p` → Bash → `./gradlew` → a 2~8G Gradle/Kotlin JVM).
+                        # subprocess.run kills only the direct child and then blocks in a
+                        # second, unbounded communicate() on the pipes those grandchildren
+                        # still hold — so it left the JVM in the runner cgroup above
+                        # `memory.high` AND waited on it (2026-09-25). Capture/text/encoding
+                        # are fixed inside the helper; cwd/env/timeout stay keywords so the
+                        # returned CompletedProcess and the raised TimeoutExpired are
+                        # shape-identical to what this call site read before.
+                        r = stages.run_stage_subprocess(
+                            argv, cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
+                            # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
+                            # is built before run_id exists, so the browser lease owner
+                            # (= run_id, browser stages only) is layered on here.
+                            env=stages.with_browser_owner(stage, stage_env, run_id),
+                            timeout=stage_timeout, progress=progress)
+                    except subprocess.TimeoutExpired as e:
+                        # The stage cap fired. BEFORE this catch, TimeoutExpired escaped
+                        # the whole try/finally: the finally's restore_main walked HEAD
+                        # back to main and the NEXT dispatch's branch prep rewound the
+                        # stage's unpushed commits — the work was cut AND erased
+                        # (mulkko-32, 2026-09-13). Capture it: (1) log the timeout in
+                        # run.log's own `=== stage … ===` idiom, (2) checkpoint the
+                        # external branch to origin so the commits survive the rewind,
+                        # and (3) return timed_out=True so the orchestrator's streak
+                        # guard can park a task that keeps timing out and the retry
+                        # resumes on origin/<branch> rather than restarting from scratch.
+                        stages.record_stage_usage(run_dir, stage, argv, timed_out=True)
+                        partial = getattr(e, "stdout", None) or ""
+                        if isinstance(partial, bytes):
+                            partial = partial.decode("utf-8", "replace")
+                        with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                            f.write(f"\n=== {stage} (timeout after {stage_timeout}s) ===\n"
+                                    f"{partial[-2000:]}\n")
+                        # Stop this clone's Gradle daemons BEFORE the push below. The
+                        # group kill above cannot reach a daemon that put itself in its
+                        # own session, and a 2~8G JVM left running holds the runner
+                        # cgroup over `memory.high` — where the very next git call sits
+                        # in `__mem_cgroup_handle_over_high` for tens of minutes
+                        # (2026-09-25; the git half of that incident is the `_run_git`
+                        # ceilings in stages.py). So: reap, then checkpoint.
+                        _stop_build_daemons(repo, progress)
+                        cp: dict = {}
+                        # `report` runs only AFTER a squash-merge deleted origin/<branch>,
+                        # so it holds no unpushed worker commits; a checkpoint there would
+                        # base off origin/<default> (remote_branch_exists False), count the
+                        # already-merged commits as ahead, and re-push the merged branch as
+                        # a duplicate-PR shape (defect B, 2026-09-20). Skip it — implement
+                        # (:844) and quick still checkpoint, plan/research/verify are no-ops.
+                        if repo_url and repo is not None and stage != "report":
+                            cp = stages.checkpoint_push(repo, branch)
+                            if cp.get("note"):
+                                progress(f"timeout checkpoint: {cp['note']}")
+                        stages.record_timeout(run_dir, stage, cp.get("tip"))
+                        note = cp.get("note") if cp else "vault task — no external branch pushed"
+                        return ExecOutcome(
+                            False,
+                            f"stage {stage}: timed out after {stage_timeout}s — {note}",
+                            {"branch": branch, "run_dir": str(run_dir),
+                             "stages": completed, "timed_out": True,
+                             "timeout_stage": stage, "checkpoint_sha": cp.get("tip"),
+                             "repo": repo_url})
+                    usage_rec = stages.record_stage_usage(
+                        run_dir, stage, argv, env=stage_env, returncode=r.returncode,
+                        duration_ms=int((time.monotonic() - stage_started) * 1000))
+                    with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                        f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
                 # Per stage, not once per run: a stage that finished cleanly can
                 # still have left a Gradle daemon holding gigabytes, and the next
                 # stage (or the implement checkpoint push below) is what pays for it.

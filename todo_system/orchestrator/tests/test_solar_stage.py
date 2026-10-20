@@ -17,17 +17,24 @@ Grouped by the implementation phase that introduced each block:
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from todo_system.orchestrator import repos, solar_stage, tasks
+from todo_system.macp import config
+from todo_system.orchestrator import message as m
+from todo_system.orchestrator import repos, solar_stage, stages, tasks
+from todo_system.orchestrator import runner as runner_mod
+from todo_system.orchestrator.registry import Agent
+from todo_system.orchestrator.runner import StagedExecutor
 
 SENTINEL = "up_SENTINELKEY0123456789"
 DEAD = "http://127.0.0.1:1/v1"          # a port nothing listens on, as a second belt
@@ -334,6 +341,137 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("UPSTAGE_API_KEY", r.stdout)
         self.assertFalse(self.art.exists())      # caller records blocked_on
+
+
+# ---- Phase 4: stages.route_to_solar + runner _execute routing (AC #1) --------
+
+class RouteToSolarTest(unittest.TestCase):
+    def test_truth_table(self):
+        self.assertTrue(stages.route_to_solar("upstage", "delegate"))
+        self.assertTrue(stages.route_to_solar("Upstage", "quick"))     # case-insensitive
+        self.assertFalse(stages.route_to_solar("upstage", "implement"))  # 5-stage lane
+        self.assertFalse(stages.route_to_solar("upstage", "verify"))
+        self.assertFalse(stages.route_to_solar("claude", "delegate"))   # claude untouched
+        self.assertFalse(stages.route_to_solar(None, "quick"))
+        self.assertFalse(stages.route_to_solar("", "delegate"))
+
+    def test_solar_stages_are_the_single_stage_lanes_only(self):
+        self.assertEqual(set(stages.SOLAR_STAGES), {"quick", "delegate"})
+
+
+class BuildArgvUnchangedTest(unittest.TestCase):
+    """AC #1 (structural half): build_stage_argv still assembles the claude
+    invocation for quick/delegate — the function is not modified by the feature."""
+
+    def test_quick_and_delegate_still_build_claude_argv(self):
+        from todo_system.orchestrator import model_select
+        with mock.patch.object(model_select, "resolve_model", return_value="m-fixed"):
+            for stage in ("delegate", "quick"):
+                argv = stages.build_stage_argv(
+                    stage, task_id="t", run_id="r",
+                    run_dir=Path("/v/Worker/runs/x"), branch="worker/t")
+                self.assertEqual(argv[0], "claude")
+                self.assertEqual(argv[1], "-p")
+                self.assertIn("--model", argv)
+                self.assertIn("m-fixed", argv)
+                self.assertIn("--max-turns", argv)
+
+
+def _agent() -> Agent:
+    return Agent(id="w", kind="ai-local", capabilities=["git"], repo="~/Worker/x")
+
+
+class ExecuteRoutingTest(unittest.TestCase):
+    """Drive a full VAULT delegate run through StagedExecutor and prove routing:
+    an `agent: upstage` task calls `solar_stage.run` and NOT
+    `run_stage_subprocess`; a claude task does the inverse (the claude argv/env
+    path is byte-identical because that branch is simply never taken for solar).
+    Mirrors test_delegate_merge's mocking — no real gh/push/subprocess."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs = self.tmp / "runs"
+        self.runs.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_dir(self) -> Path:
+        dirs = list(self.runs.iterdir())
+        self.assertEqual(len(dirs), 1, dirs)
+        return dirs[0]
+
+    def _drive(self, *, agent, solar_acct):
+        vp = subprocess.CompletedProcess([], 0, "", "")
+        vp.problem = None
+        vp.orphaned_commits = None
+
+        def write_art(*a, **kw):
+            # both the solar and claude stubs write delegate.md so the stage loop
+            # reaches the success return; the ASSERTION is which stub ran.
+            (self._run_dir() / stages.STAGE_ARTIFACT["delegate"]).write_text(
+                "# delegate\n", encoding="utf-8")
+            return subprocess.CompletedProcess(["x"], 0, "stage stdout", "")
+
+        solar_run = mock.Mock(side_effect=write_art)
+        claude_run = mock.Mock(side_effect=write_art)
+        payload = {"worker_mode": "delegate", "auto_merge": True}
+        if agent:
+            payload["agent"] = agent
+        msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="t", payload=payload)
+        with contextlib.ExitStack() as stack:
+            for p in (
+                mock.patch.object(stages, "restore_main"),
+                mock.patch.object(stages, "install_push_guard"),
+                mock.patch.object(stages, "default_branch", return_value="main"),
+                mock.patch.object(stages, "prepare_vault_branch", return_value=vp),
+                mock.patch.object(stages, "remote_branch_exists", return_value=False),
+                mock.patch.object(stages, "RUNS_DIR", self.runs),
+                mock.patch.object(stages, "build_stage_argv", return_value=["true"]),
+                mock.patch.object(stages, "cleanup_build_daemons",
+                                  return_value={"ran": True, "note": ""}),
+                mock.patch.object(stages, "run_stage_subprocess", claude_run),
+                mock.patch.object(solar_stage, "run", solar_run),
+                mock.patch.object(stages, "publish_branch",
+                                  mock.Mock(return_value={"pr_url": None, "note": ""})),
+                mock.patch.object(stages, "merge_pr",
+                                  mock.Mock(return_value={"merged": True, "note": ""})),
+                mock.patch.object(StagedExecutor, "_account_env", return_value=(None, "")),
+                mock.patch.object(StagedExecutor, "_solar_account", return_value=solar_acct),
+                mock.patch.object(StagedExecutor, "_live_sibling_hold", return_value=None),
+                mock.patch.object(StagedExecutor, "_acquire_checkout_lease", return_value=None),
+                mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("delegate",)),
+                mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
+                mock.patch("todo_system.worker.runner_heartbeat_start"),
+            ):
+                stack.enter_context(p)
+            out = StagedExecutor().execute(msg, _agent(), progress=lambda _: None)
+        return out, solar_run, claude_run
+
+    def test_upstage_delegate_routes_to_solar(self):
+        acct = config.Account(name="solar", agent="upstage")
+        out, solar_run, claude_run = self._drive(agent="upstage", solar_acct=acct)
+        self.assertTrue(out.ok, out.summary)
+        solar_run.assert_called_once()
+        claude_run.assert_not_called()
+        # solar_stage.run is handed the delegate artifact path + the account
+        _, kw = solar_run.call_args
+        self.assertEqual(kw["account"], acct)
+        self.assertEqual(Path(kw["artifact_path"]).name, "delegate.md")
+
+    def test_claude_delegate_still_uses_the_subprocess_path(self):
+        out, solar_run, claude_run = self._drive(agent=None, solar_acct=None)
+        self.assertTrue(out.ok, out.summary)
+        claude_run.assert_called_once()        # the unchanged claude argv path
+        solar_run.assert_not_called()
+
+    def test_upstage_agent_but_no_account_falls_back_to_claude(self):
+        # `agent: upstage` with NO upstage account resolved (solar_acct=None) must
+        # NOT route to solar — the runner gates on an actual account too.
+        out, solar_run, claude_run = self._drive(agent="upstage", solar_acct=None)
+        self.assertTrue(out.ok, out.summary)
+        claude_run.assert_called_once()
+        solar_run.assert_not_called()
 
 
 if __name__ == "__main__":

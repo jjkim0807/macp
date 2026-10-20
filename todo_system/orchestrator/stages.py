@@ -168,6 +168,24 @@ STAGES_QUICK = ("quick",)   # right-sizing: one combined call for trivial change
 # tree by prompt; the runner closes it on RESULT like any vault task.
 STAGES_DISCOVER = ("discover",)
 
+# The stages the Solar (upstage) harness can run: the single-stage lanes only.
+# `solar_stage.run` has read/write/finish file tools and no shell — so it cannot
+# do quick's self-verify + self-merge + `gh pr` or the 5-stage pipeline's
+# git/build work; `delegate` ("do the work, edit files, write delegate.md") is
+# exactly what it can do. quick is listed so a quick task CAN be routed once a
+# key-authenticated vendor grows a verify path, but delegate is the lane opened
+# now (runner._solar_account + the `use_solar` branch).
+SOLAR_STAGES = STAGES_QUICK + STAGES_DELEGATE
+
+
+def route_to_solar(agent: str | None, stage: str) -> bool:
+    """Whether this stage runs via the Solar harness instead of `claude -p`:
+    the task's resolved `agent` is upstage AND the stage is a single-stage lane.
+    Pure and total — the runner ALSO gates on an actually-resolved upstage
+    account, so this returning True for a task with no upstage account configured
+    still never routes (and every claude task returns False here regardless)."""
+    return (agent or "").lower() == "upstage" and stage in SOLAR_STAGES
+
 # The test runners are for the Step 5b local fallback (verify.md) — the prompt
 # tells verify to reproduce the repo's own CI commands when CI cannot run, and
 # without these the harness gated every one of them behind an approval prompt,
