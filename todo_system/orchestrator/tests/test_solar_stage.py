@@ -232,5 +232,109 @@ class WithRetryTest(unittest.TestCase):
         self.assertEqual(calls["n"], 1)        # a 401 is not transient
 
 
+# ---- Phase 3: the tool-calling loop (solar_stage.run) ------------------------
+
+def _tool_resp(name, args_dict, call_id="c", total=7):
+    """A scripted assistant response carrying exactly one tool call."""
+    return {"choices": [{"message": {"role": "assistant", "content": None,
+            "tool_calls": [{"id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(args_dict)}}]}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": total}}
+
+
+def _script(responses):
+    """A urlopen stub that returns each scripted response in turn."""
+    it = iter(responses)
+
+    def fake(req, timeout=None):
+        return _Resp(next(it))
+
+    return fake
+
+
+class RunLoopTest(unittest.TestCase):
+    def setUp(self):
+        self.wd = Path(tempfile.mkdtemp())
+        self.art = self.wd / "delegate.md"
+
+    def tearDown(self):
+        shutil.rmtree(self.wd, ignore_errors=True)
+
+    def _run(self, responses, **kw):
+        with mock.patch.object(solar_stage.urllib.request, "urlopen",
+                               side_effect=_script(responses)):
+            return solar_stage.run(
+                "delegate", task_prompt="edit the file", working_dir=str(self.wd),
+                artifact_path=str(self.art), api_key=SENTINEL, base=DEAD,
+                sleep=lambda _: None, **kw)
+
+    def test_write_then_finish_edits_the_file_and_writes_the_artifact(self):
+        r = self._run([
+            _tool_resp("write_file", {"path": "README.md", "content": "new line\n"}),
+            _tool_resp("finish", {"summary": "changed README"}),
+        ])
+        self.assertEqual(r.returncode, 0)                                   # finished
+        self.assertEqual((self.wd / "README.md").read_text(encoding="utf-8"),
+                         "new line\n")                                      # (a)
+        self.assertTrue(self.art.exists())                                  # (b)
+        art = self.art.read_text(encoding="utf-8")
+        self.assertIn("README.md", art)
+        self.assertIn("total=14", art)                 # 7 + 7 across the two calls
+        self.assertIn("finish_summary: changed README", art)
+
+    def test_the_key_never_appears_in_stdout_or_artifact(self):
+        # a server that echoes the key in a tool-call argument
+        r = self._run([
+            _tool_resp("write_file", {"path": "f.txt", "content": f"k={SENTINEL}"}),
+            _tool_resp("finish", {"summary": f"done {SENTINEL}"}),
+        ])
+        self.assertNotIn(SENTINEL, r.stdout)                                # (d)
+        self.assertNotIn(SENTINEL, self.art.read_text(encoding="utf-8"))
+
+    def test_a_path_escape_is_refused_and_not_written(self):
+        outside = self.wd.parent / "escaped-by-solar.txt"
+        r = self._run([
+            _tool_resp("write_file", {"path": "../escaped-by-solar.txt",
+                                      "content": "nope"}),
+            _tool_resp("finish", {"summary": "tried to escape"}),
+        ])
+        self.assertFalse(outside.exists())                                  # (c)
+        self.assertIn("escapes the working directory", r.stdout)
+        self.assertIn("files_written: none", self.art.read_text(encoding="utf-8"))
+
+    def test_max_iters_exhaustion_is_incomplete(self):
+        # the model keeps calling read_file and never finishes → bound trips
+        responses = [_tool_resp("read_file", {"path": "x"}, call_id=str(i))
+                     for i in range(10)]
+        r = self._run(responses, max_iters=3)
+        self.assertEqual(r.returncode, 1)                                   # (e)
+        art = self.art.read_text(encoding="utf-8")
+        self.assertIn("status: incomplete", art)
+        self.assertIn("error_kind: max_iters", art)
+        self.assertIn("iterations: 3", art)
+
+    def test_a_persistent_429_is_recorded_not_crashed(self):
+        def fake(req, timeout=None):
+            raise _http_error(429, '{"error":"slow down"}')
+
+        with mock.patch.object(solar_stage.urllib.request, "urlopen", side_effect=fake):
+            r = solar_stage.run("delegate", task_prompt="x", working_dir=str(self.wd),
+                                artifact_path=str(self.art), api_key=SENTINEL,
+                                base=DEAD, sleep=lambda _: None, max_iters=2)
+        self.assertEqual(r.returncode, 1)
+        art = self.art.read_text(encoding="utf-8")
+        self.assertIn("error_kind: rate_limit", art)
+        # the raw server body must NOT reach stdout (the runner scans it for a
+        # claude capacity marker; a literal "rate limit" would mis-defer the run)
+        self.assertNotIn("rate limit", r.stdout.lower())
+
+    def test_no_key_returns_rc1_without_an_artifact(self):
+        r = solar_stage.run("delegate", task_prompt="x", working_dir=str(self.wd),
+                            artifact_path=str(self.art), api_key="", base=DEAD)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("UPSTAGE_API_KEY", r.stdout)
+        self.assertFalse(self.art.exists())      # caller records blocked_on
+
+
 if __name__ == "__main__":
     unittest.main()
