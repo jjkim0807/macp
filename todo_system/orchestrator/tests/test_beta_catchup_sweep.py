@@ -367,9 +367,10 @@ def _write_state(path: Path, **data) -> Path:
 
 
 def _due(env, *, spawn, now=NOW, head_branch="main", is_alive=lambda _p: False,
-         progress=None):
+         progress=None, config_path=None):
     return bp.spawn_sweep_if_due(
         state_path=env.state_path, min_interval_s=bp.SWEEP_MIN_INTERVAL_S,
+        config_path=config_path if config_path is not None else env.config_path,
         now=now, head_branch=head_branch, spawn=spawn, is_alive=is_alive,
         progress=progress or (lambda _m: None))
 
@@ -412,6 +413,25 @@ def test_spawn_runs_and_records_the_pid(env):
     state = env.state()
     assert state["pid"] == 4242
     assert state["last_tick_ts"] == NOW
+
+
+def test_spawn_is_skipped_silently_when_no_config(env, tmp_path):
+    """Beta publishing is author-only: a checkout with no (or empty) config must
+    print nothing and spawn nothing — this is the empty-vault tick-noise fix."""
+    spawn = SpawnSpy()
+    lines: list[str] = []
+
+    missing = tmp_path / "no-such" / "beta_publish_config.json"
+    assert _due(env, spawn=spawn, config_path=missing,
+                progress=lines.append) is False
+
+    empty = tmp_path / "empty_config.json"
+    empty.write_text(json.dumps({"repos": {}}), encoding="utf-8")
+    assert _due(env, spawn=spawn, config_path=empty,
+                progress=lines.append) is False
+
+    assert spawn.calls == 0
+    assert lines == []
 
 
 # --- tick wiring ------------------------------------------------------------

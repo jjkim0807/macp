@@ -1211,6 +1211,7 @@ def spawn_sweep_if_due(
     state_path: Path | str = SWEEP_STATE_PATH,
     min_interval_s: float = SWEEP_MIN_INTERVAL_S,
     vault_root: Path | str = _VAULT_DATA_ROOT,
+    config_path: Path | str | None = None,
     now: float | None = None,
     head_branch: str | None = None,
     spawn: Callable[[], int] | None = None,
@@ -1223,8 +1224,14 @@ def spawn_sweep_if_due(
     This is the whole of what a tick does — it must return in milliseconds, so
     even the ls-remote discovery lives in the child process.
 
-    Three gates:
+    Four gates:
 
+    * **config present** — beta publishing is an author-only opt-in: an external
+      checkout with no (or empty) ``<vault>/.macp/beta_publish_config.json`` has
+      nothing to sweep, so we return before any ``progress`` line or state write.
+      This keeps a bare clone's every tick silent rather than printing the HEAD
+      line below. Judged on the passed ``vault_root`` (not the import-time
+      ``CONFIG_PATH``, which is pinned to ``_VAULT_DATA_ROOT``).
     * **min-poll** — at most one sweep per ``min_interval_s``, so a ~5-min tick
       does not queue ls-remotes it cannot use.
     * **vault HEAD is main** — a successful publish commits the watermark canon in
@@ -1240,6 +1247,10 @@ def spawn_sweep_if_due(
     now = time.time() if now is None else now
     spawn = spawn or _spawn_detached
     is_alive = is_alive or _pid_alive
+    if config_path is None:
+        config_path = Path(vault_root) / ".macp" / "beta_publish_config.json"
+    if not load_config(config_path):
+        return False                             # no author config → silent skip
     state = _load_sweep_state(state_path)
 
     last = state.get("last_tick_ts")
