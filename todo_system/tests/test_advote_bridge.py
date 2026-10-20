@@ -453,10 +453,12 @@ def test_map_proposal_status(worker_mode, assignment, beta, expected):
 def test_no_secrets_is_silent_noop(env):
     env.secrets_path.unlink()
     http = FakeHttp(suggestions=[_sugg()])
+    notes: list[str] = []
     out = advote_bridge.run_once(http_get=http.get, http_post=http.post, run=FakeRun(),
-                                 now=1000.0, **env.kw)
+                                 notify=notes.append, now=1000.0, **env.kw)
     assert out is None
     assert http.gets == [] and http.posts == []
+    assert notes == []                             # opt-in off → not even a log line
 
 
 def test_network_error_is_fail_open(env):

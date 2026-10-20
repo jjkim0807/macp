@@ -741,7 +741,12 @@ def run_once(
     """One bridge pass: poll advote → per-suggestion (idempotent) promote+emit →
     reverse-report. Returns a summary dict, or ``None`` for an intentional no-op
     (no secrets / inside the min-poll window / HEAD not on main). Fail-open: a
-    network or per-suggestion error is logged and skipped, never raised."""
+    network or per-suggestion error is logged and skipped, never raised.
+
+    The bridge is an author-only opt-in: ``<vault>/.secrets/advote.json`` is the
+    switch. Absent (``load_secrets`` → ``None``) it returns immediately **before**
+    any poll, notify, or state write, so a bare checkout's every tick is a truly
+    silent no-op — no log line, no network call."""
     now = time.time() if now is None else float(now)
     vault_root = Path(vault_root)
     state_path = Path(state_path)

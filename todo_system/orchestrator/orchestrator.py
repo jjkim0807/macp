@@ -2110,13 +2110,17 @@ class Orchestrator:
         a blocked task) and reverse-report macp run state back to advote. Fully
         self-contained and fail-open: no secrets, network down, or any error is
         swallowed here so a feedback bridge can never stall a tick. The min-poll
-        interval and the HEAD==main guard live inside run_once. See
-        todo_system.advote_bridge."""
+        interval and the HEAD==main guard live inside run_once. The bridge is an
+        author-only opt-in: with no <vault>/.secrets/advote.json we return before
+        even importing the module, so a bare checkout's tick does no work at all.
+        See todo_system.advote_bridge."""
         try:
-            from .. import advote_bridge
-            from ..kakao_format import LEVEL_DIGEST
             # ledger.root is Worker/assignments -> the vault root is two up.
             vault_root = Path(self.ledger.root).parent.parent
+            if not (vault_root / ".secrets" / "advote.json").exists():
+                return                            # opt-in off → silent, no import per tick
+            from .. import advote_bridge
+            from ..kakao_format import LEVEL_DIGEST
             advote_bridge.run_once(
                 vault_root=vault_root,
                 notify=lambda msg: self._notify_routed(
