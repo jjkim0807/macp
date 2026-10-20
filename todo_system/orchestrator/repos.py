@@ -27,26 +27,80 @@ GIT_TIMEOUT_CLONE_S = 300
 GIT_TIMEOUT_WORKTREE_S = 180
 
 
+def _frontmatter_block(text: str) -> str | None:
+    """The raw YAML block between the leading `---` and the next `---`, or None
+    when there is no closed frontmatter (no leading `---`, or no closing `---`).
+    None means fail-open at every call site — the field is simply absent. The
+    slice is byte-identical to the historical `_frontmatter` (`text[3:end]`,
+    `end = text.find("\\n---", 3)`)."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    return text[3:end]
+
+
+def _yaml_error_reason(e) -> str:
+    """One-line reason from a `yaml.YAMLError`. When it carries a `problem_mark`
+    the file line is reported 1-based: the block fed to the parser starts right
+    after the leading `---` (file line 1), so its line 0 is the newline after
+    `---` and its line N maps to file line N+1 — hence `mark.line + 1`. Newlines
+    are collapsed so the reason stays a single line."""
+    mark = getattr(e, "problem_mark", None)
+    problem = getattr(e, "problem", None)
+    if mark is not None:
+        detail = problem or (" ".join(str(e).split()) or "YAML error")
+        return f"line {mark.line + 1}: {detail}"
+    return " ".join(str(e).split()) or "YAML error"
+
+
+def _parse_frontmatter_block(block: str) -> tuple[dict, str | None]:
+    """Parse a frontmatter YAML block into (dict, reason). `reason` is non-None
+    ONLY when YAML raises — the one case this module treats as a hard parse
+    error rather than fail-open. A parse that succeeds but is not a dict
+    (string/list/int) stays ({}, None), preserving the historical fail-open."""
+    import yaml
+
+    try:
+        parsed = yaml.safe_load(block)
+    except yaml.YAMLError as e:
+        return {}, _yaml_error_reason(e)
+    return (parsed if isinstance(parsed, dict) else {}), None
+
+
+def frontmatter_error_from_text(text: str) -> str | None:
+    """A one-line reason iff this task markdown's frontmatter is strict-YAML
+    broken (`yaml.YAMLError`), else None. Shared by `load_dispatchable`'s
+    dispatch gate and `task_validate`'s ERROR so the two always agree on which
+    files are broken. Missing/unclosed frontmatter and non-dict YAML are NOT
+    errors here — those stay fail-open."""
+    block = _frontmatter_block(text)
+    if block is None:
+        return None
+    return _parse_frontmatter_block(block)[1]
+
+
+def frontmatter_with_error(md_path: str | Path) -> tuple[dict, str | None]:
+    """Like `_frontmatter` but also returns a reason string when the frontmatter
+    is strict-YAML broken. (fm, None) for every fail-open case (missing file,
+    no/unclosed frontmatter, non-dict YAML); ({}, reason) only on a YAMLError."""
+    p = Path(md_path)
+    if not p.exists():
+        return {}, None
+    block = _frontmatter_block(p.read_text(encoding="utf-8"))
+    if block is None:
+        return {}, None
+    return _parse_frontmatter_block(block)
+
+
 def _frontmatter(md_path: str | Path) -> dict:
     """A task markdown's frontmatter, or {} for anything unreadable. Every caller
     treats a parse failure the same way — the field is simply absent — so the
-    failure modes collapse here instead of at each call site."""
-    import yaml
-
-    p = Path(md_path)
-    if not p.exists():
-        return {}
-    text = p.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return {}
-    end = text.find("\n---", 3)
-    if end == -1:
-        return {}
-    try:
-        parsed = yaml.safe_load(text[3:end])
-    except yaml.YAMLError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    failure modes collapse here instead of at each call site. A caller that must
+    distinguish a YAML parse error from the fail-open cases uses
+    `frontmatter_with_error` instead."""
+    return frontmatter_with_error(md_path)[0]
 
 
 def _clean(v) -> str | None:
