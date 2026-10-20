@@ -10,6 +10,7 @@
   python -m todo_system.macp account list [--profile P]        # one detailed line per account
   python -m todo_system.macp account status [--profile P]      # resolved active account + runtime state
   python -m todo_system.macp account remove NAME [--profile P] # drop from the profile (dir left on disk)
+  python -m todo_system.macp account probe NAME [--tier T]     # one real Solar call → one line of JSON
   python -m todo_system.macp use PROFILE            # set the global default profile
 
 `account add` for a claude account without --config-dir creates
@@ -27,6 +28,7 @@ anything and never deletes or moves a file.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -219,6 +221,8 @@ def _cmd_account(a) -> int:
         return _cmd_account_status(a)
     if a.action == "remove":
         return _cmd_account_remove(a)
+    if a.action == "probe":
+        return _cmd_account_probe(a)
     prof = C.load_profile(a.profile)
     if not prof:
         print(f"error: profile '{a.profile}' not found (macp profile add {a.profile})")
@@ -295,6 +299,42 @@ def _cmd_account(a) -> int:
     if login_hint:
         print(f"  next: {login_hint}")
     return 0
+
+
+def _cmd_account_probe(a) -> int:
+    """``account probe NAME`` — ONE real chat completion through an upstage
+    account, printed as one line of JSON: ``ok``, the model that answered,
+    ``elapsed_s``, token counts and ``error_kind``. This is the only path that
+    spends a live API call, so it never retries (the measured tier 429s after
+    ~45 consecutive calls, and ``error_kind: "rate_limit"`` is itself the result
+    worth recording).
+
+    rc 0 = the call succeeded, 1 = it failed (the JSON says how), 2 = no such
+    upstage account, 3 = no key available — in which case nothing is called and
+    the key file's path is named so a human knows where to put it.
+    """
+    prof = C.load_profile(a.profile)
+    if not prof:
+        print(f"error: profile '{a.profile}' not found (macp profile add {a.profile})")
+        return 2
+    if not a.name:
+        print("usage: macp account probe NAME [--profile P] [--tier T] [--prompt P]")
+        return 2
+    acct = next((x for x in prof.accounts if x.name == a.name), None)
+    if acct is None:
+        print(f"error: no account '{a.name}' in profile '{a.profile}'")
+        return 2
+    if acct.agent != "upstage":
+        print(f"error: account '{a.name}' is [{acct.agent}]; probe needs an upstage account")
+        return 2
+    if ACC.read_api_key(acct) is None:
+        print(f"probe: skipped (no {ACC.UPSTAGE_KEY_ENV} in the env or "
+              f"{ACC.upstage_key_file(acct)})")
+        return 3
+    from . import upstage as UP
+    res = UP.chat(a.prompt, account=acct, tier=a.tier)
+    print(json.dumps({"account": a.name, "tier": a.tier, **res}, sort_keys=False))
+    return 0 if res.get("ok") else 1
 
 
 def _cmd_account_env(a) -> int:
@@ -626,7 +666,8 @@ def main(argv: list[str] | None = None) -> int:
     pp.set_defaults(fn=_cmd_profile)
 
     pa = sub.add_parser("account", help="manage a profile's agent accounts (multi-vendor, parallel)")
-    pa.add_argument("action", choices=["add", "list", "env", "use", "status", "remove"])
+    pa.add_argument("action",
+                    choices=["add", "list", "env", "use", "status", "remove", "probe"])
     pa.add_argument("name", nargs="?")
     pa.add_argument("--profile", default="default")
     pa.add_argument("--agent", default="claude",
@@ -646,6 +687,9 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--models", default="",
                     help="model_tier overrides, 'tier=model' comma-separated "
                          "(e.g. light=solar-mini4-260922,heavy=solar-pro4-260806)")
+    pa.add_argument("--tier", default="light", choices=["heavy", "standard", "light"],
+                    help="model_tier for `account probe` (default: light)")
+    pa.add_argument("--prompt", default="ping", help="prompt for `account probe`")
     pa.set_defaults(fn=_cmd_account)
 
     pm = sub.add_parser("memory", help="manage this project's .macp/memory/")

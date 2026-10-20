@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import importlib
 import io
+import json
 import os
+import socket
+import urllib.error
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -336,3 +339,201 @@ def test_account_list_non_claude_short_form_unchanged(cli, C):
     assert cli("account", "add", "cx", "--profile", "work", "--agent", "codex",
                "--command", "codex exec {prompt}")[0] == 0
     assert "cx [codex]: codex exec {prompt}" in cli("account", "list", "--profile", "work")[1]
+
+
+# ---- Phase 4: the HTTP client + `account probe` ------------------------------
+#
+# Double-defended against hitting the real endpoint: urlopen is replaced in
+# every case AND the base URL points at a port nothing listens on, so a stub
+# that fails to install produces a connection error, not a live API call.
+
+class _Resp:
+    """The context-manager shape `urllib.request.urlopen` returns."""
+
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+OK_PAYLOAD = {
+    "model": "solar-mini4-260922",
+    "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+}
+
+
+@pytest.fixture
+def UP(home, monkeypatch):
+    """``macp.upstage`` with the base URL pinned to a dead port."""
+    from todo_system.macp import upstage as mod
+    monkeypatch.setenv(mod.API_BASE_ENV, "http://127.0.0.1:1/v1")
+    return mod
+
+
+def _stub_urlopen(monkeypatch, UP, handler):
+    """Replace urlopen and record the single request the client makes."""
+    seen = {}
+
+    def fake(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.headers)
+        seen["body"] = json.loads(req.data.decode())
+        seen["timeout"] = timeout
+        return handler()
+
+    monkeypatch.setattr(UP.urllib.request, "urlopen", fake)
+    return seen
+
+
+def test_chat_success_reports_model_tokens_and_elapsed(UP, monkeypatch):
+    seen = _stub_urlopen(monkeypatch, UP, lambda: _Resp(OK_PAYLOAD))
+    res = UP.chat("ping", api_key=SENTINEL, tier="light")
+    assert res["ok"] is True and res["error_kind"] is None
+    assert res["model"] == "solar-mini4-260922"
+    assert (res["prompt_tokens"], res["completion_tokens"], res["total_tokens"]) == (7, 3, 10)
+    assert isinstance(res["elapsed_s"], float) and res["elapsed_s"] >= 0
+    # the request itself: OpenAI-compatible shape, key in the header only
+    assert seen["url"] == "http://127.0.0.1:1/v1/chat/completions"
+    assert seen["body"]["model"] == "solar-mini4-260922"
+    assert seen["body"]["messages"] == [{"role": "user", "content": "ping"}]
+    assert seen["headers"]["Authorization"] == f"Bearer {SENTINEL}"
+    assert SENTINEL not in json.dumps(seen["body"])
+
+
+def test_chat_tier_and_account_override_pick_the_model(UP, C, monkeypatch):
+    _stub_urlopen(monkeypatch, UP, lambda: _Resp(dict(OK_PAYLOAD, model="")))
+    assert UP.chat("x", api_key=SENTINEL, tier="heavy")["model"] == "solar-pro4-260806"
+    acct = C.Account(name="solar", agent="upstage", models={"light": "solar-override"})
+    assert UP.chat("x", account=acct, api_key=SENTINEL)["model"] == "solar-override"
+
+
+@pytest.mark.parametrize("status,kind", [
+    (401, "auth"), (403, "auth"), (429, "rate_limit"), (500, "http"), (404, "http"),
+])
+def test_chat_classifies_http_failures(UP, monkeypatch, status, kind):
+    def raise_http():
+        raise urllib.error.HTTPError(
+            "http://x/v1/chat/completions", status, "nope", {},
+            io.BytesIO(b'{"error":"denied"}'))
+
+    _stub_urlopen(monkeypatch, UP, raise_http)
+    res = UP.chat("ping", api_key=SENTINEL)
+    assert res["ok"] is False and res["error_kind"] == kind
+    assert str(status) in res["error"]
+    assert res["total_tokens"] is None
+
+
+def test_chat_classifies_timeout_and_network(UP, monkeypatch):
+    def raise_timeout():
+        raise socket.timeout("timed out")
+
+    _stub_urlopen(monkeypatch, UP, raise_timeout)
+    assert UP.chat("ping", api_key=SENTINEL, timeout=5)["error_kind"] == "timeout"
+
+    def raise_wrapped_timeout():
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    _stub_urlopen(monkeypatch, UP, raise_wrapped_timeout)
+    assert UP.chat("ping", api_key=SENTINEL)["error_kind"] == "timeout"
+
+    def raise_refused():
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    _stub_urlopen(monkeypatch, UP, raise_refused)
+    assert UP.chat("ping", api_key=SENTINEL)["error_kind"] == "network"
+
+
+def test_chat_flags_an_unexpected_body(UP, monkeypatch):
+    _stub_urlopen(monkeypatch, UP, lambda: _Resp({"unexpected": True}))
+    res = UP.chat("ping", api_key=SENTINEL)
+    assert res["ok"] is False and res["error_kind"] == "bad_response"
+
+
+def test_chat_without_a_key_calls_nothing(UP, tmp_path, monkeypatch):
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(tmp_path / "absent.env"))
+
+    def boom(req, timeout=None):                   # must not be reached
+        raise AssertionError("urlopen called without a key")
+
+    monkeypatch.setattr(UP.urllib.request, "urlopen", boom)
+    res = UP.chat("ping")
+    assert res["error_kind"] == "no_key" and res["ok"] is False
+    assert ACC.UPSTAGE_KEY_ENV in res["error"]
+
+
+def test_chat_scrubs_the_key_out_of_an_echoing_server(UP, monkeypatch):
+    """A server that quotes the credential it rejected must not turn the key
+    into a return value — the result is printed as JSON by `account probe`."""
+    def raise_echo():
+        raise urllib.error.HTTPError(
+            "http://x", 401, "unauthorized", {},
+            io.BytesIO(json.dumps({"error": f"bad key {SENTINEL}"}).encode()))
+
+    _stub_urlopen(monkeypatch, UP, raise_echo)
+    res = UP.chat("ping", api_key=SENTINEL)
+    assert res["error_kind"] == "auth"
+    assert SENTINEL not in json.dumps(res)
+    assert UP.REDACTED in res["error"]
+    # and on the success path, a reply that echoes the key is not returned at all
+    _stub_urlopen(monkeypatch, UP, lambda: _Resp(dict(
+        OK_PAYLOAD, choices=[{"message": {"content": f"your key is {SENTINEL}"}}])))
+    assert SENTINEL not in json.dumps(UP.chat("ping", api_key=SENTINEL))
+
+
+def test_probe_skips_with_rc3_and_names_only_the_path(cli, C, UP, tmp_path, monkeypatch):
+    keyfile = tmp_path / "nowhere" / "upstage.env"
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(keyfile))
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage")[0] == 0
+    rc, out = cli("account", "probe", "solar", "--profile", "work", "--tier", "light")
+    assert rc == 3
+    assert "probe: skipped" in out and str(keyfile) in out
+    assert SENTINEL not in out
+
+
+def test_probe_prints_one_json_line_on_success(cli, C, UP, tmp_path, monkeypatch):
+    _key_file(tmp_path / "up.env", f"{ACC.UPSTAGE_KEY_ENV}={SENTINEL}\n")
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(tmp_path / "up.env"))
+    _stub_urlopen(monkeypatch, UP, lambda: _Resp(OK_PAYLOAD))
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage")[0] == 0
+    rc, out = cli("account", "probe", "solar", "--profile", "work")
+    assert rc == 0
+    line = out.strip().splitlines()[-1]
+    got = json.loads(line)                         # exactly one JSON object
+    assert got["ok"] is True and got["tier"] == "light" and got["account"] == "solar"
+    assert got["total_tokens"] == 10 and got["error_kind"] is None
+    assert SENTINEL not in out
+
+
+def test_probe_rc1_on_a_failed_call(cli, C, UP, tmp_path, monkeypatch):
+    _key_file(tmp_path / "up.env", f"{ACC.UPSTAGE_KEY_ENV}={SENTINEL}\n")
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(tmp_path / "up.env"))
+
+    def raise_429():
+        raise urllib.error.HTTPError("http://x", 429, "slow down", {}, io.BytesIO(b"{}"))
+
+    _stub_urlopen(monkeypatch, UP, raise_429)
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage")[0] == 0
+    rc, out = cli("account", "probe", "solar", "--profile", "work")
+    assert rc == 1
+    assert json.loads(out.strip().splitlines()[-1])["error_kind"] == "rate_limit"
+
+
+def test_probe_rejects_a_non_upstage_or_unknown_account(cli, C):
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "cc", "--profile", "work",
+               "--config-dir", "/tmp/cc-cfg")[0] == 0
+    rc, out = cli("account", "probe", "cc", "--profile", "work")
+    assert rc == 2 and "needs an upstage account" in out
+    rc, out = cli("account", "probe", "ghost", "--profile", "work")
+    assert rc == 2 and "no account 'ghost'" in out
