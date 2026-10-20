@@ -18,7 +18,7 @@ You are the user's proactive personal AI assistant. Generate today's daily brief
 5. `Memory/episodes/` — if it exists, read the most recent 7 days of episodes
 6. `Todo/Orchestrator.md` — if it exists, the orchestrator's rendered assignment ledger (for the 🤖 section). Regenerated every tick by `scripts/orchestrator_tick.sh` (launchd, 5-minute interval), so it is at most ~5 minutes stale at briefing time.
 7. `Worker/_state/macp_monitor/latest.json` — if it exists, the macp self-defect sensor's newest report (`scripts/macp_monitor.py`, every 30 minutes). `new_candidates` are **candidates that need judgement**, not confirmed defects. The file is overwritten on every scan, so check `scanned_at` first and say so if it is more than an hour old.
-8. Specific task files under `Todo/items/` as needed for the Top 3 — read them to ground your reasoning
+8. Specific task files under `Todo/items/` as needed for the Top 3 — read them to ground your reasoning (and `Todo/templates/brief-template.md`, if present — see Output)
 9. `Todo/Snapshots/mailroom.md` — if it exists, the mailroom agent's mail summary for the last 24h (`mailroom digest --out`, written by `scripts/brief.sh` seconds before this prompt runs; check `generated_at`). The morning brief is the only scheduled delivery of mail state (a separate evening mail digest was folded into it), so always include its 📮 section. Its sections (headings written verbatim by mailroom): `🔴 조치 필요` (settled action_required, importance ≥2, with their `mail-*` task wikilinks), `📢 일괄 공지 중 마감 있는 건` (bulk broadcasts the classifier judged not to apply to the user against `Notes/mailroom-triage-profile.md`, but which carry a deadline — shown once for the user to overrule), `⏳ LLM 재분류 대기` (keyword guesses, unconfirmed), and counts.
 
 **Note**: The single source of truth for task data is the local SQLite DB `Todo/todo.db`. The snapshot above, `Todo/Dashboard.md`, `Todo/NOW.md` and `Todo/Orchestrator.md` are all rendered from it, so they agree by construction. Use the snapshot as the authoritative view of task priorities, due dates, and status when its `generated_at` is today; if it is older than today, fall back to `Todo/Dashboard.md` and say so in the brief.
@@ -33,9 +33,14 @@ If the file already exists for today, overwrite it.
 
 **Language:** write all user-visible content in the vault's language — `language:` in
 `Worker/planner_policy.yaml` if set, otherwise the language of the existing
-`Todo/items/*.md` files. Translate the section headings below into that language, but keep
-their emoji prefixes, and keep these exactly as shown because
-`scripts/_build_brief_message.py` parses them into the notification message:
+`Todo/items/*.md` files.
+
+**Layout:** if the vault has `Todo/templates/brief-template.md`, use that file's layout —
+its headings, labels and placeholder wording — verbatim in place of the template below
+(the rules in this prompt still apply). Otherwise use the template below and write its
+headings and labels in the vault's language too — do not leave English headings in a
+non-English brief. Either way keep their emoji prefixes, and keep these exactly as
+shown because `scripts/_build_brief_message.py` parses them into the notification message:
 
 - the first `> ` blockquote line (the one-line summary),
 - the `## 🎯 Top 3` heading prefix and its numbered `1. **title**` lines,
