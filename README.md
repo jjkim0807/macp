@@ -19,8 +19,8 @@ macp decides what to work on, with which resources, and when. Agents sit behind 
 `Executor` interface; the executor shipped today drives Claude Code (`claude -p`).
 
 **In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080 tasks**
-autonomously across **22 independent repositories** plus the author's vault, going from
-65 tasks in July to 490 in October (counted from its assignment ledger).
+autonomously across **22 independent repositories** plus the author's vault, about 25
+a day by October 2026 (counted from its assignment ledger).
 
 Under the hood: a markdown-first task system (task files → SQLite), an orchestrator and
 staged runner, a planner, usage pacing, and the daemons that run it all (systemd
