@@ -137,6 +137,15 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         tier = repos.task_model_tier_from_fm(fm)
         if tier:
             payload["model_tier"] = tier
+        # Vendor routing: `agent: upstage` sends a quick/delegate stage to the
+        # Solar harness (runner._solar_account + stages.route_to_solar). A
+        # frontmatter field is dead unless it reaches the payload (the
+        # touches/allowed_tools precedent), so wire it — but ONLY when present,
+        # so a task without `agent:` yields a byte-identical payload dict and
+        # every existing claude task is untouched.
+        agent = repos.task_agent_from_fm(fm)
+        if agent:
+            payload["agent"] = agent
         p90 = repos.task_estimate_p90_from_fm(fm)
         if p90:
             payload["estimate_p90"] = p90
