@@ -1,10 +1,30 @@
 # macp
 
-The engine of MaestroACP: a markdown-first task system (task files → SQLite), an
-orchestrator that dispatches tasks to headless Claude Code workers through a staged
-pipeline (research → plan → implement → verify → report), a planner that refills the
-queue, usage pacing against your Claude subscription limits, and the daemons that run
-it all (systemd `--user` on Linux, launchd on macOS).
+**macp (Maestro Agent Control Plane)** keeps coding agents working on your projects
+around the clock. You pile up tasks; macp does the rest:
+
+- **Analyze and split.** Every task runs through research → plan → implement → verify
+  → report. A task that turns out too big for one implement stage is split into 2–5
+  dependent subtasks automatically (`rescope`).
+- **Allocate resources.** Each task gets a model tier (heavy / standard / light) picked
+  from its difficulty, a tool allowlist, its own git worktree, and a slot under per-repo
+  concurrency caps. Usage pacing keeps automation inside your subscription limits.
+- **Run 24/7.** Daemons dispatch work, collect results, retry, and reap stale runs
+  without a human in the loop. People are pinged only when a decision is theirs.
+- **Refill the queue.** When the task pool runs dry, the planner runs and re-reads
+  the projects (tests, lint, build, docs) to find needed work and files it as new tasks.
+
+macp aims to be orthogonal to the coding agent itself: the agent writes the code, and
+macp decides what to work on, with which resources, and when. Agents sit behind an
+`Executor` interface; the executor shipped today drives Claude Code (`claude -p`).
+
+**In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080 tasks**
+autonomously across **22 independent repositories** plus the author's vault, going from
+65 tasks in July to 490 in October (counted from its assignment ledger).
+
+Under the hood: a markdown-first task system (task files → SQLite), an orchestrator and
+staged runner, a planner, usage pacing, and the daemons that run it all (systemd
+`--user` on Linux, launchd on macOS).
 
 The engine holds no personal data. Tasks, memory, notes, decisions, run records,
 secrets and host identity live in a separate **vault** directory that you own.
