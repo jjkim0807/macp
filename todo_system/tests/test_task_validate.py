@@ -315,3 +315,46 @@ def test_not_before_time_values_are_clean(tmp_path):
         path.write_text(f"---\nstatus: open\nnot_before: {value}\n---\n# t\n",
                         encoding="utf-8")
         assert tv.validate_file(path) == [], value
+
+
+def test_broken_yaml_frontmatter_is_an_error_with_line(tmp_path):
+    """A frontmatter that yaml.safe_load rejects is an ERROR naming the line.
+
+    The lenient worker parser never raises, so before this the same file passed
+    `cli validate` even though `load_dispatchable` refuses to dispatch it. The
+    bad line (`repo: [unclosed`) is file line 3 → the message reports `line 3`.
+    """
+    path = tmp_path / "broken.md"
+    path.write_text("---\nstatus: open\nrepo: [unclosed\n---\n# x\n",
+                    encoding="utf-8")
+    issues = tv.validate_file(path)
+    assert _levels(issues, "frontmatter") == [tv.ERROR]
+    assert "line 3" in issues[0].message
+
+
+def test_broken_yaml_real_case_escape_is_an_error(tmp_path):
+    """The 2026-10-19 shape: a backslash-escaped single quote inside a
+    double-quoted scalar (invalid YAML) is flagged, not silently passed."""
+    path = tmp_path / "real.md"
+    path.write_text("---\nstatus: open\nnext_action: \"can\\'t parse\"\n---\n# x\n",
+                    encoding="utf-8")
+    issues = tv.validate_file(path)
+    assert _levels(issues, "frontmatter") == [tv.ERROR]
+
+
+def test_valid_frontmatter_has_no_parse_error(tmp_path):
+    """Negative control: a well-formed file carries no frontmatter ERROR."""
+    path = tmp_path / "ok.md"
+    path.write_text("---\nstatus: open\nrepo: \"https://h/x/y.git\"\n---\n# x\n",
+                    encoding="utf-8")
+    assert _levels(tv.validate_file(path), "frontmatter") == []
+
+
+def test_validate_dir_surfaces_broken_yaml_even_when_closed(tmp_path):
+    """A YAML-broken file can't be read for status, so only_open must not hide
+    it — it is always surfaced as a frontmatter ERROR."""
+    (tmp_path / "broken.md").write_text(
+        "---\nstatus: done\nrepo: [unclosed\n---\n# x\n", encoding="utf-8")
+    found = tv.validate_dir(tmp_path, only_open=True)
+    assert "broken" in found
+    assert _levels(found["broken"], "frontmatter") == [tv.ERROR]

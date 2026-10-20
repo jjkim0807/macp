@@ -145,9 +145,26 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
         path = self._md("bare.md", "# just a heading\nworker_mode: blocked\n")
         self.assertEqual(self._load([_row("bare", path)]), {"bare": _base("bare", path)})
 
-    def test_fail_open_broken_yaml(self):
+    def test_broken_yaml_is_excluded(self):
+        # Reversal of the former `test_fail_open_broken_yaml`: a frontmatter that
+        # yaml.safe_load rejects used to fail open and dispatch on the DB row,
+        # which silently dropped `repo`/`allowed_tools`/`touches` and ran an
+        # external-repo task as a vault task with auto_merge in force (2026-10-19
+        # macp-gen-units-split15-ops-paths). This task treats that fail-open as
+        # the hazard and excludes the broken task instead. Unlike the drift guard,
+        # the gate is NOT conditioned on only_auto — a broken payload is unsafe in
+        # any mode — so the exclusion holds with only_auto=False too.
         path = self._md("broken.md", "---\nworker_mode: blocked\nrepo: [unclosed\n---\n# x\n")
-        self.assertEqual(self._load([_row("broken", path)]), {"broken": _base("broken", path)})
+        db = _make_db(self.tmp, [_row("broken", path)])
+        with patch("builtins.print") as p:
+            got = {t.slug: t.payload for t in tasks.load_dispatchable(db)}
+        self.assertEqual(got, {})
+        reasons = [c.args[0] for c in p.call_args_list
+                   if c.args and "frontmatter YAML error" in c.args[0]]
+        self.assertEqual(len(reasons), 1, p.call_args_list)
+        self.assertIn("broken", reasons[0])
+        # excluded under only_auto=False too — a broken payload is unsafe in any mode
+        self.assertEqual({t.slug for t in tasks.load_dispatchable(db, only_auto=False)}, set())
 
     def test_fail_open_unclosed_frontmatter(self):
         path = self._md("open.md", "---\nworker_mode: blocked\nrepo: https://h/x/y.git\n# x\n")
@@ -221,7 +238,8 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
         # Before the refactor each read_task_* re-parsed: 7 per task, 14 here.
         rows = [_row("a", self._md("a.md", _EXT_MD)), _row("b", self._md("b.md", _EXT_MD))]
         db = _make_db(self.tmp, rows)
-        with patch.object(repos, "_frontmatter", wraps=repos._frontmatter) as spy:
+        with patch.object(repos, "frontmatter_with_error",
+                          wraps=repos.frontmatter_with_error) as spy:
             got = tasks.load_dispatchable(db)
         self.assertEqual([t.slug for t in got], ["a", "b"])
         self.assertEqual(spy.call_count, 2)
