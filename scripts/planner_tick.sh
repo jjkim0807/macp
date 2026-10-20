@@ -96,6 +96,21 @@ if [ -f "Worker/_state/PAUSED" ]; then
   exit 0
 fi
 
+# Task-level dependency chaining (issue #21): flip `blocked` tasks whose every
+# `depends_on` task is done → their on_unblock mode, then sync to todo.db. Runs
+# before the budget/queue gates (which may exit early) so a completed upstream
+# promptly activates the next pure-code task. It also runs before the usage-guard gate:
+# it is a cheap markdown rewrite with no LLM call, and a pacing hold must not freeze
+# dependency chains — a downstream task may carry `bypass_guard: true` and be meant to
+# run during the hold (2026-10-20: a bypass task sat `blocked` for over an hour after
+# its upstream finished because this step sat behind Gate -0.5).
+if [[ "$INSTALLED" -eq 1 ]] || command -v uv >/dev/null 2>&1; then PY="$ENGINE_PY"; else PY="python3"; fi
+UNBLOCKED=$($PY -m todo_system.task_deps 2>/dev/null | grep -c '^unblocked:')
+if [ "${UNBLOCKED:-0}" -gt 0 ]; then
+  echo "[planner-tick] auto-unblocked ${UNBLOCKED} task(s) whose deps completed; syncing db"
+  $PY -m todo_system.cli import-md >/dev/null 2>&1 || true
+fi
+
 # Gate -0.5: Claude usage guard — don't spend a planner run while the
 # subscription quota is pacing-blocked (todo_system/usage_guard.py).
 # Exit 3 = blocked; any other outcome (uv missing, guard error) fails open.
@@ -105,17 +120,6 @@ if [[ "$INSTALLED" -eq 1 ]] || command -v uv >/dev/null 2>&1; then
     echo "[planner-tick] usage guard blocked; skip planning"
     exit 0
   fi
-fi
-
-# Task-level dependency chaining (issue #21): flip `blocked` tasks whose every
-# `depends_on` task is done → their on_unblock mode, then sync to todo.db. Runs
-# before the budget/queue gates (which may exit early) so a completed upstream
-# promptly activates the next pure-code task.
-if [[ "$INSTALLED" -eq 1 ]] || command -v uv >/dev/null 2>&1; then PY="$ENGINE_PY"; else PY="python3"; fi
-UNBLOCKED=$($PY -m todo_system.task_deps 2>/dev/null | grep -c '^unblocked:')
-if [ "${UNBLOCKED:-0}" -gt 0 ]; then
-  echo "[planner-tick] auto-unblocked ${UNBLOCKED} task(s) whose deps completed; syncing db"
-  $PY -m todo_system.cli import-md >/dev/null 2>&1 || true
 fi
 
 # Gate 0: daily budget (cost governance). Stop CREATING new work once today's task

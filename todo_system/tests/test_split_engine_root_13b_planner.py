@@ -43,7 +43,10 @@ with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
                          "MACP_VAULT_ROOT": os.environ.get("MACP_VAULT_ROOT"),
                          "PYTHONPATH": os.environ.get("PYTHONPATH"),
                          "MACP_PYTHON": os.environ.get("MACP_PYTHON")}) + "\\n")
+if os.environ.get("SEAM_USAGE_BLOCK") == "1" and "todo_system.usage_guard" in sys.argv and "check" in sys.argv:
+    sys.exit(3)
 '''
+
 
 # MACP_PYTHON and uv: record and exit 0 with no output (every gate passes,
 # every context injection is empty, the lease is "taken").
@@ -305,3 +308,21 @@ def test_planner_tick_declares_the_installed_branch_once():
     assert 'KAKAO_SEND="$ENGINE_DIR/scripts/kakao_send.sh"' in text
     assert 'bash "$KAKAO_SEND"' in text
     assert subprocess.run(["bash", "-n", str(_REAL_ENGINE / "scripts" / _PLANNER)]).returncode == 0
+
+
+def test_dependency_unblock_runs_even_while_the_usage_guard_blocks(tmp_path):
+    """2026-10-20: a `bypass_guard: true` follow-up sat `blocked` for over an hour
+    after its upstream finished, because the task_deps step sat behind the
+    usage-guard gate (exit 3 = blocked -> `exit 0` before chaining). Chaining is a
+    cheap markdown rewrite with no LLM call, so it must run before that gate."""
+    h = _Harness(tmp_path)
+    engine = h.engine(pyproject=False)
+
+    r = h.run(engine, macp_python=True, SEAM_USAGE_BLOCK="1")
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "[planner-tick] usage guard blocked; skip planning" in r.stdout, r.stdout
+    mods = [c["argv"][c["argv"].index("-m") + 1] for c in h.calls("py") if "-m" in c["argv"]]
+    assert "todo_system.task_deps" in mods, mods
+    assert mods.index("todo_system.task_deps") < mods.index("todo_system.usage_guard"), mods
+    assert h.calls("claude") == [], h.calls("claude")   # no planner LLM run during the hold
