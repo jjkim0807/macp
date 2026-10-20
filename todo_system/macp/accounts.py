@@ -64,6 +64,7 @@ import importlib
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +84,14 @@ ENV_SHARED_ROOT = "MACP_CLAUDE_SHARED_ROOT"
 ENV_ACCOUNTS_ROOT = "MACP_CLAUDE_ACCOUNTS_ROOT"
 CFG_SHARED_ROOT = "claude_shared_root"
 CFG_ACCOUNTS_ROOT = "claude_accounts_root"
+
+# Upstage (Solar) accounts authenticate with an API key, not a config dir. The
+# key is read at CALL time from the env or a key file and is never stored on the
+# account, in a profile, or in any output — see the key section at the bottom.
+UPSTAGE_KEY_ENV = "UPSTAGE_API_KEY"
+UPSTAGE_KEY_FILE_ENV = "MACP_UPSTAGE_KEY_FILE"
+CFG_UPSTAGE_KEY_FILE = "upstage_key_file"
+DEFAULT_UPSTAGE_KEY_FILE = "~/.config/macp/upstage.env"
 
 # Entries of an account dir that are symlinks into the shared root.
 SHARED_ENTRIES = (
@@ -820,3 +829,108 @@ def claude_env_for(acct, base: dict | None = None) -> dict:
     else:
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     return env
+
+
+# ---- Upstage (Solar) API key -------------------------------------------------
+#
+# An Upstage account holds only *where* its key lives (a variable name and a
+# file path) — never the value. The value is resolved at call time, env first,
+# so it never reaches a profile TOML (``config.write_profile`` serializes
+# ``Account.env`` verbatim), a log line, a commit or a PR. Display code asks
+# :func:`key_source` for the ORIGIN only, the same "existence, never contents"
+# rule the claude ``creds=yes/no`` column follows.
+
+def upstage_key_file(account=None, start=None) -> Path:
+    """Where the ``UPSTAGE_API_KEY`` key file lives, as an absolute path.
+
+    ``MACP_UPSTAGE_KEY_FILE`` → the account's ``key_file`` → the nearest
+    ``.macp/config.toml`` ``upstage_key_file`` → :data:`DEFAULT_UPSTAGE_KEY_FILE`.
+    Same walk as :func:`_resolve_root`: the first config file found decides, and
+    a relative value is taken against the directory holding that config. The
+    path need not exist — this only spells it (:func:`_abs`, symlinks not
+    followed). ``account`` is duck-typed on ``key_file`` so this works for any
+    object, including one from a profile written before the field existed.
+    """
+    env = os.environ.get(UPSTAGE_KEY_FILE_ENV)
+    if env:
+        return _abs(env)
+    on_account = str(getattr(account, "key_file", "") or "")
+    if on_account:
+        return _abs(on_account)
+    base = (Path(start) if start is not None else Path.cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, CFG_UPSTAGE_KEY_FILE)
+            if key:
+                p = Path(key).expanduser()
+                return p if p.is_absolute() else _abs(d / p)
+            break
+    return _abs(DEFAULT_UPSTAGE_KEY_FILE)
+
+
+def _warn_loose_key_file(path: Path) -> None:
+    """One stderr line when the key file is readable beyond its owner. The PATH
+    is named, never the contents; reading continues either way."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        print(f"warning: {path} is group/other-readable (expected 0600)",
+              file=sys.stderr)
+
+
+def read_key_file(path: Path | str, var: str = UPSTAGE_KEY_ENV) -> str | None:
+    """``var``'s value from a ``KEY=VALUE`` env file, else None.
+
+    Blank lines and ``#`` comments are skipped, a leading ``export`` is allowed,
+    and one layer of surrounding quotes is stripped. A missing file, an
+    unreadable one, or a file without ``var`` all read as None — like
+    ``paths._read_config_key`` this never raises, because every caller's
+    fallback is "no key".
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    _warn_loose_key_file(p)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, value = line.partition("=")
+        if not sep or name.strip() != var:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        return value.strip() or None
+    return None
+
+
+def read_api_key(account=None, env=None, start=None) -> str | None:
+    """The Upstage API key for a call, or None — env ``UPSTAGE_API_KEY`` first,
+    then :func:`read_key_file` of :func:`upstage_key_file`. The return value is
+    the secret: callers put it in a request header and nowhere else."""
+    src = os.environ if env is None else env
+    value = (src.get(UPSTAGE_KEY_ENV) or "").strip()
+    if value:
+        return value
+    return read_key_file(upstage_key_file(account, start))
+
+
+def key_source(account=None, env=None, start=None) -> str:
+    """Where :func:`read_api_key` would get the key: ``env`` | ``file`` |
+    ``missing``. The display-safe view — it returns the origin, never a value,
+    so ``account list`` and ``account probe`` can report key availability
+    without ever holding the secret."""
+    src = os.environ if env is None else env
+    if (src.get(UPSTAGE_KEY_ENV) or "").strip():
+        return "env"
+    if read_key_file(upstage_key_file(account, start)):
+        return "file"
+    return "missing"
