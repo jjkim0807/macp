@@ -513,10 +513,12 @@ def test_account_env_output_and_selection(roots, capsys):
     C.write_profile(C.Profile(name="t", accounts=[C.Account(name="s", claude_config_dir="~/x'y")]))
     assert env("--profile", "t") == (
         0, "export CLAUDE_CONFIG_DIR='" + str(roots.home / "x") + "'\\''y'\n", "")
-    # the legacy default dir is exported as-is (no special casing here — the
-    # keychain protection lives in the consumers)
+    # the legacy default dir prints NOTHING (rc 0) since #10: an explicit
+    # CLAUDE_CONFIG_DIR, even one spelling the default path, makes the CLI skip
+    # its Keychain login (2026-10-19 Remote Control outage). Same rule as
+    # accounts.claude_env_for; test_macp_cli pins it from the CLI side too.
     C.write_profile(C.Profile(name="u", accounts=[C.Account(name="s")]))
-    assert env("--profile", "u") == (0, f"export CLAUDE_CONFIG_DIR='{roots.home / '.claude'}'\n", "")
+    assert env("--profile", "u") == (0, "", "")
 
 
 def test_pick_account_rules():
