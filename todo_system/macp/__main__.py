@@ -168,8 +168,18 @@ def _account_line(x, active_name, state) -> str:
     and the live parallel ``slots=used/max``. A non-claude account keeps the
     short ``name [agent]: command`` form. The config dir stays immediately after
     ``[agent]: `` so the terse form remains a prefix of the rich one, and
-    ``slots`` is last so appending it never disturbs the earlier tokens."""
+    ``slots`` is last so appending it never disturbs the earlier tokens.
+
+    An upstage account has no config dir and no auth files; it gets its own form
+    carrying ``priority``, where its API key would come FROM (``key=env|file|
+    missing`` — :func:`accounts.key_source`, origin only) and the resolved
+    tier→model mapping. Neither the key nor the key file's path is printed."""
     mark = "* " if x.name == active_name else "  "
+    if x.agent == "upstage":
+        models = "/".join(C.solar_model_for(x, t)
+                          for t in ("heavy", "standard", "light"))
+        return (f"{mark}{x.name} [{x.agent}]: priority={getattr(x, 'priority', 100)} "
+                f"key={ACC.key_source(x)} models={models}")
     if x.agent != "claude":
         return f"{mark}{x.name} [{x.agent}]: {x.command or '(no command)'}"
     cfg = x.claude_config_dir or ACC.LEGACY_CONFIG_DIR   # shown as configured; existence uses the resolved dir
@@ -180,6 +190,24 @@ def _account_line(x, active_name, state) -> str:
     return (f"{mark}{x.name} [{x.agent}]: {cfg}  priority={getattr(x, 'priority', 100)} "
             f"creds={creds} token={token} status={status} session={sess} weekly={week} "
             f"slots={_slots_for(x.name)}")
+
+
+def _parse_models(spec: str) -> dict:
+    """``'light=solar-mini4-260922,heavy=solar-pro4-260806'`` → dict, or
+    ValueError with a one-line reason. An unknown tier is rejected rather than
+    stored: a typo would otherwise sit in the profile doing nothing."""
+    out: dict[str, str] = {}
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        tier, sep, model = part.partition("=")
+        tier, model = tier.strip(), model.strip()
+        if not sep or not tier or not model:
+            raise ValueError(f"--models entry {part!r} is not 'tier=model'")
+        if tier not in C.SOLAR_TIER_MODELS:
+            raise ValueError(f"--models: unknown tier {tier!r}")
+        out[tier] = model
+    return out
 
 
 def _cmd_account(a) -> int:
@@ -206,7 +234,8 @@ def _cmd_account(a) -> int:
             print(_account_line(x, active_name, state))
         return 0
     if not a.name:
-        print("usage: macp account add NAME [--agent V] [--profile P] [--config-dir D] [--command T]")
+        print("usage: macp account add NAME [--agent V] [--profile P] [--config-dir D] "
+              "[--command T] [--priority N] [--key-file F] [--models tier=model,…]")
         return 2
     if any(x.name == a.name for x in prof.accounts):
         print(f"account '{a.name}' already exists in profile '{a.profile}'")
@@ -235,10 +264,27 @@ def _cmd_account(a) -> int:
     else:
         # Explicit --config-dir (register only, as before) or a non-claude agent.
         config_dir = a.config_dir if a.config_dir is not None else ACC.LEGACY_CONFIG_DIR
-    prof.accounts.append(C.Account(name=a.name, agent=a.agent,
-                                   claude_config_dir=config_dir, command=a.command or ""))
+    try:
+        models = _parse_models(getattr(a, "models", "") or "")
+    except ValueError as e:
+        print(f"error: {e}")
+        print("usage: --models tier=model[,tier=model]  (tiers: "
+              + " | ".join(C.SOLAR_TIER_MODELS) + ")")
+        return 2
+    priority = getattr(a, "priority", None)
+    prof.accounts.append(C.Account(
+        name=a.name, agent=a.agent, claude_config_dir=config_dir,
+        command=a.command or "", priority=100 if priority is None else priority,
+        key_file=getattr(a, "key_file", "") or "", models=models))
     C.write_profile(prof)
-    detail = config_dir if a.agent == "claude" else a.command
+    if a.agent == "claude":
+        detail = config_dir
+    elif a.agent == "upstage":
+        # the key file's path is operator-facing config, not the secret; the
+        # VALUE is never read here (accounts.read_api_key does that at call time)
+        detail = f"key file {a.key_file or ACC.DEFAULT_UPSTAGE_KEY_FILE}"
+    else:
+        detail = a.command
     print(f"added account '{a.name}' [{a.agent}] ({detail}) to profile '{a.profile}'")
     print(f"  profile '{a.profile}' now has {len(prof.accounts)} account(s) "
           f"= parallel capacity {len(prof.accounts)}x")
@@ -584,11 +630,22 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("name", nargs="?")
     pa.add_argument("--profile", default="default")
     pa.add_argument("--agent", default="claude",
-                    help="vendor: claude | codex | cursor | gemini | aider | custom")
+                    help="vendor: claude | codex | cursor | gemini | aider | upstage | custom")
     pa.add_argument("--config-dir", default=None,
                     help="CLAUDE_CONFIG_DIR for a claude account (default: "
                          "<accounts_root>/NAME created with the shared layout)")
     pa.add_argument("--command", default="", help="invocation template for non-claude ('{prompt}')")
+    pa.add_argument("--priority", type=int, default=None,
+                    help="selection order among the profile's accounts (lower first, "
+                         "default 100); give an upstage account a HIGHER number to "
+                         "keep it behind the claude default")
+    pa.add_argument("--key-file", default="",
+                    help="path to the file holding `UPSTAGE_API_KEY=…` (0600) for an "
+                         "upstage account; only the PATH is stored — the key value "
+                         "never enters the profile, a log, a commit or a PR")
+    pa.add_argument("--models", default="",
+                    help="model_tier overrides, 'tier=model' comma-separated "
+                         "(e.g. light=solar-mini4-260922,heavy=solar-pro4-260806)")
     pa.set_defaults(fn=_cmd_account)
 
     pm = sub.add_parser("memory", help="manage this project's .macp/memory/")

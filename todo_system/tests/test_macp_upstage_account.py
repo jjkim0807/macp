@@ -12,7 +12,9 @@ test can touch the real endpoint or the live ``~/.config/macp/upstage.env``.
 from __future__ import annotations
 
 import importlib
+import io
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -242,3 +244,95 @@ def test_build_invocation_claude_path_unchanged(C):
     assert argv == ["claude", "-p", "hi"] and "CLAUDE_CONFIG_DIR" not in env
     cx = C.Account(name="cx", agent="codex", command="codex exec {prompt}")
     assert C.build_invocation(cx, "hi", ["--model", "m"])[0] == ["codex", "exec", "hi"]
+
+
+# ---- Phase 3: CLI ------------------------------------------------------------
+
+@pytest.fixture
+def cli(C, monkeypatch):
+    """``macp.__main__.main(argv)`` → (rc, stdout). The CLI module caches nothing,
+    but it reads the reloaded config module, so the fixture depends on ``C``."""
+    from todo_system.macp import __main__ as M
+    importlib.reload(M)
+
+    def run(*argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = M.main(list(argv))
+        return rc, out.getvalue()
+    return run
+
+
+def test_account_add_upstage_registers_and_lists(cli, C, tmp_path):
+    f = _key_file(tmp_path / "up.env", f"{ACC.UPSTAGE_KEY_ENV}={SENTINEL}\n")
+    assert cli("profile", "add", "work")[0] == 0
+    rc, out = cli("account", "add", "solar", "--profile", "work", "--agent", "upstage",
+                  "--priority", "150", "--key-file", str(f),
+                  "--models", "light=solar-mini4-260922")
+    assert rc == 0
+    assert "added account 'solar' [upstage]" in out
+    assert SENTINEL not in out                     # AC #2 — not even on the add line
+
+    # the profile TOML holds the metadata and NOT the key
+    text = (C.PROFILES / "work" / "config.toml").read_text(encoding="utf-8")
+    assert 'agent = "upstage"' in text and "priority = 150" in text
+    assert f'key_file = "{f}"' in text
+    assert SENTINEL not in text
+
+    rc, out = cli("account", "list", "--profile", "work")
+    assert rc == 0
+    line = next(ln for ln in out.splitlines() if "solar [upstage]" in ln)
+    assert "priority=150" in line
+    assert "key=file" in line                      # origin only…
+    assert SENTINEL not in out                     # …never the value
+    assert str(f) not in out                       # nor the key file's path
+    assert "models=solar-pro4-260806/solar-pro4-260806/solar-mini4-260922" in line
+
+
+def test_account_list_reports_key_from_env_and_missing(cli, C, tmp_path, monkeypatch):
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage")[0] == 0
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(tmp_path / "absent.env"))
+    assert "key=missing" in cli("account", "list", "--profile", "work")[1]
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_ENV, SENTINEL)
+    rc, out = cli("account", "list", "--profile", "work")
+    assert rc == 0 and "key=env" in out and SENTINEL not in out
+
+
+def test_upstage_priority_sorts_behind_the_claude_default(cli, C):
+    """if_then: start the Upstage account BELOW the default — and selection is
+    lowest-number-first, so 150 > the claude default 100 is what that means."""
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "cc", "--profile", "work",
+               "--config-dir", "/tmp/cc-cfg")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage",
+               "--priority", "150")[0] == 0
+    prof = C.load_profile("work")
+    assert [(x.name, x.priority) for x in prof.accounts] == [("cc", 100), ("solar", 150)]
+    # across every account, and among claude accounts, the upstage one is last
+    assert ACC.pick_account(prof.accounts, agent=None).name == "cc"
+    assert ACC.pick_account(prof.accounts).name == "cc"
+
+
+def test_account_add_priority_defaults_to_100(cli, C):
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "solar", "--profile", "work", "--agent", "upstage")[0] == 0
+    acct = C.load_profile("work").accounts[0]
+    assert acct.priority == 100 and acct.key_file == "" and acct.models == {}
+
+
+@pytest.mark.parametrize("spec", ["light", "=x", "light=", "nosuchtier=m"])
+def test_account_add_rejects_a_bad_models_spec(cli, C, spec):
+    assert cli("profile", "add", "work")[0] == 0
+    rc, out = cli("account", "add", "solar", "--profile", "work",
+                  "--agent", "upstage", "--models", spec)
+    assert rc == 2
+    assert "--models" in out
+    assert C.load_profile("work").accounts == []   # nothing written on a bad spec
+
+
+def test_account_list_non_claude_short_form_unchanged(cli, C):
+    assert cli("profile", "add", "work")[0] == 0
+    assert cli("account", "add", "cx", "--profile", "work", "--agent", "codex",
+               "--command", "codex exec {prompt}")[0] == 0
+    assert "cx [codex]: codex exec {prompt}" in cli("account", "list", "--profile", "work")[1]
