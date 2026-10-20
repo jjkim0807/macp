@@ -461,8 +461,26 @@ def validate_frontmatter(fm: dict, body: str = "") -> list[Issue]:
     return issues
 
 
+def _strict_frontmatter_error(text: str) -> str | None:
+    """A one-line reason iff this task's frontmatter is strict-YAML broken, else
+    None. `validate_frontmatter` is reached through the worker's lenient line
+    parser (`worker.parse_frontmatter`), which never raises on malformed YAML —
+    so a file whose frontmatter `yaml.safe_load` rejects would pass validation
+    even though `load_dispatchable` refuses to dispatch it. Delegating to the
+    orchestrator's shared detector makes "validate ERRORs" and "loader skips"
+    the exact same set of files. Imported lazily to stay clear of the
+    task_deps/cli import cycle this module already dodges."""
+    from .orchestrator import repos
+
+    return repos.frontmatter_error_from_text(text)
+
+
 def validate_file(path: Path) -> list[Issue]:
-    fm, body = _worker.parse_frontmatter(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    err = _strict_frontmatter_error(text)
+    if err is not None:
+        return [Issue(ERROR, "frontmatter", f"YAML parse error — {err}")]
+    fm, body = _worker.parse_frontmatter(text)
     return validate_frontmatter(fm, body)
 
 
@@ -474,7 +492,15 @@ def validate_dir(items_dir: Path, *, only_open: bool = True) -> dict[str, list[I
     """
     found: dict[str, list[Issue]] = {}
     for path in sorted(items_dir.glob("*.md")):
-        fm, body = _worker.parse_frontmatter(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        err = _strict_frontmatter_error(text)
+        if err is not None:
+            # A YAML-broken file can't be parsed for `status`, so the only_open
+            # filter can't judge it — surface it unconditionally rather than let
+            # a broken file hide behind an unreadable status.
+            found[path.stem] = [Issue(ERROR, "frontmatter", f"YAML parse error — {err}")]
+            continue
+        fm, body = _worker.parse_frontmatter(text)
         if only_open and str(fm.get("status", "")).strip().lower() != "open":
             continue
         issues = validate_frontmatter(fm, body)
