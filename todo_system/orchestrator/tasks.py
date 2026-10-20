@@ -67,7 +67,20 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         # Parse the task markdown once; the drift guard and every md-sourced
         # payload field below read this dict (see the note above repos'
         # `task_*_from_fm` cores). {} when unreadable, so each field is absent.
-        fm = repos._frontmatter(r["path"]) if r["path"] else {}
+        # fm_err is non-None ONLY when the frontmatter is strict-YAML broken.
+        fm, fm_err = (repos.frontmatter_with_error(r["path"]) if r["path"]
+                      else ({}, None))
+        # Strict-YAML gate: a frontmatter that `yaml.safe_load` rejects yields an
+        # empty dict here, which silently drops `repo`/`allowed_tools`/`touches`
+        # and would dispatch an external-repo task as a vault task with
+        # auto_merge in force (2026-10-19 macp-gen-units-split15-ops-paths). A
+        # broken payload is unsafe in ANY mode, so this is NOT gated on only_auto
+        # (unlike the drift guard below). Missing file / no frontmatter / unclosed
+        # / non-dict YAML stay fail-open — fm_err is None for all of those.
+        if fm_err is not None:
+            print(f"[orchestrator] load_dispatchable: skipping {r['slug']} — "
+                  f"frontmatter YAML error ({fm_err}); not dispatched")
+            continue
         # md<->DB drift guard: todo.db's worker_mode lags the markdown (the
         # todo-sync daemon rebuilds it), so a task hand-edited to a
         # non-dispatchable mode still shows a stale `auto` row until the daemon
