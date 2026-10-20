@@ -166,9 +166,12 @@ cp scripts/macp-anthropic-usage ~/.local/bin/macp-anthropic-usage && chmod +x ~/
 
 ## Known limitations
 
-- **Author-specific integrations ship in the tree**: KakaoTalk/Slack notifications
-  (without credentials they are a silent no-op), an app-beta publishing sweep, and an
-  `advote` bridge. None run unless configured, but they add noise.
+- **Author-specific integrations ship in the tree**: KakaoTalk/Slack notifications,
+  an app-beta publishing sweep, and an `advote` bridge. Each is **opt-in by the
+  presence of a vault config file or token** — with none present they are a *silent*
+  no-op: the sweep prints nothing, the bridge does no work (not even an import per
+  tick), and notifications warn once per process then stay quiet. See
+  [`scripts/NOTIFICATIONS.md`](scripts/NOTIFICATIONS.md) for the exact switches.
 - Parts of the worker prompts (`.claude/commands/`) and some docs are in Korean, and
   calendar sync uses the `Asia/Seoul` time zone.
 - External repositories are cloned under `~/Worker/`.
