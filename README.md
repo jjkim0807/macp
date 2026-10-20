@@ -137,6 +137,45 @@ The dashboard binds to loopback. It refuses to start on any other address — or
 Profiles and Claude accounts (`python -m todo_system.macp profile|account …`) live in
 `~/.macp/`.
 
+### An Upstage (Solar) account
+
+A profile's accounts can come from different vendors. `upstage` authenticates with an
+API key instead of a config dir:
+
+```bash
+python -m todo_system.macp account add solar --agent upstage --priority 150
+python -m todo_system.macp account probe solar --tier light   # one real call → one line of JSON
+```
+
+`--priority 150` keeps it *behind* the default (selection is lowest-number-first, and a
+claude account defaults to 100).
+
+**The key is never stored.** It is read when a call is made, from `UPSTAGE_API_KEY`, else
+from a key file holding one `UPSTAGE_API_KEY=…` line (default `~/.config/macp/upstage.env`,
+mode 0600 — a looser mode gets one warning on stderr). The profile keeps only the *path*,
+so no key reaches a config file, a log line, a commit or a PR, and `account list` reports
+the origin (`key=env|file|missing`) rather than any value. Point it elsewhere with
+`--key-file`, the `MACP_UPSTAGE_KEY_FILE` env var, or `upstage_key_file` in a project's
+`.macp/config.toml`.
+
+The `model_tier` → model mapping defaults to **date-pinned snapshots**
+(`solar-pro4-260806` for heavy/standard, `solar-mini4-260922` for light) because those
+are the ids whose existence was actually measured. Pins age: replace them per account
+without touching the code, either at registration —
+
+```bash
+python -m todo_system.macp account add solar --agent upstage \
+    --models light=solar-mini4-260922,heavy=solar-pro4-260806
+```
+
+— or by editing `models = { … }` in the profile's `[[account]]` block.
+
+Worker *stages* still run `claude -p` (`todo_system/orchestrator/stages.py` builds that
+argv directly), so an upstage account is callable through `probe` and
+`todo_system.macp.upstage.chat()` but is not yet a stage execution backend; wiring a
+vendor-neutral stage path is separate work. `build_invocation` refuses an upstage account
+that has no `command` rather than silently launching `claude` under its name.
+
 ## Anthropic usage & cost
 
 `todo_system.anthropic_usage` queries the Anthropic **Admin** API (no browser
