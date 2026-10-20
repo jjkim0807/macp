@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .accounts import (
-    LEGACY_CONFIG_DIR, config_dir_for, credentials_file_for, load_runtime_state,
-    resolve_active, token_file_for,
+    LEGACY_CONFIG_DIR, UPSTAGE_KEY_ENV, config_dir_for, credentials_file_for,
+    load_runtime_state, read_api_key, resolve_active, token_file_for,
 )
 
 HOME = Path(os.environ.get("MACP_HOME") or (Path.home() / ".macp"))
@@ -33,6 +33,18 @@ GLOBAL_CONFIG = HOME / "config.toml"
 PROJECT_DIR = ".macp"                  # marker dir inside a managed project
 
 WORKER_MODES = ("auto", "quick", "review", "delegate", "discover", "manual")
+
+# Default model_tier → Upstage Solar model id. These are DATE-PINNED snapshots,
+# the only ids whose existence was measured (2026-10-19); undated aliases are
+# not known to be served, and an alias default that 404s turns a live smoke into
+# "model not found" instead of a measurement. Swap a pin per account with
+# `macp account add … --models light=<id>` / `models = { … }` in the profile —
+# that configurability is the point, not the default value.
+SOLAR_TIER_MODELS = {
+    "heavy": "solar-pro4-260806",
+    "standard": "solar-pro4-260806",
+    "light": "solar-mini4-260922",
+}
 
 
 @dataclass
@@ -44,15 +56,27 @@ class Account:
       - claude_config_dir: auth isolation for Claude (CLAUDE_CONFIG_DIR).
       - command: invocation template for non-Claude agents; '{prompt}' is
         substituted (e.g. 'codex exec {prompt}', 'aider --message {prompt}').
-      - env: extra environment (API keys / config dirs) for this account.
+      - env: extra environment (config dirs, non-secret settings) for this
+        account. **Never an API key**: `write_profile` serializes this verbatim
+        into the profile TOML and `account list` prints `command`, so a secret
+        placed here leaks. Keys are read at call time —
+        `accounts.read_api_key` for upstage; see `key_file` below.
       - priority: selection order among a profile's accounts (lower first,
-        ties by listing order; default 100). Written only when non-default."""
+        ties by listing order; default 100). Written only when non-default.
+      - key_file: for a key-authenticated vendor (upstage), the path to the file
+        holding `UPSTAGE_API_KEY=…` (0600). The PATH only — the value is
+        resolved by `accounts.read_api_key` when a call is made.
+      - models: model_tier → vendor model id overrides (e.g.
+        `{"light": "solar-mini4-260922"}`); see `solar_model_for`.
+    The last two are appended: the schema test pins existing field order."""
     name: str
     agent: str = "claude"
     claude_config_dir: str = LEGACY_CONFIG_DIR
     command: str = ""
     env: dict = field(default_factory=dict)
     priority: int = 100
+    key_file: str = ""
+    models: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -119,7 +143,9 @@ def load_profile(name: str) -> Profile | None:
     accounts = [Account(name=a.get("name", ""), agent=a.get("agent", "claude"),
                         claude_config_dir=a.get("claude_config_dir", LEGACY_CONFIG_DIR),
                         command=a.get("command", ""), env=dict(a.get("env", {})),
-                        priority=int(a.get("priority", 100)))
+                        priority=int(a.get("priority", 100)),
+                        key_file=a.get("key_file", ""),
+                        models=dict(a.get("models", {})))
                 for a in d.get("account", [])]
     return Profile(name=name, vault=d.get("vault", ""),
                    daily_run_budget=int(d.get("daily_run_budget", 40)),
@@ -179,17 +205,40 @@ def resolve(start: Path | str | None = None) -> dict:
             "profile": load_profile(prof_name)}
 
 
-def account_for(profile: Profile, project: ProjectConfig | None, task_id: str = "") -> Account | None:
+def solar_model_for(account: Account | None, tier: str) -> str:
+    """The Upstage Solar model id for a ``model_tier`` — the account's ``models``
+    override first, then :data:`SOLAR_TIER_MODELS`. An unknown tier string falls
+    back to ``standard`` rather than raising, so a new worker tier name never
+    breaks a dispatch."""
+    over = (getattr(account, "models", None) or {}) if account is not None else {}
+    return str(over.get(tier) or SOLAR_TIER_MODELS.get(tier)
+               or SOLAR_TIER_MODELS["standard"])
+
+
+def account_for(profile: Profile, project: ProjectConfig | None, task_id: str = "",
+                agent: str | None = "claude") -> Account | None:
     """Pick the account to run with: the project's pinned account if set, else
-    round-robin the profile's accounts (stable per task_id for reproducibility)."""
+    round-robin the profile's accounts (stable per task_id for reproducibility).
+
+    Only accounts of ``agent`` are candidates (default ``claude``, as in
+    ``accounts.pick_account``; ``agent=None`` considers every account). The
+    filter is what keeps the round-robin stable when a profile gains a
+    non-claude account: the index is ``hash(task_id) % len(candidates)``, so
+    without it registering one upstage account would re-shuffle every existing
+    task's claude mapping.
+    """
     if not profile or not profile.accounts:
         return None
+    cands = [a for a in profile.accounts
+             if agent is None or getattr(a, "agent", "claude") == agent]
+    if not cands:
+        return None
     if project and project.account:
-        for a in profile.accounts:
+        for a in cands:
             if a.name == project.account:
                 return a
-    idx = (hash(task_id) % len(profile.accounts)) if task_id else 0
-    return profile.accounts[idx]
+    idx = (hash(task_id) % len(cands)) if task_id else 0
+    return cands[idx]
 
 
 def current_account(start: Path | str | None = None) -> tuple[Account | None, str]:
@@ -227,9 +276,32 @@ def build_invocation(account: Account, prompt: str,
     - claude (default / no command): `claude -p <prompt> [extra_args]` + CLAUDE_CONFIG_DIR.
     - other vendor: account.command with '{prompt}' substituted (appended if no
       placeholder), plus account.env. `extra_args` (claude-specific flags) are
-      ignored for non-claude agents."""
+      ignored for non-claude agents.
+    - upstage: HTTP-only by default. Without a `command` there is no CLI to run,
+      so this RAISES ValueError instead of falling through to the claude branch
+      (`agent == "claude" or not account.command`) and silently launching
+      `claude` under an upstage account's name — use `upstage.chat()` for the
+      API path. With a `command` it takes the generic vendor branch and the key
+      is injected into the returned env at call time (`accounts.read_api_key`,
+      never from the profile).
+
+    The returned env is the caller's to pass to a subprocess; this function
+    prints nothing, so an injected key stays out of every log.
+    """
     import shlex
     env = dict(account.env or {})
+    if account.agent == "upstage":
+        if not account.command:
+            raise ValueError(
+                f"upstage account '{account.name}' has no CLI command; "
+                "call the HTTP client (todo_system.macp.upstage.chat) instead")
+        key = read_api_key(account)
+        if key:
+            env[UPSTAGE_KEY_ENV] = key
+        argv = [p.replace("{prompt}", prompt) for p in shlex.split(account.command)]
+        if "{prompt}" not in account.command:
+            argv.append(prompt)
+        return argv, env
     if account.agent == "claude" or not account.command:
         argv = ["claude", "-p", prompt, *(extra_args or [])]
         cfg = os.path.expanduser(account.claude_config_dir or "")
@@ -293,6 +365,13 @@ def write_profile(prof: Profile) -> Path:
         if a.env:
             inner = ", ".join(f'{k} = "{v}"' for k, v in a.env.items())
             lines.append(f'env = {{ {inner} }}')
+        # Both written only when set, so a profile that never used them is
+        # byte-identical. `key_file` is a PATH; the key value never comes here.
+        if a.key_file:
+            lines.append(f'key_file = "{a.key_file}"')
+        if a.models:
+            inner = ", ".join(f'{k} = "{v}"' for k, v in a.models.items())
+            lines.append(f'models = {{ {inner} }}')
     path = PROFILES / prof.name / "config.toml"
     _write(path, "\n".join(lines))
     return path

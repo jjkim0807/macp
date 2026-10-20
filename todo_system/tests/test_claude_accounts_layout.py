@@ -555,7 +555,8 @@ def test_profile_schema_roundtrip_and_default_output_unchanged(roots):
 
     # new fields are appended with defaults — existing field order is untouched
     assert [f.name for f in dataclasses.fields(C.Account)] == \
-        ["name", "agent", "claude_config_dir", "command", "env", "priority"]
+        ["name", "agent", "claude_config_dir", "command", "env", "priority",
+         "key_file", "models"]
     assert [f.name for f in dataclasses.fields(C.Profile)] == \
         ["name", "vault", "daily_run_budget", "max_parallel_per_repo", "model", "accounts",
          "active_account", "max_parallel_gradle_builds"]

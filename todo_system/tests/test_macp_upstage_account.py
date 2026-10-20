@@ -140,3 +140,105 @@ def test_key_helpers_accept_an_explicit_env_mapping(home, tmp_path, monkeypatch)
     assert ACC.read_api_key(env=env) == SENTINEL   # os.environ is not consulted
     assert ACC.key_source(env=env) == "env"
     assert ACC.key_source(env={}) == "missing"
+
+
+# ---- Phase 2: profile schema, tier mapping, selection invariance ------------
+
+def test_profile_roundtrip_carries_key_file_and_models_not_the_key(C, tmp_path):
+    f = tmp_path / "up.env"
+    prof = C.Profile(name="p", accounts=[
+        C.Account(name="cc", agent="claude"),
+        C.Account(name="solar", agent="upstage", priority=150, key_file=str(f),
+                  models={"light": "solar-mini4-pinned"}),
+    ])
+    path = C.write_profile(prof)
+    text = path.read_text(encoding="utf-8")
+    assert f'key_file = "{f}"' in text
+    assert 'models = { light = "solar-mini4-pinned" }' in text
+    assert SENTINEL not in text                    # the path is stored, never a key
+    loaded = C.load_profile("p")
+    solar = loaded.accounts[1]
+    assert (solar.agent, solar.priority, solar.key_file) == ("upstage", 150, str(f))
+    assert solar.models == {"light": "solar-mini4-pinned"}
+    assert loaded.accounts[0].key_file == "" and loaded.accounts[0].models == {}
+
+
+def test_claude_only_profile_output_is_byte_identical(C):
+    # the new fields are written only when set, so an existing profile's TOML
+    # does not change at all (the historical text the schema test pins)
+    path = C.write_profile(C.Profile(name="p", accounts=[C.Account(name="x")]))
+    assert path.read_text(encoding="utf-8") == "\n".join([
+        'name = "p"', 'vault = ""', 'daily_run_budget = 40',
+        'max_parallel_per_repo = 2', 'model = "auto"', '', '[[account]]',
+        'name = "x"', 'agent = "claude"',
+        f'claude_config_dir = "{ACC.LEGACY_CONFIG_DIR}"', '',
+    ])
+
+
+def test_solar_model_for_defaults_are_measured_pins(C):
+    assert C.solar_model_for(None, "light") == "solar-mini4-260922"
+    assert C.solar_model_for(None, "standard") == "solar-pro4-260806"
+    assert C.solar_model_for(None, "heavy") == "solar-pro4-260806"
+    # an unknown tier degrades to standard instead of raising
+    assert C.solar_model_for(None, "brand-new-tier") == C.SOLAR_TIER_MODELS["standard"]
+
+
+def test_solar_model_mapping_is_configurable_per_account(C):
+    acct = C.Account(name="solar", agent="upstage",
+                     models={"light": "solar-mini-next", "heavy": "solar-pro-next"})
+    assert C.solar_model_for(acct, "light") == "solar-mini-next"
+    assert C.solar_model_for(acct, "heavy") == "solar-pro-next"
+    # a tier the override omits still gets the default pin
+    assert C.solar_model_for(acct, "standard") == C.SOLAR_TIER_MODELS["standard"]
+    # and the override survives a write → load round-trip (config, not code)
+    C.write_profile(C.Profile(name="p", accounts=[acct]))
+    assert C.solar_model_for(C.load_profile("p").accounts[0], "light") == "solar-mini-next"
+
+
+def test_account_for_round_robin_unchanged_by_an_upstage_account(C):
+    """AC #4: the claude mapping is `hash(task_id) % len(candidates)`, so adding
+    one non-claude account must not re-shuffle it."""
+    claude = [C.Account(name="school", agent="claude"),
+              C.Account(name="dev", agent="claude")]
+    before = C.Profile(name="before", accounts=list(claude))
+    after = C.Profile(name="after", accounts=[*claude,
+                                              C.Account(name="solar", agent="upstage")])
+    for task in ("task-1", "t", "macp-upstage-solar-worker-account", "x" * 40):
+        assert C.account_for(before, None, task).name == C.account_for(after, None, task).name
+    assert C.account_for(after, None).name == "school"            # no task_id → first claude
+    pinned = C.ProjectConfig(profile="after", account="dev")
+    assert C.account_for(after, pinned).name == "dev"             # pin still wins
+    # an upstage account is never returned on the claude path, even pinned…
+    assert C.account_for(after, C.ProjectConfig(account="solar"), "t").agent == "claude"
+    # …but is reachable by asking for it
+    assert C.account_for(after, None, "t", agent="upstage").name == "solar"
+    assert C.account_for(C.Profile(name="only-upstage", accounts=[
+        C.Account(name="solar", agent="upstage")]), None, "t") is None
+
+
+def test_build_invocation_never_launches_claude_for_an_upstage_account(C, tmp_path,
+                                                                      monkeypatch):
+    acct = C.Account(name="solar", agent="upstage")
+    with pytest.raises(ValueError, match="no CLI command"):
+        C.build_invocation(acct, "do it")
+    # with a command it takes the vendor branch and the key arrives at CALL time
+    f = _key_file(tmp_path / "up.env", f"{ACC.UPSTAGE_KEY_ENV}={SENTINEL}\n")
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(f))
+    cli = C.Account(name="solar", agent="upstage", command="solar-cli {prompt}")
+    argv, env = C.build_invocation(cli, "do it", ["--model", "x"])
+    assert argv == ["solar-cli", "do it"]                 # claude flags ignored
+    assert env[ACC.UPSTAGE_KEY_ENV] == SENTINEL
+    assert "CLAUDE_CONFIG_DIR" not in env
+    # no key anywhere → no variable at all (not an empty one)
+    monkeypatch.setenv(ACC.UPSTAGE_KEY_FILE_ENV, str(tmp_path / "absent.env"))
+    _, env2 = C.build_invocation(cli, "do it")
+    assert ACC.UPSTAGE_KEY_ENV not in env2
+    # the key is never written back onto the account or its profile
+    assert cli.env == {} and cli.key_file == ""
+
+
+def test_build_invocation_claude_path_unchanged(C):
+    argv, env = C.build_invocation(C.Account(name="x"), "hi")
+    assert argv == ["claude", "-p", "hi"] and "CLAUDE_CONFIG_DIR" not in env
+    cx = C.Account(name="cx", agent="codex", command="codex exec {prompt}")
+    assert C.build_invocation(cx, "hi", ["--model", "m"])[0] == ["codex", "exec", "hi"]
