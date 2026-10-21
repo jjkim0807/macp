@@ -205,10 +205,11 @@ def _install_status_fixture(tc: unittest.TestCase) -> Path:
     → active, fx-attn-2-fail (ledger failed, todo open) → attention, fx-dev-3-manual
     (manual, DEV_TAGS `app`) → human/dev, fx-life-4-admin (no worker_mode, private)
     → human/life. Dev comes from the tag fallback, not a `repo:` item file, so the
-    result does not depend on PyYAML."""
+    result does not depend on PyYAML. Memory/sessions points at an empty tmp dir so
+    project last_activity never reads the real vault journals."""
     tmp = Path(tempfile.mkdtemp())
     tc.addCleanup(shutil.rmtree, tmp, True)
-    for d in ("assign", "runs", "state", "items"):
+    for d in ("assign", "runs", "state", "items", "sessions"):
         (tmp / d).mkdir()
     db = tmp / "todo.db"
     con = sqlite3.connect(db)
@@ -237,10 +238,12 @@ def _install_status_fixture(tc: unittest.TestCase) -> Path:
               mock.patch.object(M, "STATE", tmp / "state"),
               mock.patch.object(M, "TODO_DB", db),
               mock.patch.object(M, "ITEMS", tmp / "items"),
+              mock.patch.object(M, "SESSIONS", tmp / "sessions"),
               mock.patch.object(M, "REGISTRY", tmp / "missing.yaml"),
               mock.patch.object(M, "collect_deps", return_value=[]),
               mock.patch.object(M, "_worker_running", return_value=[]),
-              mock.patch.dict(M._REPO_CACHE, clear=True)):
+              mock.patch.dict(M._REPO_CACHE, clear=True),
+              mock.patch.dict(M._SESSION_CACHE, clear=True)):
         p.start()
         tc.addCleanup(p.stop)
     return tmp
@@ -457,6 +460,122 @@ class ProjectsSectionTests(unittest.TestCase):
         self.assertTrue(by["fxq"]["on_hold"])     # waiting
         self.assertTrue(by["fxb"]["on_hold"])     # blocked
         self.assertFalse(by["fxp"]["on_hold"])    # open
+
+
+class ProjectLastActivityTests(unittest.TestCase):
+    """A project row's last_activity/last_age is the newest of run dir, ledger
+    update, the subtree's task md `updated` and linked Memory/sessions journal
+    `updated` — so a project worked by hand today reads as today even when its
+    worker runs are weeks old (research-staff-job-search showed 「41d 전」)."""
+
+    def setUp(self):
+        self.tmp = _install_status_fixture(self)
+        con = sqlite3.connect(M.TODO_DB)
+        con.execute("ALTER TABLE tasks ADD COLUMN updated TEXT")
+        con.executemany(
+            "INSERT INTO tasks (slug,title,status,due,next_action,tags,parent_slug,"
+            "is_parent,worker_mode) VALUES (?,?,'open','-','','todo',?,?,NULL)",
+            [("fxm", "m", None, 1), ("fxm-a", "ma", "fxm", 0), ("fxm-b", "mb", "fxm", 0)])
+        con.commit()
+        con.close()
+        self.now = dt.datetime.now().replace(microsecond=0)
+        self.today = self.now.date()
+
+    def _set_updated(self, slug, value):
+        con = sqlite3.connect(M.TODO_DB)
+        con.execute("UPDATE tasks SET updated=? WHERE slug=?", (value, slug))
+        con.commit()
+        con.close()
+
+    def _ledger(self, slug, when: dt.datetime):
+        (self.tmp / "assign" / f"{slug}.json").write_text(json.dumps(
+            {"task_id": slug, "agent_id": "w1", "state": "awaiting_human",
+             "updated_ts": when.astimezone().isoformat(timespec="seconds")}),
+            encoding="utf-8")
+
+    def _journal(self, name, text):
+        p = M.SESSIONS / name
+        p.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+        return p
+
+    def _row(self, slug="fxm"):
+        return {p["slug"]: p for p in M.collect_status()["projects"]}[slug]
+
+    def _assert_same_day_age(self, row):
+        age = row["last_age"]
+        self.assertTrue(age, row)
+        self.assertFalse(age.startswith("-"), row)
+        self.assertFalse(age.endswith("d"), row)
+
+    def test_md_updated_today_without_runs_or_ledger(self):
+        self._set_updated("fxm-a", self.today.isoformat())
+        r = self._row()
+        self.assertTrue(r["last_activity"].startswith(self.today.isoformat()), r)
+        self._assert_same_day_age(r)
+
+    def test_md_today_beats_ledger_yesterday(self):
+        yesterday = dt.datetime.combine(self.today - dt.timedelta(days=1), dt.time(12))
+        self._ledger("fxm-b", yesterday)
+        self.assertEqual(self._row()["last_activity"],
+                         yesterday.isoformat(timespec="seconds"))    # ledger alone
+        self._set_updated("fxm-a", self.today.isoformat())
+        r = self._row()
+        self.assertTrue(r["last_activity"].startswith(self.today.isoformat()), r)
+        self._assert_same_day_age(r)
+
+    def test_no_activity_is_empty(self):
+        self._set_updated("fxm", "-")
+        self._set_updated("fxm-a", "")
+        r = self._row()                                  # fxm-b stays NULL
+        self.assertEqual((r["last_activity"], r["last_age"]), ("", ""))
+
+    def test_run_time_is_not_lowered_by_same_day_md(self):
+        run = dt.datetime.combine(self.today, dt.time(0, 0, 1))
+        (self.tmp / "runs" / (run.strftime("%Y%m%dT%H%M%S") + "-fxm-a")).mkdir()
+        self._set_updated("fxm-a", self.today.isoformat())   # md reads as 00:00:00
+        self.assertEqual(self._row()["last_activity"], run.isoformat(timespec="seconds"))
+
+    def test_future_md_updated_ignored(self):
+        self._set_updated("fxm-a", (self.today + dt.timedelta(days=1)).isoformat())
+        self.assertEqual(self._row()["last_activity"], "")
+
+    def test_session_journal_updated_joins_max(self):
+        t1 = self.now - dt.timedelta(minutes=10)
+        t2 = self.now - dt.timedelta(minutes=20)
+        p1 = self._journal(f"{t1.date()}-fxm.testhost.md",
+                           f"---\nproject: fxm\nupdated: {t1.astimezone().isoformat()}\n"
+                           "status: active\n---\n\n# fxm\n")
+        self._journal(f"{t2.date()}-other.md",            # legacy name, linked by task
+                      f"---\nproject: unrelated\nupdated: {t2.astimezone().isoformat()}\n"
+                      'related_tasks:\n  - "[[fxm-b]]"\n---\n\n# other\n')
+        self._set_updated("fxm-a", (self.today - dt.timedelta(days=3)).isoformat())
+        r = self._row()
+        self.assertEqual(r["last_activity"], t1.isoformat(timespec="seconds"))
+        self.assertTrue(r["last_age"].endswith("m"), r)
+        p1.unlink()                                       # related_tasks mapping alone
+        self.assertEqual(self._row()["last_activity"], t2.isoformat(timespec="seconds"))
+
+    def test_session_journal_fail_soft(self):
+        future = (self.now + dt.timedelta(days=1)).astimezone().isoformat()
+        self._journal("2026-01-01-garbage.md", "no frontmatter at all\n")
+        self._journal("2026-01-01-baddate.md", "---\nproject: fxm\nupdated: not-a-date\n---\n")
+        self._journal("2026-01-01-future.md", f"---\nproject: fxm\nupdated: {future}\n---\n")
+        self._journal("2026-01-01-binary.md", b"---\nproject: fxm\nupdated: \xff\xfe\n---\n")
+        self.assertEqual(self._row()["last_activity"], "")
+        with mock.patch.object(M, "SESSIONS", self.tmp / "no-such-dir"):
+            self.assertEqual(self._row()["last_activity"], "")
+
+    def test_projects_row_keys_unchanged(self):
+        self._set_updated("fxm-a", self.today.isoformat())
+        self.assertEqual(set(self._row()), {
+            "slug", "title", "project", "status", "worker_mode", "on_hold", "action",
+            "due", "leaves_done", "leaves_total", "active", "attention", "priority",
+            "last_activity", "last_age"})
+
+    def test_tooltip_names_sources(self):
+        self.assertIn("최근 활동 ${esca(r.last_activity)} (run·ledger·md·session 중 최신)",
+                      M.HTML)
+        self.assertNotIn('title="최근 실행', M.HTML)
 
 
 class ActiveAgentDefaultTests(unittest.TestCase):
