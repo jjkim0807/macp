@@ -169,4 +169,38 @@ AC 문구를 그대로 쓴다(Verify 체크리스트와 1:1). 각 항목은 **�
 
 → **설계 함의**: 구현 1차 범위를 "claude 구독 전용" 열(모델 사다리·`_probe`·usage_guard 페이싱·쿼터회전)은 **claude 백엔드 안에 그대로 두고**, "중립" 열만 인터페이스로 끌어올리면 비-Claude 백엔드 하나를 **페이싱·effort 없이** 최소로 꽂을 수 있다(§4 결정 Q2).
 
+---
+
+## §3 후보 에이전트 대조표 (능력 vs 공식 문서)
+
+각 칸은 **그 능력의 지원 여부 + 공식 플래그**이고, 이번 세션(**조회 2026-10-22**)에
+공식 문서로 확인한 것만 적는다. 공식 페이지로 확인하지 못한 칸은 **`미확인`**(추측
+금지). 출처 URL 은 표 아래에 에이전트별로 모았다. **CLI 플래그·권한 모델은 버전마다
+바뀌므로** 구현 태스크는 착수 시점에 각 공식 레퍼런스를 재확인해야 한다.
+
+범례: ✅ 공식 확인 · ⚠️ 부분/제약 있음(셀 안에 명시) · 미확인 = 이번 세션 공식 문서로 확인 못 함.
+
+| 에이전트 | (1) 헤드리스 호출 | (2) 권한·툴 허용목록 | (3) 턴/시간 상한 | (4) 모델 선택 | (5) 사용량 보고 | (6) 프롬프트·지시 전달 |
+|---|---|---|---|---|---|---|
+| **OpenAI Codex CLI** | ✅ `codex exec "<prompt>"` (stderr=진행, stdout=최종); `codex exec -`=stdin | ⚠️ `--sandbox` {read-only(기본)·workspace-write·danger-full-access}, `--approve-for-me`; `--full-auto` 폐지. **per-tool 허용목록(Bash(git:*) 대응) 미확인**(non-interactive 페이지 미기재) | 미확인 (non-interactive 페이지 미기재) | 미확인 (`-m/--model` 이 non-interactive 공식 페이지엔 미기재) | ✅ `--json` JSONL 의 `turn.completed.usage` = {input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens} | ✅ positional arg 또는 stdin(`-`); `--output-schema <file>`(JSON Schema 강제); `-o/--output-last-message`; `--ignore-user-config`=`$CODEX_HOME/config.toml` 스킵 |
+| **Gemini CLI** | ✅ `-p`/`--prompt` (non-TTY 도 헤드리스 트리거) | ✅ `--approval-mode` {default·auto_edit·plan} + `--yolo`(=`--approval-mode=yolo`); **툴 허용목록 있음**: `tools.core`(allowlist)·`tools.exclude`·`tools.allowed`(확인창 bypass) 설정 | ✅ `model.maxSessionTurns`(기본 -1=무제한) + 초과 시 **exit 53 "Turn limit exceeded"** | ⚠️ `model.name` 설정 / `GEMINI_MODEL` env (공식); **`-m/--model` CLI 플래그는 공식 config 레퍼런스엔 미확인** | ✅ `--output-format json` → `stats` 토큰 사용량 + per-model 토큰 분해 | ✅ `-p`/`--prompt` 로 쿼리; `GEMINI.md`/stdin 은 헤드리스 페이지 미기재(미확인) |
+| **Cursor CLI** (`cursor-agent`) | ✅ `-p`/`--print` (non-TTY/파이프도 추론) | ⚠️ `-f`/`--force`(=`--yolo`) "명시적 deny 외 전부 허용"; `--sandbox` {enabled·disabled}; `--mode` {plan·ask}; `--trust`(헤드리스 전용); `--approve-mcps`. **`--allowedTools`/`--deniedTools` 미확인**(parameters 페이지 미기재) | 미확인 (agent 턴/시간 바운드 미기재; `--idle-release-timeout` 은 worker 전용) | ✅ `--model <model>`(`-m` 단축형은 미확인); `agent models`·`--list-models` 로 목록 | 미확인 (`--output-format json` 은 `result` 필드; **토큰 사용량 필드 미기재**) | ✅ positional arg; `--output-format` {text(기본)·json·stream-json}(`--print` 와만) |
+| **aider** | ✅ `--message`/`--msg`/`-m COMMAND`(응답 처리 후 종료, chat 비활성); `--message-file`/`-f FILE` | ⚠️ `--yes-always`(모든 확인에 yes) — **per-tool 허용목록 없음**(all-or-nothing); `--auto-commits`(기본 true) | 미확인 (턴/반복 상한 플래그 미기재) | ✅ `--model`(env `AIDER_MODEL`) | 미확인 (스크립트용 토큰 보고 플래그 없음; `/tokens` 은 in-chat, `--max-chat-history-tokens` 은 report 아님) | ✅ `--message` 인라인 / `--message-file`/`-f` / env `AIDER_MESSAGE`·`AIDER_MESSAGE_FILE` |
+| **OpenCode** | ✅ `opencode run [message..]` (스크립팅/자동화 목적) | ⚠️ `run --auto`(명시적 deny 외 자동 승인); `agent create --permissions`(allowlist, 생략=deny) — **허용목록은 agent 설정 경유** | 미확인 (`run` 턴/시간 상한 미기재; `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` 는 bash 전용) | ✅ `--model`/`-m` (`provider/model` 형식); `models` 로 목록 | ⚠️ `opencode stats`(세션 토큰/비용, **별도 커맨드**); `run` 자체 인라인 토큰 출력은 미확인 | ✅ positional `[message..]`; `--agent`; `--command`; `--file`/`-f`; `--format` {default·json} |
+
+### 출처 (조회 2026-10-22; 전부 공식 문서)
+
+- **OpenAI Codex CLI**: [learn.chatgpt.com/docs/non-interactive-mode](https://learn.chatgpt.com/docs/non-interactive-mode) (= `developers.openai.com/codex/noninteractive` 가 308 리다이렉트하는 공식 non-interactive 가이드).
+- **Gemini CLI**: 헤드리스 [github.com/google-gemini/gemini-cli · docs/cli/headless.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/headless.md) · 설정 [docs/reference/configuration.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md).
+- **Cursor CLI**: 헤드리스 [cursor.com/docs/cli/headless](https://cursor.com/docs/cli/headless) · 파라미터 [cursor.com/docs/cli/reference/parameters](https://cursor.com/docs/cli/reference/parameters) · 출력 포맷 [cursor.com/docs/cli/reference/output-format](https://cursor.com/docs/cli/reference/output-format).
+- **aider**: 스크립팅 [aider.chat/docs/scripting.html](https://aider.chat/docs/scripting.html) · 옵션 [aider.chat/docs/config/options.html](https://aider.chat/docs/config/options.html).
+- **OpenCode**: CLI 레퍼런스 [opencode.ai/docs/cli](https://opencode.ai/docs/cli).
+
+### 읽는 법 (구현 태스크용 요약)
+
+- **헤드리스 실행(§2-1)·프롬프트 전달(§2-8)·모델 선택(§2-4)** 은 다섯 후보 모두 공식 지원(Gemini 의 CLI `--model` 플래그만 공식 config 페이지 미확인 — 설정/ env 로는 확인). 즉 **최소 백엔드(effort·페이싱 없이)는 어느 후보로도 가능**.
+- **per-tool 허용목록(§2-2, Claude `Bash(git:*)` 대응)** 이 능력 격차가 가장 크다. **Gemini(`tools.core`)·OpenCode(`agent --permissions`)** 만 허용목록형을 공식 제공. Codex·Cursor 는 **sandbox/force 수준의 거친 승인**이고 per-tool allowlist 는 미확인, aider 는 **없음(`--yes-always` all-or-nothing)**. → 구현 AC #3("미지원 능력은 조용히 무시 말고 거절/경고")이 바로 이 격차를 방어한다.
+- **사용량 보고(§2-7)** 는 **Codex(`--json` usage)·Gemini(`--output-format json` stats)** 가 인라인 토큰을 공식 제공. OpenCode 는 별도 `stats` 커맨드, Cursor·aider 는 미확인 → 이 둘은 `usage_rec=None`(Solar 와 동일) 로 꽂으면 된다.
+- **턴 상한(§2-3)** 은 **Gemini(`maxSessionTurns`+exit 53)** 만 공식. 나머지는 미확인이나, **벽시계 timeout 은 런너가 백엔드 밖에서 강제**하므로(§2-3) 치명적이지 않다.
+
 <!-- end -->
