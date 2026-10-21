@@ -293,6 +293,41 @@ class ParseCandidatesAliasTest(DiscoveryBase):
         self.assertEqual(discovery.parse_candidates(e.read_text(encoding="utf-8")), [])
         self.assertEqual(discovery.CANDIDATE_SECTION, "후보 태스크")
 
+    def _en(self, stem: str, candidates: list[str], heading: str = "Candidate tasks") -> Path:
+        # Same shape as _report(), with an English heading.
+        p = _report(self.episodes, stem, URL_A, candidates)
+        text = p.read_text(encoding="utf-8").replace("## 후보 태스크", f"## {heading}")
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_english_heading_parses_like_korean(self):
+        ko = _report(self.episodes, "k3-discovery-a", URL_A, ["후보 A", "후보 B"])
+        en = self._en("e3-discovery-a", ["후보 A", "후보 B"])
+        self.assertNotIn("후보 태스크", en.read_text(encoding="utf-8"))
+        self.assertEqual(discovery.parse_candidates(en.read_text(encoding="utf-8")),
+                         discovery.parse_candidates(ko.read_text(encoding="utf-8")))
+        self.assertEqual(discovery.parse_candidates(en.read_text(encoding="utf-8")),
+                         ["후보 A", "후보 B"])
+        ctx = discovery.render_context([en])
+        self.assertIn("후보 2개", ctx)
+        self.assertNotIn("nested elaboration", ctx)
+
+    def test_none_marker_matches_korean_marker(self):
+        for marker in ("None", "none", "NONE."):
+            en = self._en("e4-discovery-a", [marker])
+            ko = _report(self.episodes, "k4-discovery-a", URL_A, [marker])
+            self.assertEqual(discovery.parse_candidates(en.read_text(encoding="utf-8")), [], marker)
+            self.assertEqual(discovery.parse_candidates(ko.read_text(encoding="utf-8")), [], marker)
+        kept = self._en("e5-discovery-a", ["nonexistent config key"])
+        self.assertEqual(discovery.parse_candidates(kept.read_text(encoding="utf-8")),
+                         ["nonexistent config key"])
+
+    def test_english_heading_ignores_case_and_korean_wins(self):
+        en = self._en("e6-discovery-a", ["후보 E"], heading="candidate TASKS")
+        self.assertEqual(discovery.parse_candidates(en.read_text(encoding="utf-8")), ["후보 E"])
+        both = "## Candidate tasks\n\n- 후보 E\n\n## 후보 태스크\n\n- 후보 K\n"
+        self.assertEqual(discovery.parse_candidates(both), ["후보 K"])
+
 
 class StateAtomicWriteTest(DiscoveryBase):
     def test_save_state_round_trips_valid_json(self):

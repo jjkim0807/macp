@@ -42,6 +42,7 @@ from pathlib import Path
 from .. import paths
 from . import repos
 from .atomic_io import atomic_write_text
+from .followups import is_empty_marker, section_body_any
 
 # Vault-DATA root (Worker/_state, Worker/planner_state.json, Todo/items,
 # Memory/episodes). Resolved through paths.vault_root so it follows MACP_VAULT_ROOT
@@ -70,7 +71,9 @@ ACTIVE_STATUSES = frozenset({"open", "waiting", "blocked"})
 # never contends with a real run's checkout.
 REPO_FIELD = "discover_repo"
 REPORT_GLOB = "*-discovery-*.md"
-CANDIDATE_SECTION = "후보 태스크"
+# [0] is canonical; English aliases match case-insensitively (followups.section_body_any).
+CANDIDATE_HEADINGS = ("후보 태스크", "Candidate tasks")
+CANDIDATE_SECTION = CANDIDATE_HEADINGS[0]
 # Resolved reports still show the planner what they already produced (open and
 # done) for this many days, so a finished candidate is not re-created.
 CONSUMED_WINDOW_DAYS = 14
@@ -343,22 +346,16 @@ def maybe_create(*, force: bool = False, now: float | None = None,
 
 # ----------------------------------------------------------- reports ---
 
-def _section_body(text: str, section: str) -> str | None:
-    m = re.search(
-        rf"^##[ \t]+{re.escape(section)}[ \t]*$(.*?)(?=^#{{1,2}}[ \t]|\Z)",
-        text or "", re.M | re.S)
-    return m.group(1) if m else None
-
-
 def parse_candidates(text: str) -> list[str]:
-    """Top-level bullets under `## 후보 태스크` — the report's candidate list."""
-    body = _section_body(text, CANDIDATE_SECTION)
+    """Top-level bullets under `## 후보 태스크` (or `## Candidate tasks`) — the
+    report's candidate list. `없음`/`none` bullets are skipped."""
+    body = section_body_any(text, CANDIDATE_HEADINGS)
     if not body:
         return []
     out = []
     for line in body.splitlines():
         m = re.match(r"[-*][ \t]+(.+?)[ \t]*$", line)
-        if m and m.group(1).strip() and not m.group(1).strip().startswith("없음"):
+        if m and m.group(1).strip() and not is_empty_marker(m.group(1).strip()):
             out.append(m.group(1).strip())
     return out
 
