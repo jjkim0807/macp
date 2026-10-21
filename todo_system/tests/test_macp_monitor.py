@@ -408,7 +408,7 @@ class UnmergedDelegateBranchTest(unittest.TestCase):
         return {"task_id": task_id, "state": "done", "updated_ts": updated,
                 "payload": payload}
 
-    def _check(self, assigns_list, *, landed=False, open_prs=_NO_PR_ARG):
+    def _check(self, assigns_list, *, landed=False, open_prs=_NO_PR_ARG, settled=None):
         """Run the check with git/clock/network seams stubbed. `landed` is what
         `_landed_on_main` reports for every branch.
 
@@ -422,7 +422,8 @@ class UnmergedDelegateBranchTest(unittest.TestCase):
         findings: list = []
         with mock.patch.object(M, "_now", return_value=self.NOW), \
              mock.patch.object(M, "_branch_ref_exists", side_effect=lambda b: b), \
-             mock.patch.object(M, "_landed_on_main", return_value=landed):
+             mock.patch.object(M, "_landed_on_main", return_value=landed), \
+             mock.patch.object(M, "settled_pr_for_branch", return_value=settled):
             M.check_unmerged_delegate_branch(
                 findings, assigns,
                 {} if open_prs is _NO_PR_ARG else open_prs)
@@ -764,6 +765,84 @@ class UnmergedDelegateBranchTest(unittest.TestCase):
         for bad in (None, "", "not-a-date"):
             self.assertIsNone(M._parse_pr_ts(bad), bad)
 
+
+
+    # -- settled PR (2026-10-21) --------------------------------------------
+    def test_merged_pr_counts_as_landed(self):
+        # RED control: 6 squash-merged branches whose squash subject lacked the
+        # slug were escalated as `bug` in the 10-21 brief.
+        merged = {"state": "MERGED", "number": 85, "url": "u", "repo": "o/r"}
+        self.assertEqual(self._check([self._assign("t-merged")], settled=merged), [])
+
+    def test_closed_pr_demotes_to_info_with_same_fingerprint(self):
+        closed = {"state": "CLOSED", "number": 331, "url": "u", "repo": "o/r"}
+        (f,) = self._check([self._assign("t-closed")], settled=closed)
+        self.assertEqual(f["severity"], "info")
+        self.assertEqual(f["fingerprint"], "unmerged-delegate-branch:t-closed")
+        self.assertEqual(f["evidence"]["pr_state"], "CLOSED")
+
+    def test_settled_lookup_failure_stays_bug(self):
+        (f,) = self._check([self._assign("t-fail")], settled=M.PR_LOOKUP_FAILED)
+        self.assertEqual(f["severity"], "bug")
+
+    def test_no_settled_pr_stays_bug(self):
+        (f,) = self._check([self._assign("t-none")], settled=None)
+        self.assertEqual(f["severity"], "bug")
+
+    def test_open_pr_wins_over_settled_lookup(self):
+        from unittest import mock
+        pr = {"number": 1, "url": "u", "createdAt": None}
+        with mock.patch.object(M, "settled_pr_for_branch") as look:
+            findings = []
+            with mock.patch.object(M, "_now", return_value=self.NOW), \
+                 mock.patch.object(M, "_branch_ref_exists", side_effect=lambda b: b), \
+                 mock.patch.object(M, "_landed_on_main", return_value=False):
+                M.check_unmerged_delegate_branch(findings, {"t": self._assign("t")}, {"worker/t": pr})
+            look.assert_not_called()
+        self.assertEqual(findings[0]["severity"], "info")
+
+    def test_repo_slug_from_url(self):
+        self.assertEqual(M._repo_slug_from_url("https://github.com/o/r.git"), "o/r")
+        self.assertEqual(M._repo_slug_from_url("git@github.com:o/r"), "o/r")
+        self.assertIsNone(M._repo_slug_from_url(None))
+        self.assertIsNone(M._repo_slug_from_url("https://example.com/o/r"))
+
+
+class LandedOnMainPatchEquivalenceTest(unittest.TestCase):
+    """`_landed_on_main` against a real throwaway git repo: a branch whose only
+    commit was cherry-picked onto main counts as landed (10-21: two of the 11
+    false strandings); a branch with one un-picked commit does not."""
+
+    def _repo(self):
+        import subprocess
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        def g(*a):
+            return subprocess.run(["git", *a], cwd=d, check=True, capture_output=True)
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "t@t")
+        g("config", "user.name", "t")
+        for branch, name, body, msg in ((None, "a", "1", "base"), ("worker/x", "b", "x", "work"),
+                                        ("main", "c", "y", "other")):
+            if branch:
+                g("checkout", "-q", *(["-b"] if branch != "main" else []), branch)
+            (d / name).write_text(body + "\n")
+            g("add", name)
+            g("commit", "-qm", msg)
+        return d, g
+
+    def test_cherry_picked_branch_is_landed(self):
+        from unittest import mock
+        d, g = self._repo()
+        g("cherry-pick", "worker/x")
+        with mock.patch.object(M, "ROOT", d):
+            self.assertTrue(M._landed_on_main("unrelated-slug", "worker/x"))
+
+    def test_unpicked_commit_is_not_landed(self):
+        from unittest import mock
+        d, g = self._repo()
+        with mock.patch.object(M, "ROOT", d):
+            self.assertFalse(M._landed_on_main("unrelated-slug", "worker/x"))
 
 if __name__ == "__main__":
     unittest.main()

@@ -1802,6 +1802,53 @@ class ReconcileQueueTest(unittest.TestCase):
         self.assertEqual(self._reconcile_orphan(None, name="gone.md"), [])
         self.assertEqual(self.queue["runs"][0]["status"], "pending")
 
+    def _git_vault(self):
+        import subprocess
+        # production shape: ledger at <vault>/Worker/assignments
+        root = self.tmp / "vault"
+        root.mkdir(parents=True, exist_ok=True)
+        self.ledger = Ledger(root / "Worker" / "assignments")
+        self.orch = Orchestrator(self.mb, self.reg, self.ledger, notify=lambda *a, **k: None)
+        def g(*a):
+            return subprocess.run(["git", "-C", str(root), *a], check=True, capture_output=True)
+        g("init", "-q")
+        g("config", "user.email", "t@t")
+        g("config", "user.name", "t")
+        (root / "keep.md").write_text("x\n")
+        g("add", "keep.md")
+        g("commit", "-qm", "base")
+        return root, g
+
+    def test_md_never_on_head_is_skipped(self):
+        # 2026-10-21: md existed only on an unmerged worker branch -> the run sat
+        # pending 738h with nothing able to claim it.
+        root, _ = self._git_vault()
+        self.queue = {"runs": [{"slug": "t", "status": "pending",
+                                "task_path": str(root / "Todo" / "items" / "never-merged.md")}]}
+        from todo_system import worker as _worker
+        with mock.patch.object(_worker, "load_queue", lambda: self.queue), \
+             mock.patch.object(_worker, "save_queue", lambda q: None), \
+             mock.patch.object(_worker, "queue_lock", contextlib.nullcontext):
+            self.assertEqual(self.orch.reconcile_queue(), ["t"])
+        self.assertEqual(self.queue["runs"][0]["status"], "skipped")
+
+    def test_md_on_head_but_missing_on_disk_stays_pending(self):
+        # committed but momentarily absent from the work tree: not definitive
+        root, g = self._git_vault()
+        (root / "Todo" / "items").mkdir(parents=True)
+        (root / "Todo" / "items" / "t.md").write_text("---\nworker_mode: auto\n---\n")
+        g("add", "-A")
+        g("commit", "-qm", "task")
+        (root / "Todo" / "items" / "t.md").unlink()
+        self.queue = {"runs": [{"slug": "t", "status": "pending",
+                                "task_path": str(root / "Todo" / "items" / "t.md")}]}
+        from todo_system import worker as _worker
+        with mock.patch.object(_worker, "load_queue", lambda: self.queue), \
+             mock.patch.object(_worker, "save_queue", lambda q: None), \
+             mock.patch.object(_worker, "queue_lock", contextlib.nullcontext):
+            self.assertEqual(self.orch.reconcile_queue(), [])
+        self.assertEqual(self.queue["runs"][0]["status"], "pending")
+
     def test_assigned_run_is_never_voided(self):
         # live work: its reply path is what closes it, not this reconciler
         self.ledger.save(Assignment(task_id="t", agent_id="w", corr_id="c",

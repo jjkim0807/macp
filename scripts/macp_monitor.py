@@ -258,7 +258,61 @@ def _landed_on_main(task_id: str, ref: str) -> bool:
     if _git("merge-base", "--is-ancestor", ref, "main")[0] == 0:
         return True
     _, out = _git("log", "main", "--oneline", "--grep", task_id, "-i")
-    return bool(out.strip())
+    if out.strip():
+        return True
+    # Patch-equivalence (2026-10-21): every commit the branch has over main
+    # already exists on main as the same patch (cherry-picked / rebased in).
+    # `git cherry` marks those `-`; one `+` means real unlanded work remains.
+    rc, out = _git("cherry", "main", ref)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    return rc == 0 and bool(lines) and all(ln.startswith("-") for ln in lines)
+
+
+def _repo_slug_from_url(url: str | None) -> str | None:
+    """`https://github.com/o/r.git` / `git@github.com:o/r` -> `o/r`."""
+    if not url:
+        return None
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url.strip())
+    return m.group(1) if m else None
+
+
+def settled_pr_for_branch(branch: str, repo_url: str | None = None) -> dict | None | object:
+    """The newest MERGED or CLOSED PR whose head is `branch`, looked up in the
+    task's own repo (payload `repo`) and in the vault REPO:
+    `{state, number, url, repo}`, `None` when none exists, or PR_LOOKUP_FAILED.
+
+    Why (2026-10-21 brief): all 11 "stranded" branches the sensor escalated as
+    `bug` were settled — 6 squash-merged through a PR whose squash subject does
+    not carry the slug (so `_landed_on_main`'s `--grep` misses it), 4 closed on
+    purpose by a human (superseded or rejected proposal), 1 cancelled. The
+    local `worker/*` refs just outlive the PR. A merged PR means the work
+    landed; a closed one means a person decided it should not.
+
+    Fail-loud like `open_prs_by_branch`: any `gh` failure answers the sentinel
+    so the caller keeps the finding at `bug` instead of muting it.
+    """
+    repos = []
+    for r in (_repo_slug_from_url(repo_url), REPO):
+        if r and r not in repos:
+            repos.append(r)
+    best = None
+    for r in repos:
+        try:
+            out = subprocess.run(
+                ["gh", "pr", "list", "--repo", r, "--head", branch, "--state", "all",
+                 "--limit", "5", "--json", "number,url,state,createdAt"],
+                capture_output=True, text=True, timeout=30, check=True).stdout
+            prs = json.loads(out)
+        except Exception:
+            return PR_LOOKUP_FAILED
+        for pr in prs:
+            if pr.get("state") not in ("MERGED", "CLOSED"):
+                continue
+            cand = {"state": pr["state"], "number": pr["number"], "url": pr["url"], "repo": r}
+            # A merged PR anywhere wins over a closed one: the work landed.
+            if best is None or (cand["state"] == "MERGED" and best["state"] != "MERGED"):
+                best = cand
+    return best
 
 
 def check_unmerged_delegate_branch(findings: list, assigns: dict,
@@ -350,6 +404,23 @@ def check_unmerged_delegate_branch(findings: list, assigns: dict,
                     "is_vault": is_vault,
                     "threshold_hours": threshold,
                     "updated_ts": a.get("updated_ts")}
+        if not pr:
+            settled = settled_pr_for_branch(branch, payload.get("repo"))
+            if settled is not PR_LOOKUP_FAILED and settled:
+                if settled["state"] == "MERGED":
+                    continue                            # landed through its PR
+                findings.append({
+                    "fingerprint": f"unmerged-delegate-branch:{task_id}",
+                    "severity": "info",
+                    "title": (f"{where} 브랜치 미머지(PR 닫힘): {task_id} — "
+                              f"{settled['repo']}#{settled['number']}이 머지 없이 닫힘"),
+                    "evidence": {**evidence, "pr_number": settled["number"],
+                                 "pr_url": settled["url"], "pr_state": "CLOSED"},
+                    "detail": ("이 브랜치를 head로 하는 PR이 머지 없이 닫혔다 → 사람이 반영하지 "
+                               "않기로 한 결정(대체·기각)이라 좌초가 아니다. 로컬 `worker/*` "
+                               f"ref만 남아 있다. PR: {settled['url']}"),
+                })
+                continue
         if pr:
             # The age of the PR itself, deliberately not the branch clock that
             # already fired above — an open PR explains the branch, so the only

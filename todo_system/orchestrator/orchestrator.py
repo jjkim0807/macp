@@ -2080,9 +2080,41 @@ class Orchestrator:
         if not slug or slug in assigned:
             return False
         path = run.get("task_path")
-        if not path or not Path(path).is_file():
+        if not path:
             return False
+        if not Path(path).is_file():
+            return self._task_md_never_on_head(path)
         return repos.read_task_worker_mode(path) not in DISPATCHABLE_MODES
+
+    def _task_md_never_on_head(self, raw: str) -> bool:
+        """A queued run's markdown is missing on disk — is that *definitive*?
+
+        Only when git itself answers: the vault is a work tree and HEAD has no
+        such path. That is the 2026-10-21 shape — `dripcoffee-discovery-20260920`
+        (738h) and `notify-channel-1-telegram-backend` (211h) were queued from a
+        checkout sitting on a worker branch, and their md only ever existed on
+        those never-merged branches, so nothing could claim or close the runs.
+        Anything short of a clean git answer (not a repo, git missing, timeout,
+        path outside the tree) keeps the fail-closed default: stay pending.
+        """
+        import subprocess
+        try:
+            vault_root = Path(self.ledger.root).parent.parent
+            p = Path(raw)
+            if not p.is_absolute():
+                p = vault_root / p
+            if p.exists():
+                return False
+            top = subprocess.run(["git", "-C", str(vault_root), "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=15)
+            if top.returncode != 0:
+                return False
+            rel = p.resolve().relative_to(Path(top.stdout.strip()).resolve())
+            probe = subprocess.run(["git", "-C", str(vault_root), "cat-file", "-e", f"HEAD:{rel.as_posix()}"],
+                                   capture_output=True, text=True, timeout=15)
+            return probe.returncode != 0 and not probe.stdout and "Not a valid object name HEAD" not in probe.stderr
+        except Exception:
+            return False
 
     def usage_hold(self) -> str | None:
         """Reason string when the Claude-usage guard says to stop starting new
