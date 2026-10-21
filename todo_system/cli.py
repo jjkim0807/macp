@@ -1199,7 +1199,11 @@ def import_markdown_to_db(con: sqlite3.Connection) -> int:
     imported_slugs: set[str] = set()
     count = 0
     for path in iter_task_files():
-        task = parse_task_file(path)
+        try:
+            task = parse_task_file(path)
+        except FileNotFoundError:
+            print(f"import-md: skipped vanished {path}")
+            continue
         lane = lane_map.get(task.slug)
         upsert_task(con, task, lane)
         imported_slugs.add(task.slug)
