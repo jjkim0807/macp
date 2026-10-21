@@ -338,6 +338,7 @@ def test_ahead_of_origin_still_exits_zero_and_reports_ahead(isolated_vault, monk
 def test_end_to_end_records_and_commits_only_the_journal(isolated_vault, monkeypatch, capsys):
     assert session_log.ROOT == isolated_vault.root
     monkeypatch.setattr(session_end, "ROOT", isolated_vault.root)
+    monkeypatch.setenv("MACP_HOST_ID", "host-a")  # journal names carry the host
     root = isolated_vault.root
     _init_repo(root)
     _commit(root, "seed.txt", "seed")
@@ -353,9 +354,9 @@ def test_end_to_end_records_and_commits_only_the_journal(isolated_vault, monkeyp
     )
     committed = _run_git(root, "show", "--name-only", "--format=", "HEAD").split()
     assert len(committed) == 1
-    assert committed[0].startswith("Memory/sessions/") and committed[0].endswith("-demo.md")
+    assert committed[0].startswith("Memory/sessions/") and committed[0].endswith("-demo.host-a.md")
 
-    journals = list(isolated_vault.sessions.glob("*-demo.md"))
+    journals = list(isolated_vault.sessions.glob("*-demo.*.md"))
     assert len(journals) == 1
     text = journals[0].read_text(encoding="utf-8")
     assert "did stuff" in text

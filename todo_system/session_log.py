@@ -21,6 +21,14 @@ Design notes
 - **Auto-captures git state.** Given `--repo-dir`, each checkpoint records the
   target repo's HEAD/branch/dirtiness and the commit subjects that landed since
   the previous checkpoint — the agent only has to add a freeform note.
+- **One file per host.** A journal is `Memory/sessions/<date>-<slug>.<host>.md`
+  (`<date>-<id>-<slug>.<host>.md` with `--session`). With one file per day and
+  project, a mac and the HQ VM recording the same project on the same day each
+  created the same path, and the two commits add/add-conflicted on every
+  `git rebase origin/main` — vault push stayed blocked (2026-10-19). The host is
+  `orchestrator.hq_host.local_host_id()` (`MACP_HOST_ID` env > `~/.macp/host_id`
+  > hostname), slugified. Older unsuffixed journals are still listed and shown
+  but never appended to again.
 
 Usage
 -----
@@ -34,8 +42,8 @@ Usage
     # Optionally sync the vault in the same call:
     python3 -m todo_system.session_log log --project foo --note "..." --commit --push
 
-    python3 -m todo_system.session_log list           # recent journals
-    python3 -m todo_system.session_log show foo        # a project's journal
+    python3 -m todo_system.session_log list           # recent journals, every host
+    python3 -m todo_system.session_log show foo        # a project's latest journal(s), every host
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ import subprocess
 from pathlib import Path
 
 from . import paths
+from .orchestrator import hq_host
 
 # Vault root, via the shared resolver. paths is stdlib-only, so this module
 # still runs from a bare `git clone` under plain `python3` (no uv / deps), and
@@ -61,6 +70,7 @@ _FM_ORDER = [
     "tags",
     "project",
     "session",
+    "host",
     "event_date",
     "recorded_date",
     "updated",
@@ -87,6 +97,25 @@ def _now_local() -> dt.datetime:
 def _slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
     return slug or "session"
+
+
+def _host_id(home: Path | None = None) -> str:
+    """This host's id for journal filenames, from the same identity the HQ guard
+    uses (`MACP_HOST_ID` > `~/.macp/host_id` > hostname). Only the first DNS
+    label of a hostname is kept, since macOS flaps its `.local` suffix per
+    network. `home` is the test seam `hq_host.local_host_id` already has."""
+    raw = hq_host.local_host_id(home).strip().split(".", 1)[0]
+    return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "unknown-host"
+
+
+def _split_journal_name(path: Path) -> tuple[str, str | None]:
+    """``(base, host)`` of a journal filename; host is None for legacy files.
+
+    Host ids are ``[a-z0-9-]`` only and new filenames carry no other dot (a
+    ``--session`` id's dots are dashed), so the last dot in the stem is the host
+    separator."""
+    base, dot, host = path.name.removesuffix(".md").rpartition(".")
+    return (base, host) if dot else (host, None)
 
 
 # ---------------------------------------------------------------------------
@@ -479,19 +508,27 @@ def _render_checkpoint(ts: dt.datetime, note: str | None, git: dict | None) -> s
 # ---------------------------------------------------------------------------
 
 
-def _session_path(project: str, session: str) -> Path:
-    return SESSIONS_DIR / f"{session}-{_slugify(project)}.md"
+def _session_path(project: str, session: str, host: str) -> Path:
+    return SESSIONS_DIR / f"{session}-{_slugify(project)}.{host}.md"
 
 
-def _session_path_with_id(project: str, session_id: str, date: str) -> Path:
-    return SESSIONS_DIR / f"{date}-{session_id}-{_slugify(project)}.md"
+def _session_path_with_id(project: str, session_id: str, date: str, host: str) -> Path:
+    return SESSIONS_DIR / f"{date}-{_file_session_id(session_id)}-{_slugify(project)}.{host}.md"
 
 
-def _find_session_journal(project: str, session_id: str) -> Path | None:
+def _file_session_id(session_id: str) -> str:
+    # The host suffix is split off at the last dot, so none may precede it.
+    return session_id.replace(".", "-")
+
+
+def _find_session_journal(project: str, session_id: str, host: str) -> Path | None:
     if not SESSIONS_DIR.exists():
         return None
     matches = sorted(
-        SESSIONS_DIR.glob(f"*-{session_id}-{_slugify(project)}.md"), reverse=True
+        SESSIONS_DIR.glob(
+            f"*-{_file_session_id(session_id)}-{_slugify(project)}.{host}.md"
+        ),
+        reverse=True,
     )
     return matches[0] if matches else None
 
@@ -501,19 +538,23 @@ def cmd_log(args: argparse.Namespace) -> int:
     explicit_session = args.session is not None
     session = args.session or now.date().isoformat()
     project = args.project
+    host = _host_id()
+    # Only this host's file is ever appended to. Unsuffixed journals from before
+    # per-host naming are legacy and read-only: appending to one from two hosts
+    # would just trade the add/add conflict for a modify/modify one.
     if explicit_session:
-        # A journal already on disk under the pre-fix naming (`{session}-{project}.md`,
-        # e.g. an old journal whose session id happens to look like a date) keeps
-        # being appended to as-is rather than split into a second file.
-        legacy_path = _session_path(project, session)
+        # A session id that names an existing default-session journal of this
+        # host (`{session}-{project}.{host}.md`, i.e. a date) keeps appending to
+        # it rather than splitting into a second file.
+        dated_path = _session_path(project, session, host)
         path = (
-            legacy_path
-            if legacy_path.exists()
-            else _find_session_journal(project, session)
-            or _session_path_with_id(project, session, now.date().isoformat())
+            dated_path
+            if dated_path.exists()
+            else _find_session_journal(project, session, host)
+            or _session_path_with_id(project, session, now.date().isoformat(), host)
         )
     else:
-        path = _session_path(project, session)
+        path = _session_path(project, session, host)
 
     repo_dir = Path(args.repo_dir).expanduser().resolve() if args.repo_dir else None
     if not args.note and repo_dir is None:
@@ -555,6 +596,7 @@ def cmd_log(args: argparse.Namespace) -> int:
             "tags": ["memory", "session"],
             "project": project,
             "session": session,
+            "host": host,
             "event_date": fm.get("event_date", now.date().isoformat()),
             "recorded_date": now.date().isoformat(),
             "updated": now.isoformat(timespec="seconds"),
@@ -641,7 +683,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         status = fm.get("status", "?")
         ckpts = fm.get("checkpoints", "?")
         updated = fm.get("updated", "?")
-        print(f"- {path.name:<48} status={status:<7} checkpoints={ckpts:<3} updated={updated}")
+        host = fm.get("host") or _split_journal_name(path)[1] or "-"
+        print(
+            f"- {path.name:<60} status={status:<7} checkpoints={ckpts:<3} "
+            f"updated={updated} host={host}"
+        )
     return 0
 
 
@@ -719,13 +765,29 @@ def cmd_show(args: argparse.Namespace) -> int:
     if not SESSIONS_DIR.exists():
         print("(no sessions recorded yet)")
         return 1
-    candidates = sorted(
-        SESSIONS_DIR.glob(f"*-{_slugify(args.project)}.md"), reverse=True
-    )
-    if not candidates:
+    suffix = f"-{_slugify(args.project)}"
+    # Journal key = the filename minus any host suffix, so one day's (or one
+    # session's) files from every host share a key. A legacy unsuffixed name
+    # whose session id held a dot splits wrongly, so fall back to the stem.
+    keyed: list[tuple[str, Path]] = []
+    for path in SESSIONS_DIR.glob("*.md"):
+        base = _split_journal_name(path)[0]
+        stem = path.name.removesuffix(".md")
+        if base.endswith(suffix):
+            keyed.append((base, path))
+        elif stem.endswith(suffix):
+            keyed.append((stem, path))
+    if not keyed:
         print(f"(no session journal for project '{args.project}')")
         return 1
-    print(candidates[0].read_text(encoding="utf-8"))
+    latest = max(key for key, _ in keyed)
+    group = sorted(path for key, path in keyed if key == latest)
+    if len(group) == 1:
+        print(group[0].read_text(encoding="utf-8"))
+        return 0
+    for path in group:
+        print(f"==> {path.name} <==")
+        print(path.read_text(encoding="utf-8"))
     return 0
 
 
@@ -741,7 +803,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_log = sub.add_parser("log", help="Append a checkpoint to a project's session journal")
+    p_log = sub.add_parser(
+        "log",
+        help="Append a checkpoint to a project's session journal "
+        "(one file per host: <date>-<slug>.<host>.md)",
+    )
     p_log.add_argument("--project", required=True, help="Project slug the session is about")
     p_log.add_argument("--note", help="Freeform note describing what was done since the last checkpoint")
     p_log.add_argument("--repo-dir", help="Path to the project repo; auto-captures git HEAD/branch/new-commits")
@@ -779,7 +845,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--apply", action="store_true", help="Actually write the swept files")
     p_sweep.set_defaults(func=cmd_sweep)
 
-    p_show = sub.add_parser("show", help="Print the most recent journal for a project")
+    p_show = sub.add_parser(
+        "show", help="Print the most recent journal(s) for a project — every host's"
+    )
     p_show.add_argument("project")
     p_show.set_defaults(func=cmd_show)
 

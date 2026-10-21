@@ -75,9 +75,25 @@ def _today() -> str:
     return session_log._now_local().date().isoformat()
 
 
+# Journal filenames carry the host id, so every test runs as one fixed host
+# rather than whatever machine pytest happens to be on.
+HOST = "host-a"
+
+
+@pytest.fixture(autouse=True)
+def _pin_host(monkeypatch):
+    monkeypatch.setenv("MACP_HOST_ID", HOST)
+
+
+def _name(session: str | None = "s1", project: str = "demo", host: str = HOST) -> str:
+    """Today's journal filename; ``session=None`` is the default (dated) session."""
+    stem = f"{_today()}-{project}" if session is None else f"{_today()}-{session}-{project}"
+    return f"{stem}.{host}.md"
+
+
 def _journal(vault, name: str | None = None) -> tuple[dict, str]:
     if name is None:
-        name = f"{_today()}-s1-demo.md"
+        name = _name()
     return session_log.parse_frontmatter((vault.sessions / name).read_text(encoding="utf-8"))
 
 
@@ -117,7 +133,7 @@ def test_same_day_same_project_appends_to_a_single_journal(isolated_vault):
     assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "alpha-note"]) == 0
     assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "beta-note"]) == 0
 
-    assert [p.name for p in isolated_vault.sessions.glob("*.md")] == [f"{_today()}-s1-demo.md"]
+    assert [p.name for p in isolated_vault.sessions.glob("*.md")] == [_name()]
     fm, body = _journal(isolated_vault)
     assert fm["checkpoints"] == "2"
     assert body.count("## Checkpoints") == 1
@@ -129,17 +145,16 @@ def test_default_session_id_is_todays_date(isolated_vault):
     assert session_log.main(["log", "--project", "demo", "--note", "n"]) == 0
     files = list(isolated_vault.sessions.glob("*.md"))
     assert len(files) == 1
-    stem = files[0].name.removesuffix("-demo.md")
+    stem = files[0].name.removesuffix(f"-demo.{HOST}.md")
     assert dt.date.fromisoformat(stem) == dt.datetime.now(dt.timezone.utc).astimezone().date()
 
 
 def test_explicit_session_ids_split_the_journal(isolated_vault):
     session_log.main(["log", "--project", "demo", "--session", "morning", "--note", "a"])
     session_log.main(["log", "--project", "demo", "--session", "evening", "--note", "b"])
-    today = _today()
     assert sorted(p.name for p in isolated_vault.sessions.glob("*.md")) == [
-        f"{today}-evening-demo.md",
-        f"{today}-morning-demo.md",
+        _name("evening"),
+        _name("morning"),
     ]
 
 
@@ -151,7 +166,7 @@ def test_explicit_session_id_preserves_today_date_in_filename_and_event_date(iso
         ["log", "--project", "demo", "--session", "compact-controls", "--note", "n"]
     ) == 0
 
-    expected = isolated_vault.sessions / f"{today}-compact-controls-demo.md"
+    expected = isolated_vault.sessions / _name("compact-controls")
     assert expected.exists()
     fm, _ = session_log.parse_frontmatter(expected.read_text(encoding="utf-8"))
     assert fm["event_date"] == today
@@ -162,7 +177,7 @@ def test_appending_explicit_session_across_midnight_reuses_existing_file(isolate
     """A session that started yesterday keeps appending to yesterday's journal
     instead of splitting into a new file (and event_date is not recomputed)."""
     yesterday = (dt.date.fromisoformat(_today()) - dt.timedelta(days=1)).isoformat()
-    existing = isolated_vault.sessions / f"{yesterday}-compact-controls-demo.md"
+    existing = isolated_vault.sessions / f"{yesterday}-compact-controls-demo.{HOST}.md"
     existing.write_text(
         session_log._serialize_frontmatter(
             {
@@ -200,7 +215,7 @@ def test_derive_updated_parses_event_date_after_fix(isolated_vault):
         ["log", "--project", "demo", "--session", "compact-controls", "--note", "n"]
     ) == 0
     fm, _ = session_log.parse_frontmatter(
-        (isolated_vault.sessions / f"{today}-compact-controls-demo.md").read_text(encoding="utf-8")
+        (isolated_vault.sessions / _name("compact-controls")).read_text(encoding="utf-8")
     )
     derived = session_log._derive_updated(fm["event_date"], "23:59:59", fm["updated"])
     assert derived is not None
@@ -253,7 +268,7 @@ def test_sweep_leaves_journal_active_exactly_at_threshold(isolated_vault):
     # the stored `updated` land slightly earlier than intended, pushing elapsed
     # just past the boundary this test means to pin exactly.
     now = session_log._now_local().replace(microsecond=0)
-    _set_updated(isolated_vault, f"{_today()}-s1-demo.md", now - dt.timedelta(days=session_log.STALE_AFTER_DAYS))
+    _set_updated(isolated_vault, _name(), now - dt.timedelta(days=session_log.STALE_AFTER_DAYS))
 
     changed = session_log.sweep_stale_journals(now, apply=True)
     assert changed == []
@@ -265,13 +280,13 @@ def test_sweep_marks_journal_stale_just_past_threshold(isolated_vault):
     now = session_log._now_local().replace(microsecond=0)
     _set_updated(
         isolated_vault,
-        f"{_today()}-s1-demo.md",
+        _name(),
         now - dt.timedelta(days=session_log.STALE_AFTER_DAYS, seconds=1),
     )
     before_body = _journal(isolated_vault)[1]
 
     changed = session_log.sweep_stale_journals(now, apply=True)
-    assert changed == [isolated_vault.sessions / f"{_today()}-s1-demo.md"]
+    assert changed == [isolated_vault.sessions / _name()]
     fm, body = _journal(isolated_vault)
     assert fm["status"] == "stale"
     assert body == before_body  # body byte-identical, only frontmatter changed
@@ -289,7 +304,7 @@ def test_sweep_never_reopens_or_overwrites_a_done_session(isolated_vault):
         ["log", "--project", "demo", "--session", "s1", "--note", "a", "--status", "done"]
     )
     now = session_log._now_local()
-    _set_updated(isolated_vault, f"{_today()}-s1-demo.md", now - dt.timedelta(days=70))
+    _set_updated(isolated_vault, _name(), now - dt.timedelta(days=70))
 
     assert session_log.main(["sweep", "--apply"]) == 0
     assert _journal(isolated_vault)[0]["status"] == "done"
@@ -298,7 +313,7 @@ def test_sweep_never_reopens_or_overwrites_a_done_session(isolated_vault):
 def test_sweep_dry_run_reports_but_does_not_write(isolated_vault):
     session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "a"])
     now = session_log._now_local()
-    _set_updated(isolated_vault, f"{_today()}-s1-demo.md", now - dt.timedelta(days=70))
+    _set_updated(isolated_vault, _name(), now - dt.timedelta(days=70))
 
     assert session_log.main(["sweep"]) == 0
     assert _journal(isolated_vault)[0]["status"] == "active"
@@ -306,12 +321,12 @@ def test_sweep_dry_run_reports_but_does_not_write(isolated_vault):
 
 def test_project_name_is_slugified_into_the_filename(isolated_vault):
     session_log.main(["log", "--project", "Agent Commander", "--session", "s1", "--note", "n"])
-    assert (isolated_vault.sessions / f"{_today()}-s1-agent-commander.md").exists()
+    assert (isolated_vault.sessions / _name(project="agent-commander")).exists()
 
 
 def test_new_journal_gets_title_intro_and_canonical_frontmatter(isolated_vault):
     session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "n"])
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     fm, body = session_log.parse_frontmatter(raw)
 
     assert raw.startswith("---\ntags:\n  - memory\n  - session\n")
@@ -327,7 +342,7 @@ def test_event_date_is_pinned_at_creation_and_recorded_date_tracks_now(isolated_
     session_log.main(["log", "--project", "demo", "--session", "2020-01-01", "--note", "a"])
     session_log.main(["log", "--project", "demo", "--session", "2020-01-01", "--note", "b"])
     today = _today()
-    fm, _ = _journal(isolated_vault, f"{today}-2020-01-01-demo.md")
+    fm, _ = _journal(isolated_vault, _name("2020-01-01"))
     # the session id looks like a date, but it is not the event_date source
     assert fm["event_date"] == today
     assert fm["recorded_date"] == today
@@ -370,7 +385,7 @@ def test_frontmatter_survives_repeated_checkpoints_as_a_single_block(isolated_va
     for i in range(5):
         session_log.main(["log", "--project", "demo", "--session", "s1", "--note", f"note-{i}"])
 
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     assert "---# Manual session — demo (s1)" not in raw  # no fusion
     assert raw.count("\n---\n") == 1  # exactly one closing delimiter
     assert "\n---\n\n# Manual session — demo (s1)" in raw  # blank line intact
@@ -390,12 +405,12 @@ def test_repeated_checkpoints_never_stack_a_second_frontmatter_block(isolated_va
     for i in range(5):
         session_log.main(["log", "--project", "demo", "--session", "s1", "--note", f"note-{i}"])
         seen.append(session_log.parse_frontmatter(
-            (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+            (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
         )[0]["checkpoints"])
 
     assert seen == ["1", "2", "3", "4", "5"]
 
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     assert "\n------\n" not in raw  # the stacking seam never appears
     assert raw.count("\ncheckpoints: ") == 1  # one and only one counter on disk
     assert raw.count("# Manual session — demo (s1)") == 1
@@ -413,7 +428,7 @@ def test_status_done_sticks_on_a_late_checkpoint_and_list_reads_it_back(isolated
     )
     capsys.readouterr()
 
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     fm, _ = session_log.parse_frontmatter(raw)
     assert fm["status"] == "done"
     assert fm["checkpoints"] == "4"
@@ -438,7 +453,7 @@ def test_git_delta_stays_incremental_across_many_checkpoints(isolated_vault, tmp
     head2 = _commit(repo, "b.txt", "two")
     session_log.main(["log", "--project", "demo", "--session", "s1", "--repo-dir", str(repo)])
 
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     assert raw.count("session start; recent commits") == 1  # only checkpoint 1 is a "first"
     assert "1 new commit(s) since last checkpoint:" in raw
     assert raw.count("no new commits since last checkpoint.") == 2  # checkpoints 2 and 3
@@ -457,7 +472,7 @@ def test_related_tasks_stay_in_the_parsed_frontmatter_across_checkpoints(isolate
         )
     session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "later"])
 
-    raw = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    raw = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     assert "[[Todo/items/foo]]" in raw
     fm, _ = session_log.parse_frontmatter(raw)
     assert fm["related_tasks"] == ["[[Todo/items/foo]]"]  # carried, not duplicated
@@ -499,7 +514,7 @@ def test_a_damaged_journal_is_refused_rather_than_stacked_onto(isolated_vault, c
     """Fixing the round-trip does not heal existing files: ``parse_frontmatter``
     still returns ``({}, whole file)`` for them, so an unguarded ``cmd_log``
     would pile another block on top. It must bail without writing."""
-    journal = isolated_vault.sessions / f"{_today()}-s1-demo.md"
+    journal = isolated_vault.sessions / _name()
     journal.write_text(STACKED_JOURNAL, encoding="utf-8")
 
     assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "new"]) == 2
@@ -514,7 +529,7 @@ def test_a_damaged_journal_is_refused_rather_than_stacked_onto(isolated_vault, c
 def test_the_guard_does_not_fire_on_a_journal_without_frontmatter(isolated_vault):
     """A hand-written note that never had frontmatter is not damage — it opens
     with prose, not a delimiter, so the journal is appended to as usual."""
-    journal = isolated_vault.sessions / f"{_today()}-s1-demo.md"
+    journal = isolated_vault.sessions / _name()
     journal.write_text("# hand-written\n\nsome prose\n", encoding="utf-8")
 
     assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "new"]) == 0
@@ -730,7 +745,7 @@ def test_commit_stages_only_the_session_journal(isolated_vault, tmp_path, capsys
         == "chore(session): demo manual-work checkpoint"
     )
     assert _run_git(isolated_vault.root, "show", "--name-only", "--format=").split() == [
-        f"Memory/sessions/{_today()}-s1-demo.md"
+        f"Memory/sessions/{_name()}"
     ]
     # The unrelated file was in the same tree and stayed out of the commit.
     assert "?? Notes/someone-elses-work.md" in _run_git(
@@ -752,7 +767,7 @@ def test_commit_message_carries_the_project_name(isolated_vault):
         _run_git(isolated_vault.root, "log", "-1", "--format=%s")
         == "chore(session): Agent Commander manual-work checkpoint"
     )
-    assert (isolated_vault.sessions / f"{_today()}-s1-agent-commander.md").exists()
+    assert (isolated_vault.sessions / _name(project="agent-commander")).exists()
 
 
 def test_committing_with_nothing_staged_bails_without_a_new_commit(isolated_vault, tmp_path, capsys):
@@ -765,7 +780,7 @@ def test_committing_with_nothing_staged_bails_without_a_new_commit(isolated_vaul
     capsys.readouterr()
 
     # Re-run the commit helper without rewriting the journal: nothing to stage.
-    session_log._commit_and_maybe_push(isolated_vault.sessions / f"{_today()}-s1-demo.md", "demo", push=False)
+    session_log._commit_and_maybe_push(isolated_vault.sessions / _name(), "demo", push=False)
 
     assert "session-log: nothing staged to commit" in capsys.readouterr().out
     assert _run_git(isolated_vault.root, "rev-parse", "HEAD") == first
@@ -786,7 +801,7 @@ def test_commit_failure_is_reported_but_does_not_fail_the_command(isolated_vault
         == 0
     )
     assert "session-log: git add failed (is the vault a git repo?)" in capsys.readouterr().out
-    assert (isolated_vault.sessions / f"{_today()}-s1-demo.md").exists()
+    assert (isolated_vault.sessions / _name()).exists()
 
 
 def test_push_failure_leaves_the_commit_in_place(isolated_vault, tmp_path, capsys):
@@ -839,8 +854,7 @@ def test_list_shows_newest_first_and_show_prints_the_latest_journal(isolated_vau
 
     assert session_log.main(["list"]) == 0
     out = capsys.readouterr().out
-    today = _today()
-    assert out.index(f"{today}-2026-02-01-demo.md") < out.index(f"{today}-2026-01-01-demo.md")
+    assert out.index(_name("2026-02-01")) < out.index(_name("2026-01-01"))
     assert "status=active" in out
     assert "checkpoints=1" in out
 
@@ -947,15 +961,17 @@ def test_repair_is_idempotent(isolated_vault):
 def test_a_repaired_journal_accepts_checkpoints_again(isolated_vault, tmp_path):
     """End to end: repair clears the cmd_log guard, the counter resumes from 20
     instead of restarting, and the recovered last_head makes the next capture a
-    real delta rather than another "session start"."""
-    path = _install_fixture(isolated_vault)
+    real delta rather than another "session start". Installed under this host's
+    name: unsuffixed (legacy) journals are read-only and never appended to."""
+    name = f"2026-07-20-agent-commander.{HOST}.md"
+    path = _install_fixture(isolated_vault, name)
     session_log.main(["repair", str(path), "--apply"])
 
     assert session_log.main(
         ["log", "--project", "agent-commander", "--session", "2026-07-20", "--note", "resumed"]
     ) == 0
 
-    fm, body = _journal(isolated_vault, "2026-07-20-agent-commander.md")
+    fm, body = _journal(isolated_vault, name)
     assert fm["checkpoints"] == "21"
     assert fm["last_head"] == "8df9064a85bc12097fdd31655ed22ba4fc6e81ce"  # carried
     assert body.count("## Checkpoints") == 1
@@ -998,12 +1014,12 @@ def test_repair_leaves_healthy_journals_alone(isolated_vault, capsys):
     is the correct output, not a failure."""
     session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "one"])
     session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "two"])
-    healthy = (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8")
+    healthy = (isolated_vault.sessions / _name()).read_text(encoding="utf-8")
     capsys.readouterr()
 
     assert session_log.main(["repair", "--apply"]) == 0  # no paths → scans the dir
 
-    assert (isolated_vault.sessions / f"{_today()}-s1-demo.md").read_text(encoding="utf-8") == healthy
+    assert (isolated_vault.sessions / _name()).read_text(encoding="utf-8") == healthy
     assert "nothing to repair" in capsys.readouterr().out
 
 
