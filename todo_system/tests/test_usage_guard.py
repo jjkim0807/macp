@@ -550,3 +550,25 @@ def test_hermetic_against_host_usage_guard_env():
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+
+
+def test_disable_switch_allows_without_fetching(monkeypatch):
+    # README quick start sets USAGE_GUARD_DISABLE=1 on a host whose real account
+    # may be ahead of pace; check() must allow and must not fetch or persist.
+    import todo_system.usage_guard as ug
+    monkeypatch.setenv("USAGE_GUARD_DISABLE", "1")
+    def boom(*a, **k):
+        raise AssertionError("must not fetch when disabled")
+    monkeypatch.setattr(ug, "get_snapshot", boom)
+    monkeypatch.setattr(ug, "_save_state", boom)
+    d = ug.check()
+    assert d["allowed"] is True and d.get("disabled") is True
+    assert ug.check(account="other")["allowed"] is True
+
+
+def test_disable_switch_only_on_exact_one(monkeypatch):
+    import todo_system.usage_guard as ug
+    monkeypatch.setenv("USAGE_GUARD_DISABLE", "0")
+    monkeypatch.setattr(ug, "get_snapshot", lambda **k: {"error": "x"})
+    monkeypatch.setattr(ug, "_save_state", lambda s: None)
+    assert ug.check().get("disabled") is None

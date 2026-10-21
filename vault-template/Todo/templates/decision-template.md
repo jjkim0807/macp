@@ -2,51 +2,52 @@
 tags:
   - decision
 decision_date: YYYY-MM-DD
-decision_status: proposed   # proposed | accepted | superseded
+# decision_status: proposed | accepted | superseded
+decision_status: proposed
 event_date: YYYY-MM-DD
 recorded_date: YYYY-MM-DD
 affects_tasks: []
 supersedes: "-"
 ---
 
-# <결정 제목>
+# <Decision title>
 
-> 한 줄 요약: 무엇을 결정했고 왜.
+> One-line summary: what was decided, and why.
 
-## 맥락
+## Context
 
-- 이 결정이 필요했던 배경
-- 관련된 task / entity / 외부 사실
-- 시점, 마감
+- Why this decision was needed
+- Related tasks, entities, external facts
+- Timing and deadlines
 
-## 옵션들
+## Options
 
 ### Option A: ...
 
-- 장점: ...
-- 단점: ...
-- 비용 (시간/돈/기회): ...
+- Pros: ...
+- Cons: ...
+- Cost (time / money / opportunity): ...
 
 ### Option B: ...
 
-- 장점: ...
-- 단점: ...
-- 비용: ...
+- Pros: ...
+- Cons: ...
+- Cost: ...
 
-(필요 시 C, D 추가)
+(Add C, D if needed.)
 
-## 선택
+## Choice
 
-**선택**: Option X.
+**Chosen**: Option X.
 
-## 근거
+## Rationale
 
-- 왜 다른 옵션 대신 이것: 1~3 문장
-- 핵심 트레이드오프와 우선시한 가치
-- 인용한 사실 (e.g. [[entity-slug]], [[note-slug]])
+- Why this one over the others (1–3 sentences)
+- The key trade-off and which value won
+- Facts relied on (e.g. [[entity-slug]], [[note-slug]])
 
-## 결과 모니터링
+## Watching the outcome
 
-- 어떤 신호가 보이면 결정 재검토?
-- 다음 review 시점 (있다면)
-- 후속 task (있다면 [[task-slug]] 링크)
+- Which signal would make us revisit this?
+- Next review date (if any)
+- Follow-up tasks ([[task-slug]])

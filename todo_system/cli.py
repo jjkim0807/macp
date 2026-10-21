@@ -1349,7 +1349,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     content = content.replace("updated: 2026-05-19", f"updated: {today}")
     content = content.replace("due: YYYY-MM-DD", 'due: "-"')
     content = content.replace("worker_branch: \"worker/<slug>\"", f'worker_branch: "worker/{args.slug}"')
-    content = content.replace("# 작업 제목", f"# {args.title or args.slug}")
+    content = content.replace("- 2026-05-19: created", f"- {today}: created")
+    for heading in ("# Task title", "# 작업 제목"):          # English skeleton, older Korean vaults
+        content = content.replace(heading, f"# {args.title or args.slug}", 1)
 
     dest.write_text(content, encoding="utf-8")
     print(f"created {dest}")

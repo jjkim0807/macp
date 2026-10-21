@@ -924,6 +924,12 @@ def check(*, account: str | None = None, force: bool = False,
     active account (or `account=None`, the default) runs the byte-identical path
     below.
     """
+    if os.environ.get("USAGE_GUARD_DISABLE") == "1":
+        # Explicit off switch (README quick start, API-billed setups): no fetch,
+        # no state write, never a hold. Read per call like _cfg(), so a resident
+        # daemon follows the variable without a restart.
+        return {"allowed": True, "disabled": True,
+                "reason": "usage guard disabled (USAGE_GUARD_DISABLE=1)"}
     now = time.time() if now is None else now
     if account is not None:
         return _check_account(account, force=force, now=now)

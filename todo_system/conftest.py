@@ -326,6 +326,14 @@ def _kakao_isolated(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _usage_guard_not_disabled(monkeypatch):
+    # The README quick start exports USAGE_GUARD_DISABLE=1. A developer who then
+    # runs the suite in the same shell must not turn every pacing test green or
+    # red by accident; tests that want the switch set it themselves.
+    monkeypatch.delenv("USAGE_GUARD_DISABLE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _browser_watch_isolated(tmp_path, monkeypatch):
     # The probe script really exists on the HQ: without this, any test that
     # runs cmd_maintenance would spawn node and write the live state file.
