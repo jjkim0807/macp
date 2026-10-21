@@ -54,17 +54,48 @@ esac
 exit 0
 """
 
+# browser.sh stub in the REAL format: browser.sh write_ports_env writes lowercase
+# `name= kind= display= cdp= vnc= novnc= profile=` keys, and scratch-up ends by
+# cat-ing that ports.env to stdout (the wrapper must keep it off its own stdout).
+_STUB_BROWSER_SH_REAL = """#!/bin/sh
+echo "browser.sh $*" >> "$MARK"
+case "$1" in
+  scratch-up)
+    [ "$2" = default ] && exit 1
+    d="$MACP_BROWSER_DIR/scratch/$2"
+    mkdir -p "$d"
+    {
+      echo "name=$2"
+      echo "kind=scratch"
+      echo "display=:120"
+      echo "cdp=${STUB_CDP:-9286}"
+      echo "vnc=5990"
+      echo "novnc=6170"
+      echo "profile=$d/profile"
+    } > "$d/ports.env"
+    cat "$d/ports.env"
+    ;;
+  scratch-down)
+    [ "$2" = default ] && exit 1
+    rm -rf "$MACP_BROWSER_DIR/scratch/$2"
+    ;;
+esac
+exit 0
+"""
 
-@unittest.skipUnless(WRAPPER.is_file(), "scripts/macp-browser not in this tree")
-class MacpBrowserWrapperTest(unittest.TestCase):
+
+class _WrapperHarness:
+    """setUp + helpers shared by the wrapper test classes; STUB picks browser.sh."""
+
     URL = "https://example.com"
+    STUB = _STUB_BROWSER_SH
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.dir = self.tmp / "browser"
         self.dir.mkdir()
-        (self.dir / "browser.sh").write_text(_STUB_BROWSER_SH, encoding="utf-8")
+        (self.dir / "browser.sh").write_text(self.STUB, encoding="utf-8")
         for name in ("console.mjs", "text.mjs", "login-check.mjs"):
             (self.dir / name).write_text("", encoding="utf-8")
         self.node = self.tmp / "node"
@@ -76,12 +107,15 @@ class MacpBrowserWrapperTest(unittest.TestCase):
         self._tmp.cleanup()
 
     # --- helpers ----------------------------------------------------------
-    def run_wrapper(self, *args, rc=None, owner=None, instance=None):
+    def wrapper_env(self) -> dict:
         env = {**os.environ, "MACP_BROWSER_DIR": str(self.dir),
                "MACP_BROWSER_NODE": str(self.node), "MARK": str(self.mark)}
-        env.pop(OWNER_ENV, None)
-        env.pop("STUB_RC", None)
-        env.pop("MACP_BROWSER_INSTANCE", None)
+        for key in (OWNER_ENV, "STUB_RC", "MACP_BROWSER_INSTANCE", "STUB_BG", "STUB_CDP"):
+            env.pop(key, None)
+        return env
+
+    def run_wrapper(self, *args, rc=None, owner=None, instance=None):
+        env = self.wrapper_env()
         if rc is not None:
             env["STUB_RC"] = str(rc)
         if owner is not None:
@@ -119,6 +153,9 @@ class MacpBrowserWrapperTest(unittest.TestCase):
         path.write_text(re.sub(r'"expires_epoch":\d+', f'"expires_epoch":{past}', text),
                         encoding="utf-8")
 
+
+@unittest.skipUnless(WRAPPER.is_file(), "scripts/macp-browser not in this tree")
+class MacpBrowserWrapperTest(_WrapperHarness, unittest.TestCase):
     # --- (a) default back-compat -----------------------------------------
     def test_default_path_and_port_back_compat(self):
         # probe/text with no --instance exec node with NO MACP_BROWSER_CDP.
@@ -262,6 +299,44 @@ class MacpBrowserWrapperTest(unittest.TestCase):
                 self.assertEqual(out.returncode, 64, out.stderr)
                 self.assertIn("usage: macp-browser", out.stderr)
                 self.assertEqual(self.marked(), "")
+
+
+@unittest.skipUnless(WRAPPER.is_file(), "scripts/macp-browser not in this tree")
+class MacpBrowserRealPortsEnvTest(_WrapperHarness, unittest.TestCase):
+    """ports.env as the real browser.sh writes it: lowercase `cdp=<port>`."""
+
+    STUB = _STUB_BROWSER_SH_REAL
+
+    def test_scratch_acquire_cdp_from_real_ports_env(self):
+        out = self.run_wrapper("scratch", "acquire", "--owner", "x")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # The ports.env that scratch-up cats goes to stderr, never into the JSON.
+        self.assertEqual(out.stdout.count("\n"), 1, out.stdout)
+        shown = json.loads(out.stdout)
+        self.assertEqual(shown["cdp"], "http://127.0.0.1:9286")
+        self.assertIn("cdp=9286", out.stderr)
+
+    def test_named_instance_lowercase_cdp_is_injected(self):
+        d = self.dir / "instances" / "a"
+        d.mkdir(parents=True)
+        (d / "ports.env").write_text("name=a\nkind=named\ncdp=9281\n", encoding="utf-8")
+        self.acquire("x", instance="a")
+        out = self.run_wrapper("--instance", "a", "--owner", "x", "probe", self.URL)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(
+            self.marked(),
+            f"node {self.dir}/console.mjs probe {self.URL} cdp=http://127.0.0.1:9281\n")
+
+    def test_ports_env_bad_cdp_leaves_cdp_empty(self):
+        for bad in ("abc", "123456"):
+            with self.subTest(cdp=bad):
+                d = self.dir / "instances" / f"bad{len(bad)}"
+                d.mkdir(parents=True)
+                (d / "ports.env").write_text(f"name=a\ncdp={bad}\n", encoding="utf-8")
+                out = self.run_wrapper("--instance", d.name, "probe", self.URL)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertEqual(
+                    self.marked(), f"node {self.dir}/console.mjs probe {self.URL} cdp=\n")
 
 
 if __name__ == "__main__":

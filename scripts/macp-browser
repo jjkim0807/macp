@@ -88,10 +88,12 @@ valid_instance() { valid_owner "$1"; }
 # historic lease.json/lease.lock and NO CDP injection (the .mjs tools fall back
 # to 9277). Any other name gets its own lease.<name>.json / lease.<name>.lock,
 # and its CDP address from ports.env under instances/<name>/ or scratch/<name>/
-# (leaf 1 / browser.sh writes it). ports.env may name the address either as a
-# full MACP_BROWSER_CDP= line or as a CDP_PORT= entry in the assignment table;
-# prefer the explicit URL, else build one from the port. A missing ports.env
-# leaves CDP_URL empty (lease-only ops don't need it).
+# (leaf 1 / browser.sh writes it). ports.env may name the address as a full
+# MACP_BROWSER_CDP= line, a CDP_PORT= entry in the assignment table, or the
+# lowercase cdp=<port> that browser.sh write_ports_env actually writes; prefer
+# the explicit URL, then CDP_PORT, then cdp, and build the URL only from a port
+# of 1-5 digits. A missing ports.env or a bad port leaves CDP_URL empty
+# (lease-only ops don't need it).
 resolve_instance() {
   if [ "$INSTANCE" = "default" ]; then
     LEASE="$DIR/lease.json"
@@ -110,13 +112,21 @@ resolve_instance() {
   fi
   [ -n "$pe" ] || return 0
   CDP_URL=$(
+    # ports.env is the authority for this instance: drop anything the caller's
+    # env carries under the same names before sourcing it.
+    unset MACP_BROWSER_CDP CDP_PORT cdp
     # shellcheck disable=SC1090
     . "$pe" >/dev/null 2>&1
+    port=''
     if [ -n "${MACP_BROWSER_CDP:-}" ]; then
       printf '%s' "$MACP_BROWSER_CDP"
+      exit 0
     elif [ -n "${CDP_PORT:-}" ]; then
-      printf 'http://127.0.0.1:%s' "$CDP_PORT"
+      port=$CDP_PORT
+    elif [ -n "${cdp:-}" ]; then
+      port=$cdp
     fi
+    [[ $port =~ ^[0-9]{1,5}$ ]] && printf 'http://127.0.0.1:%s' "$port"
   )
 }
 
