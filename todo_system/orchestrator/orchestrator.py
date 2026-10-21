@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2636,7 +2637,18 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "auto":
         from . import tasks
-        cands = tasks.load_dispatchable(base / args.db)
+        import sqlite3
+        db = base / args.db
+        try:
+            cands = tasks.load_dispatchable(db)
+        except sqlite3.OperationalError:
+            if db.is_file():
+                raise
+            # A fresh vault has no todo.db until the first import. Say so and still
+            # run the tick (collect / reap / reconcile need no task database).
+            print(f"[orchestrator] no task database at {db} — run "
+                  "`python -m todo_system.cli import-md` first", file=sys.stderr)
+            cands = []
         result = orch.tick(cands)
         budget = f" BUDGET-REACHED (runs today={orch._runs_today()}/{orch.daily_run_budget})" \
             if result.get("budget_reached") else ""

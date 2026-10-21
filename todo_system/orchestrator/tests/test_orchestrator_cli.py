@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -470,13 +470,18 @@ class MainVaultRelativePathsTest(unittest.TestCase):
              mock.patch.object(orchestrator, "_pull_main"), \
              mock.patch.object(orchestrator, "_check_divergence"), \
              mock.patch.object(paths, "vault_root_or_cwd", lambda *a, **k: Path.cwd()), \
-             self.assertRaises(sqlite3.OperationalError):
-            self._run(
+             redirect_stderr(io.StringIO()) as err:
+            out = self._run(
                 ["--registry", str(self.vault / "Worker" / "agents" / "registry.yaml"),
                  "--ledger", str(self.vault / "Worker" / "assignments"),
                  "--uri", f"file://{self.vault / 'Worker' / 'agents'}",
                  "auto", "--db", "Todo/todo.db"],
                 cwd=self.elsewhere, vault_env=self.vault)
+        # Since the missing-db message (2026-10-21) this no longer raises: the old
+        # base misses the vault's todo.db, so the tick reports no candidates.
+        self.assertIn("no task database", err.getvalue())
+        self.assertIn(str(self.elsewhere), err.getvalue())
+        self.assertIn("candidates=0", str(out))
 
     def test_status_with_the_old_cwd_base_cannot_find_the_registry(self):
         """RED control for the second resolution site: with the old cwd base the
@@ -517,3 +522,21 @@ class MainVaultRelativePathsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoWithoutTaskDatabaseTest(unittest.TestCase):
+    """A fresh vault has no Todo/todo.db until the first `cli import-md`; `auto`
+    used to die with sqlite3.OperationalError. It now says what to run and still
+    completes the tick with no candidates."""
+
+    setUp = MainReadonlySubcommandsTest.setUp
+    _main = MainReadonlySubcommandsTest._main
+
+    def test_auto_explains_missing_db_and_ticks(self):
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc, out = self._main(["auto", "--db", str(self.tmp / "no-such" / "todo.db")])
+        self.assertIn(rc, (0, None))
+        self.assertIn("candidates=0", out)
+        self.assertIn("cli import-md", err.getvalue())
