@@ -203,4 +203,117 @@ AC 문구를 그대로 쓴다(Verify 체크리스트와 1:1). 각 항목은 **�
 - **사용량 보고(§2-7)** 는 **Codex(`--json` usage)·Gemini(`--output-format json` stats)** 가 인라인 토큰을 공식 제공. OpenCode 는 별도 `stats` 커맨드, Cursor·aider 는 미확인 → 이 둘은 `usage_rec=None`(Solar 와 동일) 로 꽂으면 된다.
 - **턴 상한(§2-3)** 은 **Gemini(`maxSessionTurns`+exit 53)** 만 공식. 나머지는 미확인이나, **벽시계 timeout 은 런너가 백엔드 밖에서 강제**하므로(§2-3) 치명적이지 않다.
 
+---
+
+## §4 `AgentBackend` 인터페이스 초안
+
+### 결정: altitude (Open Q1)
+
+인터페이스는 **저수준 `(argv, env)` 빌더가 아니라 고수준 `run_stage(...) →
+CompletedProcess`** 로 둔다. 이유: 추상화가 수용해야 할 **두 실제 모양**이 이미
+그 높이에서 만난다 —
+
+- **CLI 서브프로세스**: `config.build_invocation`(`:273`)이 `(argv, env)` 를 만들고
+  런너가 `run_stage_subprocess(timeout)`(`runner.py:1095`)로 돌려 `CompletedProcess` 를 얻는다.
+- **엔진 내 HTTP**: `solar_stage.run`(`:257`)은 서브프로세스 없이 도구루프를 돌고
+  **`CompletedProcess`-shape 를 직접 반환**(`:294`/`:390`)하며 자기 artifact 를 쓴다.
+
+`(argv, env)` 만 감싸면 HTTP 모양이 안 들어온다. 공통 분모는 **"스테이지 하나를
+돌리고 `returncode`/`stdout` 를 주고 artifact 를 남긴다"** — 그 높이가
+`runner.py:1046–1066` 의 `use_solar` 분기가 이미 두 경로를 합류시키는 바로 그 지점이다.
+
+### 인터페이스 (메서드 시그니처 초안)
+
+```python
+# todo_system/orchestrator/agent_backend.py (신규, 구현 태스크가 생성)
+from typing import Protocol
+from pathlib import Path
+import subprocess
+
+class AgentBackend(Protocol):
+    name: str  # vendor id: "claude" | "upstage" | "codex" | "gemini" | ...
+
+    def supports(self, capability: str) -> bool:
+        """이 백엔드가 명명된 스테이지 능력(§2)을 이행할 수 있는가.
+        capability ∈ {"headless","tool_allowlist","turn_cap","model_select",
+        "effort","add_dir","usage_report","exit_quota"}.
+        디스패처가 스테이지 실행 '전에' 호출한다. 태스크가 요구하는 능력을
+        백엔드가 지원하지 않으면 조용히 버리지 말고 거절/경고한다(구현 AC #3)."""
+
+    def run_stage(self, stage: str, *, task_id: str, run_id: str, run_dir: Path,
+                  branch: str, repo: str | None, working_dir: str | None,
+                  auto_merge: bool, account, tier: str | None,
+                  allowed_tools: str | None, project_context: str,
+                  retry_context: str, env: dict, timeout: float,
+                  progress) -> subprocess.CompletedProcess:
+        """스테이지 1개를 헤드리스 실행하고 CompletedProcess-shape(returncode +
+        stdout)를 반환하며, 스테이지 artifact(stages.STAGE_ARTIFACT[stage])를
+        run_dir 아래에 쓴다. 이 모양은 solar_stage.run 과 `claude -p` 서브프로세스가
+        '이미' 둘 다 내는 것이라, 런너의 공유 tail(r.returncode/r.stdout →
+        run.log·용량 체크·artifact 체크)이 무수정으로 읽는다.
+        시그니처 키워드는 stages.build_stage_argv 의 인자 집합과 1:1 (drop-in)."""
+
+    def classify_exit(self, rc: int, stdout: str) -> str:
+        """'success' | 'exhausted' | 'error' (§2-6). Claude: rc==0 且
+        model_select._UNAVAILABLE_MARKERS 부재 = success; 마커 있으면 exhausted
+        (→ 계정 회전). 쿼터 개념 없는 백엔드는 success/error 만."""
+
+    def report_usage(self, stage: str, run_dir: Path, handle) -> dict | None:
+        """stages.USAGE_KEYS 모양의 토큰 dict, 또는 사용량 채널이 없으면 None
+        (Solar 가 usage_rec=None 을 넘기듯 — None 이면 rc==0 용량 arm 이 inert)."""
+```
+
+CLI 계열(claude/codex/cursor/gemini/aider/opencode)은 이 Protocol 을 만족하는 **하나의
+`CliAgentBackend`** 로 묶는다: `run_stage` 가 (1) `stages.load_stage_prompt`+메타로 full
+프롬프트를 만들고, (2) `argv, env = config.build_invocation(account, full, extra_args)`
+— 여기서 `extra_args` 는 **vendor 별로 번역된 플래그**(claude 는 아래 바이트 동일
+세트, 다른 vendor 는 `supports()` 가 true 인 것만) — (3) `run_stage_subprocess` 로
+실행. HTTP 계열(upstage)은 `solar_stage.run` 을 감싸는 `SolarAgentBackend`.
+
+### Claude 백엔드 불변식: argv/env **바이트 동일** (필수 조건)
+
+Claude 백엔드의 `run_stage` 는 오늘 `build_stage_argv`+`_run` 이 만드는 argv·env 를
+**바이트 동일**하게 재현해야 한다. 구체 고정점:
+
+- **argv (순서 포함)** — `stages.py:491–503`:
+  `["claude","-p", full, "--model", <m>, "--effort", <e>, "--max-turns", <N>]`
+  `(+ ["--session-id", <uuid>] if usage_enabled())` `+ ["--allowed-tools", *tools]`
+  `(+ ["--add-dir", <worker_root>] if exists)`. **`--session-id` 는 가변인자
+  `--allowed-tools` 앞**(`:496–499` 주석), `--add-dir` 는 맨 끝. 이 순서가 깨지면 바이트
+  동일이 아니다.
+- **env** — `runner.py:1100` `stages.with_browser_owner(stage, stage_env, run_id)`
+  위에 claude 경로는 `claude_auth.claude_env()`(`:148`, `CLAUDE_CODE_OAUTH_TOKEN` 주입)
+  와 per-account `CLAUDE_CONFIG_DIR`(`_account_env` `:301`)·bash 타임아웃이 얹힌다.
+- **프롬프트 본문** — `strip_frontmatter(load_stage_prompt(stage))` + 런 메타 블록
+  (`stages.py:412–490`). 한 글자도 달라지면 안 된다.
+
+**오늘 이 argv 전체를 핀하는 테스트는 없다** — `build_stage_argv` 는
+`test_claude_accounts_switch.py:964` 에서 **mock(`return_value=["true"]`)으로만** 쓰이고
+출력을 검증하는 골든 테스트가 없다. 따라서 **구현 첫 leaf 는 리팩터 전에 먼저
+"현재 claude 스테이지 argv 를 스테이지별로 캡처하는 골든/스냅샷 테스트"를 추가**해야
+한다(그게 바이트 동일의 안전망이다 — §5 leaf ②-a).
+
+반면 **이미 존재해 무수정 green 으로 유지해야 할** 바이트 동일 테스트(= Verify 가
+확인할 것) — 전부 `todo_system/tests/test_macp_upstage_account.py`:
+- `test_build_invocation_claude_path_unchanged`(`:245`) — `build_invocation(Account(name="x"),"hi")` == `["claude","-p","hi"]`, env 에 `CLAUDE_CONFIG_DIR` 없음.
+- `test_build_invocation_never_launches_claude_for_an_upstage_account`(`:224`) — upstage 계정은 claude 로 안 샌다(ValueError).
+- `test_claude_only_profile_output_is_byte_identical`(`:171`) — upstage 계정을 더해도 claude-only 프로필 TOML 바이트 동일.
+- `test_account_for_round_robin_unchanged_by_an_upstage_account`(`:203`) — 계정 라운드로빈 불변.
+
+### 나머지 Open Q 결정 (구현 태스크가 "설계대로" 따름)
+
+- **Q2 — 모델 사다리·사용량 페이싱**: **초기엔 claude 전용으로 둔다.** `model_select`
+  의 `LADDERS`/`_probe`/`resolve_model`(claude 모델·`claude -p` 프로브)과 `usage_guard`
+  (`/api/oauth/usage` 구독 페이싱)는 claude 백엔드 안에 그대로 남기고, 비-Claude 백엔드는
+  **effort 없이·페이싱 없이** 돌린다(vendor별 모델은 `Account.models`). `classify_tier`
+  는 중립이라 공유. 이유: §2 요약표의 "claude 구독 전용" 열을 1차 범위에서 제외해야
+  비-Claude 백엔드 1종을 최소 변경으로 꽂는다.
+- **Q3 — 미지원 능력 처리**: **디스패치 시점에 거절/경고**(백엔드 `supports()`
+  반환을 디스패처가 검사). 조용한 무시 금지 — 특히 `tool_allowlist` 미지원 백엔드가
+  read-only 여야 할 research/verify 를 받으면 안 된다. 구현 AC #3 과 일치.
+- **Q4 — 첫 레인**: **단일 스테이지 delegate/quick 부터**(Solar 선례와 동일 —
+  `route_to_solar` 가 이미 그 두 스테이지만 비-claude 로 보낸다). 5-스테이지 전체
+  파이프라인은 이후. 이유: `use_solar` 분기가 이미 quick/delegate 에서 비-claude 를
+  수용하므로 가장 작은 안전한 시작점이고, §5 leaf 순서를 좌우한다.
+
 <!-- end -->
