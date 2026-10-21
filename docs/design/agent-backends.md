@@ -383,5 +383,3 @@ Q4 결정대로 **단일 스테이지 quick 부터** 붙인다(Gemini 의 확인
 
 구현 태스크([[macp-agent-backends-2-implement]])의 게이트는 여기에 전체 `pytest` 실패 0
 이 더해진다(위 ①~⑧ 각 leaf 가 자기 경계에서 green).
-
-<!-- end -->
