@@ -316,4 +316,72 @@ Claude 백엔드의 `run_stage` 는 오늘 `build_stage_argv`+`_run` 이 만드�
   파이프라인은 이후. 이유: `use_solar` 분기가 이미 quick/delegate 에서 비-claude 를
   수용하므로 가장 작은 안전한 시작점이고, §5 leaf 순서를 좌우한다.
 
+---
+
+## §5 구현 leaf 분할안 + 첫 에이전트 추천
+
+### leaf 순서 (각 20~60분, 경계마다 green — expand→migrate→contract)
+
+순서는 의존 체인이다. **첫 leaf 가 가장 안전·독립**(바이트 동일 안전망), 각 뒤 leaf 는
+앞 leaf 가 머지됐다고 가정한다. 각 leaf 는 자기만으로 컴파일·통과(tree 가 매 경계에서
+green)해야 하고, claude 경로는 ③까지 **바이트 동일**로 유지된다. 상위 구현 태스크
+[[macp-agent-backends-2-implement]] 의 AC 번호를 괄호로 매핑했다.
+
+| # | leaf | green 조건(완료) | touches | est |
+|---|---|---|---|---|
+| ① | **claude 스테이지 argv 골든 테스트 추가(안전망)** — 오늘 `build_stage_argv` 가 스테이지별로 내는 argv+env 모양을 스냅샷으로 핀. 프로덕션 코드 무변경(테스트만). 지금은 mock(`test_claude_accounts_switch.py:964`)뿐이라 리팩터를 지켜줄 핀이 없다 | 새 골든 테스트가 현재 argv 와 바이트 일치하며 green (AC #1 의 안전망) | `todo_system/tests/test_agent_backend_golden.py` (신규) | 40m |
+| ② | **`AgentBackend` Protocol + `ClaudeAgentBackend` 추가(additive)** — `agent_backend.py` 신규. `ClaudeAgentBackend.run_stage` 는 기존 `build_stage_argv`+`run_stage_subprocess` 를 **그대로 위임**(동작·argv·env 불변). 아직 아무도 호출 안 함 | 단위 테스트가 `ClaudeAgentBackend` argv==①골든; 전체 suite green (AC #1) | `todo_system/orchestrator/agent_backend.py`·`todo_system/tests/test_agent_backend.py` (신규) | 50m |
+| ③ | **디스패치를 claude 백엔드 경유로 migrate** — `runner.py:1046–1066` 의 claude 분기를 `ClaudeAgentBackend.run_stage` 호출로 교체(①골든이 바이트 동일 보증). `use_solar` 분기는 그대로 | 기존 전체 테스트+①골든 무수정 green; claude 경로 argv/env 불변 (AC #1) | `todo_system/orchestrator/runner.py` | 60m |
+| ④ | **디스패치 시 능력 게이트(거절/경고)** — `supports(capability)` + 디스패처가 태스크 요구 능력을 백엔드가 못 대면 **디스패치 전에 거절/경고**(특히 `tool_allowlist` 없는 백엔드 → read-only 여야 할 research/verify 거부) | allowlist 없는 백엔드를 research 에 배정 시 거절/경고하는 테스트 green (AC #3) | `agent_backend.py`·`stages.py`·`todo_system/tests/test_agent_backend_capability.py` (신규) | 50m |
+| ⑤ | **첫 비-Claude CLI 백엔드 추가(additive)** — `CliAgentBackend`(또는 추천 에이전트 구체 백엔드): `config.build_invocation`+번역된 extra_args 로 invocation, `classify_exit`, `report_usage=None`. `Account.agent`/태스크 frontmatter 로 선택. 아직 quick 에 미배선. **착수 시 추천 에이전트의 모델 선택 플래그(§3 미확인 칸)부터 프로브** | 단위 테스트가 비-claude argv/env 를 핀; 전체 green (AC #2 준비) | `agent_backend.py`·(필요시)`config.py`·`todo_system/tests/test_cli_agent_backend.py` (신규) | 60m |
+| ⑥ | **quick/delegate 라우팅 일반화(contract)** — `stages.route_to_solar` 단일 vendor 게이트를 "이 백엔드가 이 스테이지를 지원하는가" 일반 라우팅으로 교체. **Solar 경로는 계속 green**(회귀 금지) | Solar 테스트 무회귀 + 추천 에이전트가 quick 으로 라우팅되는 테스트 green (AC #2) | `stages.py`·`runner.py` | 50m |
+| ⑦ | **실제 quick 태스크 1건 완주(로컬 기록)** — 추천 에이전트 계정 설정 후 quick 태스크 1건을 **shadow 아닌 실제 실행**으로 끝까지. 로컬 run 기록 첨부 (추천 에이전트 CLI 가 호스트에 설치돼 있어야 함 — 없으면 이 leaf 가 blocked_on 으로 그 설치를 먼저 요구) | quick 태스크 1건이 비-claude 백엔드로 완주하고 로컬에 기록됨 (AC #2) | 계정 설정 + 로컬 run 기록(코드 변경 최소) | 40–60m |
+| ⑧ | **서술 갱신(계획 중 → 실제)** — `docs/concepts.md:28–29`·`README.md:31–32` 의 "planned/계획 중" 을 실제 지원 범위로 교체 | 두 문장이 실제 지원을 반영; `uvx ruff check .` rc 0 | `docs/concepts.md`·`README.md` | 20m |
+
+> ①→③ 이 "expand(인터페이스 추가)→migrate(디스패치 전환)" 이고 claude 를 바이트
+> 동일로 지킨다. ⑥ 이 "contract"(옛 단일 vendor 게이트 제거)인데 Solar 를 깨지 않게
+> 일반 라우팅으로 대체한다. ④ 능력 게이트는 ⑤ 비-claude 백엔드가 들어오기 전에 와야
+> 미지원 능력이 조용히 새지 않는다.
+
+### 첫 비-Claude 에이전트 추천: **Gemini CLI**
+
+추천 근거는 전부 §3 의 **✅ 공식 확인 칸**만 쓴다(미확인 칸에 기대지 않음):
+
+1. **유일하게 per-tool 허용목록을 공식 제공** (`tools.core` allowlist, `tools.exclude`,
+   `tools.allowed`). §2-2 는 능력 격차가 가장 큰 항목이고, 이 allowlist 덕분에
+   research/verify 의 **read-only 보장을 백엔드 차원에서 지킬 수 있다**(다른 후보는
+   AC #3 거절에 의존해야 함). Codex·Cursor 는 per-tool allowlist 미확인, aider 는 없음.
+2. **턴 상한 공식 제공** (`model.maxSessionTurns`, 초과 시 exit 53) — §2-3 을 직접 충족.
+3. **인라인 사용량 보고 공식 제공** (`--output-format json` 의 `stats` 토큰 + per-model
+   분해) — §2-7 을 `report_usage` 로 바로 채운다(Codex 도 `--json usage` 로 가능하나
+   아래 4번 이유로 2순위).
+4. 헤드리스(`-p`/`--prompt`)·프롬프트 전달 공식 확인.
+
+유일한 ⚠️: **모델 선택 CLI 플래그(`-m/--model`)가 공식 config 레퍼런스엔 미확인**
+(확인된 건 `model.name` 설정 / `GEMINI_MODEL` env). → leaf ⑤ 착수 시 `-m/--model`
+존재부터 프로브하고, 없으면 `Account.env` 로 `GEMINI_MODEL` 을 주입한다
+(`build_invocation` 이 이미 `account.env` 를 반환 env 에 넣으므로 배선은 그 경로).
+이건 작은 경계 프로브이지 블로커가 아니다.
+
+**2순위 OpenAI Codex CLI** (사용량 ✅·헤드리스 ✅지만 per-tool allowlist·모델 플래그가
+non-interactive 공식 페이지에 미확인), **최소 배선용 aider** (`--message` 로 가장 단순하나
+per-tool allowlist 가 없어 read-only 보장 불가 — delegate 외엔 비추천). **Cursor 는
+`-p` 무한 hang 포럼 보고**(§3 출처)로 신뢰성 리스크가 있어 1차 제외.
+
+Q4 결정대로 **단일 스테이지 quick 부터** 붙인다(Gemini 의 확인된 allowlist+usage 가
+첫 실제 실행을 가장 안전하게 만든다).
+
+### 완료 게이트 (이 설계 노트 자체의 "done")
+
+이 leaf(①, 설계 문서)는 **문서 전용 변경**이라 아래 둘로 닫는다(둘 다 docs-only 로
+사소히 통과하지만 Verify 가 실제로 돌린다):
+
+- `uvx ruff check .` → rc 0 (ruff 는 `.py` 만 린트; 문서는 무영향).
+- `bash scripts/check_engine_isolation.sh` → `RESULT: PASS`, exit 0 (게이트의
+  `git archive HEAD todo_system scripts .claude/commands pyproject.toml uv.lock README.md
+  LICENSE` 에 `docs/` 가 없으므로 문서 추가는 엔진 격리에 영향 없음).
+
+구현 태스크([[macp-agent-backends-2-implement]])의 게이트는 여기에 전체 `pytest` 실패 0
+이 더해진다(위 ①~⑧ 각 leaf 가 자기 경계에서 green).
+
 <!-- end -->
