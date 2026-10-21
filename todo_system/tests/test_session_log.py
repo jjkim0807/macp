@@ -881,6 +881,228 @@ def test_list_handles_an_empty_sessions_directory(isolated_vault, capsys):
 
 
 # ---------------------------------------------------------------------------
+# One journal per host
+#
+# With one file per day and project, a mac and the HQ VM recording the same
+# project on the same day each *created* the same path, and the vault's
+# `git rebase origin/main` add/add-conflicted on every sync (2026-10-19). Host
+# names here are neutral placeholders — real ones would trip the public
+# identifier gate.
+# ---------------------------------------------------------------------------
+
+
+def test_two_hosts_same_day_same_project_get_separate_journals(isolated_vault, monkeypatch):
+    assert session_log.main(["log", "--project", "demo", "--note", "from-a"]) == 0
+    monkeypatch.setenv("MACP_HOST_ID", "host-b")
+    assert session_log.main(["log", "--project", "demo", "--note", "from-b"]) == 0
+
+    assert sorted(p.name for p in isolated_vault.sessions.glob("*.md")) == [
+        _name(None, host="host-a"),
+        _name(None, host="host-b"),
+    ]
+    for host, note in (("host-a", "from-a"), ("host-b", "from-b")):
+        fm, body = _journal(isolated_vault, _name(None, host=host))
+        assert fm["checkpoints"] == "1"
+        assert fm["host"] == host
+        assert note in body
+
+
+def _clone_pair(base: Path) -> tuple[Path, Path]:
+    """A bare origin with one seed commit and two independent clones of it."""
+    origin = base / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], capture_output=True, check=True
+    )
+    seed = _init_repo(base / "seed")
+    _commit(seed, "README", "seed")
+    _run_git(seed, "push", "-q", str(origin), "main")
+    clones = []
+    for name in ("a", "b"):
+        clone = base / name
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(clone)], capture_output=True, check=True
+        )
+        _run_git(clone, "config", "user.email", "test@example.com")
+        _run_git(clone, "config", "user.name", "Test User")
+        _run_git(clone, "config", "commit.gpgsign", "false")
+        _run_git(clone, "config", "core.hooksPath", str(clone / ".no-hooks"))
+        clones.append(clone)
+    return clones[0], clones[1]
+
+
+def _log_commit_as(monkeypatch, tmp_path: Path, root: Path, host: str, note: str) -> None:
+    # Guard before anything can run `git add`: we must be pointed at a tmp clone.
+    assert root.is_relative_to(tmp_path)
+    monkeypatch.setattr(session_log, "ROOT", root)
+    monkeypatch.setattr(session_log, "SESSIONS_DIR", root / "Memory" / "sessions")
+    monkeypatch.setenv("MACP_HOST_ID", host)
+    assert session_log.main(["log", "--project", "demo", "--note", note, "--commit"]) == 0
+
+
+def _rebase_after_other_host_pushed(
+    monkeypatch, tmp_path: Path, base: Path, host_a: str, host_b: str
+) -> tuple[Path, subprocess.CompletedProcess]:
+    """Host a commits + pushes, host b commits, then b rebases onto origin —
+    exactly what the vault sync does on the second host."""
+    a, b = _clone_pair(base)
+    _log_commit_as(monkeypatch, tmp_path, a, host_a, "from-a")
+    _run_git(a, "push", "-q", "origin", "main")
+    _log_commit_as(monkeypatch, tmp_path, b, host_b, "from-b")
+    _run_git(b, "fetch", "-q", "origin")
+    rebase = subprocess.run(
+        ["git", "-C", str(b), "rebase", "origin/main"], capture_output=True, text=True
+    )
+    return b, rebase
+
+
+def test_two_hosts_log_commit_then_rebase_has_no_add_add_conflict(monkeypatch, tmp_path):
+    b, rebase = _rebase_after_other_host_pushed(
+        monkeypatch, tmp_path, tmp_path / "distinct", "host-a", "host-b"
+    )
+    assert rebase.returncode == 0, rebase.stdout + rebase.stderr
+    tracked = _run_git(b, "ls-files", "Memory/sessions").split()
+    assert tracked == [
+        f"Memory/sessions/{_name(None, host='host-a')}",
+        f"Memory/sessions/{_name(None, host='host-b')}",
+    ]
+
+    # RED control: the same scenario with one shared host id is the pre-fix
+    # shape (one path per day and project), and the rebase must hit add/add —
+    # otherwise the green half above could be passing vacuously.
+    b, rebase = _rebase_after_other_host_pushed(
+        monkeypatch, tmp_path, tmp_path / "same", "host-a", "host-a"
+    )
+    assert rebase.returncode != 0
+    assert f"AA Memory/sessions/{_name(None, host='host-a')}" in _run_git(
+        b, "status", "--porcelain"
+    )
+    _run_git(b, "rebase", "--abort")
+
+
+def test_list_and_show_include_both_hosts_journals(isolated_vault, monkeypatch, capsys):
+    session_log.main(["log", "--project", "demo", "--note", "alpha-note"])
+    monkeypatch.setenv("MACP_HOST_ID", "host-b")
+    session_log.main(["log", "--project", "demo", "--note", "beta-note"])
+    capsys.readouterr()
+
+    assert session_log.main(["list"]) == 0
+    listed = capsys.readouterr().out
+    assert _name(None, host="host-a") in listed
+    assert _name(None, host="host-b") in listed
+    assert "host=host-a" in listed and "host=host-b" in listed
+
+    assert session_log.main(["show", "demo"]) == 0
+    shown = capsys.readouterr().out
+    assert "alpha-note" in shown and "beta-note" in shown
+    assert shown.count("==> ") == 2
+    assert f"==> {_name(None, host='host-a')} <==" in shown
+
+
+def test_show_prints_one_journal_without_a_header(isolated_vault, capsys):
+    """A single host's latest journal prints exactly as before per-host files."""
+    session_log.main(["log", "--project", "demo", "--note", "only-note"])
+    capsys.readouterr()
+    assert session_log.main(["show", "demo"]) == 0
+    shown = capsys.readouterr().out
+    assert shown == (isolated_vault.sessions / _name(None)).read_text(encoding="utf-8") + "\n"
+
+
+def test_legacy_unsuffixed_journal_is_listed_shown_but_never_appended(isolated_vault, capsys):
+    legacy = isolated_vault.sessions / f"{_today()}-demo.md"
+    legacy.write_text(
+        session_log._serialize_frontmatter(
+            {
+                "tags": ["memory", "session"],
+                "project": "demo",
+                "session": _today(),
+                "status": "active",
+                "checkpoints": 1,
+            }
+        )
+        + "\n# Manual session — demo\n\n## Checkpoints\n\n### 09:00:00\n\nlegacy-note\n",
+        encoding="utf-8",
+    )
+    before = legacy.read_text(encoding="utf-8")
+
+    assert session_log.main(["log", "--project", "demo", "--note", "new-note"]) == 0
+
+    assert legacy.read_text(encoding="utf-8") == before  # byte-identical
+    fm, body = _journal(isolated_vault, _name(None))
+    assert fm["checkpoints"] == "1" and "new-note" in body
+    capsys.readouterr()
+
+    assert session_log.main(["list"]) == 0
+    listed = capsys.readouterr().out
+    assert legacy.name in listed and _name(None) in listed
+    assert "host=-" in listed  # a legacy journal has no host to show
+
+    assert session_log.main(["show", "demo"]) == 0
+    shown = capsys.readouterr().out
+    assert "legacy-note" in shown and "new-note" in shown
+
+
+def test_explicit_session_is_not_shared_across_hosts(isolated_vault, monkeypatch):
+    """Cross-midnight reuse of an explicit session only ever finds this host's file."""
+    yesterday = (dt.date.fromisoformat(_today()) - dt.timedelta(days=1)).isoformat()
+    a_file = isolated_vault.sessions / f"{yesterday}-s1-demo.host-a.md"
+    a_file.write_text(
+        session_log._serialize_frontmatter(
+            {"project": "demo", "session": "s1", "host": "host-a", "checkpoints": 1}
+        )
+        + "\n## Checkpoints\n\n### 23:55:00\n\nfirst\n",
+        encoding="utf-8",
+    )
+    before = a_file.read_text(encoding="utf-8")
+
+    monkeypatch.setenv("MACP_HOST_ID", "host-b")
+    assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "b"]) == 0
+    assert a_file.read_text(encoding="utf-8") == before
+    assert (isolated_vault.sessions / _name("s1", host="host-b")).exists()
+
+    # …while host-a still picks its own journal back up across midnight.
+    monkeypatch.setenv("MACP_HOST_ID", "host-a")
+    assert session_log.main(["log", "--project", "demo", "--session", "s1", "--note", "a"]) == 0
+    assert _journal(isolated_vault, a_file.name)[0]["checkpoints"] == "2"
+    assert not (isolated_vault.sessions / _name("s1", host="host-a")).exists()
+
+
+def test_a_dotted_session_id_keeps_the_host_suffix_unambiguous(isolated_vault, capsys):
+    session_log.main(["log", "--project", "demo", "--session", "v1.2", "--note", "dotted"])
+    path = isolated_vault.sessions / _name("v1-2")
+    assert path.exists()
+    assert session_log._split_journal_name(path) == (f"{_today()}-v1-2-demo", HOST)
+    assert _journal(isolated_vault, path.name)[0]["session"] == "v1.2"
+    capsys.readouterr()
+    assert session_log.main(["show", "demo"]) == 0
+    assert "dotted" in capsys.readouterr().out
+
+
+def test_host_id_resolution(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_HOST_ID", "HQ_Box.example")
+    assert session_log._host_id(tmp_path) == "hq-box"
+    monkeypatch.setenv("MACP_HOST_ID", "!!!")
+    assert session_log._host_id(tmp_path) == "unknown-host"
+
+    monkeypatch.delenv("MACP_HOST_ID")
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "host_id").write_text("Desk Top\n", encoding="utf-8")
+    assert session_log._host_id(tmp_path) == "desk-top"
+
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    monkeypatch.setattr(session_log.hq_host.socket, "gethostname", lambda: "Laptop.local")
+    assert session_log._host_id(empty_home) == "laptop"  # `.local` flaps per network
+
+
+def test_split_journal_name():
+    assert session_log._split_journal_name(Path("2026-10-21-demo.host-a.md")) == (
+        "2026-10-21-demo",
+        "host-a",
+    )
+    assert session_log._split_journal_name(Path("2026-10-21-demo.md")) == ("2026-10-21-demo", None)
+
+
+# ---------------------------------------------------------------------------
 # `repair`: unstacking journals the old round-trip already damaged
 #
 # The fixture is not synthetic. It is the real
@@ -1291,8 +1513,15 @@ def test_frontmatter_quotes_wikilinks_and_colon_bearing_list_items():
 # ---------------------------------------------------------------------------
 
 # `python3 -m todo_system.session_log` imports the package before the module, so
-# __init__.py is part of the contract too.
-STDLIB_ONLY_SOURCES = ("__init__.py", "session_log.py", "graph_memory.py")
+# __init__.py is part of the contract too — and so is the host-id helper
+# session_log imports (with its package __init__).
+STDLIB_ONLY_SOURCES = (
+    "__init__.py",
+    "session_log.py",
+    "graph_memory.py",
+    "orchestrator/__init__.py",
+    "orchestrator/hq_host.py",
+)
 
 
 def _import_roots(source: str) -> set[str]:
