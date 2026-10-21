@@ -29,7 +29,7 @@ You write tasks as small markdown files. macp then:
 macp aims to be **orthogonal to the coding agent**. The agent writes the code; macp
 decides what gets worked on, with which resources, and when. Agents sit behind an
 `Executor` interface. Today's executor drives [Claude Code](https://code.claude.com)
-(`claude -p`), and small quick/delegate tasks can also run on Upstage Solar.
+(`claude -p`); support for other coding agents is planned.
 
 **In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080
 tasks** on its own across **22 independent repositories**. In October 2026 that was

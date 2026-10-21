@@ -217,6 +217,5 @@ a decision, the task is **parked** for you (`awaiting_human`) with the question.
 - [How it works](concepts.md) — the pieces, the life of a task, the planner.
 - [Task files](tasks.md) — every frontmatter field, worker modes, templates.
 - [Running 24/7](running.md) — daemons, systemd/launchd units, the dashboard.
-- [Configuration](configuration.md) — environment variables, accounts, usage pacing,
-  Upstage Solar.
+- [Configuration](configuration.md) — environment variables, accounts, usage pacing.
 - [Troubleshooting](troubleshooting.md) — the mistakes everyone makes once.

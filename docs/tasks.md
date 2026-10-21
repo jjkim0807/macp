@@ -119,7 +119,6 @@ A task with no `worker_mode` belongs to you.
 | `acceptance_criteria` | list of checks verify must see pass |
 | `model_tier` | `heavy` · `standard` · `light`. Otherwise inferred (see [How it works](concepts.md#choosing-resources)) |
 | `long_job` | a shell command that outlives a stage (data collection, a long benchmark). The runner starts it detached and resumes the task when it ends |
-| `agent` | `upstage` runs quick/delegate stages on Upstage Solar (see [Configuration](configuration.md#upstage-solar)) |
 | `bypass_guard` | `true` lets this one task through a usage-pacing hold |
 
 ## Ordering and gating

@@ -7,7 +7,6 @@ be replaced by a `.macp/config.toml` in the vault.
 - [Environment variables](#environment-variables)
 - [Usage pacing](#usage-pacing)
 - [Profiles and accounts](#profiles-and-accounts)
-- [Upstage Solar](#upstage-solar)
 - [Anthropic usage and cost](#anthropic-usage-and-cost)
 - [Notifications and other integrations](#notifications-and-other-integrations)
 
@@ -41,7 +40,6 @@ in the skeleton, and the matching environment variable wins:
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |
 | `USAGE_GUARD_DISABLE` | `1` turns usage pacing off |
 | `USAGE_GUARD_*` | pacing thresholds (below) |
-| `UPSTAGE_API_KEY`, `MACP_UPSTAGE_KEY_FILE` | the Upstage key, or where to read it |
 | `ANTHROPIC_ADMIN_KEY` | Anthropic Admin API key for the usage/cost CLI |
 
 ## Usage pacing
@@ -81,43 +79,6 @@ A profile holds one or more agent accounts. Selection takes the project's pin fr
 `.macp/config.toml` if there is one, then the profile's `active_account`, then the
 lowest `priority` number (a Claude account defaults to 100). Several Claude accounts
 let the runner spread parallel runs across them.
-
-## Upstage Solar
-
-An account can come from another vendor. `upstage` uses an API key instead of a
-config directory:
-
-```bash
-uv run python -m todo_system.macp account add solar --agent upstage --priority 150
-uv run python -m todo_system.macp account probe solar --tier light   # one real call → one line of JSON
-```
-
-`--priority 150` keeps it *behind* the default Claude account.
-
-**The key is never stored.** It is read at call time from `UPSTAGE_API_KEY`, or else
-from a key file holding one `UPSTAGE_API_KEY=…` line. The default file is
-`~/.config/macp/upstage.env`; keep it at mode 0600, because a looser mode prints a
-warning. The profile keeps only the *path*, so no key reaches a config file, log line,
-commit or PR. `account list` reports where the key comes from
-(`key=env|file|missing`), never its value. Point elsewhere with `--key-file`,
-`MACP_UPSTAGE_KEY_FILE`, or `upstage_key_file` in a project's `.macp/config.toml`.
-
-**Running stages on Solar.** A task with `agent: upstage` in its frontmatter runs its
-`quick` or `delegate` stage on Solar (`orchestrator/solar_stage.py`). That is an
-in-engine tool-calling loop with read-file, write-file and finish tools and **no
-shell**, bounded by an iteration cap and a deadline. Every other task, and every
-stage of the five-stage pipeline, still runs on Claude Code.
-
-**Models.** The tier → model mapping defaults to date-pinned snapshots:
-`solar-pro4-260806` for heavy/standard and `solar-mini4-260922` for light. Pins age,
-so replace them per account:
-
-```bash
-uv run python -m todo_system.macp account add solar --agent upstage \
-    --models light=solar-mini4-260922,heavy=solar-pro4-260806
-```
-
-You can also edit `models = { … }` in the profile's `[[account]]` block.
 
 ## Anthropic usage and cost
 

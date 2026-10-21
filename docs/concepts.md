@@ -26,8 +26,7 @@ The planes talk only through **messages** (`TASK_ASSIGN`, `PROGRESS`, `RESULT`,
 tasks are chosen, and the orchestrator does not know how code gets written. That
 separation is what keeps macp independent of any particular agent. The runner calls an
 `Executor` (`todo_system/orchestrator/runner.py`). Today's executors drive Claude Code
-(`claude -p`), and for quick/delegate stages they can drive Upstage Solar
-(`orchestrator/solar_stage.py`).
+(`claude -p`); executors for other coding agents are planned.
 
 A person is a data-plane agent too: `registry.yaml` lists you as `kind: human`. Tasks
 routed to you are parked in your inbox, not executed.
@@ -197,7 +196,7 @@ workers.
 | `todo_system/orchestrator/human.py`, `resume.py`, `project_stall.py`, `decisions.py` | the human side: replies, conditional resume, stall and decision surfacing |
 | `todo_system/orchestrator/trace.py`, `metrics.py`, `dashboard.py` | read-only views of the system |
 | `todo_system/usage_guard.py` | subscription usage pacing |
-| `todo_system/macp/` | profiles and accounts (`python -m todo_system.macp`), including Upstage |
+| `todo_system/macp/` | profiles and accounts (`python -m todo_system.macp`) |
 | `todo_system/paths.py` | how the engine finds the vault and itself |
 | `.claude/commands/` | the stage prompts (`worker-research.md`, `worker-implement.md`, …) and interactive skills |
 | `scripts/` | daemons, the dashboard, unit installers and integrations — see [scripts/README.md](../scripts/README.md) |
