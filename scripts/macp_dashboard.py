@@ -78,6 +78,7 @@ RUNS = VAULT / "Worker" / "runs"
 STATE = VAULT / "Worker" / "_state"
 TODO_DB = VAULT / "Todo" / "todo.db"
 ITEMS = VAULT / "Todo" / "items"
+SESSIONS = VAULT / "Memory" / "sessions"
 REGISTRY = VAULT / "Worker" / "agents" / "registry.yaml"
 
 ACTIVE = ("dispatched", "in_progress")
@@ -613,7 +614,9 @@ def collect_projects(assignments: list[dict]) -> list[dict]:
     collect_status passes their slugs to collect_human, which leaves them out.
 
     Order: a project with a task running now first, then `priority` (high first),
-    then the subtree's latest activity (newest run dir or ledger update)."""
+    then the subtree's latest activity (newest of run dir, ledger update, task md
+    `updated`, linked session journal `updated`) — so hand work on a project whose
+    worker runs are old still reads as recent."""
     rows = []
     try:
         with _ro_conn(TODO_DB) as con:
@@ -622,8 +625,10 @@ def collect_projects(assignments: list[dict]) -> list[dict]:
             con.row_factory = sqlite3.Row
             cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
             prio = "priority" if "priority" in cols else "NULL"   # older DBs lack it
+            upd = "COALESCE(updated,'')" if "updated" in cols else "''"
             tasks = {r["slug"]: dict(r) for r in con.execute(
                 f"SELECT slug, title, status, COALESCE(parent_slug,'') parent, {prio} prio, "
+                f"{upd} upd, "
                 "COALESCE(is_parent,0) is_parent, COALESCE(next_action,'') next_action, "
                 "COALESCE(due,'') due, COALESCE(worker_mode,'') wm, "
                 "COALESCE(tags,'') tags FROM tasks")}
@@ -635,6 +640,11 @@ def collect_projects(assignments: list[dict]) -> list[dict]:
             kids.setdefault(t["parent"], []).append(slug)
     state = {r["task"]: r for r in assignments}
     last = _last_activity(assignments)
+    for s, t in tasks.items():                     # hand edits: the md's `updated`
+        _bump(last, s, _activity_when(t["upd"]))
+    for s, when in _session_activity().items():    # hand sessions (Memory/sessions)
+        if s in tasks:
+            _bump(last, s, when)
     for slug, t in tasks.items():
         if (t["status"] not in LIVE_PROJECT or _live_parent(t["parent"], tasks)
                 or not (t["is_parent"] or kids.get(slug))):
@@ -746,6 +756,91 @@ def _last_activity(assignments: list[dict]) -> dict[str, dt.datetime]:
         except ValueError:
             continue
         bump(r["task"], t.astimezone().replace(tzinfo=None) if t.tzinfo else t)
+    return out
+
+
+def _bump(out: dict[str, dt.datetime], slug: str, when: dt.datetime | None):
+    """Raise out[slug] to `when` — never lowers an existing value."""
+    if when and (slug not in out or when > out[slug]):
+        out[slug] = when
+
+
+def _parse_when(raw) -> dt.datetime | None:
+    """Local naive datetime from an ISO date/datetime ('' / '-' / junk → None). A bare
+    YYYY-MM-DD (task md `updated`) reads as that day's 00:00, so a same-day run time
+    still wins over it."""
+    raw = str(raw or "").strip()
+    if not raw or raw == "-":
+        return None
+    try:
+        t = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return t.astimezone().replace(tzinfo=None) if t.tzinfo else t
+
+
+def _activity_when(raw) -> dt.datetime | None:
+    """_parse_when, minus future times (they would render a negative age)."""
+    t = _parse_when(raw)
+    return t if t is not None and t <= dt.datetime.now() else None
+
+
+# path → (mtime, project, related slugs, updated) so a 3s poll re-reads a session
+# journal only when it changes.
+_SESSION_CACHE: dict[str, tuple[float, str, tuple[str, ...], dt.datetime | None]] = {}
+
+
+def _journal_slug(ref) -> str:
+    """'[[Todo/items/foo|별칭]]' / 'foo.md' / 'foo' → 'foo'."""
+    s = str(ref or "").strip().strip('"').strip("'").replace("[[", "").replace("]]", "")
+    return s.split("|")[0].rsplit("/", 1)[-1].removesuffix(".md").strip()
+
+
+def _session_activity() -> dict[str, dt.datetime]:
+    """{slug: latest journal `updated`} over Memory/sessions/*.md, keyed by each
+    journal's frontmatter `project` and every `related_tasks` slug — never by file
+    name (<date>-<slug>.<host>.md, <date>-<id>-<slug>.<host>.md and the legacy
+    <date>-<slug>.md all occur). Fail-soft: a missing dir, an unreadable or broken
+    file, or an unparseable/future `updated` is skipped."""
+    out: dict[str, dt.datetime] = {}
+    try:
+        paths = sorted(SESSIONS.glob("*.md"))
+    except OSError:
+        return out
+    if not paths:
+        _SESSION_CACHE.clear()
+        return out
+    try:
+        from todo_system.session_log import parse_frontmatter
+    except Exception:
+        return out
+    now = dt.datetime.now()
+    seen: set[str] = set()
+    for p in paths:
+        key = str(p)
+        try:
+            mtime = p.stat().st_mtime
+            hit = _SESSION_CACHE.get(key)
+            if hit is None or hit[0] != mtime:
+                fm, _ = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+                rel = fm.get("related_tasks") or []
+                if isinstance(rel, str):
+                    rel = [rel]
+                hit = (mtime, _journal_slug(fm.get("project")),
+                       tuple(s for s in map(_journal_slug, rel) if s),
+                       _parse_when(fm.get("updated")))
+                _SESSION_CACHE[key] = hit
+        except Exception:
+            continue
+        seen.add(key)
+        _, project, related, when = hit
+        if when is None or when > now:
+            continue
+        for s in (project, *related):
+            if s:
+                _bump(out, s, when)
+    for key in set(_SESSION_CACHE) - seen:          # keep the cache bounded
+        _SESSION_CACHE.pop(key, None)
     return out
 
 
@@ -1581,7 +1676,7 @@ const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div cla
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['대기','b-wait'],blocked:['블록','b-fail']};
 const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(dn*100/t):0,st=PST[r.status];
-  return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="최근 실행 ${esca(r.last_activity)}">${esc(r.last_age)} 전</span> `:''}<span class="pbar" title="${dn}/${t} 완료"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
+  return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="최근 활동 ${esca(r.last_activity)} (run·ledger·md·session 중 최신)">${esc(r.last_age)} 전</span> `:''}<span class="pbar" title="${dn}/${t} 완료"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
 const runRow=r=>{const w=r.when||'';return `<div class="row clk" data-open="run:${esca(r.run)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)} <span class="age mono">${esc(w.slice(0,2))}:${esc(w.slice(2,4))}</span></div><div class="note">${stages(r.stages)||'—'}${(r.artifacts||[]).length?' · '+esc((r.artifacts||[]).join(', ')):''}</div></div></div>`};
 const recentRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.todo_status&&r.todo_status!=='open'?` <span class="age">(${esc(r.todo_status)})</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span></div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+' 전':'—'}</span></div>`;
