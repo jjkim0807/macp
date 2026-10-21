@@ -1063,3 +1063,168 @@ def test_trace_repo_dir_fallback_no_env_is_engine_root(monkeypatch, tmp_path):
         captured = _trace_captured_repo_dir(empty_runs)
     # byte-identical to the pre-migration fallback (stages.REPO_ROOT) when unset.
     assert captured == [Path(trace.__file__).resolve().parents[2]]
+
+
+# --- vault_root_or_cwd(): the base for relative CLI arguments ------------------
+# The orchestrator/runner used to resolve --uri / --ledger / --db against
+# Path.cwd() implicitly. vault_root_or_cwd() moves that base to the vault while
+# keeping the cwd as the *fallback*, so an unresolvable install behaves exactly
+# as it did before the change rather than failing at argument assembly.
+
+
+def test_vault_root_or_cwd_returns_the_resolved_vault(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(tmp_path))
+    assert paths.vault_root_or_cwd() == tmp_path
+
+
+def test_vault_root_or_cwd_falls_back_to_cwd_when_unresolvable(monkeypatch, tmp_path):
+    def boom(start=None):
+        raise paths.VaultRootError("no vault")
+    monkeypatch.setattr(paths, "vault_root", boom)
+    monkeypatch.chdir(tmp_path)
+    # The fallback is what makes the migration byte-identical in the worst case.
+    assert paths.vault_root_or_cwd() == Path.cwd()
+
+
+def test_vault_root_or_cwd_propagates_other_errors(monkeypatch):
+    def boom(start=None):
+        raise OSError("disk")
+    monkeypatch.setattr(paths, "vault_root", boom)
+    # Only "cannot resolve" is a fallback case; real failures must stay loud.
+    with pytest.raises(OSError):
+        paths.vault_root_or_cwd()
+
+
+# --- worker_root(): the external-repo clone root (was hard-coded ~/Worker) -----
+
+
+def test_paths_worker_root_env_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_WORKER_ROOT", str(tmp_path / "w"))
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(
+        "worker_root = '/from-config'\n", encoding="utf-8")
+    assert paths.worker_root(start=tmp_path) == tmp_path / "w"
+
+
+@requires_tomllib
+def test_paths_worker_root_config_key_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_WORKER_ROOT", raising=False)
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(
+        'worker_root = "/srv/clones"\n', encoding="utf-8")
+    assert paths.worker_root(start=tmp_path) == Path("/srv/clones")
+
+
+def test_paths_worker_root_marker_without_key_falls_through_to_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_WORKER_ROOT", raising=False)
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text("profile = 'test'\n", encoding="utf-8")
+    # The historical default, byte-identical to the deleted DEFAULT_WORKER_ROOT.
+    assert paths.worker_root(start=tmp_path) == Path.home() / "Worker"
+
+
+def test_paths_worker_root_expands_tilde(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_WORKER_ROOT", "~/clones")
+    assert paths.worker_root(start=tmp_path) == Path.home() / "clones"
+
+
+def test_paths_worker_root_anchors_on_vault_not_cwd(monkeypatch, tmp_path):
+    """AC1 + AC3 together: resolvable from a cwd that is not the vault.
+
+    A cwd-upward search (what label_prefix() does) would find no .macp marker
+    under /tmp and silently take the default; anchoring on vault_root_or_cwd()
+    reads the vault's key instead.
+    """
+    vault = tmp_path / "vault"
+    (vault / ".macp").mkdir(parents=True)
+    (vault / ".macp" / "config.toml").write_text(
+        "worker_root = '/srv/clones'\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.delenv("MACP_WORKER_ROOT", raising=False)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault))
+    monkeypatch.chdir(elsewhere)
+    assert paths.worker_root() == Path("/srv/clones")
+
+
+# --- timezone(): the calendar zone (was four hard-coded "Asia/Seoul") ---------
+
+
+def test_paths_timezone_env_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(
+        "timezone = 'Asia/Seoul'\n", encoding="utf-8")
+    assert paths.timezone(start=tmp_path) == "Europe/Berlin"
+
+
+@requires_tomllib
+def test_paths_timezone_config_key_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(
+        'timezone = "Asia/Seoul"\n', encoding="utf-8")
+    assert paths.timezone(start=tmp_path) == "Asia/Seoul"
+
+
+def test_paths_timezone_falls_back_to_host_tz_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert paths.timezone(start=tmp_path) == "America/New_York"
+
+
+def test_paths_timezone_ignores_posix_rule_tz(monkeypatch, tmp_path):
+    """A TZ holding a POSIX rule string is not an IANA name — Google rejects it."""
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.setenv("TZ", "KST-9")
+    monkeypatch.setattr(paths, "_LOCALTIME_PATH", tmp_path / "missing-localtime")
+    assert paths.timezone(start=tmp_path) is None
+
+
+def test_paths_timezone_reads_localtime_symlink(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    zoneinfo_dir = tmp_path / "zoneinfo"
+    (zoneinfo_dir / "Europe").mkdir(parents=True)
+    zone = zoneinfo_dir / "Europe" / "Berlin"
+    zone.write_bytes(b"TZif")
+    localtime = tmp_path / "localtime"
+    localtime.symlink_to(zone)
+    monkeypatch.setattr(paths, "_LOCALTIME_PATH", localtime)
+    monkeypatch.setattr(paths, "_ZONEINFO_DIR", zoneinfo_dir)
+    assert paths.timezone(start=tmp_path) == "Europe/Berlin"
+
+
+def test_paths_timezone_is_none_when_nothing_answers(monkeypatch, tmp_path):
+    """AC2's "no key → host local": observed as None, which calendar_sync turns
+    into an *absent* timeZone key so Google applies the calendar's own zone."""
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(paths, "_LOCALTIME_PATH", tmp_path / "missing-localtime")
+    assert paths.timezone(start=tmp_path) is None
+
+
+def test_paths_timezone_none_when_localtime_is_outside_zoneinfo(monkeypatch, tmp_path):
+    """A symlink pointing outside the tzdata tree yields no name, not a crash."""
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    other = tmp_path / "elsewhere"
+    other.write_bytes(b"TZif")
+    localtime = tmp_path / "localtime"
+    localtime.symlink_to(other)
+    monkeypatch.setattr(paths, "_LOCALTIME_PATH", localtime)
+    monkeypatch.setattr(paths, "_ZONEINFO_DIR", tmp_path / "zoneinfo")
+    assert paths.timezone(start=tmp_path) is None
+
+
+def test_paths_timezone_anchors_on_vault_not_cwd(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / ".macp").mkdir(parents=True)
+    (vault / ".macp" / "config.toml").write_text(
+        "timezone = 'Europe/Berlin'\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault))
+    monkeypatch.chdir(elsewhere)
+    assert paths.timezone() == "Europe/Berlin"

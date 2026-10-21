@@ -47,6 +47,15 @@ repo layout. The wheel is recognised by that package-internal marker
 site-packages. It never consults ``MACP_VAULT_ROOT``: engine files ship with the
 code, vault data does not.
 
+``worker_root()`` and ``timezone()`` lift the last two **host assumptions** out of
+the code — "external repos live under ``~/Worker``" and "the calendar runs on
+Asia/Seoul" — into the same env → config-key → default ladder. Both anchor their
+config search at ``vault_root_or_cwd()`` instead of the cwd, because the
+orchestrator and runner have to read them while running from outside the vault.
+``vault_root_or_cwd()`` is ``vault_root()`` with a cwd fallback, used to resolve
+*relative CLI arguments* (``--ledger Worker/assignments``) against the vault
+rather than against wherever the process happened to start.
+
 ``vault_search_start()`` is the ``start=`` anchor the engine modules hand to
 ``vault_root()`` for their import-time constants: the engine root in a checkout
 (so the combined vault keeps finding itself with no env and no cwd involved), and
@@ -338,3 +347,146 @@ def repo_slug(start: Path | None = None) -> str:
             break
 
     return _DEFAULT_REPO_SLUG
+
+
+def vault_root_or_cwd(start: Path | None = None) -> Path:
+    """:func:`vault_root`, but falling back to the cwd instead of raising.
+
+    The base for resolving **relative CLI arguments** (``--uri file://Worker/agents``,
+    ``--ledger Worker/assignments``, ``--db Todo/todo.db``). Those used to resolve
+    against ``Path.cwd()`` implicitly, which forced every orchestrator/runner
+    invocation to run with its cwd *at* the vault; anchoring them here lets the
+    same relative defaults work from any directory.
+
+    Falls back to ``Path.cwd()`` on :class:`VaultRootError` so the worst case is
+    **byte-identical to the pre-resolver behaviour**: an install with neither
+    ``MACP_VAULT_ROOT`` nor a ``.macp`` marker keeps interpreting the arguments
+    exactly as it does today instead of failing at argument-assembly time. Other
+    exceptions pass through — only the "cannot resolve" case is a fallback case.
+
+    ``start`` is :func:`vault_root`'s test seam, forwarded unchanged.
+    """
+    try:
+        return vault_root(start=start)
+    except VaultRootError:
+        return Path.cwd()
+
+
+_DEFAULT_WORKER_ROOT = "~/Worker"
+
+
+def worker_root(start: Path | None = None) -> Path:
+    """Resolve the directory external repositories are cloned under.
+
+    Resolution order mirrors :func:`label_prefix`:
+
+    1. ``MACP_WORKER_ROOT`` environment variable, if set and non-empty.
+    2. The ``worker_root`` key of the nearest ``.macp/config.toml``.
+    3. ``~/Worker`` — the historical hard-coded default, so a host that
+       configures nothing keeps the clone layout it has today.
+
+    Both configured forms go through ``expanduser()``, so ``~/w`` is accepted.
+
+    Unlike :func:`label_prefix`, the config search starts at
+    :func:`vault_root_or_cwd` rather than the cwd: the orchestrator and runner
+    must resolve this knob while running from *outside* the vault (their cwd can
+    be an external repo checkout, or ``/tmp``), where a cwd-upward walk would
+    find no ``.macp`` marker at all. ``start``, when given, overrides that
+    anchor and is the test seam.
+
+    Resolved **per call**, never frozen into a module constant or a default
+    argument — an import-time snapshot is read before any test or caller can set
+    the env var, which is precisely the trap this resolver replaces.
+    """
+    env = os.environ.get("MACP_WORKER_ROOT")
+    if env:
+        return Path(env).expanduser()
+
+    base = (start or vault_root_or_cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "worker_root")
+            if key:
+                return Path(key).expanduser()
+            break
+
+    return Path(_DEFAULT_WORKER_ROOT).expanduser()
+
+
+_LOCALTIME_PATH = Path("/etc/localtime")
+_ZONEINFO_DIR = Path("/usr/share/zoneinfo")
+
+
+def _host_iana_timezone() -> str | None:
+    """The host's local timezone as an IANA name (``Asia/Seoul``), or None.
+
+    The stdlib has no "local IANA zone" API — ``time.tzname`` yields only
+    abbreviations (``KST``), which Google Calendar rejects. Two sources that do
+    carry the real name:
+
+    1. ``TZ``, when it looks like an IANA identifier (contains ``/``, or is
+       ``UTC``). A ``TZ`` holding a POSIX rule string (``KST-9``) is not a name
+       and is skipped.
+    2. ``/etc/localtime`` when it is a symlink into the zoneinfo database: its
+       target relative to ``/usr/share/zoneinfo`` *is* the IANA name.
+
+    Returns None when neither answers (a copied, non-symlink ``/etc/localtime``;
+    macOS variants; a container with no tzdata). Callers treat None as "say
+    nothing about the zone" rather than guessing a region.
+
+    Never raises: ``paths`` is imported by bare-``python3`` daemons, so a
+    missing or unreadable ``/etc`` must not take a daemon down. The two paths
+    are module constants so tests can point them at a ``tmp_path``.
+    """
+    env = os.environ.get("TZ")
+    if env and ("/" in env or env == "UTC"):
+        return env
+    try:
+        if _LOCALTIME_PATH.is_symlink():
+            target = Path(os.readlink(_LOCALTIME_PATH))
+            if not target.is_absolute():
+                target = (_LOCALTIME_PATH.parent / target).resolve()
+            name = target.relative_to(_ZONEINFO_DIR).as_posix()
+            return name or None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def timezone(start: Path | None = None) -> str | None:
+    """Resolve the IANA timezone calendar events are written in, or None.
+
+    Resolution order:
+
+    1. ``MACP_TIMEZONE`` environment variable, if set and non-empty.
+    2. The ``timezone`` key of the nearest ``.macp/config.toml``.
+    3. :func:`_host_iana_timezone` — the host's own zone, when it is
+       discoverable as an IANA name.
+    4. ``None``, meaning **"do not state a timezone"**. Calendar callers then
+       omit the ``timeZone`` key from the event body and Google applies the
+       target calendar's own zone, which is the correct reading of "host local"
+       for a vault that has pinned nothing.
+
+    The replacement for four hard-coded ``"Asia/Seoul"`` literals: a vault that
+    wants that zone pins ``timezone = "Asia/Seoul"`` in ``.macp/config.toml``.
+
+    Anchors its config search at :func:`vault_root_or_cwd`, not the cwd, for the
+    same reason :func:`worker_root` does. ``start`` overrides that anchor and is
+    the test seam. Resolved per call — the sync daemon is long-lived and should
+    pick up a config edit without a restart.
+    """
+    env = os.environ.get("MACP_TIMEZONE")
+    if env:
+        return env
+
+    base = (start or vault_root_or_cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "timezone")
+            if key:
+                return key
+            break
+
+    return _host_iana_timezone()
