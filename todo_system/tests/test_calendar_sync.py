@@ -581,5 +581,127 @@ def test_render_unified_calendar_and_todo_share_date_section(tmp_path, monkeypat
     assert "공유된 날짜 태스크" in section_block
 
 
+# --- AC2: the event timezone is configuration, not a hard-coded Asia/Seoul ----
+# `_event_timezone()` is `paths.timezone()`: MACP_TIMEZONE → the `timezone` key
+# of .macp/config.toml → the host's own IANA zone → None. None means the body
+# omits `timeZone` entirely and Google applies the calendar's own zone.
+#
+# TRAP these cases are written around: the gate runs with
+# MACP_VAULT_ROOT=vault-template, and the host's /etc/localtime usually answers,
+# so clearing MACP_TIMEZONE is NOT enough to reach the None branch — the
+# "no zone" cases patch the resolver itself.
+
+
+def _upsert(events, **kw):
+    """`_upsert_event` with everything but the timing fields pinned."""
+    fields = dict(scheduled_date=None, scheduled_start=None, scheduled_end=None,
+                  due_time=None)
+    fields.update(kw)
+    CS._upsert_event(_FakeService(events), "cal", "s", "title", "2026-08-10",
+                     next_action="", source_path="x.md", **fields)
+    return events.inserted[0]
+
+
+def _no_timezone_configured(monkeypatch):
+    monkeypatch.setattr(CS.paths, "timezone", lambda *a, **k: None)
+
+
+def test_event_timezone_comes_from_the_env(monkeypatch):
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    body = _upsert(_FakeEvents(), scheduled_start="09:00", scheduled_end="10:00")
+    assert body["start"]["timeZone"] == "Europe/Berlin"
+    assert body["end"]["timeZone"] == "Europe/Berlin"
+    # The dateTime half is untouched by the zone knob.
+    assert body["start"]["dateTime"].startswith("2026-08-10T09:00")
+
+
+def test_event_timezone_comes_from_the_config_key(monkeypatch, tmp_path):
+    """The `timezone` key of the vault's .macp/config.toml, read via paths."""
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(
+        'timezone = "Europe/Berlin"\n', encoding="utf-8")
+    monkeypatch.delenv("MACP_TIMEZONE", raising=False)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(tmp_path))
+    body = _upsert(_FakeEvents(), scheduled_start="09:00", scheduled_end="10:00")
+    assert body["start"]["timeZone"] == "Europe/Berlin"
+
+
+def test_due_time_event_also_takes_the_configured_timezone(monkeypatch):
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    body = _upsert(_FakeEvents(), due_time="14:30")
+    assert body["start"]["timeZone"] == "Europe/Berlin"
+    assert body["end"]["timeZone"] == "Europe/Berlin"
+    assert body["start"]["dateTime"].startswith("2026-08-10T14:30")
+
+
+def test_no_configured_timezone_omits_the_key_entirely(monkeypatch):
+    """"No key → host local" is observed as the ABSENCE of `timeZone`: Google
+    then applies the calendar's own timezone. Never a guessed region."""
+    _no_timezone_configured(monkeypatch)
+    body = _upsert(_FakeEvents(), scheduled_start="09:00", scheduled_end="10:00")
+    assert "timeZone" not in body["start"]
+    assert "timeZone" not in body["end"]
+    assert body["start"]["dateTime"].startswith("2026-08-10T09:00")
+
+
+def test_no_configured_timezone_omits_the_key_on_the_due_time_path(monkeypatch):
+    _no_timezone_configured(monkeypatch)
+    body = _upsert(_FakeEvents(), due_time="14:30")
+    assert "timeZone" not in body["start"]
+    assert "timeZone" not in body["end"]
+
+
+def test_all_day_event_never_carried_a_timezone(monkeypatch):
+    """Invariance: the all-day branch uses `date`, not `dateTime`, and the zone
+    knob must not start adding a key there."""
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    body = _upsert(_FakeEvents())
+    assert body["start"] == {"date": "2026-08-10"}
+    assert body["end"] == {"date": "2026-08-11"}
+
+
+def test_event_tzinfo_uses_the_configured_zone(monkeypatch):
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    offset = dt.datetime(2026, 1, 15, tzinfo=CS._event_tzinfo()).utcoffset()
+    assert offset == dt.timedelta(hours=1)        # CET in January
+
+
+def test_event_tzinfo_falls_back_to_the_host_zone_on_an_unknown_name(monkeypatch):
+    """A bad name must not raise inside a daemon tick; the clock arithmetic
+    call sites need an aware datetime and have no "say nothing" option."""
+    monkeypatch.setenv("MACP_TIMEZONE", "Not/AZone")
+    assert CS._event_tzinfo() == dt.datetime.now().astimezone().tzinfo
+
+
+class _RecordingEvents(_FakeEvents):
+    def __init__(self):
+        super().__init__()
+        self.list_kw: list[dict] = []
+
+    def list(self, **kw):
+        self.list_kw.append(kw)
+        return super().list(**kw)
+
+
+def _fetch(monkeypatch, events):
+    monkeypatch.setattr(CS, "load_credentials", lambda *a, **k: object())
+    monkeypatch.setattr(CS, "build", lambda *a, **k: _FakeService(events))
+    return CS.fetch_upcoming_events("cal", Path("/nope"), Path("/nope"))
+
+
+def test_fetch_passes_the_configured_timezone_to_the_api(monkeypatch):
+    monkeypatch.setenv("MACP_TIMEZONE", "Europe/Berlin")
+    events = _RecordingEvents()
+    _fetch(monkeypatch, events)
+    assert events.list_kw[0]["timeZone"] == "Europe/Berlin"
+
+
+def test_fetch_omits_the_timezone_argument_when_nothing_is_configured(monkeypatch):
+    _no_timezone_configured(monkeypatch)
+    events = _RecordingEvents()
+    _fetch(monkeypatch, events)
+    assert "timeZone" not in events.list_kw[0]
+
+
 if __name__ == "__main__":
     unittest.main()

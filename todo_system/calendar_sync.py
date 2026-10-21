@@ -20,6 +20,45 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 ROOT = paths.vault_root()
 
 
+def _event_timezone() -> str | None:
+    """The IANA timezone calendar events are written in, or None.
+
+    A thin wrapper over :func:`paths.timezone` (``MACP_TIMEZONE`` → the
+    ``timezone`` key of ``.macp/config.toml`` → the host's own zone), read at
+    CALL time because the sync daemon is long-lived and should pick up a config
+    edit without a restart.
+
+    ``None`` means "say nothing about the zone": the event body omits its
+    ``timeZone`` key and Google applies the target calendar's own timezone,
+    which is the correct reading of "host local" for a vault that has pinned
+    nothing. Replaces four hard-coded ``"Asia/Seoul"`` literals — a vault that
+    wants that zone writes ``timezone = "Asia/Seoul"`` in ``.macp/config.toml``.
+    """
+    return paths.timezone()
+
+
+def _event_tzinfo() -> dt.tzinfo | None:
+    """:func:`_event_timezone` as a ``tzinfo`` for local-clock arithmetic.
+
+    Used for the "now" that anchors the API's ``timeMin``/``timeMax`` windows
+    and the rendered date headings — not for event bodies, which carry the IANA
+    *name*. Falls back to the host's own local zone (``.astimezone()``) when
+    nothing is configured or the name has no tzdata entry; those call sites need
+    an aware datetime and have no "say nothing" option. Was a hard-coded
+    ``dt.timezone(dt.timedelta(hours=9))`` in five places.
+    """
+    name = _event_timezone()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            # Unknown name / no tzdata installed: the host's zone beats raising
+            # inside a daemon tick.
+            pass
+    return dt.datetime.now().astimezone().tzinfo
+
+
 def _extract_field_from_markdown(source_path: str, field: str) -> str | None:
     """Extract a frontmatter field value from a markdown file."""
     path = Path(source_path)
@@ -130,18 +169,29 @@ def _upsert_event(
         "reminders": {"useDefault": False, "overrides": []},
     }
 
+    # One lookup per event, applied to both ends. An absent `tz` leaves the key
+    # OUT of the body rather than writing a guess; with a `tz` the body is
+    # byte-identical to the previous hard-coded form, key order included.
+    tz = _event_timezone()
+
+    def _timed(when: dt.datetime) -> dict[str, str]:
+        d = {"dateTime": when.isoformat()}
+        if tz:
+            d["timeZone"] = tz
+        return d
+
     if scheduled_start and scheduled_end:
         # Use scheduled work time for calendar event
         start_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_start}:00")
         end_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_end}:00")
-        body["start"] = {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Seoul"}
-        body["end"] = {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Seoul"}
+        body["start"] = _timed(start_dt)
+        body["end"] = _timed(end_dt)
     elif due_time:
         # Fallback to due_time (deadline) — show as 1h event
         start_dt = dt.datetime.fromisoformat(f"{due_date.isoformat()}T{due_time}:00")
         end_dt = start_dt + dt.timedelta(hours=1)
-        body["start"] = {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Seoul"}
-        body["end"] = {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Seoul"}
+        body["start"] = _timed(start_dt)
+        body["end"] = _timed(end_dt)
     else:
         end_date = event_date + dt.timedelta(days=1)
         body["start"] = {"date": event_date.isoformat()}
@@ -200,7 +250,7 @@ def sync_due_tasks_to_calendar(
     # todo_slug we no longer sync, and events drift out of a narrow window
     # (done long ago, or newly worker-owned) faster than they get cleaned.
     open_slugs = {str(r["slug"]) for r in rows}
-    now = dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
+    now = dt.datetime.now(_event_tzinfo())
     time_min = (now - dt.timedelta(days=400)).isoformat()
     time_max = (now + dt.timedelta(days=400)).isoformat()
     deleted_stale = 0
@@ -274,26 +324,27 @@ def fetch_upcoming_events(
     creds = load_credentials(client_secret_path, token_path)
     service = build("calendar", "v3", credentials=creds)
 
-    KST = dt.timezone(dt.timedelta(hours=9))
-    now = dt.datetime.now(KST)  # Asia/Seoul
+    tzinfo = _event_tzinfo()
+    now = dt.datetime.now(tzinfo)
     # Start from today's midnight so today's earlier events still show
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     time_min = today_start.isoformat()
     time_max = (today_start + dt.timedelta(days=days)).isoformat()
 
-    result = (
-        service.events()
-        .list(
-            calendarId=calendar_id,
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=100,
-            timeZone="Asia/Seoul",
-        )
-        .execute()
-    )
+    list_kw: dict[str, object] = {
+        "calendarId": calendar_id,
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": True,
+        "orderBy": "startTime",
+        "maxResults": 100,
+    }
+    # Same rule as the event body: no configured zone means no `timeZone`
+    # argument, and Google answers in the calendar's own timezone.
+    tz_name = _event_timezone()
+    if tz_name:
+        list_kw["timeZone"] = tz_name
+    result = service.events().list(**list_kw).execute()
 
     events: list[dict[str, str]] = []
     for item in result.get("items", []):
@@ -302,8 +353,8 @@ def fetch_upcoming_events(
         all_day = "date" in item["start"]
 
         if not all_day and raw_start:
-            start_dt_parsed = dt.datetime.fromisoformat(raw_start).astimezone(KST)
-            end_dt_parsed = dt.datetime.fromisoformat(raw_end).astimezone(KST)
+            start_dt_parsed = dt.datetime.fromisoformat(raw_start).astimezone(tzinfo)
+            end_dt_parsed = dt.datetime.fromisoformat(raw_end).astimezone(tzinfo)
             start = start_dt_parsed.isoformat()
             end = end_dt_parsed.isoformat()
         else:
@@ -330,7 +381,7 @@ def render_calendar_markdown(
     """Render upcoming Google Calendar events as markdown."""
     events = fetch_upcoming_events(calendar_id, client_secret_path, token_path, days)
 
-    now = dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
+    now = dt.datetime.now(_event_tzinfo())
     synced = now.strftime("%Y-%m-%dT%H:%M:%S")
 
     lines = [
@@ -415,8 +466,7 @@ def render_unified_markdown(
     if events is None:
         events = fetch_upcoming_events(calendar_id, client_secret_path, token_path, days)
 
-    KST = dt.timezone(dt.timedelta(hours=9))
-    now = dt.datetime.now(KST)
+    now = dt.datetime.now(_event_tzinfo())
     synced = now.strftime("%Y-%m-%dT%H:%M:%S")
     today_str = now.strftime("%Y-%m-%d")
     tomorrow_str = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
