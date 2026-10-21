@@ -101,6 +101,19 @@ class FollowupsTest(unittest.TestCase):
             followups.parse_report_followups("# title\n\nno sections here"), [])
         self.assertEqual(followups.parse_report_followups(""), [])
 
+    def test_parse_korean_output_is_pinned(self):
+        # Exact output and id for a Korean report — pinned before the English
+        # aliases landed so Korean parsing stays byte-identical.
+        self.assertEqual(followups.parse_report_followups(REPORT_BOTH), [
+            {"section": "다음 단계", "text": "후속 A: 무언가를 재측정"},
+            {"section": "다음 단계", "text": "후속 B: 별도 태스크로 분리"},
+            {"section": "사람이 검토해야 할 부분", "text": "검토 필요: fail-open 분기 수동 확인"},
+        ])
+        self.assertEqual(
+            followups._fid("demo", "다음 단계", "후속 A: 무언가를 재측정"), "1b18a845689b")
+        self.assertEqual(followups.FOLLOWUP_SECTIONS,
+                         ("다음 단계", "사람이 검토해야 할 부분"))
+
     # ---- append / dedup -------------------------------------------------
 
     def test_append_records_open_followups(self):

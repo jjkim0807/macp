@@ -284,6 +284,16 @@ class ReportsTest(DiscoveryBase):
         self.assertEqual(discovery.parse_candidates(text), [])
 
 
+class ParseCandidatesAliasTest(DiscoveryBase):
+    def test_korean_candidates_pinned(self):
+        p = _report(self.episodes, "k1-discovery-a", URL_A, ["후보 A", "후보 B"])
+        self.assertEqual(discovery.parse_candidates(p.read_text(encoding="utf-8")),
+                         ["후보 A", "후보 B"])
+        e = _report(self.episodes, "k2-discovery-a", URL_A, [])
+        self.assertEqual(discovery.parse_candidates(e.read_text(encoding="utf-8")), [])
+        self.assertEqual(discovery.CANDIDATE_SECTION, "후보 태스크")
+
+
 class StateAtomicWriteTest(DiscoveryBase):
     def test_save_state_round_trips_valid_json(self):
         ok = discovery._save_state({"repos": {"a": 1}, "reports": {}}, self.state)
