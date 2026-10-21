@@ -10,3 +10,10 @@
 
 # owner/repo of THIS vault's git remote, used in links and PR bodies (MACP_REPO_SLUG).
 # repo_slug = "you/my-vault"
+
+# IANA timezone calendar events are written in (MACP_TIMEZONE). Left unset, events
+# carry no timezone and Google applies the target calendar's own.
+# timezone = "Asia/Seoul"
+
+# Where external repos (`repo:` tasks) are cloned (MACP_WORKER_ROOT). Default ~/Worker.
+# worker_root = "~/Worker"

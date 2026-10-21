@@ -80,7 +80,6 @@ uv run python -m todo_system.cli new hello-world --template auto-worker
 uv run python -m todo_system.cli validate hello-world   # → worker contract OK
 uv run python -m todo_system.cli import-md              # → imported tasks: 1
 
-cd ~/my-vault
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 #   → dispatched hello-world -> worker-default
 uv run --project ~/macp python -m todo_system.orchestrator.runner \
@@ -111,8 +110,7 @@ personal-scale system, published as-is:
   silent unless their config file exists; see
   [scripts/NOTIFICATIONS.md](scripts/NOTIFICATIONS.md).
 - Parts of the worker prompts (`.claude/commands/`), code comments and log messages
-  are in Korean, and calendar sync uses the `Asia/Seoul` time zone. Translation is in
-  progress.
+  are in Korean. Translation is in progress.
 
 Issues and pull requests are welcome.
 

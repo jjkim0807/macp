@@ -27,7 +27,12 @@ in the skeleton, and the matching environment variable wins:
 # label_prefix = "com.example."   # launchd/systemd label prefix (MACP_LABEL_PREFIX)
 # calendar_id  = "primary"        # Google Calendar for `cli calendar-sync` (MACP_CALENDAR_ID)
 # repo_slug    = "you/my-vault"   # this vault's GitHub remote, for links (MACP_REPO_SLUG)
+# timezone     = "Asia/Seoul"     # IANA zone for calendar events (MACP_TIMEZONE)
+# worker_root  = "~/Worker"       # where `repo:` tasks are cloned (MACP_WORKER_ROOT)
 ```
+
+Without `timezone`, calendar events use the host's own IANA zone. If the host does not
+report one, the event carries no zone and Google applies the calendar's own.
 
 ## Environment variables
 
@@ -35,6 +40,8 @@ in the skeleton, and the matching environment variable wins:
 |---|---|
 | `MACP_VAULT_ROOT` | the vault directory |
 | `MACP_LABEL_PREFIX`, `MACP_CALENDAR_ID`, `MACP_REPO_SLUG` | override the `.macp/config.toml` keys |
+| `MACP_TIMEZONE` | IANA timezone for calendar events (key `timezone`; default: the host's zone) |
+| `MACP_WORKER_ROOT` | where external repositories are cloned (key `worker_root`; default `~/Worker`) |
 | `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
 | `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |

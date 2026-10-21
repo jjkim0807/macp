@@ -62,7 +62,6 @@ uv run python -m todo_system.cli new hello-world --template auto-worker
 uv run python -m todo_system.cli validate hello-world   # → worker contract OK
 uv run python -m todo_system.cli import-md              # → imported tasks: 1
 
-cd ~/my-vault
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 #   → dispatched hello-world -> worker-default
 uv run --project ~/macp python -m todo_system.orchestrator.runner \

@@ -3,7 +3,7 @@
 [Getting started](getting-started.md) runs each piece once by hand. Running
 continuously means keeping five processes alive:
 
-| Process | Command (run from the vault) | Cadence |
+| Process | Command | Cadence |
 |---|---|---|
 | **runner** | `orchestrator.runner --agent worker-default --mode live-staged --daemon` | long-lived; executes pipelines |
 | **orchestrator tick** | `orchestrator.orchestrator auto` | every ~5 min: dispatch, collect, retry, reap |
@@ -17,7 +17,8 @@ morning brief, and the health report.
 ## The quickest way: four terminals
 
 ```bash
-cd ~/my-vault
+cd ~/my-vault      # only `cli daemon` still needs the vault as its cwd; the runner
+                   # and the orchestrator tick resolve it from MACP_VAULT_ROOT
 P="uv run --project $HOME/macp python"
 $P -m todo_system.orchestrator.runner --agent worker-default --mode live-staged --daemon
 $P -u -m todo_system.cli daemon --interval 3
@@ -85,7 +86,6 @@ checkout and `MACP_VAULT_ROOT`.
 ## A healthy system, at a glance
 
 ```bash
-cd ~/my-vault
 P="uv run --project $HOME/macp python"
 $P -m todo_system.orchestrator.orchestrator status     # the ledger
 $P -m todo_system.orchestrator.orchestrator agents     # runner liveness

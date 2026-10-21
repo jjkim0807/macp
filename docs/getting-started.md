@@ -94,11 +94,10 @@ never the database.
 
 ### 5. Dispatch, run, collect
 
-The orchestrator and runner resolve `Worker/` relative to the current directory, so
-run them from the vault:
+The orchestrator and runner find `Worker/` through `MACP_VAULT_ROOT`, so they work
+from any directory:
 
 ```bash
-cd ~/my-vault
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 # candidates=1 dispatched=1 ...
 #   dispatched hello-world -> worker-default
@@ -176,14 +175,13 @@ stops, and you merge it yourself.
 
 ```bash
 cd ~/macp && uv run python -m todo_system.cli import-md
-cd ~/my-vault
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 uv run --project ~/macp python -m todo_system.orchestrator.runner \
     --agent worker-default --mode live-staged --once
 ```
 
 `live-staged` runs the five stages, each as its own `claude -p` call. The repository
-is cloned under `~/Worker/<repo>`, and the run works in a fresh git worktree on the
+is cloned under `~/Worker/<repo>` (change the root with `MACP_WORKER_ROOT`), and the run works in a fresh git worktree on the
 branch `worker/add-version-flag`. A run can take from a few minutes to over an hour.
 
 ### 3. Read what happened
