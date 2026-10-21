@@ -105,4 +105,68 @@ other coding agents are **planned** / 다른 코딩 에이전트 지원은 **계
 
 - `docs/concepts.md:28–29`, `README.md:31–32` — "executors for other coding agents are **planned** / 계획 중". 구현 태스크([[macp-agent-backends-2-implement]] AC #4)가 실제 지원 범위로 갱신한다. 이 설계 노트는 참조만.
 
+---
+
+## §2 스테이지가 에이전트에 요구하는 능력 (8항목)
+
+스테이지 하나를 돌리려면 백엔드가 아래 8가지를 제공해야 한다. 능력 이름은 태스크
+AC 문구를 그대로 쓴다(Verify 체크리스트와 1:1). 각 항목은 **오늘의 Claude 기제**와
+**중립 백엔드가 노출해야 할 것**을 짝지었고, 끝에 그 능력이 **오늘 claude 구독 전용**
+인지 **이미 vendor 중립**인지를 표시한다.
+
+1. **헤드리스 프롬프트 실행** — 비대화형으로 프롬프트 1개를 받아 끝까지 자율 실행.
+   - *Claude 기제*: `claude -p <full_prompt>` (`stages.py:491`, 조립 `:490` `full = prompt + meta`). `-p`(= `--print`) 가 헤드리스 모드.
+   - *중립 백엔드*: `run_stage(stage, prompt, …)` — 프롬프트를 받아 1회 비대화 실행하고 종료코드·stdout 를 돌려주는 진입점. **모든 백엔드의 필수 능력**(없으면 후보 탈락).
+   - 상태: vendor 중립 가능(모든 후보 CLI 가 헤드리스 서브커맨드를 가짐 — §3).
+
+2. **도구 허용 목록** — 스테이지가 쓸 수 있는 셸/파일 도구를 화이트리스트로 제한.
+   - *Claude 기제*: `--allowed-tools Read Edit Write "Bash(git:*)" …` (`stages.py:499`); 목록은 `STAGE_TOOLS`(`:259`)에서 오고 `_safe_tools`(`:329`)가 `FORBIDDEN_TOOL_SUBSTRINGS`(`:303`)로 거른다. `Bash(git:*)` 는 claude 고유의 "툴명(글롭)" 문법.
+   - *중립 백엔드*: 능력 `supports("tool_allowlist")`. 지원하면 자기 표기로 번역, **미지원이면 조용히 무시하지 말고 디스패치 전에 거절/경고**(구현 AC #3 — 읽기전용이어야 할 research/verify 의 안전 보장이 조용히 증발하면 안 된다).
+   - 상태: claude 는 세밀(per-tool glob), 다수 후보는 **거친 승인 모드**(allow-all / per-command)뿐 — 능력 격차가 가장 큰 항목.
+
+3. **턴/시간 상한** — 한 스테이지가 무한정 돌지 않도록 바운드.
+   - *Claude 기제*: `--max-turns`(`stages.py:493`, `STAGE_MAX_TURNS` `:284` — implement 200, verify 50…) + 바깥의 `run_stage_subprocess(timeout=stage_timeout)`(`runner.py:1095`, 벽시계).
+   - *중립 백엔드*: 능력 "턴 상한"(있으면) + 공통 "시간 상한"(런너가 서브프로세스/호출을 벽시계로 reap — 백엔드 독립). 턴 개념 없는 백엔드는 시간 상한만.
+   - 상태: 시간 상한은 vendor 중립(런너가 강제). 턴 상한은 claude 고유 — 능력으로 노출하되 선택적.
+
+4. **모델·effort 선택** — 태스크 tier 에 맞는 모델과 추론 강도 지정.
+   - *Claude 기제*: `--model <id> --effort <max|high|medium>` (`stages.py:492`); id·effort 는 `stage_model`/`stage_effort`(`:85`/`:95`) → `model_select.LADDERS`/`TIER_EFFORT`(`:54`/`:64`)에서, tier 는 `classify_tier`(`:271`, **중립**)에서.
+   - *중립 백엔드*: tier→모델은 `Account.models`(`config.py:69`, 이미 중립, 예 `{"light":"solar-mini4-260922"}`) 또는 백엔드 기본. `effort` 는 **claude 전용 개념** — 능력 없으면 생략(미지원을 거절까진 안 함; 품질만 영향).
+   - 상태: tier 판정(classify_tier)은 중립. claude 모델 사다리·effort·가용성 프로브(`_probe` `:116`)는 **구독 전용**.
+
+5. **작업 디렉터리·추가 디렉터리** — 코드를 수정할 checkout(cwd)과 읽기 허용 추가 경로.
+   - *Claude 기제*: 외부 리포는 cwd=볼트 루트에서 프롬프트 메타의 `working_dir`(`stages.py:464`)로 안내 + `--add-dir <worker_root>`(`:502`)로 볼트 run_dir 아티팩트를 읽게 함.
+   - *중립 백엔드*: 능력 "cwd 설정"(모든 CLI 필수) + "추가 읽기 경로"(선택). `--add-dir` 대응물이 없으면 프롬프트에 경로를 적어 안내하거나 미지원 표기.
+   - 상태: cwd 는 vendor 중립. add-dir(샌드박스 밖 경로 허용)은 에이전트별 상이.
+
+6. **종료 의미 (성공 / 쿼터 소진 / 오류)** — 종료코드+출력을 세 갈래로 해석.
+   - *Claude 기제*: `rc==0` = 성공; 단 claude 는 **쿼터 소진에도 rc=0** 을 내므로(`model_select.py:86–90` 사건 주석) 출력을 `_UNAVAILABLE_MARKERS`(`:91`)/`stages.is_capacity_limit`로 함께 본다. 소진이면 `_maybe_rotate_account`(`runner.py:371`)가 계정 회전. 그 외 rc≠0 = 오류.
+   - *중립 백엔드*: 능력 `classify_exit(rc, stdout) → success|exhausted|error`. "쿼터 소진"의 신호는 vendor마다 다르다(claude=문구+rc0, upstage=`rate_limit` 토큰, OpenAI=HTTP 429…). **백엔드가 자기 신호를 공통 3갈래로 환원**.
+   - 상태: "성공/오류" 2갈래는 중립. "쿼터 소진" 감지와 계정 회전은 claude 구독 모델 특화 — Solar 는 `usage_rec=None` 으로 이 arm 을 아예 비활성(`runner.py:1051–1052`).
+
+7. **사용량 보고** — 스테이지가 쓴 토큰을 `stages.json` 에 기록.
+   - *Claude 기제*: `--session-id <uuid>`(`stages.py:498`, `MACP_STAGE_USAGE!=0` 일 때) 로 transcript 를 만들고 `record_stage_usage` 가 그 transcript 를 되읽어 `USAGE_KEYS`(`:375` input/output/cache_* 토큰) dict 로 저장.
+   - *중립 백엔드*: 능력 "사용량 보고". transcript read-back 은 claude 고유이므로, 백엔드는 자기 응답의 토큰 카운트를 **같은 `USAGE_KEYS` 모양 dict** 로 반환하면 된다. 없으면 `None`(비활성, 경보 아님).
+   - 상태: claude transcript 경로는 구독·CLI 전용. "토큰 dict 반환" 계약은 중립 — Solar 가 이미 집계하되 `usage_rec=None` 로 넘긴다.
+
+8. **프롬프트(.claude/commands) 전달** — 스테이지 지침을 에이전트에 어떻게 넣는가.
+   - *Claude 기제*: `load_stage_prompt`(`stages.py:309`)가 `.claude/commands/worker-<stage>.md` 전체를 읽어 `strip_frontmatter` 후 run 메타와 합쳐 `-p` 로 통째 전달.
+   - *중립 백엔드*: 두 모양이 이미 공존한다 — (a) **전체 프롬프트** 전달(CLI 백엔드: claude/codex/… 가 긴 지시문을 그대로 받음), (b) **축약 payload**(`_solar_task_prompt` `runner.py:238` = summary/outcome/next_action 만, HTTP 모델이 도구루프 시스템 프롬프트로 감쌈). 백엔드가 자기에 맞는 모양을 고르되, **디렉토리 이름 `.claude/`에 묶이지 않도록** 프롬프트 소스를 백엔드와 분리.
+   - 상태: `.md` 읽기는 중립. 어떤 모양으로 넣느냐는 백엔드 특성(전체 vs 축약).
+
+### 요약: 오늘 claude 구독 전용 vs 이미 vendor 중립
+
+| 능력 | claude 구독/CLI 전용 | 이미 vendor 중립(재사용) |
+|---|---|---|
+| (1) 헤드리스 실행 | `-p` 플래그 | 개념 자체(모든 CLI 지원) |
+| (2) 툴 허용목록 | `Bash(git:*)` 세밀 문법 | `_safe_tools`/`FORBIDDEN_TOOL_SUBSTRINGS` 필터 로직 |
+| (3) 턴/시간 상한 | `--max-turns` (턴) | 벽시계 timeout(런너가 강제) |
+| (4) 모델·effort | `LADDERS`·`TIER_EFFORT`·`_probe`·`--effort` | `classify_tier`·`Account.models` |
+| (5) cwd·add-dir | `--add-dir` | cwd 지정 |
+| (6) 종료 의미 | 쿼터 소진 rc0+문구, `_maybe_rotate_account` | success/error 2갈래, `classify_exit` 계약 |
+| (7) 사용량 보고 | `--session-id` transcript read-back | `USAGE_KEYS` dict 반환 계약 |
+| (8) 프롬프트 전달 | — | `.md` 읽기 + 전체/축약 선택(`_solar_task_prompt` 선례) |
+
+→ **설계 함의**: 구현 1차 범위를 "claude 구독 전용" 열(모델 사다리·`_probe`·usage_guard 페이싱·쿼터회전)은 **claude 백엔드 안에 그대로 두고**, "중립" 열만 인터페이스로 끌어올리면 비-Claude 백엔드 하나를 **페이싱·effort 없이** 최소로 꽂을 수 있다(§4 결정 Q2).
+
 <!-- end -->
