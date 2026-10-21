@@ -59,6 +59,25 @@ stage: report
 - 후속 하나만 있다
 """
 
+# The same two reports with English headings and an English "none" marker —
+# they must parse to exactly the Korean result.
+REPORT_BOTH_EN = (REPORT_BOTH
+                  .replace("## 사람이 검토해야 할 부분", "## Needs human review")
+                  .replace("## 다음 단계", "## Next steps"))
+
+REPORT_EMPTY_REVIEW_EN = """---
+stage: report
+---
+
+## Needs human review
+
+- None
+
+## Next steps
+
+- 후속 하나만 있다
+"""
+
 TS = "2026-01-01T00:00:00"
 
 
@@ -113,6 +132,46 @@ class FollowupsTest(unittest.TestCase):
             followups._fid("demo", "다음 단계", "후속 A: 무언가를 재측정"), "1b18a845689b")
         self.assertEqual(followups.FOLLOWUP_SECTIONS,
                          ("다음 단계", "사람이 검토해야 할 부분"))
+
+    def test_parse_english_headings_match_korean(self):
+        self.assertNotIn("## 다음 단계", REPORT_BOTH_EN)
+        self.assertEqual(followups.parse_report_followups(REPORT_BOTH_EN),
+                         followups.parse_report_followups(REPORT_BOTH))
+        self.assertEqual(followups.parse_report_followups(REPORT_EMPTY_REVIEW_EN),
+                         followups.parse_report_followups(REPORT_EMPTY_REVIEW))
+
+    def test_parse_none_marker_matches_korean_marker(self):
+        for heading in ("다음 단계", "Next steps"):
+            for marker in ("none", "None", "NONE.", "None — nothing to do"):
+                text = f"# r\n\n## {heading}\n\n- {marker}\n"
+                self.assertEqual(followups.parse_report_followups(text), [],
+                                 (heading, marker))
+        # word boundary: a real bullet that merely starts with "non…" is kept
+        self.assertEqual(
+            followups.parse_report_followups(
+                "# r\n\n## Next steps\n\n- nonexistent path in X\n"),
+            [{"section": "다음 단계", "text": "nonexistent path in X"}])
+
+    def test_parse_english_heading_ignores_case(self):
+        self.assertEqual(
+            followups.parse_report_followups("## next STEPS\n\n- 후속 E\n"),
+            [{"section": "다음 단계", "text": "후속 E"}])
+        self.assertEqual(
+            followups.parse_report_followups("## needs Human Review\n\n- 검토 E\n"),
+            [{"section": "사람이 검토해야 할 부분", "text": "검토 E"}])
+
+    def test_parse_korean_heading_wins_when_both_present(self):
+        text = "## Next steps\n\n- 후속 E\n\n## 다음 단계\n\n- 후속 K\n"
+        self.assertEqual(followups.parse_report_followups(text),
+                         [{"section": "다음 단계", "text": "후속 K"}])
+
+    def test_english_report_dedups_against_korean_report(self):
+        a = self._append_both(run="r1")
+        b = followups.append_followups(
+            REPORT_BOTH_EN, source_task="demo", source_run="r2", ts=TS)
+        self.assertEqual(len(a), 3)
+        self.assertEqual(b, [])
+        self.assertEqual(len(followups.load_followups()), 3)
 
     # ---- append / dedup -------------------------------------------------
 

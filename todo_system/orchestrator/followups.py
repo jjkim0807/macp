@@ -96,22 +96,47 @@ CLI = "python -m todo_system.orchestrator.followups"
 # The report.md sections whose bullets are follow-ups. Both are captured on
 # purpose (Research Open-Q): "다음 단계" is the obvious one, but a
 # "사람이 검토해야 할 부분" note is exactly the kind of thing that goes unowned.
-FOLLOWUP_SECTIONS = ("다음 단계", "사람이 검토해야 할 부분")
+# Each tuple is one section's accepted headings: [0] is the canonical (Korean)
+# name and is what gets recorded; the rest are English aliases, matched
+# case-insensitively, so an English report yields the same records and ids.
+NEXT_STEPS_HEADINGS = ("다음 단계", "Next steps")
+HUMAN_REVIEW_HEADINGS = ("사람이 검토해야 할 부분", "Needs human review")
+FOLLOWUP_SECTIONS = (NEXT_STEPS_HEADINGS[0], HUMAN_REVIEW_HEADINGS[0])
 
-# A bullet whose text is (or opens with) this sentinel is the section's
+# A bullet whose text is (or opens with) one of these sentinels is the section's
 # "nothing here" marker, not a follow-up — the report template writes
-# `- bullet (없으면 "없음")`.
-_EMPTY_MARKER = "없음"
+# `- bullet (없으면 "없음")`. `none` must stand as a whole word, so a real bullet
+# like "nonexistent path …" is kept.
+EMPTY_MARKERS = ("없음", "none")
+_EMPTY_MARKER = EMPTY_MARKERS[0]
+
+
+def section_body_any(text: str, headings: tuple[str, ...]) -> str | None:
+    """The block under the first of `headings` present in `text` (see _section_body).
+
+    Tried in tuple order, so the canonical heading wins when several appear.
+    Aliases after [0] ignore case; [0] keeps the exact case-sensitive match."""
+    for i, heading in enumerate(headings):
+        pat = re.escape(heading) if i == 0 else f"(?i:{re.escape(heading)})"
+        m = re.search(
+            rf"^##[ \t]+{pat}[ \t]*$(.*?)(?=^#{{1,2}}[ \t]|\Z)",
+            text or "", re.M | re.S)
+        if m:
+            return m.group(1)
+    return None
+
+
+def is_empty_marker(item: str) -> bool:
+    """True when a bullet's text is a "nothing here" sentinel (EMPTY_MARKERS)."""
+    return (item.startswith(EMPTY_MARKERS[0])
+            or re.match(rf"{EMPTY_MARKERS[1]}\b", item, re.I) is not None)
 
 
 def _section_body(text: str, section: str) -> str | None:
     """The raw block under `## <section>`, up to the next `#`/`##` header or EOF.
 
     None when the header is absent (distinct from present-but-empty)."""
-    m = re.search(
-        rf"^##[ \t]+{re.escape(section)}[ \t]*$(.*?)(?=^#{{1,2}}[ \t]|\Z)",
-        text or "", re.M | re.S)
-    return m.group(1) if m else None
+    return section_body_any(text, (section,))
 
 
 def parse_report_followups(text: str) -> list[dict]:
@@ -119,11 +144,13 @@ def parse_report_followups(text: str) -> list[dict]:
 
     Only TOP-LEVEL bullets (no leading whitespace) count — a nested sub-bullet is
     elaboration on its parent, not an item of its own, and `re.match` on `[-*]`
-    naturally drops any line that starts with a space. Blank and `없음` bullets are
-    skipped. Order is section order, then document order within a section."""
+    naturally drops any line that starts with a space. Blank and `없음`/`none`
+    bullets are skipped. English headings (`## Next steps`, `## Needs human
+    review`) are read too and recorded under the canonical Korean section name.
+    Order is section order, then document order within a section."""
     out: list[dict] = []
-    for section in FOLLOWUP_SECTIONS:
-        body = _section_body(text or "", section)
+    for headings in (NEXT_STEPS_HEADINGS, HUMAN_REVIEW_HEADINGS):
+        body = section_body_any(text or "", headings)
         if not body:
             continue
         for line in body.splitlines():
@@ -131,9 +158,9 @@ def parse_report_followups(text: str) -> list[dict]:
             if not bm:
                 continue
             item = bm.group(1).strip()
-            if not item or item.startswith(_EMPTY_MARKER):
+            if not item or is_empty_marker(item):
                 continue
-            out.append({"section": section, "text": item})
+            out.append({"section": headings[0], "text": item})
     return out
 
 
