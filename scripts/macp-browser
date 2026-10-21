@@ -328,11 +328,30 @@ lease() {
   esac
 }
 
+# Run browser.sh with stdin=/dev/null and stdout+stderr in a temp file, then
+# replay that file on stderr. browser.sh backgrounds Chrome/Xvfb, and a
+# background child that inherited our stderr pipe would keep
+# `out=$(macp-browser scratch acquire …)` from ever returning.
+browser_sh_detached() {
+  local log rc
+  log=$(mktemp "${TMPDIR:-/tmp}/macp-browser.XXXXXX") || {
+    echo "macp-browser: mktemp failed" >&2
+    return 1
+  }
+  bash "$DIR/browser.sh" "$@" </dev/null >"$log" 2>&1
+  rc=$?
+  cat "$log" >&2
+  rm -f "$log"
+  return "$rc"
+}
+
 # Throwaway login-less instances. acquire auto-names one (s-<owner>-<utc>), spins
 # it up via browser.sh scratch-up, leases it (always succeeds — fresh instance),
 # and prints one JSON line. release drops the lease and tears the instance down.
 # gc tears down every scratch instance whose lease is gone or expired. Never acts
 # on `default` (browser.sh refuses scratch-down default as a second guard).
+# browser.sh scratch-up/scratch-down run detached from the caller's
+# stdin/stdout/stderr (browser_sh_detached).
 scratch() {
   local sub="${1:-}" seen='' purpose='' purpose_set='' name='' acquired
   TTL=30
@@ -378,7 +397,7 @@ scratch_acquire() {
     echo "macp-browser: flock not found (needed for lease acquire/release)" >&2
     exit 69
   }
-  bash "$DIR/browser.sh" scratch-up "$INSTANCE" >&2 || {
+  browser_sh_detached scratch-up "$INSTANCE" || {
     echo "macp-browser: browser.sh scratch-up $INSTANCE failed" >&2
     exit 1
   }
@@ -415,7 +434,7 @@ scratch_release() {
   INSTANCE="$n"
   resolve_instance
   rm -f "$LEASE"
-  bash "$DIR/browser.sh" scratch-down "$n" >&2 || {
+  browser_sh_detached scratch-down "$n" || {
     echo "macp-browser: browser.sh scratch-down $n failed" >&2
     exit 1
   }
@@ -431,7 +450,7 @@ scratch_gc() {
     resolve_instance
     read_lease && continue   # live lease: leave it
     rm -f "$LEASE"
-    bash "$DIR/browser.sh" scratch-down "$nm" >&2 || true
+    browser_sh_detached scratch-down "$nm" || true
   done
 }
 

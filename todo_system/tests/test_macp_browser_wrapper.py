@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -73,6 +74,12 @@ case "$1" in
       echo "novnc=6170"
       echo "profile=$d/profile"
     } > "$d/ports.env"
+    if [ -n "$STUB_BG" ]; then
+      # A long-lived child that inherits our fds, like browser.sh's
+      # `running ... || setsid nohup google-chrome ... &` subshell.
+      sleep 60 &
+      echo $! > "$STUB_BG"
+    fi
     cat "$d/ports.env"
     ;;
   scratch-down)
@@ -92,6 +99,9 @@ class _WrapperHarness:
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        # A cleanup, not tearDown: cleanups a test registers later (e.g. killing
+        # a recorded pid read from a file in tmp) run before this one.
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.dir = self.tmp / "browser"
         self.dir.mkdir()
@@ -102,9 +112,6 @@ class _WrapperHarness:
         self.node.write_text(_STUB_NODE, encoding="utf-8")
         self.node.chmod(0o755)
         self.mark = self.tmp / "mark"
-
-    def tearDown(self):
-        self._tmp.cleanup()
 
     # --- helpers ----------------------------------------------------------
     def wrapper_env(self) -> dict:
@@ -337,6 +344,38 @@ class MacpBrowserRealPortsEnvTest(_WrapperHarness, unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertEqual(
                     self.marked(), f"node {self.dir}/console.mjs probe {self.URL} cdp=\n")
+
+    @staticmethod
+    def _kill_bg(pidfile: Path):
+        # Only the one pid the stub recorded, and only a positive one — never a
+        # pattern kill or a process-group signal.
+        try:
+            pid = int(pidfile.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return
+        if pid <= 0:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def test_scratch_acquire_returns_inside_command_substitution(self):
+        pidfile = self.tmp / "bg.pid"
+        self.addCleanup(self._kill_bg, pidfile)
+        env = {**self.wrapper_env(), "STUB_BG": str(pidfile)}
+        script = 'out=$(bash "$1" scratch acquire --owner x); printf %s "$out"'
+        try:
+            out = subprocess.run(["bash", "-c", script, "_", str(WRAPPER)], cwd=self.tmp,
+                                 env=env, capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("scratch acquire did not return within 10s inside $(...) — "
+                      "a background child holds the pipe")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(pidfile.exists(), "stub did not start its background child")
+        shown = json.loads(out.stdout)
+        self.assertTrue(shown["instance"].startswith("s-x-"), shown)
+        self.assertEqual(shown["cdp"], "http://127.0.0.1:9286")
 
 
 if __name__ == "__main__":
