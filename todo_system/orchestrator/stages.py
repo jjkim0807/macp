@@ -497,7 +497,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         # is variadic: nothing should depend on where its list ends.
         argv += [SESSION_ID_FLAG, str(uuid.uuid4())]
     argv += ["--allowed-tools", *_safe_tools(stage, allowed_tools)]
-    wr = Path(worker_root) if worker_root else (Path.home() / "Worker")
+    wr = Path(worker_root) if worker_root else paths.worker_root()
     if wr.exists():
         argv += ["--add-dir", str(wr)]
     return argv

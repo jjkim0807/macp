@@ -18,7 +18,20 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_WORKER_ROOT = Path.home() / "Worker"
+from .. import paths
+
+
+def _worker_root(worker_root: str | Path | None) -> Path:
+    """The clone root: an explicit argument, else :func:`paths.worker_root`.
+
+    Resolved HERE, at call time, and never as a function default. A
+    ``worker_root: Path = DEFAULT_WORKER_ROOT`` default — what every function
+    below used to carry — is evaluated once at import, so ``MACP_WORKER_ROOT``
+    (and the ``worker_root`` config key) could never take effect in a process
+    that imported this module before the env was read. That is the exact trap
+    this helper exists to close; keep the resolution inside the function body.
+    """
+    return Path(worker_root) if worker_root is not None else paths.worker_root()
 
 # Mirrors mailbox.py's GIT_TIMEOUT_* split: a clone talks to a remote and can
 # wedge on a stalled credential helper or dead network, so it gets the long
@@ -271,11 +284,11 @@ def repo_name(url: str) -> str:
     return name[:-4] if name.endswith(".git") else name
 
 
-def local_path(url: str, worker_root: str | Path = DEFAULT_WORKER_ROOT) -> Path:
-    return Path(worker_root) / repo_name(url)
+def local_path(url: str, worker_root: str | Path | None = None) -> Path:
+    return _worker_root(worker_root) / repo_name(url)
 
 
-def ensure_local(url: str, worker_root: str | Path = DEFAULT_WORKER_ROOT,
+def ensure_local(url: str, worker_root: str | Path | None = None,
                  clone: bool = False, log: list[str] | None = None) -> Path | None:
     """Resolve a git URL to a local checkout. Reuses an existing checkout under
     worker_root; clones only if clone=True. Returns None if absent and not
@@ -293,7 +306,9 @@ def ensure_local(url: str, worker_root: str | Path = DEFAULT_WORKER_ROOT,
         if log is not None:
             log.append(s)
 
-    dest = local_path(url, worker_root)
+    # Resolve once, then pass the resolved root down, so one call never reads
+    # the config twice (and cannot see two different answers mid-call).
+    dest = local_path(url, _worker_root(worker_root))
     if (dest / ".git").exists():
         return dest
     if not clone:
@@ -330,7 +345,7 @@ def ensure_local(url: str, worker_root: str | Path = DEFAULT_WORKER_ROOT,
 
 
 def worktree_path(url: str, slug: str,
-                  worker_root: str | Path = DEFAULT_WORKER_ROOT) -> Path:
+                  worker_root: str | Path | None = None) -> Path:
     """Where a per-run git worktree for `slug` would live, derived from the
     shared clone's location: `<worker_root>/<repo>.wt/<slug>`.
 
@@ -342,11 +357,11 @@ def worktree_path(url: str, slug: str,
     reach. Its own reaper is worktree_sweep.reclaim_parked_worktrees (same doctor
     tick), which removes a failed / parked run's worktree only after the
     retention window and never while a run, long_job or process holds it."""
-    base = local_path(url, worker_root)
+    base = local_path(url, _worker_root(worker_root))
     return base.parent / f"{base.name}.wt" / slug
 
 
-def ensure_worktree(url: str, slug: str, worker_root: str | Path = DEFAULT_WORKER_ROOT,
+def ensure_worktree(url: str, slug: str, worker_root: str | Path | None = None,
                     clone: bool = False, log: list[str] | None = None) -> Path | None:
     """Ensure a per-run git worktree for `slug` exists under the shared clone and
     return its path, or None if the shared clone is absent (and not cloned) or
@@ -372,10 +387,11 @@ def ensure_worktree(url: str, slug: str, worker_root: str | Path = DEFAULT_WORKE
         if log is not None:
             log.append(s)
 
-    base = ensure_local(url, worker_root, clone=clone, log=log)
+    root = _worker_root(worker_root)
+    base = ensure_local(url, root, clone=clone, log=log)
     if base is None:
         return None
-    wt = worktree_path(url, slug, worker_root)
+    wt = worktree_path(url, slug, root)
     if (wt / ".git").exists():
         return wt
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -402,13 +418,14 @@ def ensure_worktree(url: str, slug: str, worker_root: str | Path = DEFAULT_WORKE
     return None
 
 
-def resolve(payload: dict, agent_repo: str | None, worker_root: str | Path = DEFAULT_WORKER_ROOT,
+def resolve(payload: dict, agent_repo: str | None,
+            worker_root: str | Path | None = None,
             clone: bool = False) -> Path | None:
     """Resolve the working repo for a task: task's own repo URL wins, else the
     agent's fixed repo, else None (vault tasks are handled by the caller)."""
     url = (payload or {}).get("repo")
     if url:
-        return ensure_local(url, worker_root, clone=clone)
+        return ensure_local(url, _worker_root(worker_root), clone=clone)
     if agent_repo:
         p = Path(os.path.expanduser(agent_repo))
         return p if (p / ".git").exists() else None

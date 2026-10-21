@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -384,6 +385,72 @@ class GitTimeoutTest(unittest.TestCase):
                                         worker_root=self.wr, clone=False, log=log)
         self.assertIsNone(got)
         self.assertTrue(log and "timed out" in log[-1], log)
+
+
+class WorkerRootResolutionTest(unittest.TestCase):
+    """AC3: the clone root comes from MACP_WORKER_ROOT / the `worker_root`
+    config key, defaulting to ~/Worker.
+
+    It used to be `DEFAULT_WORKER_ROOT`, a module constant frozen at import and
+    baked into five function *defaults* — so no env var set after this module
+    was first imported could ever reach them. Nothing here clones or touches
+    the real clone root: the derivation functions are pure, and `ensure_local` /
+    `ensure_worktree` are called with `clone=False`.
+    """
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"MACP_WORKER_ROOT": "/tmp/w"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_local_path_follows_the_env(self):
+        self.assertEqual(repos.local_path("https://h/x/foo.git"),
+                         Path("/tmp/w/foo"))
+
+    def test_worktree_path_follows_the_env(self):
+        self.assertEqual(repos.worktree_path("https://h/x/foo.git", "task-a"),
+                         Path("/tmp/w/foo.wt/task-a"))
+
+    def test_ensure_local_looks_under_the_env_root(self):
+        # No checkout at /tmp/w/foo and clone=False -> None, having looked
+        # there and not under ~/Worker.
+        with mock.patch.object(repos, "local_path",
+                               wraps=repos.local_path) as lp:
+            self.assertIsNone(repos.ensure_local("https://h/x/foo.git"))
+        self.assertEqual(lp.call_args.args[1], Path("/tmp/w"))
+
+    def test_ensure_worktree_resolves_the_root_once(self):
+        """One call must not read the config twice — `ensure_worktree` resolves
+        and passes the value down, so a mid-call change cannot split the paths."""
+        calls: list[Path] = []
+        with mock.patch.object(repos.paths, "worker_root",
+                               side_effect=lambda *a, **k: calls.append(Path("/tmp/w"))
+                               or Path("/tmp/w")):
+            self.assertIsNone(repos.ensure_worktree("https://h/x/foo.git", "s"))
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_explicit_argument_beats_the_env(self):
+        self.assertEqual(repos.local_path("https://h/x/foo.git", "/explicit"),
+                         Path("/explicit/foo"))
+
+    def test_tilde_in_the_env_is_expanded(self):
+        with mock.patch.dict(os.environ, {"MACP_WORKER_ROOT": "~/clones"}):
+            self.assertEqual(repos.local_path("https://h/x/foo.git"),
+                             Path.home() / "clones" / "foo")
+
+    def test_default_without_the_env_is_still_home_worker(self):
+        """Behaviour invariance: an unconfigured host keeps today's layout."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACP_WORKER_ROOT", None)
+            os.environ.pop("MACP_VAULT_ROOT", None)
+            self.assertEqual(repos.local_path("https://h/x/foo.git"),
+                             Path.home() / "Worker" / "foo")
+
+    def test_resolve_uses_the_env_root_for_a_task_repo(self):
+        with mock.patch.object(repos, "ensure_local",
+                               return_value=None) as ensure:
+            repos.resolve({"repo": "https://h/x/foo.git"}, None)
+        self.assertEqual(ensure.call_args.args[1], Path("/tmp/w"))
 
 
 if __name__ == "__main__":

@@ -70,7 +70,6 @@ from .. import paths
 from ..kakao_format import compose_alert
 from .. import worker as _worker
 from . import jobs
-from . import repos
 
 # Engine root — paths.engine_root(): the repo root in a development checkout,
 # todo_system/_engine in an installed wheel; immune to MACP_VAULT_ROOT. In a
@@ -902,7 +901,7 @@ def _remote_owner() -> str | None:
     return slug.split("/", 1)[0] or None
 
 
-def _ls_remote_sha(repo_name: str, *, worker_root: Path | str = repos.DEFAULT_WORKER_ROOT,
+def _ls_remote_sha(repo_name: str, *, worker_root: Path | str | None = None,
                    run: Runner = _run) -> str | None:
     """``origin/<default>``'s sha for a configured repo, in one ls-remote.
 
@@ -912,8 +911,12 @@ def _ls_remote_sha(repo_name: str, *, worker_root: Path | str = repos.DEFAULT_WO
     sweep skips such a repo anyway — it has nowhere to build — but discovery still
     reports it), and to ``None`` when no owner is configured.
     ``None`` for any failure: no answer is never read as "up to date".
+
+    ``worker_root=None`` resolves the clone root at call time
+    (``paths.worker_root()``); it was a default argument frozen at import.
     """
-    checkout = Path(worker_root) / repo_name
+    root = Path(worker_root) if worker_root is not None else paths.worker_root()
+    checkout = root / repo_name
     if (checkout / ".git").exists():
         branch = _default_branch(checkout, run=run)
         argv = ["git", "-C", str(checkout), "ls-remote", "origin", f"refs/heads/{branch}"]
@@ -1019,7 +1022,7 @@ def sweep_unpublished(
     lock_dir: Path | str = LOCK_DIR,
     state_path: Path | str = SWEEP_STATE_PATH,
     worktree_root: Path | str = SWEEP_WORKTREE_DIR,
-    worker_root: Path | str = repos.DEFAULT_WORKER_ROOT,
+    worker_root: Path | str | None = None,   # None = paths.worker_root() at call time
     ls_remote: Callable[[str], str | None] | None = None,
     publish: Callable[..., str | None] = maybe_publish,
     run: Runner = _run,
@@ -1042,6 +1045,9 @@ def sweep_unpublished(
     rationed is the gradle build, which a failure spends just as fully.
     """
     now = time.time() if now is None else now
+    # Resolve the clone root once per sweep (was an import-frozen default arg),
+    # so the lambda below and the per-candidate checkout agree on one value.
+    worker_root = Path(worker_root) if worker_root is not None else paths.worker_root()
     resolve_sha = ls_remote or (
         lambda name: _ls_remote_sha(name, worker_root=worker_root, run=run))
 

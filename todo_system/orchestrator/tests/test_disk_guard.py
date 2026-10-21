@@ -29,6 +29,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from todo_system import paths
 from todo_system.orchestrator import disk_guard as dg
 from todo_system.orchestrator import jobs, repos
 from todo_system.orchestrator.assignment import Assignment
@@ -636,7 +637,7 @@ class SuiteIsolationTest(unittest.TestCase):
         self.assertFalse(dg.enabled())
 
     def test_every_path_seam_points_into_a_tmp_dir(self):
-        real = {"WORKER_ROOT": repos.DEFAULT_WORKER_ROOT,
+        real = {"WORKER_ROOT": paths.worker_root(),
                 "ASSIGNMENTS_DIR": jobs.REPO_ROOT / "Worker" / "assignments",
                 "JOBS_DIR": jobs.REPO_ROOT / "Worker" / "jobs"}
         for attr, path in real.items():

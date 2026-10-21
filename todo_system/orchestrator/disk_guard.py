@@ -57,6 +57,7 @@ import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from .. import paths
 from . import assignment, jobs, repos
 
 GIB = 1024 ** 3
@@ -79,7 +80,7 @@ SKIP_TEXT_LIMIT = 400          # chars of `name=reason` pairs in the progress li
 # Seams, all read at CALL time — never frozen into a default argument, the trap
 # todo_system/tests/conftest.py documents — so the suite-wide fixture in
 # todo_system/conftest.py can point every one of them at a tmp dir.
-WORKER_ROOT = repos.DEFAULT_WORKER_ROOT
+WORKER_ROOT = paths.worker_root()
 ASSIGNMENTS_DIR = jobs.REPO_ROOT / "Worker" / "assignments"   # the orchestrator's ledger
 JOBS_DIR = jobs.JOBS_DIR
 _disk_usage = shutil.disk_usage

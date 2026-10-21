@@ -44,7 +44,6 @@ from . import paths
 from .kakao_format import LEVEL_DIGEST, compose_alert
 from .orchestrator import stages as _stages
 from .orchestrator import worktree_sweep as _worktree_sweep
-from .orchestrator.repos import DEFAULT_WORKER_ROOT
 from todo_system import daemonctl
 
 # Two roots, split the way orchestrator/human.py and stages.py split theirs.
@@ -1000,7 +999,19 @@ def autoclose_stale_reviews_local() -> int:
 # ---------------------------------------------------------------------------
 # Stale worker worktree reporting (read-only)
 # ---------------------------------------------------------------------------
-# Live runs execute in a linked git worktree at `<DEFAULT_WORKER_ROOT>/wt-<slug>`
+def _default_worktree_parent() -> Path:
+    """The clone root worktrees live under — ``MACP_WORKER_ROOT`` / the
+    ``worker_root`` config key, default ``~/Worker``.
+
+    A function, not a constant, so the knob is read per call. It also keeps the
+    two sweeps below from touching the module-global ``paths``: both of them
+    bind a LOCAL ``paths`` list, which would shadow the module and make a direct
+    ``paths.worker_root()`` an unbound-local error.
+    """
+    return paths.worker_root()
+
+
+# Live runs execute in a linked git worktree at `<paths.worker_root()>/wt-<slug>`
 # so that a concurrent daemon `restore_main` cannot yank HEAD out from under a
 # running stage. Nothing removes them once the PR merges, so they accumulate —
 # 22 linked worktrees on this host when this was written.
@@ -1359,7 +1370,7 @@ def stale_worktree_actions(repo_root: Path = ROOT,
     """
     try:
         parent = (Path(worktree_parent) if worktree_parent is not None
-                  else DEFAULT_WORKER_ROOT).resolve()
+                  else _default_worktree_parent()).resolve()
         candidates, over_cap, over_budget = _removable_candidates(repo_root, parent)
         paths = [raw_path for raw_path, _branch in candidates]
 
@@ -1439,7 +1450,7 @@ def reclaim_stale_worktrees(repo_root: Path = ROOT,
     """
     try:
         parent = (Path(worktree_parent) if worktree_parent is not None
-                  else DEFAULT_WORKER_ROOT).resolve()
+                  else _default_worktree_parent()).resolve()
         excluded: list[str] = []
         candidates, over_cap, over_budget = _removable_candidates(
             repo_root, parent,
@@ -2220,7 +2231,10 @@ def sync_vault_state(paths: tuple[str, ...] = VAULT_SYNC_PATHS, _run=None) -> in
 # this: CI has no live database, and merging is not applying.
 MIGRATION_TARGETS = {
     "Pairent": {
-        "repo": Path.home() / "Worker" / "Pairent",
+        # Under the configured clone root (MACP_WORKER_ROOT / `worker_root`,
+        # default ~/Worker). Frozen at import like the rest of this table — it
+        # is read by one hand-run check, not by a long-lived daemon.
+        "repo": paths.worker_root() / "Pairent",
         "pw_file": Path.home() / "Documents" / "pairent-supabase" / "credentials.txt",
         "pw_key": "DB password:",
         "dsn": ("postgresql://postgres.qyxlikbhntvnrruacrzs:{pw}"
@@ -3235,15 +3249,15 @@ def ensure_vault_branch_fresh(branch: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_EXTERNAL_BASE = Path.home() / "Worker"
-
-
 def resolve_working_dir(task: WorkerTask) -> Path:
     """Compute the absolute working_dir for an external repo task.
 
     Order:
     1. ``working_dir`` field if set (expand ~).
-    2. Default: ``~/Worker/<repo-name>`` (derived from ``repo`` URL).
+    2. Default: ``<paths.worker_root()>/<repo-name>`` (derived from ``repo``
+       URL) — ``MACP_WORKER_ROOT`` / the ``worker_root`` config key, defaulting
+       to ``~/Worker``. Resolved at call time, not as a module constant, so the
+       knob is honoured by a process that imported this module first.
     """
     if task.working_dir:
         return Path(task.working_dir).expanduser().resolve()
@@ -3254,7 +3268,7 @@ def resolve_working_dir(task: WorkerTask) -> Path:
     if repo.endswith(".git"):
         repo = repo[:-4]
     name = repo.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-    return (DEFAULT_EXTERNAL_BASE / name).resolve()
+    return (paths.worker_root() / name).resolve()
 
 
 # Wall-clock ceilings for the git calls in `ensure_external_repo_ready` (the
@@ -3541,10 +3555,10 @@ def build_stage_command(
         "--allowed-tools",
         *tools.split(),
     ]
-    # Allow worker stages to operate on external side-project repos under
-    # ~/Worker (e.g. LucidCue, DripCoffee, Pairent). Vault root is the
+    # Allow worker stages to operate on external side-project repos under the
+    # clone root (e.g. LucidCue, DripCoffee, Pairent). Vault root is the
     # invocation cwd; this --add-dir extends accessible filesystem scope.
-    worker_extra_dir = Path.home() / "Worker"
+    worker_extra_dir = paths.worker_root()
     if worker_extra_dir.exists():
         argv += ["--add-dir", str(worker_extra_dir)]
     return argv, full_prompt
