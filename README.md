@@ -1,221 +1,120 @@
-# macp
+# macp — Maestro Agent Control Plane
 
-The engine of MaestroACP: a markdown-first task system (task files → SQLite), an
-orchestrator that dispatches tasks to headless Claude Code workers through a staged
-pipeline (research → plan → implement → verify → report), a planner that refills the
-queue, usage pacing against your Claude subscription limits, and the daemons that run
-it all (systemd `--user` on Linux, launchd on macOS).
+**Queue tasks; macp keeps coding agents working on them around the clock.**
 
-The engine holds no personal data. Tasks, memory, notes, decisions, run records,
-secrets and host identity live in a separate **vault** directory that you own.
+[한국어 README](README.ko.md) · [Getting started](docs/getting-started.md) ·
+[How it works](docs/concepts.md) · [Task files](docs/tasks.md) ·
+[Running 24/7](docs/running.md) · [Configuration](docs/configuration.md) ·
+[Troubleshooting](docs/troubleshooting.md) · [Security](SECURITY.md)
 
-> **Maturity.** This is a personal-scale system published as-is. The core (task CLI,
-> orchestrator, staged runner, usage guard, dashboard) is tested and runs standalone,
-> but several integrations are still shaped around the author's own setup — see
-> [Known limitations](#known-limitations). Read [SECURITY.md](SECURITY.md) before you
-> let a worker run for real: workers execute code on your machine and can push to
-> GitHub.
+A coding agent is good at the one task in front of it. Keeping many projects moving
+takes more than that. Something has to decide what to work on next, how much model to
+spend on it, which tools it may use, when it is really finished, and when a person has
+to step in. macp is that layer.
 
-## Requirements
+You write tasks as small markdown files. macp then:
 
-- Linux or macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`
-- For real worker runs: the [Claude Code](https://code.claude.com) CLI on `PATH` and
-  logged in (`claude` works in a terminal), and `gh` authenticated if tasks open PRs
+- **Analyzes and splits.** Every task goes through research → plan → implement →
+  verify → report. A task that turns out too big for one implement stage is split
+  into 2–5 dependent subtasks automatically.
+- **Allocates resources.** Each task gets a model tier (heavy / standard / light)
+  chosen from its difficulty, a tool allowlist, its own git worktree, and a slot under
+  per-repository concurrency limits. Usage pacing keeps automation inside your
+  subscription limits.
+- **Runs 24/7.** Daemons dispatch work, collect results, retry, and clean up stale runs
+  without anyone watching. You are asked only when a decision is yours.
+- **Refills the queue.** When the task pool runs dry, a planner runs and re-reads your
+  projects (tests, build, docs) to find needed work and files it as new tasks.
 
-## Quick start (no Claude calls)
+macp aims to be **orthogonal to the coding agent**. The agent writes the code; macp
+decides what gets worked on, with which resources, and when. Agents sit behind an
+`Executor` interface. Today's executor drives [Claude Code](https://code.claude.com)
+(`claude -p`), and small quick/delegate tasks can also run on Upstage Solar.
+
+**In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080
+tasks** on its own across **22 independent repositories**. In October 2026 that was
+about 25 a day (counted from its assignment ledger).
+
+## How it fits together
+
+```
+          you ──────────────► Todo/items/*.md  (one task per file)
+                                     │
+                       ┌─────────────┴───────────────┐
+  control plane        │ orchestrator (every ~5 min) │◄── planner (queue empty?
+                       │ route · pace · dispatch ·   │     find work, file tasks)
+                       │ collect · retry · reap      │
+                       └─────────────┬───────────────┘
+                                     │  assignment ledger + mailbox
+                       ┌─────────────┴───────────────┐
+  data plane           │ runner                      │──► coding agent per stage
+                       │ research → plan → implement │     (own worktree, model tier,
+                       │ → verify → report (PR)      │      tool allowlist)
+                       └─────────────┬───────────────┘
+                                     │  questions it cannot answer
+                                     ▼
+                                    you
+```
+
+The **control plane** (orchestrator, planner, ledger) decides; the **data plane**
+(agent runners and people) does the work. Everything personal lives in a **vault**
+directory you own: tasks, memory, run records, secrets. This repository is the engine
+and holds no personal data. [How it works](docs/concepts.md) has the full picture.
+
+## Try it in five minutes
+
+No agent is called and nothing leaves your machine. You need Linux or macOS,
+Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/) and `git`.
 
 ```bash
 git clone https://github.com/jjkim0807/macp ~/macp && cd ~/macp
 uv sync
 
-# 1. Make a vault from the skeleton and point the engine at it.
-cp -r vault-template ~/my-vault
+cp -r vault-template ~/my-vault            # your vault: tasks, runs, memory
 export MACP_VAULT_ROOT=~/my-vault
+export USAGE_GUARD_DISABLE=1               # nothing to pace yet (see below)
 
-# 2. Scaffold a task, then edit ~/my-vault/Todo/items/hello-world.md:
-#    fill outcome / next_action / if_then and change `worker_mode: blocked` to `auto`.
 uv run python -m todo_system.cli new hello-world --template auto-worker
-uv run python -m todo_system.cli import-md      # markdown → Todo/todo.db
-uv run python -m todo_system.cli list
+#   edit ~/my-vault/Todo/items/hello-world.md:
+#   write an outcome, and change `worker_mode: blocked` to `worker_mode: auto`
+uv run python -m todo_system.cli validate hello-world   # → worker contract OK
+uv run python -m todo_system.cli import-md              # → imported tasks: 1
 
-# 3. Dispatch it and run the worker once in shadow mode (no agent is spawned).
-#    The orchestrator and runner resolve Worker/ relative to the current
-#    directory, so run them from the vault.
 cd ~/my-vault
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
+#   → dispatched hello-world -> worker-default
 uv run --project ~/macp python -m todo_system.orchestrator.runner \
     --agent worker-default --mode shadow --once
+#   → RESULT: shadow run for 'hello-world' (no agent spawned)
+uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator status
+#   → done   hello-world   worker-default
 ```
 
-`--mode live-staged` instead of `shadow` runs the real five-stage pipeline with
-`claude -p`. A task with `repo:` set is cloned under `~/Worker/<repo>` and worked on in
-a per-run git worktree; a task without it works on the vault itself.
+That is the whole loop: a task file was imported, routed, dispatched, executed (in
+shadow mode) and collected. `USAGE_GUARD_DISABLE=1` skips usage pacing. Without it, a
+machine where Claude Code is logged in is paced against that account's real usage,
+and dispatch can be held. [Getting started](docs/getting-started.md) walks through the
+same steps with explanations, then a first **real** run against one of your
+repositories.
 
-## Vault
+## Status
 
-Resolution order:
+macp runs the author's projects every day. The core (task CLI, orchestrator, staged
+runner, usage guard, dashboard) is tested and runs standalone. It is still a
+personal-scale system, published as-is:
 
-1. `MACP_VAULT_ROOT`
-2. the nearest `.macp/config.toml` — searched upward from the current directory when
-   the engine is installed as a package, and upward from the engine checkout when you
-   run from a source clone (so with a clone, set `MACP_VAULT_ROOT`)
-3. otherwise a clear `VaultRootError`
+- Workers execute code on your machine and can push to GitHub. **Read
+  [SECURITY.md](SECURITY.md) before the first live run.**
+- Some integrations are shaped around the author's setup: KakaoTalk/Slack
+  notifications, an app-beta publishing sweep, and an `advote` bridge. They stay
+  silent unless their config file exists; see
+  [scripts/NOTIFICATIONS.md](scripts/NOTIFICATIONS.md).
+- Parts of the worker prompts (`.claude/commands/`), code comments and log messages
+  are in Korean, and calendar sync uses the `Asia/Seoul` time zone. Translation is in
+  progress.
 
-`vault-template/` contains the skeleton:
-
-| Path | What it is |
-|---|---|
-| `Todo/items/*.md` | one task per file — the source of truth (`Todo/todo.db` is a derived cache) |
-| `Todo/templates/` | task templates for `cli new --template …` |
-| `Worker/agents/registry.yaml` | who owns which tasks: a `human` agent and the `ai-local` worker |
-| `Worker/runs/`, `Worker/assignments/` | per-run artifacts and the dispatch ledger (created on first use) |
-| `Memory/`, `Notes/`, `Decisions/` | free-form knowledge the planner and workers read |
-| `.macp/config.toml` | optional host identity: daemon label prefix, calendar id, repo slug |
-
-Keep the vault in its own private git repository; the daemons commit task-state
-changes to it.
-
-## Task files
-
-Markdown with YAML frontmatter. The fields the engine acts on:
-
-| Field | Meaning |
-|---|---|
-| `status` | `open` · `done` · `cancelled` |
-| `worker_mode` | `auto` (5-stage pipeline) · `quick` (one combined stage) · `delegate` (research/update, no code merge) · `manual` (a human does it) · `blocked` · `off` |
-| `outcome`, `next_action`, `if_then` | done-criterion, first step, and the concrete trigger — required |
-| `repo` | git URL of the project the task changes; omit for vault-only work |
-| `auto_merge` | `true` lets the report stage squash-merge its PR once local checks pass |
-| `allowed_tools` | a **quoted, comma-separated string** that replaces the stage's tool allowlist |
-| `touches` | a **YAML list** of repo-relative paths; two tasks of the same repo run in parallel only when both declare disjoint lists |
-| `acceptance_criteria` | list of checks the verify stage must see pass |
-| `model_tier` | `heavy` · `standard` · `light` (otherwise inferred) |
-| `depends_on`, `not_before` | ordering and earliest start (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`) |
-
-Never put a `# comment` after a value — the parser keeps it as part of the value.
-`uv run python -m todo_system.cli validate <slug>` checks a file against the worker
-contract.
-
-## Running it continuously
-
-The pieces are a **runner** (long-lived, executes pipelines), an **orchestrator tick**
-(every ~5 min: dispatch, collect results, reap stale runs), **todo-sync** (watches
-`Todo/items` → `todo.db`), an optional **planner** tick, and the **dashboard**. A
-minimal setup is just these, for example as your own systemd user units or tmux panes:
-
-```bash
-cd ~/my-vault
-uv run --project ~/macp python -m todo_system.orchestrator.runner --agent worker-default --mode live-staged --daemon
-uv run --project ~/macp python -u -m todo_system.cli daemon --interval 3
-while sleep 300; do uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto; done
-uv run --project ~/macp python ~/macp/scripts/macp_dashboard.py      # http://127.0.0.1:8787
-```
-
-`scripts/systemd/gen_units.py --print` renders the **engine-core units** (Linux) —
-runner, orchestrator, planner, maintenance, todo-sync, dashboard, brief, health —
-resolving each engine script from the install location (`MACP_ENGINE_ROOT`, default:
-the checkout), so every rendered `ExecStart` points at a script that ships in this
-repository. The vault root (logs/, Todo/, Worker/) comes from `MACP_VAULT_ROOT`
-(`MAESTRO_VAULT_DIR` is kept as a backward-compat alias). `scripts/install_*_launchagent.sh`
-are the macOS equivalents. Review the `--print` output before writing anything, and
-note that `--only` filters which units are *enabled*, not which files are written.
-
-The dashboard binds to loopback. It refuses to start on any other address — or, when
-`MACP_PUBLIC_EXPOSURE=1` declares that a tunnel fronts it, on loopback too — unless
-`MACP_DASHBOARD_TOKEN` is set.
-
-## Configuration
-
-| Variable | Effect |
-|---|---|
-| `MACP_VAULT_ROOT` | the vault directory |
-| `MACP_LABEL_PREFIX`, `MACP_CALENDAR_ID`, `MACP_REPO_SLUG` | override `.macp/config.toml` keys |
-| `MACP_MAX_PARALLEL_PER_REPO`, `MACP_MAX_PARALLEL_GRADLE_BUILDS` | concurrency caps |
-| `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see above) |
-
-Profiles and Claude accounts (`python -m todo_system.macp profile|account …`) live in
-`~/.macp/`.
-
-### An Upstage (Solar) account
-
-A profile's accounts can come from different vendors. `upstage` authenticates with an
-API key instead of a config dir:
-
-```bash
-python -m todo_system.macp account add solar --agent upstage --priority 150
-python -m todo_system.macp account probe solar --tier light   # one real call → one line of JSON
-```
-
-`--priority 150` keeps it *behind* the default (selection is lowest-number-first, and a
-claude account defaults to 100).
-
-**The key is never stored.** It is read when a call is made, from `UPSTAGE_API_KEY`, else
-from a key file holding one `UPSTAGE_API_KEY=…` line (default `~/.config/macp/upstage.env`,
-mode 0600 — a looser mode gets one warning on stderr). The profile keeps only the *path*,
-so no key reaches a config file, a log line, a commit or a PR, and `account list` reports
-the origin (`key=env|file|missing`) rather than any value. Point it elsewhere with
-`--key-file`, the `MACP_UPSTAGE_KEY_FILE` env var, or `upstage_key_file` in a project's
-`.macp/config.toml`.
-
-The `model_tier` → model mapping defaults to **date-pinned snapshots**
-(`solar-pro4-260806` for heavy/standard, `solar-mini4-260922` for light) because those
-are the ids whose existence was actually measured. Pins age: replace them per account
-without touching the code, either at registration —
-
-```bash
-python -m todo_system.macp account add solar --agent upstage \
-    --models light=solar-mini4-260922,heavy=solar-pro4-260806
-```
-
-— or by editing `models = { … }` in the profile's `[[account]]` block.
-
-Worker *stages* still run `claude -p` (`todo_system/orchestrator/stages.py` builds that
-argv directly), so an upstage account is callable through `probe` and
-`todo_system.macp.upstage.chat()` but is not yet a stage execution backend; wiring a
-vendor-neutral stage path is separate work. `build_invocation` refuses an upstage account
-that has no `command` rather than silently launching `claude` under its name.
-
-## Anthropic usage & cost
-
-`todo_system.anthropic_usage` queries the Anthropic **Admin** API (no browser
-console) for token counts and billed dollars:
-
-```bash
-# tokens per model/key + list-price cost, one-minute buckets
-uv run python -m todo_system.anthropic_usage usage \
-    --since 2026-10-16T00:30Z --until 2026-10-16T00:40Z --bucket 1m
-# the amounts Anthropic billed, in USD (cents in the API)
-uv run python -m todo_system.anthropic_usage cost --day 2026-10-16
-```
-
-Add `--json` for machine-readable output. The key is read from
-`ANTHROPIC_ADMIN_KEY`, else `<vault>/.secrets/anthropic-admin-key`, and is never
-printed. Report data lags live traffic by ~5 minutes. A **personal** account's
-key gets 403 — the Admin API needs an organization (switch the account first);
-the CLI then prints a one-line hint and exits 2.
-
-Stdlib-only, so it also runs from a bare clone (`python3 -m
-todo_system.anthropic_usage …`). For worker stages in other checkouts, install
-the space-free wrapper and allow `Bash(macp-anthropic-usage:*)`:
-
-```bash
-cp scripts/macp-anthropic-usage ~/.local/bin/macp-anthropic-usage && chmod +x ~/.local/bin/macp-anthropic-usage
-```
-
-## Known limitations
-
-- **Author-specific integrations ship in the tree**: KakaoTalk/Slack notifications,
-  an app-beta publishing sweep, and an `advote` bridge. Each is **opt-in by the
-  presence of a vault config file or token** — with none present they are a *silent*
-  no-op: the sweep prints nothing, the bridge does no work (not even an import per
-  tick), and notifications warn once per process then stay quiet. See
-  [`scripts/NOTIFICATIONS.md`](scripts/NOTIFICATIONS.md) for the exact switches.
-- Parts of the worker prompts (`.claude/commands/`) and some docs are in Korean, and
-  calendar sync uses the `Asia/Seoul` time zone.
-- External repositories are cloned under `~/Worker/`.
-
-These are being cleaned up; issues and PRs are welcome.
+Issues and pull requests are welcome.
 
 ## Development
 
@@ -226,7 +125,8 @@ bash scripts/check_engine_isolation.sh
 ```
 
 GitHub Actions is not used; run the checks locally. The full suite takes several
-minutes.
+minutes. [docs/concepts.md](docs/concepts.md#repository-map) has a map of the
+repository.
 
 ## License
 
