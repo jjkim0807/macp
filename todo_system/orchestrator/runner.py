@@ -30,6 +30,7 @@ from typing import Callable, Protocol
 
 from ..claude_auth import claude_env
 from ..kakao_format import compose_alert
+from .. import paths
 from .. import worker as _worker
 from . import background
 from . import beta_publish
@@ -2214,12 +2215,17 @@ class Runner:
 # ---------------------------------------------------------------------------
 
 
-def resolve_agent(args) -> Agent | None:
+def resolve_agent(args, base: Path | None = None) -> Agent | None:
     """Agent identity from the registry (--agent) or inline flags (--agent-id).
     The inline path loads no registry, so a bare-python3 remote host needs no
-    PyYAML — only the stdlib transport."""
+    PyYAML — only the stdlib transport.
+
+    ``base`` resolves a relative ``--registry`` (and the relative
+    ``DEFAULT_REGISTRY``); ``None`` keeps ``load_registry``'s own cwd default, so
+    existing callers behave exactly as before.
+    """
     if getattr(args, "agent", None):
-        return load_registry(args.registry).get(args.agent)
+        return load_registry(args.registry, base=base).get(args.agent)
     if getattr(args, "agent_id", None):
         def _split(s):
             return [x for x in (s or "").split(",") if x]
@@ -2252,7 +2258,13 @@ def _main(argv: list[str] | None = None) -> int:
     p.add_argument("--interval", type=float, default=15.0)
     args = p.parse_args(argv)
 
-    agent = resolve_agent(args)
+    # `--uri`/`--registry` default to vault-relative values, which used to mean
+    # "relative to the cwd" and pinned this command to the vault directory. The
+    # vault root is the right base; cwd stays the fallback, so a cwd-at-the-vault
+    # invocation (what the units do) is byte-identical.
+    base = paths.vault_root_or_cwd()
+
+    agent = resolve_agent(args, base)
     if agent is None:
         print("error: pass --agent <id> (registry) or --agent-id <id> (inline)")
         return 2
@@ -2266,11 +2278,13 @@ def _main(argv: list[str] | None = None) -> int:
         # remote host's own plane and stay unguarded. No marker = no change
         # (fail-open — see hq_host.py).
         from . import hq_host
-        ok, reason = hq_host.check(Path.cwd())
+        # The vault holds the HQ marker, so the check reads it from there — from
+        # a cwd outside the vault it found no marker and fell open.
+        ok, reason = hq_host.check(base)
         if not ok:
             print(f"hq-host guard: {reason}")
             return 3
-    runner = Runner(open_mailbox(args.uri), agent, make_executor(args.mode))
+    runner = Runner(open_mailbox(args.uri, base=base), agent, make_executor(args.mode))
 
     if args.daemon:
         runner.run_forever(args.interval)

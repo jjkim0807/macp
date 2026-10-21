@@ -132,30 +132,44 @@ class CliTest(unittest.TestCase):
 
 
 class OrchestratorGuardTest(unittest.TestCase):
-    """_main-level: a mismatched marker exits 3 BEFORE the lease is created."""
+    """_main-level: a mismatched marker exits 3 BEFORE the lease is created.
+
+    `Worker/hq_host` is a git-tracked VAULT file, so `_main` reads it at
+    `paths.vault_root_or_cwd()` — these cases point MACP_VAULT_ROOT at the
+    fixture. They used to rely on the cwd alone, which silently disarmed the
+    guard whenever the orchestrator ran from anywhere but the vault.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "Worker").mkdir()
         (self.tmp / "Worker" / "hq_host").write_text("other-host\n",
                                                      encoding="utf-8")
+        self.env = {"MACP_HOST_ID": "me", "MACP_VAULT_ROOT": str(self.tmp)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_auto_mismatch_exits_3_without_lease(self):
         lock = self.tmp / "orchestrator.lock"
-        with contextlib.chdir(self.tmp), \
-                mock.patch.dict(os.environ, {"MACP_HOST_ID": "me"}):
+        with contextlib.chdir(self.tmp), mock.patch.dict(os.environ, self.env):
             rc = orch_mod._main(["--lease", str(lock), "auto",
                                  "--db", str(self.tmp / "todo.db")])
         self.assertEqual(rc, 3)
         self.assertFalse(lock.exists())
 
     def test_dispatch_mismatch_exits_3(self):
-        with contextlib.chdir(self.tmp), \
-                mock.patch.dict(os.environ, {"MACP_HOST_ID": "me"}):
+        with contextlib.chdir(self.tmp), mock.patch.dict(os.environ, self.env):
             rc = orch_mod._main(["dispatch", "--task", "t"])
+        self.assertEqual(rc, 3)
+
+    def test_auto_mismatch_exits_3_from_a_cwd_outside_the_vault(self):
+        """The point of reading the marker at the vault root: the guard now
+        fires even when the orchestrator is started from somewhere else."""
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        with contextlib.chdir(elsewhere), mock.patch.dict(os.environ, self.env):
+            rc = orch_mod._main(["auto", "--db", str(self.tmp / "todo.db")])
         self.assertEqual(rc, 3)
 
 
@@ -218,20 +232,33 @@ class PullMainTest(unittest.TestCase):
 
 
 class RunnerGuardTest(unittest.TestCase):
-    """runner._main: ai-local is gated on the marker, ai-remote is not."""
+    """runner._main: ai-local is gated on the marker, ai-remote is not.
+
+    Same vault-root rule as OrchestratorGuardTest — MACP_VAULT_ROOT points at
+    the fixture holding `Worker/hq_host`.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "Worker").mkdir()
         (self.tmp / "Worker" / "hq_host").write_text("other-host\n",
                                                      encoding="utf-8")
+        self.env = {"MACP_HOST_ID": "me", "MACP_VAULT_ROOT": str(self.tmp)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_ai_local_mismatch_exits_3(self):
-        with contextlib.chdir(self.tmp), \
-                mock.patch.dict(os.environ, {"MACP_HOST_ID": "me"}):
+        with contextlib.chdir(self.tmp), mock.patch.dict(os.environ, self.env):
+            rc = runner_mod._main(["--agent-id", "x", "--kind", "ai-local",
+                                   "--uri", f"file://{self.tmp}/agents",
+                                   "--once"])
+        self.assertEqual(rc, 3)
+
+    def test_ai_local_mismatch_exits_3_from_a_cwd_outside_the_vault(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        with contextlib.chdir(elsewhere), mock.patch.dict(os.environ, self.env):
             rc = runner_mod._main(["--agent-id", "x", "--kind", "ai-local",
                                    "--uri", f"file://{self.tmp}/agents",
                                    "--once"])
@@ -240,8 +267,7 @@ class RunnerGuardTest(unittest.TestCase):
     def test_ai_remote_skips_guard(self):
         # Same mismatched marker; rc 0 (one poll of an empty FileMailbox, the
         # test_runner.py offline path) proves the guard never fired.
-        with contextlib.chdir(self.tmp), \
-                mock.patch.dict(os.environ, {"MACP_HOST_ID": "me"}):
+        with contextlib.chdir(self.tmp), mock.patch.dict(os.environ, self.env):
             rc = runner_mod._main(["--agent-id", "x", "--kind", "ai-remote",
                                    "--uri", f"file://{self.tmp}/agents",
                                    "--once"])

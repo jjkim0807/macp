@@ -9,13 +9,16 @@ from test_trace.py's TraceCliTest.
 from __future__ import annotations
 
 import io
+import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from todo_system import paths
 from todo_system.orchestrator import orchestrator, stages
 from todo_system.orchestrator.assignment import AWAITING_HUMAN, Assignment, Ledger
 
@@ -345,6 +348,171 @@ class MainAutoSubcommandTest(unittest.TestCase):
             rc, out = self._main(["auto", "--db", "Todo/todo.db"])
         self.assertEqual(rc, 0)
         self.assertIn("BUDGET-REACHED (runs today=5/7)", out)
+
+
+def make_fake_vault(root: Path) -> Path:
+    """A minimal vault: the `.macp` marker plus the three trees the orchestrator's
+    relative CLI defaults name (`Worker/agents`, `Worker/assignments`, `Todo`).
+
+    The registry's `mailbox:` is deliberately the RELATIVE `file://Worker/agents`
+    — the same shape the live units pass — so these tests fail if a relative uri
+    stops resolving against the vault.
+    """
+    vault = root / "vault"
+    (vault / ".macp").mkdir(parents=True)
+    (vault / ".macp" / "config.toml").write_text("profile = 'test'\n", encoding="utf-8")
+    (vault / "Worker" / "agents").mkdir(parents=True)
+    (vault / "Worker" / "assignments").mkdir(parents=True)
+    (vault / "Worker" / "agents" / "registry.yaml").write_text(
+        _registry_yaml("file://Worker/agents"), encoding="utf-8")
+    (vault / "Todo").mkdir()
+    from todo_system import cli
+    con = sqlite3.connect(vault / "Todo" / "todo.db")
+    try:
+        cli.init_db(con)
+        con.commit()
+    finally:
+        con.close()
+    return vault
+
+
+class MainVaultRelativePathsTest(unittest.TestCase):
+    """AC1: `status` / `auto` work with the cwd OUTSIDE the vault.
+
+    Every path argument the units rely on defaults to a vault-relative string
+    (`--ledger Worker/assignments`, `--registry Worker/agents/registry.yaml`,
+    `--db Todo/todo.db`, `--uri …Worker/agents`). They used to resolve against
+    the cwd, which is why the orchestrator had to be started from the vault
+    directory. These cases run from a sibling directory with MACP_VAULT_ROOT set.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.vault = make_fake_vault(self.tmp)
+        self.elsewhere = self.tmp / "elsewhere"
+        self.elsewhere.mkdir()
+        cwd = Path.cwd()
+        self.addCleanup(os.chdir, cwd)
+
+    def _run(self, cmd_args, *, cwd: Path, vault_env: Path | None):
+        os.chdir(cwd)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if vault_env is None:
+                os.environ.pop("MACP_VAULT_ROOT", None)
+            else:
+                os.environ["MACP_VAULT_ROOT"] = str(vault_env)
+            with redirect_stdout(buf):
+                rc = orchestrator._main(cmd_args)
+        return rc, buf.getvalue()
+
+    def test_status_reads_the_vault_ledger_from_an_outside_cwd(self):
+        Ledger(self.vault / "Worker" / "assignments").save(Assignment(
+            task_id="t-relative", agent_id="worker-default", corr_id="c1",
+            state=AWAITING_HUMAN, nudge_index=1))
+        # No --ledger / --registry: the relative defaults must find the vault.
+        rc, out = self._run(["--uri", "file://Worker/agents", "status"],
+                            cwd=self.elsewhere, vault_env=self.vault)
+        self.assertEqual(rc, 0)
+        self.assertIn("t-relative", out)
+        self.assertIn("worker-default", out)
+
+    def test_status_output_is_identical_from_the_vault_and_from_outside(self):
+        """Behaviour invariance: the cwd-at-the-vault invocation the units make
+        must produce exactly what it produced before this change."""
+        Ledger(self.vault / "Worker" / "assignments").save(Assignment(
+            task_id="t-same", agent_id="worker-default", corr_id="c1",
+            state=AWAITING_HUMAN))
+        argv = ["--uri", "file://Worker/agents", "status"]
+        # cwd == vault, no env: resolution comes from the .macp marker.
+        rc_in, out_in = self._run(argv, cwd=self.vault, vault_env=None)
+        rc_out, out_out = self._run(argv, cwd=self.elsewhere, vault_env=self.vault)
+        self.assertEqual(rc_in, 0)
+        self.assertEqual(rc_out, 0)
+        self.assertEqual(out_in, out_out)
+
+    def test_auto_opens_the_vault_db_and_guards_the_vault_repo(self):
+        tick_result = {
+            "reaped": [], "dispatched": [], "updated": [], "reconciled": [],
+            "closed": [], "unblocked": [], "unparked": [], "resumed": [],
+            "split_parents": [], "parents": [], "requeued": [], "renudged": [],
+            "budget_reached": False, "paused": False, "usage_hold": None,
+        }
+        with mock.patch("todo_system.orchestrator.hq_host.check",
+                        return_value=(True, "")) as check, \
+             mock.patch.object(orchestrator, "_pull_main") as pull, \
+             mock.patch.object(orchestrator, "_check_divergence") as diverge, \
+             mock.patch.object(orchestrator.Orchestrator, "tick",
+                               return_value=tick_result):
+            rc, out = self._run(
+                ["--uri", "file://Worker/agents", "auto", "--db", "Todo/todo.db"],
+                cwd=self.elsewhere, vault_env=self.vault)
+        self.assertEqual(rc, 0)
+        # candidates=0 means the relative --db actually opened the vault's
+        # sqlite file; a cwd-based resolution raises OperationalError instead
+        # (see test_auto_with_the_old_cwd_base_cannot_open_the_db).
+        self.assertIn("candidates=0", out)
+        # The three former Path.cwd() call sites now name the vault repo. From a
+        # cwd outside it they inspected — and git-pulled — the wrong tree.
+        self.assertEqual(check.call_args.args[0], self.vault)
+        self.assertEqual(pull.call_args.args[0], self.vault)
+        self.assertEqual(diverge.call_args.args[0], self.vault)
+
+    def test_auto_with_the_old_cwd_base_cannot_open_the_db(self):
+        """RED control: pin the pre-change behaviour by restoring the old base.
+
+        With `base = Path.cwd()` — exactly what the code did before — the same
+        argv cannot open `Todo/todo.db`, because the cwd is not the vault.
+        """
+        with mock.patch("todo_system.orchestrator.hq_host.check",
+                        return_value=(True, "")), \
+             mock.patch.object(orchestrator, "_pull_main"), \
+             mock.patch.object(orchestrator, "_check_divergence"), \
+             mock.patch.object(paths, "vault_root_or_cwd", lambda *a, **k: Path.cwd()), \
+             self.assertRaises(sqlite3.OperationalError):
+            self._run(
+                ["--registry", str(self.vault / "Worker" / "agents" / "registry.yaml"),
+                 "--ledger", str(self.vault / "Worker" / "assignments"),
+                 "--uri", f"file://{self.vault / 'Worker' / 'agents'}",
+                 "auto", "--db", "Todo/todo.db"],
+                cwd=self.elsewhere, vault_env=self.vault)
+
+    def test_status_with_the_old_cwd_base_cannot_find_the_registry(self):
+        """RED control for the second resolution site: with the old cwd base the
+        relative `--registry` default misses the vault's registry.yaml."""
+        with mock.patch.object(paths, "vault_root_or_cwd", lambda *a, **k: Path.cwd()), \
+             self.assertRaises(FileNotFoundError):
+            self._run(["--uri", "file://Worker/agents", "status"],
+                      cwd=self.elsewhere, vault_env=self.vault)
+
+    def test_dashboard_writes_relative_out_into_the_vault(self):
+        rc, out = self._run(
+            ["--uri", "file://Worker/agents", "dashboard",
+             "--out", "Todo/Orchestrator.md", "--db", "Todo/todo.db"],
+            cwd=self.elsewhere, vault_env=self.vault)
+        self.assertEqual(rc, 0)
+        written = self.vault / "Todo" / "Orchestrator.md"
+        self.assertTrue(written.exists())
+        # The printed path names the file actually written, not the raw argument.
+        self.assertIn(f"wrote {written}", out)
+        self.assertFalse((self.elsewhere / "Todo" / "Orchestrator.md").exists())
+
+    def test_agent_mailbox_uri_resolves_against_the_vault(self):
+        """`_mailbox_for` opens each agent's own (possibly relative) `mailbox:`
+        uri; it takes the same base, or a dispatch would write the envelope into
+        a `Worker/agents` directory under the cwd."""
+        with mock.patch("todo_system.orchestrator.hq_host.check",
+                        return_value=(True, "")):
+            rc, out = self._run(
+                ["--uri", f"file://{self.vault / 'Worker' / 'agents'}",
+                 "dispatch", "--task", "t-mb", "--payload", "{}"],
+                cwd=self.elsewhere, vault_env=self.vault)
+        self.assertEqual(rc, 0)
+        self.assertIn("dispatched t-mb -> worker-default", out)
+        inbox = self.vault / "Worker" / "agents" / "worker-default" / "inbox"
+        self.assertEqual(len(list(inbox.glob("*.json"))), 1)
+        self.assertFalse((self.elsewhere / "Worker").exists())
 
 
 if __name__ == "__main__":

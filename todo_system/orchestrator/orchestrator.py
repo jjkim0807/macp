@@ -235,6 +235,7 @@ class Orchestrator:
                  capacity_cooldown_max_s: float = 6 * 3600,
                  job_poll_cooldown_s: float = 300,
                  default_uri: str = f"git://{DEFAULT_ROOT}",
+                 mailbox_base: Path | None = None,
                  alert_route=None):
         self.mb = mailbox                 # default; used for collect (pulls replies)
         self.reg = registry
@@ -269,6 +270,12 @@ class Orchestrator:
                                                         # detached long_job runs
         self.stale_timeout_s = stale_timeout_s
         self.default_uri = default_uri
+        # Base for RELATIVE mailbox uris opened later, per agent (`_mailbox_for`).
+        # None = open_mailbox's own default (the cwd), so every existing caller
+        # and test is unchanged; `_main` passes the vault root so a registry's
+        # relative `mailbox: file://Worker/agents` resolves against the vault
+        # instead of wherever the process was started.
+        self._mb_base = mailbox_base
         self._agent_mb: dict[str, Mailbox] = {}
 
     def _runs_today(self) -> int:
@@ -368,7 +375,7 @@ class Orchestrator:
         if not uri or uri == self.default_uri:
             return self.mb
         if uri not in self._agent_mb:
-            self._agent_mb[uri] = open_mailbox(uri)
+            self._agent_mb[uri] = open_mailbox(uri, base=self._mb_base)
         return self._agent_mb[uri]
 
     # -- Router -----------------------------------------------------------
@@ -2510,6 +2517,15 @@ def _main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
 
+    # Every path argument above defaults to a VAULT-RELATIVE string
+    # (`Worker/assignments`, `Todo/todo.db`, `git://Worker/agents`), which used
+    # to mean "relative to the cwd" and so forced this command to run with its
+    # cwd at the vault. Resolve them against the vault root instead; the
+    # argument *strings* are untouched, so an absolute argument still wins
+    # (`base / "/abs"` == `/abs`) and a cwd-at-the-vault invocation — what the
+    # systemd/launchd units do — produces byte-identical values.
+    base = paths.vault_root_or_cwd()
+
     # HQ host guard — only the marker-elected host runs the AI-dispatch
     # subcommands (`auto`, `dispatch` — the two that reach dispatch()). Before
     # the lease on purpose: a non-HQ host must not even create the lock file.
@@ -2518,13 +2534,16 @@ def _main(argv: list[str] | None = None) -> int:
     # every 5-minute tick.
     if args.cmd in ("auto", "dispatch"):
         from . import hq_host
-        ok, reason = hq_host.check(Path.cwd())
+        ok, reason = hq_host.check(base)
         if not ok:
             print(f"hq-host guard: {reason}")
             return 3
         if args.cmd == "auto":
-            _pull_main(Path.cwd())
-            _check_divergence(Path.cwd())
+            # The vault repo, not the cwd: these three read the HQ marker and
+            # git-pull/diff the vault. From a cwd outside it they inspected
+            # (and pulled) whatever repo the process happened to sit in.
+            _pull_main(base)
+            _check_divergence(base)
 
     if args.lease:
         lease = Lease(args.lease)
@@ -2571,11 +2590,12 @@ def _main(argv: list[str] | None = None) -> int:
             gradle_cap = int(env_gradle)
         except ValueError:
             pass
-    orch = Orchestrator(open_mailbox(args.uri), load_registry(args.registry),
-                        Ledger(args.ledger), daily_run_budget=budget,
+    orch = Orchestrator(open_mailbox(args.uri, base=base),
+                        load_registry(args.registry, base=base),
+                        Ledger(base / args.ledger), daily_run_budget=budget,
                         max_parallel_per_repo=max(1, int(cap)),
                         max_parallel_gradle_builds=max(0, int(gradle_cap)),
-                        default_uri=args.uri)
+                        default_uri=args.uri, mailbox_base=base)
 
     if args.cmd == "dispatch":
         a = orch.dispatch(Task(args.task, json.loads(args.payload)))
@@ -2616,7 +2636,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "auto":
         from . import tasks
-        cands = tasks.load_dispatchable(args.db)
+        cands = tasks.load_dispatchable(base / args.db)
         result = orch.tick(cands)
         budget = f" BUDGET-REACHED (runs today={orch._runs_today()}/{orch.daily_run_budget})" \
             if result.get("budget_reached") else ""
@@ -2638,19 +2658,23 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "dashboard":
         from . import dashboard
-        dashboard.write(orch.ledger, orch.reg, args.out, args.db,
-                        args.decisions_dir, args.items_dir)
-        print(f"wrote {args.out}")
+        # One resolved value per path, reused in the write and in the printed
+        # line, so the output never names a different file than the one written.
+        out = base / args.out
+        dashboard.write(orch.ledger, orch.reg, out, base / args.db,
+                        base / args.decisions_dir, base / args.items_dir)
+        print(f"wrote {out}")
         return 0
 
     if args.cmd == "serve":
         from . import dashboard
+        out = base / args.out
         updated = orch.collect()
         nudged = orch.renudge_due()
-        dashboard.write(orch.ledger, orch.reg, args.out, args.db,
-                        args.decisions_dir, args.items_dir)
+        dashboard.write(orch.ledger, orch.reg, out, base / args.db,
+                        base / args.decisions_dir, base / args.items_dir)
         print(f"serve: collected={len(updated)} renudged={len(nudged)} "
-              f"dashboard={args.out} (coexistence — no AI dispatch)")
+              f"dashboard={out} (coexistence — no AI dispatch)")
         return 0
 
     return 2
