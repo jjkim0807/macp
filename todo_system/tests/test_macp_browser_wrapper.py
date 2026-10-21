@@ -10,7 +10,9 @@ browser.sh scratch-up/scratch-down.
 
 All Chrome is stubbed: a fake `node` that echoes its argv + MACP_BROWSER_CDP to
 $MARK, and a fake `browser.sh` whose scratch-up/scratch-down create/remove a
-`scratch/<name>/ports.env` the way leaf 1's real browser.sh does. No real
+`scratch/<name>/ports.env` the way leaf 1's real browser.sh does. A second
+browser.sh stub writes ports.env in the real lowercase `cdp=` format, cats it to
+stdout, and can leave a background child holding the inherited fds. No real
 browser, no network.
 """
 
