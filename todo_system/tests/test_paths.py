@@ -261,6 +261,107 @@ def test_repo_slug_marker_without_key_falls_through_to_default(monkeypatch, tmp_
     assert paths.repo_slug(start=tmp_path) == "example-org/MaestroACP"
 
 
+# --- state_backend(): env > config > default "git"; invalid value raises -----
+
+def test_state_backend_env_wins(monkeypatch, tmp_path):
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("state_backend = 'external'\n", encoding="utf-8")
+    monkeypatch.setenv("MACP_STATE_BACKEND", "git")
+    assert paths.state_backend(start=tmp_path) == "git"
+
+
+@requires_tomllib
+def test_state_backend_config_key_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("state_backend = 'external'\n", encoding="utf-8")
+    assert paths.state_backend(start=tmp_path) == "external"
+
+
+def test_state_backend_default_git_when_env_and_config_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    start = tmp_path / "no" / "macp" / "here"
+    start.mkdir(parents=True)
+    assert paths.state_backend(start=start) == "git"
+
+
+def test_state_backend_marker_without_key_falls_through_to_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("profile = 'test-host'\n", encoding="utf-8")
+    assert paths.state_backend(start=tmp_path) == "git"
+
+
+def test_state_backend_env_invalid_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_STATE_BACKEND", "bogus")
+    with pytest.raises(ValueError):
+        paths.state_backend(start=tmp_path)
+
+
+@requires_tomllib
+def test_state_backend_config_invalid_raises(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("state_backend = 'bogus'\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        paths.state_backend(start=tmp_path)
+
+
+# --- state_sqlite_path(): env > config > XDG default -------------------------
+
+def test_state_sqlite_path_env_wins(monkeypatch, tmp_path):
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text(
+        f"state_sqlite_path = '{(tmp_path / 'config.sqlite').as_posix()}'\n", encoding="utf-8"
+    )
+    env_path = tmp_path / "env.sqlite"
+    monkeypatch.setenv("MACP_STATE_SQLITE_PATH", str(env_path))
+    assert paths.state_sqlite_path(start=tmp_path) == env_path
+
+
+@requires_tomllib
+def test_state_sqlite_path_config_key_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_SQLITE_PATH", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    config_path = tmp_path / "config.sqlite"
+    (macp / "config.toml").write_text(
+        f"state_sqlite_path = '{config_path.as_posix()}'\n", encoding="utf-8"
+    )
+    assert paths.state_sqlite_path(start=tmp_path) == config_path
+
+
+def test_state_sqlite_path_default_respects_xdg_data_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_SQLITE_PATH", raising=False)
+    start = tmp_path / "no" / "macp" / "here"
+    start.mkdir(parents=True)
+    xdg = tmp_path / "xdg-data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    result = paths.state_sqlite_path(start=start)
+    assert result == xdg / "macp" / "state.sqlite"
+    assert not str(result).startswith(str(tmp_path / "no"))
+
+
+def test_state_sqlite_path_default_falls_back_to_local_share_without_xdg(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_SQLITE_PATH", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    start = tmp_path / "no" / "macp" / "here"
+    start.mkdir(parents=True)
+    assert paths.state_sqlite_path(start=start) == Path(
+        "~/.local/share/macp/state.sqlite"
+    ).expanduser()
+
+
+def test_state_sqlite_path_expanduser(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_STATE_SQLITE_PATH", "~/state.sqlite")
+    assert paths.state_sqlite_path(start=tmp_path) == Path("~/state.sqlite").expanduser()
+
+
 # --- tomllib-less interpreters (macOS launchd /usr/bin/python3 = 3.9) ---------
 # Without the fallback a 3.9 launchd daemon resolved every config key to None and
 # took the neutral default — a silent label change on the Mac. These cases hide
