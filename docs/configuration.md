@@ -30,6 +30,8 @@ in the skeleton, and the matching environment variable wins:
 # timezone     = "Asia/Seoul"     # IANA zone for calendar events (MACP_TIMEZONE)
 # worker_root  = "~/Worker"       # where `repo:` tasks are cloned (MACP_WORKER_ROOT)
 # language     = "en"             # UI language for log/CLI text: en | ko (MACP_LANGUAGE)
+# state_backend      = "git"      # orchestrator state backend: git | external (MACP_STATE_BACKEND)
+# state_sqlite_path  = "~/.local/share/macp/state.sqlite"  # external backend's db path (MACP_STATE_SQLITE_PATH)
 ```
 
 Without `timezone`, calendar events use the host's own IANA zone. If the host does not
@@ -44,6 +46,8 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `MACP_TIMEZONE` | IANA timezone for calendar events (key `timezone`; default: the host's zone) |
 | `MACP_WORKER_ROOT` | where external repositories are cloned (key `worker_root`; default `~/Worker`) |
 | `MACP_LANGUAGE` | UI language for engine log/CLI text, `en` or `ko` (key `language`; default `en`; other values read as `en`) |
+| `MACP_STATE_BACKEND` | orchestrator state backend: `git` (default) or `external` (key `state_backend`) |
+| `MACP_STATE_SQLITE_PATH` | external backend's SQLite path (key `state_sqlite_path`; default `$XDG_DATA_HOME/macp/state.sqlite`, else `~/.local/share/macp/state.sqlite`) |
 | `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
 | `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |

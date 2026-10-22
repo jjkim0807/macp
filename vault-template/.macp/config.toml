@@ -20,3 +20,10 @@
 
 # UI language for engine log/CLI text: "en" | "ko" (MACP_LANGUAGE). Default "en".
 # language = "en"
+
+# Orchestrator state backend: "git" (default) or "external" (MACP_STATE_BACKEND).
+# state_backend = "git"
+
+# SQLite path the "external" state backend reads/writes (MACP_STATE_SQLITE_PATH).
+# Default $XDG_DATA_HOME/macp/state.sqlite, else ~/.local/share/macp/state.sqlite.
+# state_sqlite_path = "~/.local/share/macp/state.sqlite"
