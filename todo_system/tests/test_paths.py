@@ -1228,3 +1228,91 @@ def test_paths_timezone_anchors_on_vault_not_cwd(monkeypatch, tmp_path):
     monkeypatch.setenv("MACP_VAULT_ROOT", str(vault))
     monkeypatch.chdir(elsewhere)
     assert paths.timezone() == "Europe/Berlin"
+
+
+# --- ui_language(): engine log/CLI text language (ko | en) -------------------
+
+
+def _language_config(tmp_path, text):
+    (tmp_path / ".macp").mkdir()
+    (tmp_path / ".macp" / "config.toml").write_text(text, encoding="utf-8")
+
+
+def test_ui_language_env_wins_over_config(monkeypatch, tmp_path):
+    _language_config(tmp_path, 'language = "en"\n')
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert paths.ui_language(start=tmp_path) == "ko"
+
+
+@requires_tomllib
+def test_ui_language_env_en_wins_over_config_ko(monkeypatch, tmp_path):
+    _language_config(tmp_path, 'language = "ko"\n')
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert paths.ui_language(start=tmp_path) == "en"
+
+
+@requires_tomllib
+def test_ui_language_config_key_used_without_env(monkeypatch, tmp_path):
+    _language_config(tmp_path, 'language = "ko"\n')
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    assert paths.ui_language(start=tmp_path) == "ko"
+
+
+def test_ui_language_default_is_en(monkeypatch, tmp_path):
+    # The marker alone (no `language` key) stops the walk and takes the default;
+    # this is the vault-template shape.
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    _language_config(tmp_path, "profile = 'test'\n")
+    assert paths.ui_language(start=tmp_path) == "en"
+
+
+def test_ui_language_default_when_no_config_anywhere(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    monkeypatch.setattr(paths, "_read_config_key",
+                        lambda *a: pytest.fail("no config.toml should be found"))
+    monkeypatch.setattr(paths.Path, "is_file", lambda self: False)
+    assert paths.ui_language(start=tmp_path) == "en"
+
+
+@requires_tomllib
+def test_ui_language_unknown_value_is_en(monkeypatch, tmp_path):
+    _language_config(tmp_path, 'language = "ko"\n')
+    monkeypatch.setenv("MACP_LANGUAGE", "fr")
+    assert paths.ui_language(start=tmp_path) == "en"   # env wins first, then the whitelist
+
+    other = tmp_path / "other"
+    other.mkdir()
+    _language_config(other, 'language = "jp"\n')
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    assert paths.ui_language(start=other) == "en"
+
+
+def test_ui_language_normalises_case_and_space(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", " KO ")
+    assert paths.ui_language(start=tmp_path) == "ko"
+
+
+def test_ui_language_bad_toml_falls_back_to_en(monkeypatch, tmp_path):
+    _language_config(tmp_path, "language = [\n")
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    assert paths.ui_language(start=tmp_path) == "en"
+
+
+@requires_tomllib
+def test_ui_language_anchors_at_vault_root_not_cwd(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _language_config(vault, 'language = "ko"\n')
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.delenv("MACP_LANGUAGE", raising=False)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault))
+    monkeypatch.chdir(elsewhere)
+    assert paths.ui_language() == "ko"
+
+
+def test_ui_language_has_no_import_time_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert paths.ui_language(start=tmp_path) == "ko"
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert paths.ui_language(start=tmp_path) == "en"

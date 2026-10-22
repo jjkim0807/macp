@@ -490,3 +490,41 @@ def timezone(start: Path | None = None) -> str | None:
             break
 
     return _host_iana_timezone()
+
+
+_DEFAULT_UI_LANGUAGE = "en"
+_UI_LANGUAGES = frozenset({"ko", "en"})
+
+
+def ui_language(start: Path | None = None) -> str:
+    """Resolve the language of engine log/CLI text: ``"ko"`` or ``"en"``.
+
+    Resolution order:
+
+    1. ``MACP_LANGUAGE`` environment variable, if set and non-empty.
+    2. The ``language`` key of the nearest ``.macp/config.toml``.
+    3. ``"en"``.
+
+    The first non-empty source wins; its value is then ``strip().lower()``-ed
+    and anything outside ``{"ko", "en"}`` reads as ``"en"`` — so an unknown
+    ``MACP_LANGUAGE`` gives ``"en"`` even when the config says ``"ko"``.
+
+    Anchors its config search at :func:`vault_root_or_cwd`, like
+    :func:`timezone`, because the orchestrator and runner run from outside the
+    vault. ``start`` overrides that anchor and is the test seam. Resolved per
+    call. Never raises: ``i18n`` calls this from bare-``python3`` daemons.
+    """
+    raw = os.environ.get("MACP_LANGUAGE")
+    if not raw:
+        raw = None
+        try:
+            base = (start or vault_root_or_cwd()).resolve()
+            for d in (base, *base.parents):
+                cfg = d / ".macp" / "config.toml"
+                if cfg.is_file():
+                    raw = _read_config_key(cfg, "language")
+                    break
+        except OSError:
+            raw = None
+    value = (raw or "").strip().lower()
+    return value if value in _UI_LANGUAGES else _DEFAULT_UI_LANGUAGE

@@ -334,6 +334,15 @@ def _usage_guard_not_disabled(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _ui_language_ko(monkeypatch):
+    # The test vault (vault-template) leaves `language` unset, so the engine
+    # default "en" would apply; the existing suites pin the Korean strings (the
+    # author's vault sets language = "ko"). Tests of the en path or of the
+    # resolver order override this with setenv/delenv.
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+
+
+@pytest.fixture(autouse=True)
 def _browser_watch_isolated(tmp_path, monkeypatch):
     # The probe script really exists on the HQ: without this, any test that
     # runs cmd_maintenance would spawn node and write the live state file.
