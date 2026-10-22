@@ -29,6 +29,7 @@ from todo_system.orchestrator.state_store import (
     PlannerKV,
     StateStore,
     TodoCacheReader,
+    open_state_store,
 )
 
 
@@ -270,3 +271,19 @@ def test_todo_cache_explicit_db_path(vault, tmp_path):
     store = GitStateStore(vault, todo_db_path=db)
     assert store.todo_cache().counts()["done"] == 3
     assert store.todo_cache() is store.todo_cache()
+
+
+# --- open_state_store(): routes on paths.state_backend() ---------------------
+
+
+def test_open_state_store_default_returns_git_store(monkeypatch, vault):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    result = open_state_store(vault)
+    assert isinstance(result, GitStateStore)
+    assert result.vault_root == vault
+
+
+def test_open_state_store_env_external_raises_not_implemented(monkeypatch, vault):
+    monkeypatch.setenv("MACP_STATE_BACKEND", "external")
+    with pytest.raises(NotImplementedError):
+        open_state_store(vault)
