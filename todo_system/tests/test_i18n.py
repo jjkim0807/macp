@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import string
 from pathlib import Path
 from unittest import mock
 
-from todo_system import cli
+from todo_system import cli, i18n
 from todo_system.orchestrator import resume
 from todo_system.orchestrator.assignment import AWAITING_HUMAN, FAILED, Assignment, Ledger
 from todo_system.orchestrator.mailbox import FileMailbox
@@ -117,3 +118,43 @@ def test_ko_hold_reasons_are_byte_identical(monkeypatch):
              [held("a", touches=["a/**"])], 2) == "depends_on 직렬"
     assert r("t", {"touches": ["a/x.py"]}, [held("a", touches=["a/**"])], 2) == "겹침 있음"
     assert r("t", {"touches": ["a/**"]}, [], 2) == "직렬 대기"
+
+
+# --- the table ------------------------------------------------------------------
+
+
+def _fields(template: str) -> set[str]:
+    return {name for _, name, _, _ in string.Formatter().parse(template) if name}
+
+
+def test_ko_and_en_have_identical_key_sets():
+    assert set(i18n.MESSAGES) == {"ko", "en"}
+    assert set(i18n.MESSAGES["ko"]) == set(i18n.MESSAGES["en"])
+    for lang, table in i18n.MESSAGES.items():
+        assert all(v.strip() for v in table.values()), lang
+
+
+def test_placeholders_match_across_languages():
+    for key, ko in i18n.MESSAGES["ko"].items():
+        assert _fields(ko) == _fields(i18n.MESSAGES["en"][key]), key
+
+
+def test_t_follows_ui_language(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert i18n.t("hold.overlap") == "겹침 있음"
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert i18n.t("hold.overlap") == "touches overlap"
+
+
+def test_missing_en_key_does_not_fall_back_to_ko(monkeypatch):
+    monkeypatch.setitem(i18n.MESSAGES["ko"], "only.ko", "한국어")
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert i18n.t("only.ko") == "only.ko"
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert i18n.t("only.ko") == "한국어"
+
+
+def test_t_never_raises_on_bad_format_args(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert i18n.t("hold.cap", wrong=1) == i18n.MESSAGES["en"]["hold.cap"]
+    assert i18n.t("hold.cap", cap=3) == "cap reached — at most 3 concurrent runs per repo"
