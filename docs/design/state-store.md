@@ -154,6 +154,27 @@ class TodoCacheReader(ABC):   # 거울상: metrics._db_counts(:45-55) + cli.DB_P
 각 영역의 기존 구현(또는 그 하위클래스)을 **보유(has-a)**하고, 호출부는
 `StateStore`를 통해 그 영역에 닿는다.
 
+### 네트워크 백엔드 수용 점검 (§⑦ Cloud SQL · §⑧ 원격 접근 대비)
+
+②의 draft 시그니처가 네트워크 백엔드(§⑧ (a) 본부 HTTP 상태 API, §⑦ Cloud SQL)를 수용하는지 세 축으로 점검:
+
+- **동기 호출**: ledger(save/load/all/active)·mailbox(send/receive/ack)·kv(get/put/all) 시그니처는 전부
+  **동기**다. 네트워크 백엔드는 블로킹 HTTP/DB 클라이언트 + 호출당 타임아웃으로 수용 가능 — async 전환
+  **불필요**. 근거: 현행 mailbox 가 이미 git 전송을 **동기 블로킹**으로 돌리며 호출당 타임아웃을 건다
+  (`mailbox.py:43-45` `GIT_TIMEOUT_LOCAL_S=180`/`GIT_TIMEOUT_NETWORK_S=300`, 선택기 `_git_timeout`:58).
+  "네트워크를 타는 동기 상태 접근 + 내부 타임아웃"은 이미 코드에 있는 패턴이다.
+- **타임아웃**: 추상 시그니처엔 타임아웃 인자가 **없다**(의도) → 백엔드 구현이 내부 상수로 건다(mailbox 가
+  그렇듯). leaf ⑦(네트워크 백엔드)이 백엔드별 timeout(HTTP connect/read, DB statement)을 `mailbox.py:43-45`
+  처럼 모듈 상수로 둬야 한다(설계 요구).
+- **오류 타입**: 네트워크 실패를 표현할 **공통 예외**(예: `StateStoreUnavailable`)가 필요 — 호출부(워커 틱)가
+  이를 잡아 §⑧의 재시도(backoff)/로컬 큐 fallback 으로 연결되게. 현행은 git 실패가 subprocess 오류/타임아웃
+  으로 올라와 틱이 처리하는데, 네트워크 백엔드도 같은 자리에서 잡히도록 공통 예외로 승격한다.
+- **수용 결론(1차 근거)**: `open_mailbox`(`mailbox.py:341`)가 이미 **URI 스킴**으로 백엔드를 고르고
+  (`git://`→GitMailbox, `file://`→FileMailbox), 원격 Runner 가 `--uri "git://Worker/agents"`
+  (`orchestrator_runner_remote.sh:54-57`)로 그 팩토리를 탄다. 네트워크 백엔드 = **새 스킴 추가**
+  (`https://` 상태 API 또는 `postgres://`)이지 재작성이 아니다 → ②의 인터페이스는 네트워크 백엔드를
+  **수용한다**(동기·타임아웃·오류타입 세 축 모두 기존 mailbox 패턴으로 충족).
+
 ---
 
 ## ③ 모드 전환 설정 + external SQLite 스키마 초안
@@ -319,10 +340,15 @@ leaf ⑥의 자동화 스위트(`test_state_store_git_ops.py`)가 된다.
 
 ---
 
-## ⑥ 후속 leaf 지도 (②~⑥, +⑦ 선택)
+## ⑥ 후속 leaf 지도 (②~⑥ 필수 · ⑦ 원격 접근 · ⑧/⑧b/⑧c 트래커)
 
-각 leaf = 범위 한 줄 + touches 후보. ②~⑥은 **필수**, ⑦은 **선택**(다중 호스트 공유가
-필요해질 때). 순서는 직렬 의존(앞이 머지돼야 뒤가 안전):
+각 leaf = 범위 한 줄 + touches 후보. 순서는 직렬 의존(앞이 머지돼야 뒤가 안전). ②~⑥은 **필수**(상태
+저장소 추상화 본체), ⑦은 **원격 접근/네트워크 공유 백엔드**(다중 호스트 공유 필요 시, 부모 체인에서
+human_gate), ⑧·⑧b·⑧c 는 **트래커 어댑터**(§⑨ 설계를 구현):
+
+> **번호 공간 주의**: 여기 leaf 번호(②~⑧)는 **부모 태스크의 분해 단계**이고, 이 문서의 절 번호
+> (§①~§⑨)와는 **다른 공간**이다 — 우연히 겹칠 뿐이다. 대응: leaf ⑦ ↔ §⑦(예약 슬롯)·§⑧(원격 접근
+> 비교/권장), leaf ⑧/⑧b/⑧c ↔ §⑨(트래커).
 
 - **② `StateStore` ABC + `GitStateStore` 현상유지 어댑터** — 네 영역을 하위 표면으로 묶고
   git 백엔드가 현행 `Ledger`/`open_mailbox`/planner_state/todo.db 를 **그대로** 감싼다.
@@ -340,12 +366,21 @@ leaf ⑥의 자동화 스위트(`test_state_store_git_ops.py`)가 된다.
   (`worker.py`의 QUEUE/PLANNER·`metrics.py`의 LEDGER/DB·orchestrator)를 `StateStore`
   경유로 돌린다. *touches*: `todo_system/tests/test_state_store_git_ops.py`(신규) +
   `worker.py`·`metrics.py`·orchestrator 호출부.
-- **⑦ (선택, 다중 호스트 공유 필요 시) Cloud SQL(Postgres) 백엔드** — external 축을
-  네트워크 공유 DB 로 확장. **Supabase·Neon 금지**([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]);
-  **GCP Cloud SQL 만** 각주 확장. *touches*: 신규 백엔드 모듈 + 테스트.
+- **⑦ 원격 접근 / 네트워크 공유 백엔드 leaf (human_gate)** — external 축을 다른 머신의 러너가 공유
+  (§⑧ 상세·권장안을 흡수). 1차는 **(a) 본부 HTTP 상태 API + 토큰**(SQLite SoT 를 본부 한 곳에 유지);
+  네트워크 공유 DB 가 필요해지면 **(b) GCP Cloud SQL(Postgres) 만**(~$10~25/월, 사람 게이트 —
+  **Supabase·Neon 금지** [[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]). (c) 현행 git inbox 는
+  상태 공유가 불필요한 원격 호스트의 baseline 으로 유지. 기존 "⑦ (선택) Cloud SQL" 불릿을 이 leaf 가
+  흡수. *touches*: 신규 상태 API 서버 + 클라이언트 모듈(또는 Cloud SQL 백엔드) + 테스트. 실제 네트워크
+  노출·프로비저닝은 **사람 결정**.
+- **⑧ 트래커 어댑터 leaf (§⑨ 설계)** — 외부 트래커 ↔ 태스크 md 브리지. 부모 체인 번호와 일치:
+  - **⑧ Jira(REST v3) 어댑터** · **⑧b GitHub Issues(REST) 어댑터** · **⑧c Linear(GraphQL) 어댑터**.
+  *touches*: `todo_system/orchestrator/tracker_adapter.py`(신규 `TrackerAdapter` ABC + `TaskRecord` DTO)
+  + provider별 모듈(`tracker_jira.py`/`tracker_github.py`/`tracker_linear.py`, 신규) + 테스트. `external_ref`
+  frontmatter 필드 배선(§⑨)과 polling 틱 훅 포함.
 
-> 열림 질문 해소: 부모 분해는 ②~⑦이지만 이 leaf 의 수용 기준은 ②~⑥을 필수로 본다.
-> 위처럼 ②~⑥을 필수, ⑦을 선택으로 적어 양쪽을 만족한다.
+> 열림 질문 해소: 상태 저장소 추상화의 수용 기준은 leaf ②~⑥(필수). leaf ⑦(원격 접근, human_gate)과
+> ⑧/⑧b/⑧c(트래커)는 §⑦~§⑨ 설계가 선행 조건을 깔아둔, 부모 체인의 후속 분해다.
 
 ---
 
@@ -567,5 +602,14 @@ WebFetch/WebSearch 로 2026-10-22 확인(확인 못 한 칸은 '미확인'):
 3. ledger 는 external 모드에서도 git-추적 `Worker/assignments/` 로 **읽기 전용 스냅샷**
    export(권위 사본은 SQLite) — 본부/대시보드 호환 유지(§④).
 4. todo.db 는 **비이관**(md 의 파생 캐시)(§②§③).
-5. 상시 외부 SaaS DB(Supabase/Neon) **배제**; Cloud SQL 은 선택 각주(§⑥⑦)
+5. 상시 외부 SaaS DB(Supabase/Neon) **배제**; Cloud SQL 은 선택(§⑦ 예약 슬롯 · §⑧ 비교 (b) · §⑥ leaf ⑦)
    ([[Decisions/2026-10-13-macp-task-store]], [[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]).
+6. **원격 접근**(§⑦·§⑧) = 권장 **(a) 본부 HTTP 상태 API + 토큰**(SQLite SoT 는 본부 한 곳; Tailscale
+   테일넷 노출 권장), **(c) git baseline 유지**, **(b) Cloud SQL(~$10~25/월)은 사람-게이트 에스컬레이션**
+   — 실제 네트워크 노출·프로비저닝은 사람 결정. 본부 장애 시 재시도+로컬 아웃박스 flush, claim=lease(TTL)로
+   at-least-once 중복 실행 방지(네트워크 백엔드에선 틈브스톤 불필요).
+7. **외부 트래커**(§⑨) = `TrackerAdapter`(pull/push/map), **md 가 정본**·트래커는 뷰(충돌 시 md 우선),
+   `external_ref` frontmatter 로 연결, **polling 1차**(webhook 은 실시간 필수 시 + 백스톱). Jira(REST v3)·
+   GitHub(REST)·Linear(GraphQL) — 혼합 transport.
+8. ②의 `StateStore` 인터페이스는 **네트워크 백엔드 수용**(동기 호출+내부 타임아웃+공통 예외; `open_mailbox`
+   URI-스킴 seam 으로 "새 스킴 추가" — §② 네트워크 백엔드 수용 점검).
