@@ -2160,3 +2160,44 @@ class KoGolden(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, M.HTML.encode("utf-8"))
         self.assertEqual(hashlib.sha256(body).hexdigest(), _KO_HTML_SHA256)
+
+
+class EnServerStrings(unittest.TestCase):
+    """With language = en the strings the server builds carry no Hangul."""
+
+    def setUp(self):
+        p = mock.patch.dict(os.environ, {"MACP_LANGUAGE": "en"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_worker_state_details_en(self):
+        got = {name: M.determine_worker_state(**kw) for name, kw in _worker_state_cases()}
+        for name, (_, detail) in got.items():
+            self.assertIsNone(_HANGUL.search(detail), (name, detail))
+        # the enum values are the JSON contract — language never touches them
+        self.assertEqual([s for s, _ in got.values()],
+                         ["paused", "hold", "budget", "running", "post_run", "post_run",
+                          "post_run", "waiting_serial", "waiting_serial", "no_work"])
+        self.assertEqual(got["budget"][1],
+                         "daily run budget reached (3/3) — waiting for reset")
+        self.assertEqual(got["post_run_note"][1], "a post-processing — note")
+        self.assertEqual(got["contended"][1],
+                         "waiting in series — a ×2 share one checkout (max 1 per repo)")
+        self.assertEqual(got["no_work"][1], "no dispatchable tasks")
+
+    def test_collect_human_parked_fallback_en(self):
+        a = [{"task": "p1", "state": "awaiting_human", "note": "", "project": "x"}]
+        with mock.patch.object(M, "TODO_DB", Path(tempfile.mkdtemp()) / "missing.db"), \
+                mock.patch.object(M, "REGISTRY", Path("/nonexistent/registry.yaml")):
+            rows = M.collect_human(a, today=dt.date(2049, 1, 10))
+        self.assertEqual(rows[0]["action"], "awaiting review/approval")
+
+    def test_sms_setup_page_en(self):
+        for tok in ("tok", ""):
+            with mock.patch.dict(os.environ, {"MACP_SMS_TOKEN": tok}):
+                page = _sms_handler()._sms_setup_page()
+            self.assertIsNone(_HANGUL.search(page), page)
+            self.assertIn("<h2>SMS relay setup</h2>", page)
+        with mock.patch.dict(os.environ, {"MACP_SMS_TOKEN": "tok"}):
+            self.assertIn(">Apply settings in the SMS Relay app</a>",
+                          _sms_handler()._sms_setup_page())

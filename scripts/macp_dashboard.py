@@ -55,6 +55,7 @@ if str(_INSTALL_DIR) not in _sys.path:
     _sys.path.insert(0, str(_INSTALL_DIR))
 from todo_system import paths  # noqa: E402
 from todo_system import sms  # noqa: E402
+from todo_system import i18n  # noqa: E402
 from todo_system import not_before as _nb  # noqa: E402 — alias: is_deferred is taken below
 from todo_system.orchestrator.assignment import display_state, is_deferred  # noqa: E402
 # Engine root through the resolver: dev checkout -> repo root (same value as the
@@ -183,7 +184,7 @@ def determine_worker_state(
     """Why is the worker in the state it is? Pure — no file/process/db I/O.
 
     Returns ``(worker_state, worker_state_detail)`` where ``worker_state`` is one
-    of ``WORKER_STATES`` and ``worker_state_detail`` is a one-line Korean gloss
+    of ``WORKER_STATES`` and ``worker_state_detail`` is a one-line gloss in ``ui_language()``
     carrying no prompt text or secrets.
 
     Inputs:
@@ -205,13 +206,13 @@ def determine_worker_state(
     post_run > waiting_serial > no_work.
     """
     if paused:
-        return "paused", "일시정지(PAUSED) — 새 작업 디스패치 중단"
+        return "paused", i18n.t("dash.state.paused")
     if not usage_allowed:
-        return "hold", "usage guard HOLD — 사용량 한도로 대기"
+        return "hold", i18n.t("dash.state.hold")
     if budget and runs_today >= budget:
-        return "budget", f"일일 실행 예산 도달 ({runs_today}/{budget}) — 리셋까지 대기"
+        return "budget", i18n.t("dash.state.budget", runs_today=runs_today, budget=budget)
     if stage_count >= 1:
-        return "running", f"워커 실행 중 — claude 스테이지 {stage_count}개"
+        return "running", i18n.t("dash.state.running", n=stage_count)
     if in_flight:
         # stage 0 but a ledger row is still live: beta build / merge
         # post-processing finishing up. This is the salient state whether or not
@@ -221,9 +222,10 @@ def determine_worker_state(
         if len(in_flight) == 1:
             note = (in_flight[0].get("note") or "")[:40]
             tail = f" — {note}" if note else ""
-            return "post_run", f"{labels[0]} 후처리 중{tail}"
+            return "post_run", i18n.t("dash.state.post_run_one", label=labels[0], tail=tail)
         uniq = sorted(set(labels))
-        return "post_run", f"{len(in_flight)}건 후처리 중 ({', '.join(uniq)})"
+        return "post_run", i18n.t("dash.state.post_run_many", n=len(in_flight),
+                                  labels=", ".join(uniq))
     if dispatchable_checkouts:
         # stage 0, nothing in-flight: the orchestrator has not dispatched yet.
         # Candidates that collide on one checkout cannot all go (serial per
@@ -236,11 +238,11 @@ def determine_worker_state(
             waiters[_checkout_label(k)] = waiters.get(_checkout_label(k), 0) + 1
         contended = {lbl: n for lbl, n in waiters.items() if n > cap}
         if contended:
-            parts = ", ".join(f"{lbl} {n}건"
+            parts = ", ".join(i18n.t("dash.state.contended_part", label=lbl, n=n)
                               for lbl, n in sorted(contended.items()))
-            return "waiting_serial", f"직렬 대기 — {parts}가 한 체크아웃을 공유 (repo당 최대 {cap}개)"
-        return "waiting_serial", f"다음 틱에 디스패치 예정 ({len(dispatchable_checkouts)}건 대기)"
-    return "no_work", "디스패치 가능한 태스크 없음"
+            return "waiting_serial", i18n.t("dash.state.contended", parts=parts, cap=cap)
+        return "waiting_serial", i18n.t("dash.state.next_tick", n=len(dispatchable_checkouts))
+    return "no_work", i18n.t("dash.state.no_work")
 
 
 def collect_assignments() -> list[dict]:
@@ -876,7 +878,7 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                 and r.get("todo_status") not in ("cancelled", "done")
                 and r["task"] not in umbrellas):
             items.append({"slug": r["task"], "title": r["task"], "category": "dev",
-                          "action": r["note"] or "검토/승인 대기", "why": "parked",
+                          "action": r["note"] or i18n.t("dash.human.parked"), "why": "parked",
                           "project": r.get("project", ""), "due": "", "not_before": "",
                           "urgent": True, "later": False})
             seen.add(r["task"])
@@ -2332,12 +2334,12 @@ class Handler(BaseHTTPRequestHandler):
             scheme = self.headers.get("X-Forwarded-Proto") or ("http" if local else "https")
             endpoint = f"{scheme}://{host}/api/sms"
             link = f"macpsms://setup?url={quote(endpoint, safe='')}&token={quote(sms_token, safe='')}"
-            body = (f'<p><a style="font-size:1.4em" href="{escape(link)}">SMS 릴레이 앱에 설정 적용</a></p>'
+            body = (f'<p><a style="font-size:1.4em" href="{escape(link)}">{escape(i18n.t("dash.sms.apply"))}</a></p>'
                     f"<p>endpoint: <code>{escape(endpoint)}</code></p>")
         return ("<!doctype html><meta charset=utf-8>"
                 '<meta name=viewport content="width=device-width,initial-scale=1">'
                 f"<title>SMS relay setup</title><body style='font-family:sans-serif;padding:1em'>"
-                f"<h2>SMS 릴레이 설정</h2>{body}</body>")
+                f"<h2>{escape(i18n.t('dash.sms.title'))}</h2>{body}</body>")
 
     # -- SMS ingest (phone -> todo_system.sms) --------------------------------
     # Write-only and gated by its OWN secret (MACP_SMS_TOKEN): the phone never
