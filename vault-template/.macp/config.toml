@@ -17,3 +17,6 @@
 
 # Where external repos (`repo:` tasks) are cloned (MACP_WORKER_ROOT). Default ~/Worker.
 # worker_root = "~/Worker"
+
+# UI language for engine log/CLI text: "en" | "ko" (MACP_LANGUAGE). Default "en".
+# language = "en"
