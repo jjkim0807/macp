@@ -2155,6 +2155,57 @@ def wait_ingest_alerts(timeout: float = 5.0) -> bool:
     return not any(t.is_alive() for t in pending)
 
 
+STATUS_TTL_S = float(os.environ.get("MACP_DASHBOARD_STATUS_TTL", "2.0") or 2.0)
+
+
+class _StatusCache:
+    """Single-flight, short-TTL cache for the /api/status body.
+
+    collect_status() walks the whole vault (every ledger json, the todo DB, run
+    dirs) — 5-13 s on a loaded host. Each client polls every 3 s, and before this
+    cache every request computed its own copy concurrently. Once a compute took
+    longer than the poll interval, requests piled up faster than they finished:
+    on 2026-10-22 (after the queue view added a second full ledger read) the
+    server sat at 110 threads in futex waits, loopback requests timed out and the
+    app could not reach HQ.
+
+    Now at most ONE compute runs at a time per server. A request that finds a body
+    younger than `ttl` gets it immediately; one that arrives while a compute is in
+    flight waits for that compute instead of starting another. If the compute
+    raises, waiters are released and the next request retries."""
+
+    def __init__(self, ttl: float = STATUS_TTL_S, wait_s: float = 60.0):
+        self.ttl = ttl
+        self.wait_s = wait_s
+        self._cv = threading.Condition(threading.Lock())
+        self._body: bytes | None = None
+        self._at = 0.0
+        self._busy = False
+
+    def get(self, compute) -> bytes:
+        with self._cv:
+            while True:
+                if self._body is not None and time.monotonic() - self._at < self.ttl:
+                    return self._body
+                if not self._busy:
+                    self._busy = True
+                    break
+                woke = self._cv.wait(timeout=self.wait_s)
+                if not woke and self._body is not None:
+                    return self._body          # compute is stuck: serve the last good body
+        try:
+            body = compute()
+        except BaseException:
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
+            raise
+        with self._cv:
+            self._body, self._at, self._busy = body, time.monotonic(), False
+            self._cv.notify_all()
+        return body
+
+
 class Handler(BaseHTTPRequestHandler):
     # Shared secret; None = open (only allowed on loopback, see `serve`).
     token: str | None = None
@@ -2166,6 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
     RL_MAX_FAILS = 5
     _auth_failures: dict[str, list[float]] = {}
     _auth_lock = threading.Lock()
+    _status_cache = _StatusCache()     # fallback; serve() gives each server its own
 
     def log_message(self, *a):  # quiet
         pass
@@ -2239,8 +2291,9 @@ class Handler(BaseHTTPRequestHandler):
             # off: tailscale serve terminates TLS and forwards plain http here.
             extra["Set-Cookie"] = f"{COOKIE}={self.token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict"
         if urlparse(self.path).path == "/api/status":
-            self._reply(200, json.dumps(collect_status()).encode("utf-8"),
-                        "application/json", extra)
+            body = self._status_cache.get(
+                lambda: json.dumps(collect_status()).encode("utf-8"))
+            self._reply(200, body, "application/json", extra)
         elif urlparse(self.path).path == "/api/task":
             slug = (parse_qs(urlparse(self.path).query).get("slug") or [""])[0]
             detail = collect_task_detail(slug)
@@ -2356,6 +2409,7 @@ def serve(host: str, port: int, token: str | None,
         "token": token or None,
         "_auth_failures": {},          # per-server: no leakage across servers/tests
         "_auth_lock": threading.Lock(),
+        "_status_cache": _StatusCache(),   # per-server single-flight /api/status
     })
     return ThreadingHTTPServer((host, port), handler)
 

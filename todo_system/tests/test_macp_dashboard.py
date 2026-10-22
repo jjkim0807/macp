@@ -25,6 +25,7 @@ import sqlite3
 import tempfile
 import threading
 import types
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from unittest import mock
@@ -1980,3 +1981,80 @@ class QueueCollectTests(unittest.TestCase):
         before = tree()
         M.collect_queue()
         self.assertEqual(tree(), before)
+
+
+class StatusSingleFlightTests(unittest.TestCase):
+    """2026-10-22: concurrent /api/status polls each ran collect_status() (5-13 s on
+    a loaded host); requests outpaced completions, the server hit 110 threads and
+    the app could not connect. One compute per server at a time, short TTL reuse."""
+
+    def test_concurrent_callers_share_one_compute(self):
+        import threading as th
+        cache = M._StatusCache(ttl=5.0)
+        calls = []
+
+        def compute():
+            calls.append(1)
+            time.sleep(0.3)
+            return b"body"
+
+        out = []
+        ts = [th.Thread(target=lambda: out.append(cache.get(compute))) for _ in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out, [b"body"] * 20)
+
+    def test_ttl_expiry_recomputes(self):
+        cache = M._StatusCache(ttl=0.05)
+        n = iter(range(10))
+        self.assertEqual(cache.get(lambda: str(next(n)).encode()), b"0")
+        self.assertEqual(cache.get(lambda: str(next(n)).encode()), b"0")   # within ttl
+        time.sleep(0.08)
+        self.assertEqual(cache.get(lambda: str(next(n)).encode()), b"1")
+
+    def test_failed_compute_releases_and_next_call_retries(self):
+        cache = M._StatusCache(ttl=5.0)
+
+        def boom():
+            raise RuntimeError("x")
+
+        with self.assertRaises(RuntimeError):
+            cache.get(boom)
+        self.assertEqual(cache.get(lambda: b"ok"), b"ok")
+
+    def test_http_concurrent_polls_compute_once(self):
+        import threading as th
+        import urllib.request
+        calls = []
+
+        def slow_status():
+            calls.append(1)
+            time.sleep(0.4)
+            return {"ok": True}
+
+        srv = M.serve("127.0.0.1", 0, None)
+        port = srv.server_address[1]
+        th.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.object(M, "collect_status", slow_status):
+                codes = []
+
+                def hit():
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status",
+                                                timeout=10) as r:
+                        codes.append((r.status, r.read()))
+
+                ts = [th.Thread(target=hit) for _ in range(12)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(15)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([c for c, _ in codes], [200] * 12)
+            self.assertTrue(all(b == b'{"ok": true}' for _, b in codes))
+        finally:
+            srv.shutdown()
+            srv.server_close()
