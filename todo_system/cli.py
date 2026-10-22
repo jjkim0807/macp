@@ -1651,6 +1651,75 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_dashboard():
+    """scripts/macp_dashboard.py as a module (scripts/ is not a package). Loaded
+    lazily by `queue` only, so no other command pays for — or depends on — it."""
+    import importlib.util
+
+    mod = sys.modules.get("macp_dashboard")
+    if mod is not None:
+        return mod
+    src = paths.engine_root() / "scripts" / "macp_dashboard.py"
+    spec = importlib.util.spec_from_file_location("macp_dashboard", src)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["macp_dashboard"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop("macp_dashboard", None)
+        raise
+    return mod
+
+
+def _queue_for_db(db: Path) -> dict:
+    """The dashboard's own collect_queue, pointed at the vault that owns `db`
+    (`<vault>/Todo/todo.db`), so `queue --json` is the /api/status rows."""
+    vault = db.resolve().parent.parent
+    try:
+        st = json.loads((vault / "Worker" / "_state" / "usage_guard" / "latest.json")
+                        .read_text(encoding="utf-8"))
+        usage = st.get("decision") or None
+    except Exception:
+        usage = None
+    return _load_dashboard().collect_queue(
+        db=db, assign=vault / "Worker" / "assignments",
+        registry=vault / "Worker" / "agents" / "registry.yaml", usage=usage)
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    try:
+        q = _queue_for_db(Path(args.db))
+    except Exception as e:
+        print(f"queue: dashboard module unavailable ({e})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(q, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"큐 ({len(q['queue'])})")
+    if q["queue"]:
+        print(f"  {'#':>2}  {'WAIT':<13}  {'SLUG':<40}  {'CHECKOUT':<16}  사유")
+        for i, r in enumerate(q["queue"], 1):
+            print(f"  {i:>2}  {r['wait']:<13}  {r['slug']:<40}  {r['checkout']:<16}  "
+                  f"{r['wait_text']}")
+    else:
+        print("  (없음)")
+    print(f"⏳ 예약됨 ({len(q['queue_upcoming'])})")
+    if q["queue_upcoming"]:
+        print(f"  {'SLUG':<40}  NOT_BEFORE")
+        for r in q["queue_upcoming"]:
+            print(f"  {r['slug']:<40}  {r['not_before']}")
+    else:
+        print("  (없음)")
+    print(f"🔗 선행 대기 ({len(q['queue_blocked'])})")
+    if q["queue_blocked"]:
+        for r in q["queue_blocked"]:
+            print(f"  {r['slug']:<40}  ← {', '.join(r['waiting_on']) or '(선행 완료)'}")
+    else:
+        print("  (없음)")
+    return 0
+
+
 def cmd_now(args: argparse.Namespace) -> int:
     con = db_connect(Path(args.db))
     init_db(con)
@@ -1820,6 +1889,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_weekly = sub.add_parser("weekly-review", help="Print weekly review snapshot")
     p_weekly.set_defaults(func=cmd_weekly_review)
+
+    p_queue = sub.add_parser(
+        "queue", help="Worker queue: dispatch order + wait reason, scheduled, blocked (read-only)")
+    p_queue.add_argument("--json", action="store_true",
+                         help="Same rows as /api/status queue / queue_upcoming / queue_blocked")
+    p_queue.set_defaults(func=cmd_queue)
 
     p_complete = sub.add_parser("complete", help="Complete a task (or one subtask) by slug")
     p_complete.add_argument("slug", help="Task slug (filename without .md)")

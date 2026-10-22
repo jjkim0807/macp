@@ -379,3 +379,65 @@ def test_weekly_review_done_only_is_empty(
     assert rc == 0
     assert "no open tasks" in out
     assert "Weekly closed" not in out
+
+
+# ---------------------------------------------------------------- queue
+
+QUEUE_ROW_KEYS = ["slug", "title", "project", "group", "worker_mode", "priority",
+                  "checkout", "wait", "wait_text", "holder", "since"]
+
+
+def _queue_vault(tmp_path: Path) -> Path:
+    """`<tmp>/Todo/todo.db` + a catch-all registry + an empty ledger: the layout
+    `queue` derives the vault from (db -> parent.parent)."""
+    for d in ("Todo/items", "Worker/assignments", "Worker/agents", "Worker/runs"):
+        (tmp_path / d).mkdir(parents=True)
+    (tmp_path / "Worker/agents/registry.yaml").write_text(
+        "agents:\n  - id: w\n    kind: ai-local\n    projects: ['*']\n", encoding="utf-8")
+    db = tmp_path / "Todo" / "todo.db"
+    con = cli.db_connect(db)
+    cli.init_db(con)
+    con.close()
+    _seed(db,
+          {"slug": "qx-auto", "title": "Queued auto", "worker_mode": "auto",
+           "path": str(tmp_path / "Todo/items/qx-auto.md")},
+          {"slug": "qx-later", "title": "Scheduled", "worker_mode": "auto",
+           "not_before": "2999-01-01", "path": str(tmp_path / "Todo/items/qx-later.md")})
+    return db
+
+
+def test_queue_prints_the_three_blocks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    db = _queue_vault(tmp_path)
+
+    rc, out = _run(db, capsys, "queue")
+
+    assert rc == 0
+    assert "큐 (1)" in out
+    assert "⏳ 예약됨 (1)" in out
+    assert "🔗 선행 대기 (0)" in out
+    assert "qx-auto" in out and "next_tick" in out
+    assert "qx-later" in out and "2999-01-01" in out
+    assert "(없음)" in out
+
+
+def test_queue_json_is_the_dashboard_rows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    db = _queue_vault(tmp_path)
+
+    rc, out = _run(db, capsys, "queue", "--json")
+
+    assert rc == 0
+    got = json.loads(out)
+    assert sorted(got) == ["queue", "queue_blocked", "queue_upcoming"]
+    assert [list(r) for r in got["queue"]] == [QUEUE_ROW_KEYS]
+    assert got["queue"][0]["slug"] == "qx-auto"
+    assert got["queue_upcoming"][0]["slug"] == "qx-later"
+    assert got["queue_blocked"] == []
+    # one row builder: the CLI prints exactly what the dashboard's collector returns
+    dash = cli._load_dashboard()
+    assert got == dash.collect_queue(
+        db=db, assign=tmp_path / "Worker/assignments",
+        registry=tmp_path / "Worker/agents/registry.yaml")
