@@ -414,6 +414,93 @@ def worker_root(start: Path | None = None) -> Path:
     return Path(_DEFAULT_WORKER_ROOT).expanduser()
 
 
+_DEFAULT_STATE_BACKEND = "git"
+_VALID_STATE_BACKENDS = frozenset({"git", "external"})
+
+
+def state_backend(start: Path | None = None) -> str:
+    """Resolve which :class:`~todo_system.orchestrator.state_store.StateStore`
+    implementation the orchestrator should use: ``"git"`` or ``"external"``.
+
+    Resolution order mirrors :func:`repo_slug`:
+
+    1. ``MACP_STATE_BACKEND`` environment variable, if set and non-empty.
+    2. The ``state_backend`` key of the nearest ``.macp/config.toml`` found by
+       walking up from ``start`` (or the current working directory).
+    3. ``_DEFAULT_STATE_BACKEND`` (``"git"``) — a fresh install keeps using the
+       git-backed store it has today.
+
+    Unlike every other resolver in this module, an out-of-range value is a hard
+    error rather than a silent fallback: ``ValueError`` is raised from whichever
+    source (env or config) supplied it, naming the allowed values, so a typo in
+    either place fails loudly instead of quietly routing state onto the wrong
+    backend.
+
+    ``start`` is the same test seam as :func:`vault_root`.
+    """
+    env = os.environ.get("MACP_STATE_BACKEND")
+    if env:
+        if env not in _VALID_STATE_BACKENDS:
+            raise ValueError(
+                f"MACP_STATE_BACKEND must be one of {sorted(_VALID_STATE_BACKENDS)}, got {env!r}"
+            )
+        return env
+
+    base = (start or Path.cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "state_backend")
+            if key:
+                if key not in _VALID_STATE_BACKENDS:
+                    raise ValueError(
+                        f"state_backend config key must be one of {sorted(_VALID_STATE_BACKENDS)}, got {key!r}"
+                    )
+                return key
+            break
+
+    return _DEFAULT_STATE_BACKEND
+
+
+_DEFAULT_STATE_SQLITE_PATH = "~/.local/share/macp/state.sqlite"
+
+
+def state_sqlite_path(start: Path | None = None) -> Path:
+    """Resolve the SQLite file the ``external`` state backend reads/writes.
+
+    Resolution order mirrors :func:`worker_root`:
+
+    1. ``MACP_STATE_SQLITE_PATH`` environment variable, if set and non-empty.
+    2. The ``state_sqlite_path`` key of the nearest ``.macp/config.toml``.
+    3. ``$XDG_DATA_HOME/macp/state.sqlite`` when ``XDG_DATA_HOME`` is set and
+       non-empty, else ``~/.local/share/macp/state.sqlite``.
+
+    All three forms go through ``expanduser()``, so ``~/state.sqlite`` is
+    accepted. The default deliberately lands outside the vault tree — the
+    point of the external backend is state that is not vault-git-tracked.
+
+    Resolved **per call**, like :func:`worker_root`, never frozen into a module
+    constant.
+    """
+    env = os.environ.get("MACP_STATE_SQLITE_PATH")
+    if env:
+        return Path(env).expanduser()
+
+    base = (start or vault_root_or_cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "state_sqlite_path")
+            if key:
+                return Path(key).expanduser()
+            break
+
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "macp" / "state.sqlite"
+    return Path(_DEFAULT_STATE_SQLITE_PATH).expanduser()
+
+
 _LOCALTIME_PATH = Path("/etc/localtime")
 _ZONEINFO_DIR = Path("/usr/share/zoneinfo")
 
