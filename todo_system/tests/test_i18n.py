@@ -120,6 +120,65 @@ def test_ko_hold_reasons_are_byte_identical(monkeypatch):
     assert r("t", {"touches": ["a/**"]}, [], 2) == "직렬 대기"
 
 
+# --- en: the same points in English ---------------------------------------------
+
+
+def test_en_hold_reasons(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+
+    def held(slug, **payload):
+        return Assignment(task_id=slug, agent_id="w", corr_id="c", payload=dict(payload))
+
+    r = Orchestrator._hold_reason
+    assert r("t", {"touches": ["c/**"]},
+             [held("a", touches=["a/**"]), held("b", touches=["b/**"])], 2) == (
+        "cap reached — at most 2 concurrent runs per repo")
+    assert r("t", {}, [held("a", touches=["a/**"])], 2) == "overlap undetermined (no touches)"
+    assert r("t", {"touches": ["b/**"], "depends_on": ["a"]},
+             [held("a", touches=["a/**"])], 2) == "serial via depends_on"
+    assert r("t", {"touches": ["a/x.py"]}, [held("a", touches=["a/**"])], 2) == "touches overlap"
+    assert r("t", {"touches": ["a/**"]}, [], 2) == "waiting in series"
+
+
+def test_en_hold_note(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch = _orch(tmp_path)
+    assert _hold_note(orch, "other-slug", "touches overlap") == (
+        "waiting — `other-slug` is running in the same checkout (repo); reason: touches overlap")
+    assert _hold_note(orch, "") == (
+        "waiting — another task is running in the same checkout (repo); reason: waiting in series")
+
+
+def test_en_resume_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    root = _vault(tmp_path, "s")
+    tail = ("  expires: in 24h (on expiry only the reservation is removed, with one alert)\n"
+            "  the next orchestrator tick checks the conditions — do not edit the assignment json.\n")
+    rc, out = _resume_out(root, "s", after_commit="a1b2c3d")
+    assert rc == 0
+    assert out == (
+        f"resume reserved: {resume.record_path(root, 's')}\n"
+        "  condition: live checkout HEAD is main + a1b2c3d is an ancestor of HEAD"
+        " + state is awaiting_human/failed\n" + tail)
+    rc, out = _resume_out(root, "s")
+    assert rc == 0
+    assert out == (
+        f"resume reserved: {resume.record_path(root, 's')}\n"
+        "  condition: live checkout HEAD is main + no commit condition"
+        " + state is awaiting_human/failed\n" + tail)
+    # The ResumeError text comes from resume.py (out of scope, still Korean).
+    rc, out = _resume_out(root, "__no_such_slug__")
+    assert rc == 2
+    assert out.startswith("resume reservation refused: ")
+
+
+def test_note_truncation_is_kept(monkeypatch, tmp_path):
+    orch = _orch(tmp_path)
+    for lang in ("ko", "en"):
+        monkeypatch.setenv("MACP_LANGUAGE", lang)
+        assert len(_hold_note(orch, "other-slug", "x" * 300)) == 200
+
+
 # --- the table ------------------------------------------------------------------
 
 

@@ -20,6 +20,7 @@ from . import worker as _worker
 from . import task_validate as _task_validate
 from . import session_end as _session_end
 from . import paths
+from . import i18n
 
 ROOT = paths.vault_root()
 TODO_DIR = ROOT / "Todo"
@@ -1319,15 +1320,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         path = _resume.schedule(ROOT, args.slug, after_commit=args.after_commit,
                                 expire_hours=args.expire_hours, note=args.note or "")
     except _resume.ResumeError as e:
-        print(f"resume 예약 거부: {e}")
+        print(i18n.t("resume.refused", error=e))
         return 2
     sha = (args.after_commit or "").strip()
-    ancestry = f"{sha}가 HEAD의 조상" if sha else "커밋 조건 없음"
-    print(f"resume 예약: {path}")
-    print(f"  조건: 라이브 체크아웃 HEAD가 main + {ancestry} "
-          f"+ state가 awaiting_human/failed")
-    print(f"  만료: {args.expire_hours}h 뒤 (만료되면 예약만 지워지고 경보 1회)")
-    print("  다음 오케스트레이터 틱이 조건을 판정합니다 — assignment json은 건드리지 마세요.")
+    ancestry = (i18n.t("resume.ancestry_sha", sha=sha) if sha
+                else i18n.t("resume.ancestry_none"))
+    print(i18n.t("resume.reserved", path=path))
+    print(i18n.t("resume.condition", ancestry=ancestry))
+    print(i18n.t("resume.expiry", hours=args.expire_hours))
+    print(i18n.t("resume.next_tick"))
     return 0
 
 

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import human, message as m, stages
-from .. import kakao_format, paths
+from .. import i18n, kakao_format, paths
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
     ACCEPTED, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS, REJECTED,
@@ -670,9 +670,10 @@ class Orchestrator:
 
     @staticmethod
     def _hold_reason(t_slug: str, t_payload: dict, held: list, cap: int) -> str:
-        """WHY is `t` held behind the siblings already in `held`? A short Korean
-        phrase for the deferred row's note, so the dashboards can tell a plain
-        cap hit from a 'touches undetermined' hold from a real overlap.
+        """WHY is `t` held behind the siblings already in `held`? A short phrase
+        in the configured UI language (i18n `hold.*`) for the deferred row's
+        note, so the dashboards can tell a plain cap hit from a 'touches
+        undetermined' hold from a real overlap.
 
         Mirrors the dispatch guard's own branches (cap first, then the first
         sibling `_can_run_concurrently` rejects, classified in that predicate's
@@ -680,7 +681,7 @@ class Orchestrator:
         glob overlap). Pure — no Orchestrator state, stdlib + same-module helpers.
         """
         if len(held) >= cap:
-            return f"상한 도달 — repo당 동시 실행 최대 {cap}개"
+            return i18n.t("hold.cap", cap=cap)
         t_touch = _as_glob_list((t_payload or {}).get("touches"))
         for o in held:
             o_payload = o.payload or {}
@@ -688,12 +689,12 @@ class Orchestrator:
                     t_slug, t_payload or {}, o.task_id, o_payload):
                 continue
             if not t_touch or not _as_glob_list(o_payload.get("touches")):
-                return "겹침 미판정 (touches 없음)"
+                return i18n.t("hold.no_touches")
             if (o.task_id in _as_glob_list((t_payload or {}).get("depends_on"))
                     or t_slug in _as_glob_list(o_payload.get("depends_on"))):
-                return "depends_on 직렬"
-            return "겹침 있음"
-        return "직렬 대기"      # unreachable (we only hold when a sibling blocks)
+                return i18n.t("hold.depends_on")
+            return i18n.t("hold.overlap")
+        return i18n.t("hold.serial")      # unreachable (we only hold when a sibling blocks)
 
     @staticmethod
     def _checkout_label(key: str) -> str:
@@ -703,7 +704,7 @@ class Orchestrator:
         return tail.removesuffix(".git") or key
 
     def _note_checkout_hold(self, t: Task, key: str, owner: str,
-                            reason: str = "직렬 대기") -> None:
+                            reason: str | None = None) -> None:
         """Make a held task's ledger row say WHY it is still waiting.
 
         `reason` (from `_hold_reason`) distinguishes a cap hit from a
@@ -729,9 +730,11 @@ class Orchestrator:
         a = self.ledger.load(t.slug)
         if a is None or not a.is_deferred:
             return
-        other = f"`{owner}`" if owner and owner != t.slug else "다른 태스크"
-        note = (f"대기 — 같은 체크아웃({self._checkout_label(key)})에서 {other} "
-                f"실행 중; 사유: {reason}")[:200]
+        if reason is None:
+            reason = i18n.t("hold.serial")
+        other = f"`{owner}`" if owner and owner != t.slug else i18n.t("hold.other_task")
+        note = i18n.t("hold.note", label=self._checkout_label(key), other=other,
+                      reason=reason)[:200]
         if a.last_note == note:
             return
         a.last_note = note
