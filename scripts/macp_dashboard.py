@@ -2089,6 +2089,9 @@ async function tick(){
 }
 tick();setInterval(tick,3000);
 </script></body></html>"""
+# The template above is language-neutral: each of its words is an @@key@@ marker
+# whose ko/en text lives in i18n.DASHBOARD (e.g. the account line's "슬롯" label
+# is dash.js.slots), so `language = "ko"` serves the page byte for byte as before.
 _MARKER_RE = re.compile(r"@@([a-z0-9_.]+)@@")
 
 
