@@ -1547,6 +1547,7 @@ font-size:12px;font-weight:600}
 .rmeta{display:flex;align-items:center;justify-content:flex-end;gap:6px;
 flex:0 1 auto;min-width:0;flex-wrap:wrap}
 .age{color:var(--mut);font-size:12px;white-space:nowrap}
+.rmeta.qd{max-width:42%}
 .qdeps{white-space:normal;overflow-wrap:anywhere;text-align:right}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .badge{padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
@@ -1778,9 +1779,9 @@ const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(
 // order received (tick order). Existing badge classes only — no new colours.
 const QW={next_tick:['다음 틱','b-run'],checkout_busy:['리포 사용중','b-def'],gradle_cap:['빌드 상한','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['예산','b-wait'],cooldown:['재시도 대기','b-gray'],capacity:['재시도 대기','b-gray']};
 const qwBadge=w=>{const m=QW[w]||[w||'?','b-gray'];return `<span class="badge ${m[1]}">${esc(m[0])}</span>`};
-const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'부터':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
+const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder&&!(r.wait_text||'').includes(r.holder)?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'부터':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
 const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}부터</span></div></div>`;
-const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'선행 완료 — 언블락 대기'}</span></div></div>`;
+const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta qd"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'선행 완료 — 언블락 대기'}</span></div></div>`;
 // Open/closed of the queue <details> survives reloads under the contract keys
 // mdash.sec.queue / mdash.sec.queue-upcoming / mdash.sec.queue-blocked.
 const QSEC={'d-queue':'queue','d-queue-upcoming':'queue-upcoming','d-queue-blocked':'queue-blocked'};
