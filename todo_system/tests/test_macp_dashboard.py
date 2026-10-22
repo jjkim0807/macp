@@ -2201,3 +2201,53 @@ class EnServerStrings(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MACP_SMS_TOKEN": "tok"}):
             self.assertIn(">Apply settings in the SMS Relay app</a>",
                           _sms_handler()._sms_setup_page())
+
+
+class RenderHtmlByLanguage(unittest.TestCase):
+    """The page template carries @@key@@ markers; render_html(lang) fills them."""
+
+    def test_render_html_ko_is_html(self):
+        self.assertEqual(M.render_html("ko"), M.HTML)
+
+    def test_template_has_no_hangul(self):
+        # every Korean word on the page lives in i18n.DASHBOARD, none in the template
+        self.assertIsNone(_HANGUL.search(M._HTML_TEMPLATE))
+
+    def test_render_html_en_has_no_hangul(self):
+        en = M.render_html("en")
+        bad = [ln for ln in en.splitlines() if _HANGUL.search(ln)]
+        self.assertEqual(bad, [])
+
+    def test_render_html_no_leftover_markers(self):
+        from todo_system import i18n
+        used = set(M._MARKER_RE.findall(M._HTML_TEMPLATE))
+        self.assertTrue(used)
+        for lang in ("ko", "en"):
+            self.assertNotIn("@@", M.render_html(lang), lang)
+            self.assertEqual(used - set(i18n.DASHBOARD[lang]), set(), lang)
+        # and no table entry is dead weight
+        self.assertEqual(set(i18n.DASHBOARD["ko"]) - used, set())
+
+    def test_render_html_en_sets_lang_and_locale(self):
+        en = M.render_html("en")
+        self.assertIn('<html lang="en">', en)
+        self.assertIn("toLocaleString('en-US',", en)
+        self.assertIn('<html lang="ko">', M.HTML)
+        self.assertIn("toLocaleString('ko-KR',", M.HTML)
+
+    def test_render_html_en_keeps_the_shell_hooks(self):
+        # ids, data-* hooks and the favicon are language-neutral
+        en, ko = M.render_html("en"), M.HTML
+        for pat in (r'id="[^"]+"', r'data-sec="[^"]+"', r"\$\('[^']+'\)"):
+            self.assertEqual(re.findall(pat, en), re.findall(pat, ko), pat)
+        self.assertNotIn("__FAVICON__", en)
+
+    def test_served_root_follows_language(self):
+        with mock.patch.dict(os.environ, {"MACP_LANGUAGE": "en"}), _LiveServer(None) as s:
+            status, _, body = s.get("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, M.render_html("en").encode("utf-8"))
+        self.assertIsNone(_HANGUL.search(body.decode("utf-8")))
+        with mock.patch.dict(os.environ, {"MACP_LANGUAGE": "ko"}), _LiveServer(None) as s:
+            _, _, body = s.get("/")
+        self.assertEqual(hashlib.sha256(body).hexdigest(), _KO_HTML_SHA256)

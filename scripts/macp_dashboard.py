@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import functools
 import glob
 import hmac
 import json
@@ -1480,7 +1481,7 @@ FAVICON_HREF = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("
 
 # ---- HTML ------------------------------------------------------------------
 
-HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+_HTML_TEMPLATE = """<!doctype html><html lang="@@dash.html.lang@@"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MaestroACP · live</title>
 <meta name="color-scheme" content="dark light">
@@ -1612,93 +1613,93 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
 </style></head><body>
 <header>
   <span id="hdot" class="dot"></span>
-  <div class="htitle">MaestroACP<span class="mut"> · 실행 현황</span></div>
+  <div class="htitle">MaestroACP<span class="mut"> · @@dash.html.subtitle@@</span></div>
   <span id="hstate" class="pill">…</span>
-  <button id="theme" class="pill" type="button" aria-label="테마 전환 (자동/라이트/다크)">◐ 자동</button>
+  <button id="theme" class="pill" type="button" aria-label="@@dash.html.theme_aria@@">@@dash.js.theme_auto@@</button>
   <span id="clock" class="mut mono"></span>
 </header>
 <main class="wrap" id="app">
-  <!-- 현재 상태 (idle/실행중/PAUSED/usage HOLD) — always visible triage -->
+  <!-- @@dash.cmt.status@@ — always visible triage -->
   <section class="card" id="c-status">
     <div class="state"><span id="state-line">…</span><span class="sub" id="state-sub"></span><span class="sub" id="state-acct"></span></div>
-    <!-- first screen = status line + 3 action counts (주의·결정·진행 중). runs today·
-         queue·todo open·usage·슬롯 moved into 시스템 상세 (#sys-metrics / #usage). -->
+    <!-- first screen = status line + 3 action counts (@@dash.cmt.action_counts@@). runs today·
+         queue·todo open·usage·@@dash.js.slots@@ moved into @@dash.html.system@@ (#sys-metrics / #usage). -->
     <div class="metrics">
-      <div class="m"><b id="mv-attn">–</b><span>주의</span></div>
-      <div class="m"><b id="mv-human">–</b><span>결정</span></div>
-      <div class="m"><b id="mv-active">–</b><span>진행 중</span></div>
+      <div class="m"><b id="mv-attn">–</b><span>@@dash.html.attention@@</span></div>
+      <div class="m"><b id="mv-human">–</b><span>@@dash.html.decide@@</span></div>
+      <div class="m"><b id="mv-active">–</b><span>@@dash.html.in_progress@@</span></div>
     </div>
   </section>
 
-  <!-- 진행 중인 프로젝트 (최상위 부모 태스크) -->
+  <!-- @@dash.cmt.projects@@ -->
   <section class="card" id="c-projects">
-    <h2>프로젝트 <span class="cnt" id="cnt-proj">0</span></h2>
+    <h2>@@dash.html.projects@@ <span class="cnt" id="cnt-proj">0</span></h2>
     <div class="list" id="projects"></div>
-    <button class="more" data-sec="projects" hidden>더보기</button>
+    <button class="more" data-sec="projects" hidden>@@dash.html.more@@</button>
     <details id="d-projhold" hidden style="margin-top:8px">
-      <summary>보류 <span class="cnt" id="cnt-projhold">0</span></summary>
+      <summary>@@dash.html.on_hold@@ <span class="cnt" id="cnt-projhold">0</span></summary>
       <div class="list" id="projects-hold"></div>
     </details>
   </section>
 
-  <!-- 내가 결정할 것 (사람 몫) -->
+  <!-- @@dash.cmt.human@@ -->
   <section class="card" id="c-human">
-    <h2>결정할 것 · 🔥 급한 것 <span class="cnt" id="cnt-urgent">0</span></h2>
+    <h2>@@dash.html.to_decide@@ <span class="cnt" id="cnt-urgent">0</span></h2>
     <div class="list" id="human-urgent"></div>
     <details id="d-humanlife" style="margin-top:8px">
-      <summary>🎓 현생 (여유 있음) <span class="cnt" id="cnt-life">0</span></summary>
+      <summary>🎓 @@dash.html.life@@ <span class="cnt" id="cnt-life">0</span></summary>
       <div class="list" id="human-life"></div>
     </details>
     <details id="d-humandev" style="margin-top:8px">
-      <summary>🛠 개발 프로젝트 (사람 몫) <span class="cnt" id="cnt-dev">0</span></summary>
+      <summary>🛠 @@dash.html.dev@@ <span class="cnt" id="cnt-dev">0</span></summary>
       <div class="list" id="human-dev"></div>
     </details>
     <details id="d-humanblocked" style="margin-top:8px">
-      <summary>⛔ 대기 중 (블록) <span class="cnt" id="cnt-blocked">0</span></summary>
+      <summary>⛔ @@dash.html.blocked@@ <span class="cnt" id="cnt-blocked">0</span></summary>
       <div class="list" id="human-blocked"></div>
     </details>
     <details id="d-humanlater" style="margin-top:8px">
-      <summary>⏳ 시작일 전 <span class="cnt" id="cnt-later">0</span></summary>
+      <summary>⏳ @@dash.html.later@@ <span class="cnt" id="cnt-later">0</span></summary>
       <div class="list" id="human-later"></div>
     </details>
   </section>
 
-  <!-- 깨진 것 (failed · 사람 대기) -->
+  <!-- @@dash.cmt.broken@@ -->
   <section class="card" id="c-attention">
-    <h2>깨진 것 · failed·사람대기 <span class="cnt" id="cnt-attn">0</span></h2>
+    <h2>@@dash.html.broken@@ <span class="cnt" id="cnt-attn">0</span></h2>
     <div class="list" id="attention"></div>
   </section>
 
-  <!-- 지금 실행 중 -->
+  <!-- @@dash.cmt.active@@ -->
   <section class="card" id="c-active">
-    <h2>진행 중 <span class="cnt" id="cnt-active">0</span></h2>
+    <h2>@@dash.html.in_progress@@ <span class="cnt" id="cnt-active">0</span></h2>
     <div class="list" id="active"></div>
-    <button class="more" data-sec="active" hidden>더보기</button>
+    <button class="more" data-sec="active" hidden>@@dash.html.more@@</button>
   </section>
 
-  <!-- 큐: 디스패치 대기 순서·사유 (서버 판정, 읽기 전용). 기본 접힘, 그룹 폴딩 없음. -->
+  <!-- @@dash.cmt.queue@@ -->
   <section class="card" id="c-queue">
     <details id="d-queue">
-      <summary>큐 <span class="cnt" id="cnt-queue">0</span></summary>
+      <summary>@@dash.html.queue@@ <span class="cnt" id="cnt-queue">0</span></summary>
       <div class="list" id="queue"></div>
       <details id="d-queue-upcoming" hidden style="margin-top:8px">
-        <summary>⏳ 예약됨 <span class="cnt" id="cnt-queue-upcoming">0</span></summary>
+        <summary>⏳ @@dash.html.queue_upcoming@@ <span class="cnt" id="cnt-queue-upcoming">0</span></summary>
         <div class="list" id="queue-upcoming"></div>
       </details>
       <details id="d-queue-blocked" hidden style="margin-top:8px">
-        <summary>🔗 선행 대기 <span class="cnt" id="cnt-queue-blocked">0</span></summary>
+        <summary>🔗 @@dash.html.queue_blocked@@ <span class="cnt" id="cnt-queue-blocked">0</span></summary>
         <div class="list" id="queue-blocked"></div>
       </details>
     </details>
   </section>
 
-  <!-- 이하 이력·참고·계측: 기본 접힘 '시스템 상세' 한 카드로 합침. 안의 기존
-       <details>/<div id> 는 중첩으로 보존(id·cnt-* 앵커 불변). runs 는 '이력'에
-       흡수되므로 cnt-runs/#runs 는 숨긴 자리표시로만 남긴다. -->
+  <!-- @@dash.cmt.system_1@@
+       <details>/<div id> @@dash.cmt.system_2@@
+       @@dash.cmt.system_3@@ -->
   <section class="card" id="c-recent">
     <details id="d-sys">
-      <summary>시스템 상세 <span class="cnt" id="cnt-sys">0</span></summary>
-      <!-- runs today/queue/todo open·슬롯·usage: moved off the first screen (same ids,
+      <summary>@@dash.html.system@@ <span class="cnt" id="cnt-sys">0</span></summary>
+      <!-- runs today/queue/todo open·@@dash.js.slots@@·usage: moved off the first screen (same ids,
            update()/setUsage/setState keep working since the elements only moved). -->
       <div id="sys-metrics">
         <div class="metrics">
@@ -1710,80 +1711,80 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
       </div>
       <div class="usage" id="usage" hidden></div>
       <details id="d-recent" open style="margin-top:8px">
-        <summary>이력 (실행·태스크) <span class="cnt" id="cnt-recent">0</span></summary>
+        <summary>@@dash.html.history@@ <span class="cnt" id="cnt-recent">0</span></summary>
         <div class="list" id="recent"></div>
-        <button class="more" data-sec="recent" hidden>더보기</button>
+        <button class="more" data-sec="recent" hidden>@@dash.html.more@@</button>
       </details>
       <details id="d-agents" style="margin-top:8px">
-        <summary>에이전트 (러너) <span class="cnt" id="cnt-agents">0</span></summary>
+        <summary>@@dash.html.agents@@ <span class="cnt" id="cnt-agents">0</span></summary>
         <div class="list" id="agents"></div>
       </details>
       <details id="d-mode" style="margin-top:8px">
-        <summary>오픈 태스크 (worker_mode별) <span class="cnt" id="cnt-mode">0</span></summary>
+        <summary>@@dash.html.by_mode@@ <span class="cnt" id="cnt-mode">0</span></summary>
         <div class="chips" id="mode"></div>
       </details>
       <details id="d-deps" style="margin-top:8px">
-        <summary>🔗 크로스-프로젝트 의존성 <span class="cnt" id="cnt-deps">0</span></summary>
+        <summary>🔗 @@dash.html.deps@@ <span class="cnt" id="cnt-deps">0</span></summary>
         <div class="list" id="deps"></div>
       </details>
-      <!-- id 보존용 자리표시(runs 는 이력에 흡수됨) -->
+      <!-- @@dash.cmt.runs_placeholder@@ -->
       <div id="d-runs" hidden><span class="cnt" id="cnt-runs">0</span><div class="list" id="runs"></div></div>
     </details>
   </section>
 </main>
-<footer>자동 새로고침 3초 · <span id="upd"></span></footer>
+<footer>@@dash.html.footer@@ · <span id="upd"></span></footer>
 <div id="dv" hidden>
   <header>
-    <button class="lnk" id="dv-back" title="뒤로 (Esc)">←</button>
-    <div class="htitle" id="dv-title">상세</div>
-    <button class="lnk" id="dv-reload" title="새로고침">↻</button>
+    <button class="lnk" id="dv-back" title="@@dash.html.back@@">←</button>
+    <div class="htitle" id="dv-title">@@dash.html.detail@@</div>
+    <button class="lnk" id="dv-reload" title="@@dash.html.reload@@">↻</button>
   </header>
   <main class="wrap" id="dv-body"></main>
 </div>
 <script>
 // The shell above is static markup. tick() mounts delegated handlers ONCE, then
 // each 3s poll only rewrites the leaf list bodies + metric numbers — it never
-// wipes the whole #app — so open <details>, page scroll, and 더보기 stay put.
+// wipes the whole #app — so open <details>, page scroll, and @@dash.html.more@@ stay put.
 const $=id=>document.getElementById(id);
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const esca=s=>(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(s)}</span>`};
 function pcolor(s){let h=0;for(const c of(s||''))h=(h*31+c.charCodeAt(0))>>>0;return h%360}
-function copyBtn(id){return `<button class="cp" data-cp="${esca(id)}" title="task id 복사: ${esca(id)}">⧉ id</button>`}
-function pchip(p){if(!p)return '';const h=pcolor(p);return `<span class="pchip" style="color:hsl(${h},65%,74%);border-color:hsl(${h},35%,44%)" title="프로젝트: ${esca(p)}">${esc(p)}</span>`}
+function copyBtn(id){return `<button class="cp" data-cp="${esca(id)}" title="@@dash.js.copy_id@@ ${esca(id)}">⧉ id</button>`}
+function pchip(p){if(!p)return '';const h=pcolor(p);return `<span class="pchip" style="color:hsl(${h},65%,74%);border-color:hsl(${h},35%,44%)" title="@@dash.js.project@@ ${esca(p)}">${esc(p)}</span>`}
 function tlabel(slug,title,project){return `${pchip(project)}<span class="ttl">${esc(title||slug)}</span>`}
 // List rows carry no ⧉ id button (info diet); only the task/run detail views do.
 function tlabelCp(slug,title,project){return tlabel(slug,title,project)+' '+copyBtn(slug)}
 function stages(st){return (st||[]).map(s=>`<span class="stg ${s.rc===0?'s-ok':'s-bad'}" title="${esc(s.name)} rc=${s.rc}">${esc((s.name[0]||'?').toUpperCase())}</span>`).join('')}
 const empty=t=>`<div class="empty">${t}</div>`;
-const dur=s=>{if(s==null)return '—';if(s<=0)return '지금';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?`${h}시간 ${m}분`:`${m}분`};
-const at=e=>e==null?'':new Date(e*1000).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
+const dur=s=>{if(s==null)return '—';if(s<=0)return '@@dash.js.now@@';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?`${h}@@dash.js.hours@@ ${m}@@dash.js.minutes@@`:`${m}@@dash.js.minutes@@`};
+const at=e=>e==null?'':new Date(e*1000).toLocaleString('@@dash.js.locale@@',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
 
 const LIM=10, PROJLIM=5, ACTLIM=6, showAll={runs:false,recent:false,projects:false,active:false};
 let last=null, mounted=false;
 
-const WHY={parked:['검토대기','b-wait'],owned:['결정필요','b-pur'],blocked:['블록','b-fail'],manual:['수동','b-gray'],backlog:['미설정','b-blu']};
+const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owned@@','b-pur'],blocked:['@@dash.js.why_blocked@@','b-fail'],manual:['@@dash.js.why_manual@@','b-gray'],backlog:['@@dash.js.why_backlog@@','b-blu']};
 const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m[1]}">${m[0]}</span>`};
 
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
-const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}부터</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
+const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
-const PST={waiting:['대기','b-wait'],blocked:['블록','b-fail']};
+const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
 const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(dn*100/t):0,st=PST[r.status];
-  return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="최근 활동 ${esca(r.last_activity)} (run·ledger·md·session 중 최신)">${esc(r.last_age)} 전</span> `:''}<span class="pbar" title="${dn}/${t} 완료"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
+  return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="@@dash.js.last_activity@@ ${esca(r.last_activity)} @@dash.js.latest_of@@">${esc(r.last_age)}@@dash.js.ago@@</span> `:''}<span class="pbar" title="${dn}/${t}@@dash.js.done@@"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
 const runRow=r=>{const w=r.when||'';return `<div class="row clk" data-open="run:${esca(r.run)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)} <span class="age mono">${esc(w.slice(0,2))}:${esc(w.slice(2,4))}</span></div><div class="note">${stages(r.stages)||'—'}${(r.artifacts||[]).length?' · '+esc((r.artifacts||[]).join(', ')):''}</div></div></div>`};
 const recentRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.todo_status&&r.todo_status!=='open'?` <span class="age">(${esc(r.todo_status)})</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
-const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span></div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+' 전':'—'}</span></div>`;
+const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span></div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+'@@dash.js.ago@@':'—'}</span></div>`;
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
 
-// 큐 (docs/dashboard-parity.md "큐"): the server judges `wait`; rows render in the
+// @@dash.html.queue@@ (docs/dashboard-parity.md "@@dash.html.queue@@"): the server judges `wait`; rows render in the
 // order received (tick order). Existing badge classes only — no new colours.
-const QW={next_tick:['다음 틱','b-run'],checkout_busy:['리포 사용중','b-def'],gradle_cap:['빌드 상한','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['예산','b-wait'],cooldown:['재시도 대기','b-gray'],capacity:['재시도 대기','b-gray']};
+const QW={next_tick:['@@dash.js.qw_next_tick@@','b-run'],checkout_busy:['@@dash.js.qw_checkout_busy@@','b-def'],gradle_cap:['@@dash.js.qw_gradle_cap@@','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['@@dash.js.qw_budget@@','b-wait'],cooldown:['@@dash.js.qw_retry@@','b-gray'],capacity:['@@dash.js.qw_retry@@','b-gray']};
 const qwBadge=w=>{const m=QW[w]||[w||'?','b-gray'];return `<span class="badge ${m[1]}">${esc(m[0])}</span>`};
-const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder&&!(r.wait_text||'').includes(r.holder)?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'부터':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
-const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}부터</span></div></div>`;
-const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta qd"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'선행 완료 — 언블락 대기'}</span></div></div>`;
+const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder&&!(r.wait_text||'').includes(r.holder)?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'@@dash.js.from@@':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
+const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span></div></div>`;
+const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta qd"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'@@dash.js.deps_done@@'}</span></div></div>`;
 // Open/closed of the queue <details> survives reloads under the contract keys
 // mdash.sec.queue / mdash.sec.queue-upcoming / mdash.sec.queue-blocked.
 const QSEC={'d-queue':'queue','d-queue-upcoming':'queue-upcoming','d-queue-blocked':'queue-blocked'};
@@ -1803,7 +1804,7 @@ const fill=(id,list,render,emptyMsg)=>{$(id).innerHTML=list.length?list.map(rend
 // <head> script already set data-theme from storage before first paint; here we
 // keep the button label in sync and handle clicks. Storage key = 'mdash.theme'.
 const THEMES=['auto','light','dark'];
-const THEME_LBL={auto:'◐ 자동',light:'☀ 라이트',dark:'🌙 다크'};
+const THEME_LBL={auto:'@@dash.js.theme_auto@@',light:'@@dash.js.theme_light@@',dark:'@@dash.js.theme_dark@@'};
 const themeGet=()=>{try{const t=localStorage.getItem('mdash.theme');return THEMES.includes(t)?t:'auto'}catch(_){return 'auto'}};
 const themeApply=t=>{const el=document.documentElement;if(t==='light'||t==='dark')el.dataset.theme=t;else delete el.dataset.theme;const b=$('theme');if(b)b.textContent=THEME_LBL[t]||THEME_LBL.auto};
 const themeSet=t=>{try{localStorage.setItem('mdash.theme',t)}catch(_){}themeApply(t)};
@@ -1822,16 +1823,16 @@ function foldFill(id,sec,list,render,emptyMsg){
       seen[g]=1;
       const op=grpOpen(sec,g);
       const kids=list.filter(x=>(x.group||'')===g).map(render).join('');
-      h+=`<div class="grp"><div class="row grphead clk" data-gsec="${esca(sec)}" data-grp="${esca(g)}">${pchip(g)}<span class="cnt">${cnt[g]}건</span><span class="gar">${op?'▾':'▸'}</span></div><div class="grpkids"${op?'':' hidden'}>${kids}</div></div>`;
+      h+=`<div class="grp"><div class="row grphead clk" data-gsec="${esca(sec)}" data-grp="${esca(g)}">${pchip(g)}<span class="cnt">${cnt[g]}@@dash.js.count@@</span><span class="gar">${op?'▾':'▸'}</span></div><div class="grpkids"${op?'':' hidden'}>${kids}</div></div>`;
     }else h+=render(r);                             // singleton / no-group → standalone
   }
   $(id).innerHTML=h;
 }
 function fillMore(sec,list,render){
   const shown=showAll[sec]?list:list.slice(0,LIM);
-  $(sec).innerHTML=list.length?shown.map(render).join(''):empty('없음');
+  $(sec).innerHTML=list.length?shown.map(render).join(''):empty('@@dash.js.none@@');
   const btn=document.querySelector(`.more[data-sec="${sec}"]`);
-  if(btn){if(list.length>LIM){btn.hidden=false;btn.textContent=showAll[sec]?'접기':`더보기 (+${list.length-LIM})`}else btn.hidden=true}
+  if(btn){if(list.length>LIM){btn.hidden=false;btn.textContent=showAll[sec]?'@@dash.js.less@@':`@@dash.html.more@@ (+${list.length-LIM})`}else btn.hidden=true}
 }
 // Unified history: runs ∪ recent, deduped by slug (a run wins over a ledger-only
 // recent — it carries more of "what happened"), newest first. Time key uses only
@@ -1848,9 +1849,9 @@ function renderHistory(d){
   hist.sort((a,b)=>b.t.localeCompare(a.t));
   $('cnt-recent').textContent=hist.length;
   const shown=showAll.recent?hist:hist.slice(0,LIM);
-  $('recent').innerHTML=hist.length?shown.map(histRow).join(''):empty('없음');
+  $('recent').innerHTML=hist.length?shown.map(histRow).join(''):empty('@@dash.js.none@@');
   const btn=document.querySelector('.more[data-sec="recent"]');
-  if(btn){if(hist.length>LIM){btn.hidden=false;btn.textContent=showAll.recent?'접기':`더보기 (+${hist.length-LIM})`}else btn.hidden=true}
+  if(btn){if(hist.length>LIM){btn.hidden=false;btn.textContent=showAll.recent?'@@dash.js.less@@':`@@dash.html.more@@ (+${hist.length-LIM})`}else btn.hidden=true}
 }
 
 // worker_state (from /api/status) → badge label / short tag / color / live dot.
@@ -1858,28 +1859,28 @@ function renderHistory(d){
 const WSTATE={
   paused:        {label:'⏸ PAUSED',   hs:'PAUSED', color:'var(--yel)', live:false},
   hold:          {label:'⛔ usage HOLD',hs:'HOLD',  color:'var(--red)', live:false},
-  budget:        {label:'⏳ 예산 도달', hs:'budget', color:'var(--yel)', live:false},
-  running:       {label:'● 워커 실행중', hs:'실행중', color:'var(--grn)', live:true},
-  post_run:      {label:'◍ 후처리 중',  hs:'후처리', color:'var(--grn)', live:true},
-  waiting_serial:{label:'◷ 직렬 대기',  hs:'직렬대기',color:'var(--yel)', live:false},
-  no_work:       {label:'○ 유휴 (idle)',hs:'idle',  color:'var(--mut)', live:false},
+  budget:        {label:'⏳ @@dash.js.ws_budget@@', hs:'budget', color:'var(--yel)', live:false},
+  running:       {label:'● @@dash.js.ws_running@@', hs:'@@dash.js.ws_running_hs@@', color:'var(--grn)', live:true},
+  post_run:      {label:'◍ @@dash.js.ws_post_run@@',  hs:'@@dash.js.ws_post_run_hs@@', color:'var(--grn)', live:true},
+  waiting_serial:{label:'◷ @@dash.js.ws_serial@@',  hs:'@@dash.js.ws_serial_hs@@',color:'var(--yel)', live:false},
+  no_work:       {label:'○ @@dash.js.ws_idle@@',hs:'idle',  color:'var(--mut)', live:false},
 };
 function setState(d){
   const sl=$('state-line'),hs=$('hstate');
   // Current Claude account (/api/status.account, leaf ③): the server decides, this only renders.
-  // Missing key (older server) → blank; null active → '계정: -'. Leaf ④: ' · PAUSED' when
+  // Missing key (older server) → blank; null active → '@@dash.js.account@@ -'. Leaf ④: ' · PAUSED' when
   // every account is unavailable (a.paused); accounts[]/last_switch are not rendered here.
-  // Multi-account capacity: '슬롯 used/max (name used/max, …)' from a.slots, which the
+  // Multi-account capacity: '@@dash.js.slots@@ used/max (name used/max, …)' from a.slots, which the
   // server (collect_account_slots) computes from the runner's snapshot — rendered only when a
   // runner has reported (total_max != null), else omitted. Server computes, client renders.
-  // Off the first-screen account line (info diet) → #sys-slots inside 시스템 상세.
+  // Off the first-screen account line (info diet) → #sys-slots inside @@dash.html.system@@.
   const ae=$('state-acct');
-  if(ae){const a=d.account;ae.textContent=a?('계정: '+(a.active?`${a.active} (${a.source})`:'-')+(a.paused?' · PAUSED':'')):'';}
+  if(ae){const a=d.account;ae.textContent=a?('@@dash.js.account@@ '+(a.active?`${a.active} (${a.source})`:'-')+(a.paused?' · PAUSED':'')):'';}
   const se=$('sys-slots');
   if(se){const a=d.account,s=a&&a.slots;
     if(s&&s.total_max!=null){
       const pa=(s.per_account||[]).map(r=>`${r.name} ${r.used}/${r.max==null?'-':r.max}`).join(', ');
-      se.textContent=`슬롯 ${s.total_used}/${s.total_max}`+(pa?` (${pa})`:'');}
+      se.textContent=`@@dash.js.slots@@ ${s.total_used}/${s.total_max}`+(pa?` (${pa})`:'');}
     else se.textContent='';}
   const m=d.worker_state&&WSTATE[d.worker_state];
   if(m){
@@ -1890,7 +1891,7 @@ function setState(d){
     // a usage HOLD prefer the live release countdown when the guard provides one.
     let sub=d.worker_state_detail||'';
     if(d.worker_state==='hold'&&d.usage){const s=d.usage.blocked_in_s;
-      if(s!=null&&s>0)sub=`HOLD 해제 ${dur(s)} 뒤`}
+      if(s!=null&&s>0)sub=`@@dash.js.hold_release@@ ${dur(s)}@@dash.js.later@@`}
     $('state-sub').textContent=sub;
     return;
   }
@@ -1899,15 +1900,15 @@ function setState(d){
   let label,color,live=false;
   if(paused){label='⏸ PAUSED';color='var(--yel)'}
   else if(hold){label='⛔ usage HOLD';color='var(--red)'}
-  else if(busy){label='● 워커 실행중';color='var(--grn)';live=true}
-  else{label='○ 유휴 (idle)';color='var(--mut)'}
+  else if(busy){label='● @@dash.js.ws_running@@';color='var(--grn)';live=true}
+  else{label='○ @@dash.js.ws_idle@@';color='var(--mut)'}
   sl.textContent=label;sl.style.color=color;
-  hs.textContent=paused?'PAUSED':(hold?'HOLD':(busy?'실행중':'idle'));
+  hs.textContent=paused?'PAUSED':(hold?'HOLD':(busy?'@@dash.js.ws_running_hs@@':'idle'));
   hs.style.color=color;hs.style.borderColor=color;
   $('hdot').style.background=color;$('hdot').className='dot'+(live?' live':'');
   let sub='';
-  if(hold&&d.usage){const s=d.usage.blocked_in_s;sub=s!=null&&s>0?`HOLD 해제 ${dur(s)} 뒤`:'다음 guard 틱에 해제 예정'}
-  else if(busy){sub=`${d.active.length} task 실행 중`}
+  if(hold&&d.usage){const s=d.usage.blocked_in_s;sub=s!=null&&s>0?`@@dash.js.hold_release@@ ${dur(s)}@@dash.js.later@@`:'@@dash.js.hold_next_guard@@'}
+  else if(busy){sub=`${d.active.length} @@dash.js.tasks_running@@`}
   $('state-sub').textContent=sub;
 }
 
@@ -1919,18 +1920,18 @@ function setUsage(u){
   const col=v=>v==null?'var(--mut)':(v>=80?'var(--red)':(v>=50?'var(--yel)':'var(--grn)'));
   let h=`<div class="ur"><div class="u"><b style="color:${col(u.session)}">${pc(u.session)}</b><span>session (5h)</span></div><div class="u"><b style="color:${col(u.weekly)}">${pc(u.weekly)}</b><span>weekly (7d)</span></div><div class="u"><b style="color:${u.allowed?'var(--grn)':'var(--red)'}">${u.allowed?'OPEN':'HOLD'}</b><span>guard</span></div></div>`;
   if(!u.allowed){
-    h+=`<div class="note" style="color:var(--yel);margin-top:7px">HOLD 해제 ${u.blocked_in_s!=null&&u.blocked_in_s>0?dur(u.blocked_in_s)+' 뒤':(u.blocked_in_s!=null?'예정 시각 지남 — 다음 guard 틱에 해제':'시각 미상')}${u.blocked_until?` (${at(u.blocked_until)})`:''}</div>`;
+    h+=`<div class="note" style="color:var(--yel);margin-top:7px">@@dash.js.hold_release@@ ${u.blocked_in_s!=null&&u.blocked_in_s>0?dur(u.blocked_in_s)+'@@dash.js.later@@':(u.blocked_in_s!=null?'@@dash.js.hold_overdue@@':'@@dash.js.hold_unknown@@')}${u.blocked_until?` (${at(u.blocked_until)})`:''}</div>`;
     if(u.reason)h+=`<div class="note" style="color:var(--yel)">${esc(u.reason)}</div>`;
   }
-  h+=`<div class="note" style="margin-top:7px">reset · session ${at(u.session_resets_at)||'—'} (${dur(u.session_resets_in_s)} 뒤) · weekly ${at(u.weekly_resets_at)||'—'} (${dur(u.weekly_resets_in_s)} 뒤)</div>`;
-  if(u.age_s!=null&&u.age_s>3600)h+=`<div class="note">usage 데이터 ${Math.round(u.age_s/60)}분 전 (stale)</div>`;
+  h+=`<div class="note" style="margin-top:7px">reset · session ${at(u.session_resets_at)||'—'} (${dur(u.session_resets_in_s)}@@dash.js.later@@) · weekly ${at(u.weekly_resets_at)||'—'} (${dur(u.weekly_resets_in_s)}@@dash.js.later@@)</div>`;
+  if(u.age_s!=null&&u.age_s>3600)h+=`<div class="note">@@dash.js.usage_data@@ ${Math.round(u.age_s/60)}@@dash.js.min_ago_stale@@</div>`;
   box.innerHTML=h;
 }
 
 function update(d){
   setState(d);
   $('clock').textContent=(d.now||'').split(' ')[1]||d.now||'';
-  $('upd').textContent='마지막 갱신 '+(d.now||'');
+  $('upd').textContent='@@dash.js.last_update@@ '+(d.now||'');
   $('mv-runs').textContent=d.runs_today;
   $('mv-active').textContent=d.active.length;
   $('mv-queue').textContent=(d.todo&&d.todo.dispatchable)||0;
@@ -1943,51 +1944,51 @@ function update(d){
   const blocked=rest.filter(r=>r.why==='blocked'),open=rest.filter(r=>r.why!=='blocked');
   const life=open.filter(r=>r.category!=='dev'),dev=open.filter(r=>r.category==='dev');
   $('cnt-blocked').textContent=blocked.length;
-  foldFill('human-blocked','human-blocked',blocked,humanRow,'없음');
+  foldFill('human-blocked','human-blocked',blocked,humanRow,'@@dash.js.none@@');
   $('cnt-urgent').textContent=urgent.length;$('cnt-later').textContent=later.length;
   $('cnt-life').textContent=life.length;$('cnt-dev').textContent=dev.length;
-  foldFill('human-urgent','human-urgent',urgent,humanRow,'급하게 결정할 일 없음 ✓');
-  foldFill('human-life','human-life',life,humanRow,'없음');
-  foldFill('human-dev','human-dev',dev,humanRow,'없음');
-  foldFill('human-later','human-later',later,humanRow,'없음');
+  foldFill('human-urgent','human-urgent',urgent,humanRow,'@@dash.js.nothing_urgent@@');
+  foldFill('human-life','human-life',life,humanRow,'@@dash.js.none@@');
+  foldFill('human-dev','human-dev',dev,humanRow,'@@dash.js.none@@');
+  foldFill('human-later','human-later',later,humanRow,'@@dash.js.none@@');
   // empty sub-blocks fold away (human-urgent keeps its ✓ empty line; c-human stays).
   $('d-humanlife').hidden=!life.length;
   $('d-humandev').hidden=!dev.length;
   $('d-humanblocked').hidden=!blocked.length;
   $('d-humanlater').hidden=!later.length;
 
-  // open projects on the first screen (top PROJLIM + 더보기); waiting/blocked fold
-  // under a collapsed 보류. cnt-proj stays the full open count.
+  // open projects on the first screen (top PROJLIM + @@dash.html.more@@); waiting/blocked fold
+  // under a collapsed @@dash.html.on_hold@@. cnt-proj stays the full open count.
   const projs=d.projects||[],openP=projs.filter(p=>!p.on_hold),holdP=projs.filter(p=>p.on_hold);
   $('cnt-proj').textContent=openP.length;
   const shownP=showAll.projects?openP:openP.slice(0,PROJLIM);
-  fill('projects',shownP,projRow,'진행 중인 프로젝트 없음');
+  fill('projects',shownP,projRow,'@@dash.js.no_projects@@');
   const pbtn=document.querySelector('.more[data-sec="projects"]');
-  if(pbtn){if(openP.length>PROJLIM){pbtn.hidden=false;pbtn.textContent=showAll.projects?'접기':`더보기 (+${openP.length-PROJLIM})`}else pbtn.hidden=true}
+  if(pbtn){if(openP.length>PROJLIM){pbtn.hidden=false;pbtn.textContent=showAll.projects?'@@dash.js.less@@':`@@dash.html.more@@ (+${openP.length-PROJLIM})`}else pbtn.hidden=true}
   $('cnt-projhold').textContent=holdP.length;
   $('d-projhold').hidden=!holdP.length;
-  fill('projects-hold',holdP,projRow,'없음');
+  fill('projects-hold',holdP,projRow,'@@dash.js.none@@');
 
   $('cnt-attn').textContent=d.attention.length;
-  $('c-attention').hidden=!d.attention.length;   // 깨진 것 0건이면 카드 자체 숨김
-  foldFill('attention','attention',d.attention,attnRow,'주의가 필요한 항목 없음 ✓');
+  $('c-attention').hidden=!d.attention.length;   // @@dash.cmt.hide_broken@@
+  foldFill('attention','attention',d.attention,attnRow,'@@dash.js.nothing_attention@@');
 
-  // 진행 중: top ACTLIM on the first screen (folded by project), rest behind 더보기.
+  // @@dash.html.in_progress@@: top ACTLIM on the first screen (folded by project), rest behind @@dash.html.more@@.
   // cnt-active stays the full count; foldFill keeps its grouping on the shown slice.
   $('cnt-active').textContent=d.active.length;
   const shownA=showAll.active?d.active:d.active.slice(0,ACTLIM);
-  foldFill('active','active',shownA,activeRow,'지금 실행 중인 task 없음');
+  foldFill('active','active',shownA,activeRow,'@@dash.js.no_active@@');
   const abtn=document.querySelector('.more[data-sec="active"]');
-  if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'접기':`더보기 (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
+  if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'@@dash.js.less@@':`@@dash.html.more@@ (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
 
-  // 큐: server order as-is, no group folding (the order is the information).
+  // @@dash.html.queue@@: server order as-is, no group folding (the order is the information).
   const q=d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
   $('cnt-queue').textContent=q.length;
-  fill('queue',q,queueRow,'큐 비어 있음');
+  fill('queue',q,queueRow,'@@dash.js.queue_empty@@');
   $('cnt-queue-upcoming').textContent=qu.length;
   $('cnt-queue-blocked').textContent=qb.length;
-  fill('queue-upcoming',qu,upcomingRow,'없음');
-  fill('queue-blocked',qb,blockedRow,'없음');
+  fill('queue-upcoming',qu,upcomingRow,'@@dash.js.none@@');
+  fill('queue-blocked',qb,blockedRow,'@@dash.js.none@@');
   $('d-queue-upcoming').hidden=!qu.length;
   $('d-queue-blocked').hidden=!qb.length;
 
@@ -1998,14 +1999,14 @@ function update(d){
     (d.deps||[]).length,Object.keys((d.todo&&d.todo.by_mode)||{}).length].filter(n=>n>0).length;
 
   $('cnt-agents').textContent=d.agents.length;
-  fill('agents',d.agents,agentRow,'없음');
+  fill('agents',d.agents,agentRow,'@@dash.js.none@@');
 
   const modes=Object.entries((d.todo&&d.todo.by_mode)||{});
   $('cnt-mode').textContent=modes.length;
-  $('mode').innerHTML=modes.length?modes.map(([k,v])=>`<span>${esc(k)}: ${v}</span>`).join(''):empty('없음');
+  $('mode').innerHTML=modes.length?modes.map(([k,v])=>`<span>${esc(k)}: ${v}</span>`).join(''):empty('@@dash.js.none@@');
 
   $('cnt-deps').textContent=d.deps.length;
-  fill('deps',d.deps,depRow,'선언된 크로스-프로젝트 의존성 없음');
+  fill('deps',d.deps,depRow,'@@dash.js.no_deps@@');
 }
 
 // ---- tap-through detail (run / task) ----
@@ -2014,7 +2015,7 @@ function update(d){
 const dstack=[];
 const kv=(k,v)=>v?`<div class="kv"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div></div>`:'';
 const pre=(t,mono)=>`<div class="pre${mono?' mono':''}">${esc(t)||'—'}</div>`;
-const sz=n=>n<1000?`${n}자`:`${(n/1000).toFixed(1)}k자`;
+const sz=n=>n<1000?`${n}@@dash.js.chars@@`:`${(n/1000).toFixed(1)}k@@dash.js.chars@@`;
 const hm=w=>(w||'').length>=4?`${w.slice(0,2)}:${w.slice(2,4)}`:'';
 const card=(inner)=>`<section class="card">${inner}</section>`;
 function ctxCard(t,l){
@@ -2022,44 +2023,44 @@ function ctxCard(t,l){
   const meta=[l.state?badge(l.state):'',t.status?`<span class="age">todo: ${esc(t.status)}</span>`:'',
     t.worker_mode?`<span class="age">· ${esc(t.worker_mode)}</span>`:'',l.refail?`<span class="age">↻${l.refail}</span>`:'',
     t.due&&t.due!=='-'?`<span class="age">due ${esc(t.due)}</span>`:'',l.age?`<span class="age mono">${esc(l.age)}</span>`:''].filter(Boolean).join(' ');
-  return card(`<h2>태스크</h2><div class="rmeta" style="justify-content:flex-start">${meta}</div>${kv('완료 조건',t.outcome)}${kv('다음 행동',t.next_action)}${kv('If-Then',t.if_then)}${kv('워커 메모',l.note)}${kv('agent',l.agent)}`);
+  return card(`<h2>@@dash.js.task@@</h2><div class="rmeta" style="justify-content:flex-start">${meta}</div>${kv('@@dash.js.outcome@@',t.outcome)}${kv('@@dash.js.next_action@@',t.next_action)}${kv('If-Then',t.if_then)}${kv('@@dash.js.worker_note@@',l.note)}${kv('agent',l.agent)}`);
 }
 function runDetail(d){
   const arts=d.artifacts||[];
   const st=(d.stages||[]).map(s=>`<span style="white-space:nowrap">${stages([s])}${esc(s.name)} rc=${s.rc}</span>`).join(' &nbsp;');
-  return card(`<h2>${esc(d.date)} ${hm(d.when)}</h2><div>${tlabelCp(d.slug,d.title,d.project)}</div><div class="note mono">${esc(d.slug)}</div>${st?`<div class="note" style="margin-top:8px">${st}</div>`:''}<div style="margin-top:10px"><button class="lnk" data-open="task:${esca(d.slug)}">태스크 상세 →</button></div>`)
+  return card(`<h2>${esc(d.date)} ${hm(d.when)}</h2><div>${tlabelCp(d.slug,d.title,d.project)}</div><div class="note mono">${esc(d.slug)}</div>${st?`<div class="note" style="margin-top:8px">${st}</div>`:''}<div style="margin-top:10px"><button class="lnk" data-open="task:${esca(d.slug)}">@@dash.js.task_detail_link@@</button></div>`)
     +ctxCard(d.task||{},d.ledger||{})
-    +card(`<h2>산출물 <span class="cnt">${arts.length}</span></h2>${arts.length?arts.map((a,i)=>`<details${i===arts.length-1?' open':''}><summary>${esc(a.name)} <span class="age">${sz(a.size||0)}</span></summary>${pre(a.content)}${a.truncated?'<div class="note">— 서버 상한에서 잘림 —</div>':''}</details>`).join(''):empty('산출물 없음')}`)
-    +card(d.log_tail?`<details><summary>run.log ${d.log_truncated?'<span class="age">끝부분만</span>':''}</summary>${pre(d.log_tail,1)}</details>`:empty('run.log 없음'));
+    +card(`<h2>@@dash.js.artifacts@@ <span class="cnt">${arts.length}</span></h2>${arts.length?arts.map((a,i)=>`<details${i===arts.length-1?' open':''}><summary>${esc(a.name)} <span class="age">${sz(a.size||0)}</span></summary>${pre(a.content)}${a.truncated?'<div class="note">— @@dash.js.truncated@@ —</div>':''}</details>`).join(''):empty('@@dash.js.no_artifacts@@')}`)
+    +card(d.log_tail?`<details><summary>run.log ${d.log_truncated?'<span class="age">@@dash.js.tail_only@@</span>':''}</summary>${pre(d.log_tail,1)}</details>`:empty('@@dash.js.no_runlog@@'));
 }
 const taskRunRow=r=>{const n=r.run||'';return `<div class="row clk" data-open="run:${esca(n)}"><div class="main"><div class="mono">${esc(n.slice(0,4))}-${esc(n.slice(4,6))}-${esc(n.slice(6,8))} ${hm(r.when)}</div><div class="note">${stages(r.stages)||'—'}${(r.artifacts||[]).length?' · '+esc(r.artifacts.join(', ')):''}</div></div><span class="age">›</span></div>`};
 function taskDetail(d){
   const runs=d.runs||[];
   return card(`<div>${tlabelCp(d.slug,d.title,d.project)}</div><div class="note mono">${esc(d.slug)}</div>`)
     +ctxCard(d.task||{},d.ledger||{})
-    +card(`<h2>실행 <span class="cnt">${runs.length}</span></h2><div class="list">${runs.length?runs.map(taskRunRow).join(''):empty('실행 기록 없음')}</div>`)
-    +(d.body?card(`<details open><summary>태스크 본문</summary>${pre(d.body)}${d.body_truncated?'<div class="note">— 서버 상한에서 잘림 —</div>':''}</details>`):'');
+    +card(`<h2>@@dash.js.runs@@ <span class="cnt">${runs.length}</span></h2><div class="list">${runs.length?runs.map(taskRunRow).join(''):empty('@@dash.js.no_runs@@')}</div>`)
+    +(d.body?card(`<details open><summary>@@dash.js.task_body@@</summary>${pre(d.body)}${d.body_truncated?'<div class="note">— @@dash.js.truncated@@ —</div>':''}</details>`):'');
 }
 async function showDetail(ref){
   const i=ref.indexOf(':'),kind=ref.slice(0,i),id=ref.slice(i+1),body=$('dv-body');
   $('dv').hidden=false;document.body.style.overflow='hidden';
-  $('dv-title').textContent=kind==='run'?'실행 상세':'태스크 상세';
-  body.innerHTML=card(empty('불러오는 중…'));$('dv').scrollTop=0;
+  $('dv-title').textContent=kind==='run'?'@@dash.js.run_detail@@':'@@dash.js.task_detail@@';
+  body.innerHTML=card(empty('@@dash.js.loading@@'));$('dv').scrollTop=0;
   try{
     const r=await fetch(kind==='run'?`/api/run?id=${encodeURIComponent(id)}`:`/api/task?slug=${encodeURIComponent(id)}`);
     if(dstack[dstack.length-1]!==ref)return;          // user already moved on
-    if(r.status===404){body.innerHTML=card(empty(kind==='run'?'실행 기록을 찾을 수 없음':'태스크를 찾을 수 없음'));return}
+    if(r.status===404){body.innerHTML=card(empty(kind==='run'?'@@dash.js.run_not_found@@':'@@dash.js.task_not_found@@'));return}
     if(!r.ok)throw new Error(r.status);
     const d=await r.json();
     if(dstack[dstack.length-1]!==ref)return;
     body.innerHTML=kind==='run'?runDetail(d):taskDetail(d);
-  }catch(e){if(dstack[dstack.length-1]===ref)body.innerHTML=card(empty('불러오기 실패 — ↻로 다시 시도'))}
+  }catch(e){if(dstack[dstack.length-1]===ref)body.innerHTML=card(empty('@@dash.js.load_failed@@'))}
 }
 function openDetail(ref){dstack.push(ref);history.pushState({dv:dstack.length},'');showDetail(ref)}
 function closeDetail(){$('dv').hidden=true;$('dv-body').innerHTML='';document.body.style.overflow=''}
 window.addEventListener('popstate',()=>{dstack.pop();if(dstack.length)showDetail(dstack[dstack.length-1]);else closeDetail()});
 
-async function cp(el){try{await navigator.clipboard.writeText(el.dataset.cp);const o=el.innerHTML;el.innerHTML='✓ 복사됨';el.classList.add('ok');setTimeout(()=>{el.innerHTML=o;el.classList.remove('ok')},1000)}catch(_){el.innerHTML='✗'}}
+async function cp(el){try{await navigator.clipboard.writeText(el.dataset.cp);const o=el.innerHTML;el.innerHTML='✓ @@dash.js.copied@@';el.classList.add('ok');setTimeout(()=>{el.innerHTML=o;el.classList.remove('ok')},1000)}catch(_){el.innerHTML='✗'}}
 
 function mount(){
   // delegated on document so it survives every leaf innerHTML swap
@@ -2084,11 +2085,23 @@ function mount(){
 
 async function tick(){
   try{const r=await fetch('/api/status');last=await r.json();if(!mounted)mount();update(last)}
-  catch(e){const hs=$('hstate');hs.textContent='연결 끊김';hs.style.color='var(--red)'}
+  catch(e){const hs=$('hstate');hs.textContent='@@dash.js.disconnected@@';hs.style.color='var(--red)'}
 }
 tick();setInterval(tick,3000);
 </script></body></html>"""
-HTML = HTML.replace("__FAVICON__", FAVICON_HREF)
+_MARKER_RE = re.compile(r"@@([a-z0-9_.]+)@@")
+
+
+@functools.lru_cache(maxsize=4)
+def render_html(lang: str) -> str:
+    """The page in ``lang``: every ``@@key@@`` marker filled from
+    ``i18n.DASHBOARD`` (a key missing from that language renders as itself)."""
+    ph = i18n.dashboard_phrases(lang)
+    page = _MARKER_RE.sub(lambda m: ph.get(m.group(1), m.group(1)), _HTML_TEMPLATE)
+    return page.replace("__FAVICON__", FAVICON_HREF)
+
+
+HTML = render_html("ko")   # the ko page, byte-identical to the pre-i18n constant
 
 
 COOKIE = "macp_dash"
@@ -2318,7 +2331,8 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path.startswith("/api/"):
             self._reply(404, b'{"error": "not found"}', "application/json", extra)
         else:
-            self._reply(200, HTML.encode("utf-8"), "text/html; charset=utf-8", extra)
+            self._reply(200, render_html(paths.ui_language()).encode("utf-8"),
+                        "text/html; charset=utf-8", extra)
 
 
     def _sms_setup_page(self) -> str:
