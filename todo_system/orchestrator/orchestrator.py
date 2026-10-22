@@ -179,6 +179,23 @@ def _parse_ts(ts) -> float:
         return 0.0
 
 
+def _local_iso(ts) -> str:
+    """A ledger timestamp as local naive ISO to the second; "" if unparseable."""
+    epoch = _parse_ts(ts)
+    if not epoch:
+        return ""
+    return dt.datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+
+
+def _clock(epoch: float | None, now: float) -> str:
+    """`HH:MM` for a same-day epoch, `MM/DD HH:MM` otherwise; "?" when unknown."""
+    if not epoch:
+        return "?"
+    when = dt.datetime.fromtimestamp(epoch)
+    same_day = when.date() == dt.datetime.fromtimestamp(now).date()
+    return when.strftime("%H:%M" if same_day else "%m/%d %H:%M")
+
+
 @dataclass
 class Task:
     slug: str
@@ -802,6 +819,82 @@ class Orchestrator:
             dispatched.append(a)
             live.setdefault(key, []).append(a)
         return dispatched
+
+    # -- Queue view (read-only) -------------------------------------------
+    def queue_snapshot(self, tasks: list[Task], *, now: float | None = None,
+                       paused: bool = False, usage_hold: str | None = None,
+                       budget_exceeded: bool = False) -> list[dict]:
+        """Why each dispatchable task is not out yet, in tick() order.
+
+        Read-only: no ledger/mailbox write, no print, no usage refresh — the hold
+        inputs are passed in. It runs the SAME gates tick() runs (hold_wait →
+        _checkout_gate → _ledger_gate) and simulates this tick's claims the way
+        _dispatch_serial_per_checkout does, so a later same-checkout task reads
+        `checkout_busy` behind an earlier `next_tick` one. Rows that tick() can
+        never dispatch — DONE, in-flight, AWAITING_HUMAN, unroutable — are left
+        out rather than shown as `next_tick`. When several gates apply the
+        outermost (WAIT_RANK) is reported.
+        """
+        now = now if now is not None else dt.datetime.now().timestamp()
+        live = self._checkout_inflight()
+        cap = max(1, int(self.max_parallel_per_repo))
+        out: list[dict] = []
+        for t in tasks:
+            existing = self.ledger.load(t.slug)
+            lg = self._ledger_gate(existing, now)
+            if lg.kind in ("done", "busy") or self.route(t.slug) is None:
+                continue
+            key = self._checkout_key(t.payload)
+            h = hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
+                          budget_exceeded=budget_exceeded)
+            cg = self._checkout_gate(t, key, live, cap) if h is None else CheckoutGate(None)
+            lw = {"poll": WAIT_COOLDOWN, "cooldown": WAIT_COOLDOWN,
+                  "poison": WAIT_COOLDOWN, "capacity": WAIT_CAPACITY}.get(lg.kind)
+            waits = [w for w in (h, lw, cg.wait) if w]
+            wait = min(waits, key=WAIT_RANK.__getitem__) if waits else WAIT_NEXT_TICK
+            if h is None and cg.wait is None and lg.kind == "go":
+                # what dispatch() would return this tick — claims the checkout for
+                # the rest of the pass, never saved
+                live.setdefault(key, []).append(Assignment(
+                    task_id=t.slug, agent_id="", corr_id="", payload=t.payload))
+            holder = cg.holder if wait == WAIT_CHECKOUT_BUSY else ""
+            out.append({
+                "slug": t.slug,
+                "wait": wait,
+                "wait_text": self._wait_text(wait, lg, existing, cg, key, usage_hold, now),
+                "holder": holder,
+                "checkout": self._checkout_label(key),
+                "since": _local_iso(existing.updated_ts) if existing else "",
+                "payload": t.payload or {},
+            })
+        return out
+
+    def _wait_text(self, wait: str, lg: LedgerGate, existing: Assignment | None,
+                   cg: CheckoutGate, key: str, usage_hold: str | None,
+                   now: float) -> str:
+        """One Korean line explaining `wait` (queue view only)."""
+        if wait == WAIT_PAUSED:
+            return "PAUSED — 수동 정지 중"
+        if wait == WAIT_USAGE_HOLD:
+            return f"사용량 HOLD — {usage_hold}"
+        if wait == WAIT_BUDGET:
+            return f"일일 실행 예산 도달 ({self._runs_today()}/{self.daily_run_budget})"
+        if wait == WAIT_COOLDOWN:
+            if lg.kind == "poison":
+                return "반복 실패 — 다음 틱에 격리 예정"
+            if lg.kind == "poll":
+                return f"재확인 대기 — {_clock(lg.until, now)}"
+            n = existing.refail_count if existing else 0
+            return f"실패 쿨다운 — {_clock(lg.until, now)} 재시도 예정 (↻{n})"
+        if wait == WAIT_CAPACITY:
+            return f"capacity 재시도 대기 — {_clock(lg.until, now)}"
+        if wait == WAIT_CHECKOUT_BUSY:
+            return (f"같은 체크아웃({self._checkout_label(key)})에서 `{cg.holder}` "
+                    f"실행 중; 사유: {cg.reason}")
+        if wait == WAIT_GRADLE_CAP:
+            return (f"gradle 동시 빌드 상한 {self.max_parallel_gradle_builds} 도달 "
+                    f"({cg.gradle_runs} 실행 중)")
+        return "다음 틱에 디스패치"
 
     # -- Tracker ----------------------------------------------------------
     def collect(self) -> list[Assignment]:
