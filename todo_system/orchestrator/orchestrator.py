@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from . import human, message as m, stages
 from .. import kakao_format, paths
@@ -33,6 +34,76 @@ from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, Registry, load_registry
 
 _IN_FLIGHT = (DISPATCHED, ACCEPTED, IN_PROGRESS)
+
+# Queue-view wait verdicts — WHY a dispatchable task is not out yet. Emitted by
+# queue_snapshot() into /api/status `queue[].wait` and `cli queue --json`, and
+# rendered by the web/app dashboards: treat these strings as wire format.
+WAIT_NEXT_TICK = "next_tick"
+WAIT_CHECKOUT_BUSY = "checkout_busy"
+WAIT_GRADLE_CAP = "gradle_cap"
+WAIT_USAGE_HOLD = "usage_hold"
+WAIT_PAUSED = "paused"
+WAIT_BUDGET = "budget"
+WAIT_COOLDOWN = "cooldown"
+WAIT_CAPACITY = "capacity"
+# Outermost gate wins when several apply (lower rank = further out). Display
+# priority only — tick() still evaluates the gates in its own order.
+WAIT_RANK = {
+    WAIT_PAUSED: 0,
+    WAIT_USAGE_HOLD: 1, WAIT_BUDGET: 1,
+    WAIT_COOLDOWN: 2, WAIT_CAPACITY: 2,
+    WAIT_CHECKOUT_BUSY: 3, WAIT_GRADLE_CAP: 3,
+    WAIT_NEXT_TICK: 4,
+}
+
+
+def hold_wait(payload: dict | None, *, paused: bool, usage_hold: str | None,
+              budget_exceeded: bool) -> str | None:
+    """Which tick-wide hold keeps this task out of `runnable`, or None.
+
+    Pure: the three hold inputs are passed in, so tick() feeds its own reads and
+    the queue view feeds read-only ones (it must never call `usage_hold()`, which
+    refreshes usage state). PAUSED stops everything — a human saying stop, which
+    a task file cannot countermand. `bypass_guard: true` lets a task through the
+    COST holds (quota pacing, daily run budget) only. When both cost holds apply,
+    usage_hold is reported: they share one display tier.
+    """
+    if paused:
+        return WAIT_PAUSED
+    if (payload or {}).get("bypass_guard"):
+        return None
+    if usage_hold:
+        return WAIT_USAGE_HOLD
+    if budget_exceeded:
+        return WAIT_BUDGET
+    return None
+
+
+class LedgerGate(NamedTuple):
+    """dispatch()'s read-only verdict on a task's existing ledger row.
+
+    kind: "done" | "busy" (non-terminal: in-flight or AWAITING_HUMAN) | "poison"
+    (would be quarantined now) | "poll" (deferred row inside the job-poll
+    cooldown) | "capacity" (capacity_limited, inside its backoff) | "cooldown"
+    (inside the fail backoff) | "go". `until` = epoch the cooldown ends, else None.
+    """
+    kind: str
+    until: float | None = None
+    deferred: bool = False
+    capacity: bool = False
+
+
+class CheckoutGate(NamedTuple):
+    """_dispatch_serial_per_checkout's verdict for one task against `live`.
+
+    wait: WAIT_CHECKOUT_BUSY | WAIT_GRADLE_CAP | None (free). holder = slug of the
+    first in-flight sibling for checkout_busy; reason = `_hold_reason` text;
+    gradle_runs = live gradle-run count for gradle_cap.
+    """
+    wait: str | None
+    holder: str = ""
+    reason: str = ""
+    gradle_runs: int = 0
 
 # What one agent's mailbox read can legitimately raise: an unreachable or
 # unreadable root, a failed git subprocess, an unknown transport, or a
@@ -390,64 +461,27 @@ class Orchestrator:
         task is not re-processed every tick; that once looped expensive
         opus+max-effort pipelines on already-done tasks)."""
         existing = self.ledger.load(task.slug)
-        if existing and existing.state == DONE:
-            return None   # already completed — never re-run (dedup even if the todo
-                          # status wasn't marked done, e.g. a failed mark_done; this
-                          # is what let a merged task re-run into a duplicate PR)
-        if existing and not existing.is_terminal:
-            # Includes every AWAITING_HUMAN row, which is why parking is absolute:
-            # a parked task is skipped here no matter what its markdown says. Do
-            # NOT relax this (and do not add AWAITING_HUMAN to assignment.TERMINAL)
-            # — it is what keeps a PR review or a NEEDS_INPUT question waiting for
-            # the human who owes an answer. Un-parking is reconcile_unparked()'s
-            # job: it moves the row to a terminal state first, on evidence, and
-            # only then does it reach this line as re-dispatchable.
+        g = self._ledger_gate(existing, now)
+        if g.kind in ("done", "busy"):
             return None
-        # Bound here, not just inside the FAILED/REJECTED block below, because the
+        # Bound here, not just inside the FAILED/REJECTED block, because the
         # re-dispatch block further down reads it under the same condition — and a
         # future reorder must not turn that into a NameError.
-        deferred = False
-        if existing and existing.state in (FAILED, REJECTED):
-            capacity = getattr(existing, "capacity_limited", False)
-            # A detached long_job in flight is a wait we asked for: not a defect,
-            # so it must never poison, and it clears by itself.
-            job_running = getattr(existing, "job_running", False)
-            # Ditto a run the checkout guard held back: it never started, so there
-            # is no evidence about the task at all. Counting that as a failure
-            # would let a busy sibling quarantine a perfectly healthy task.
-            checkout_busy = getattr(existing, "checkout_busy", False)
-            deferred = job_running or checkout_busy
-            if not (capacity or deferred) \
-                    and existing.refail_count >= self.poison_threshold \
-                    and not existing.kind.startswith("human"):
-                # poison task: don't retry a task that keeps failing forever — the
-                # tiered cooldown alone would re-dispatch it every 6h indefinitely.
-                # Quarantine it (park for a human) once and stop churning cost.
-                # Capacity limits never poison — they aren't the task's fault.
-                existing.state = AWAITING_HUMAN
-                existing.updated_ts = m.now_iso()
-                existing.history.append({"ts": m.now_iso(), "type": "quarantined-poison",
-                                         "from": "orchestrator"})
-                # Failure framing, stamped before the save below — _notify_poison
-                # runs after it, so a set inside the notifier would never persist.
-                existing.last_alert_kind = ALERT_QUARANTINE
-                self.ledger.save(existing)
-                self._notify_poison(existing)
-                return None
-            now = now if now is not None else dt.datetime.now().timestamp()
-            # a usage/rate limit just needs to wait for capacity, not the escalating
-            # fail backoff (which is for genuinely broken tasks). A long_job poll is
-            # cheaper still — no agent is spawned — so it re-checks on a flat, short
-            # interval: the capacity backoff would leave a finished job idle for up
-            # to its full window before anyone noticed.
-            if deferred:
-                cooldown = self.job_poll_cooldown_s
-            elif capacity:
-                cooldown = self._capacity_cooldown(getattr(existing, "capacity_retry_count", 0))
-            else:
-                cooldown = self._fail_cooldown(existing.refail_count)
-            if now - _parse_ts(existing.updated_ts) < cooldown:
-                return None
+        deferred = g.deferred
+        if g.kind == "poison":
+            # Quarantine it (park for a human) once and stop churning cost.
+            existing.state = AWAITING_HUMAN
+            existing.updated_ts = m.now_iso()
+            existing.history.append({"ts": m.now_iso(), "type": "quarantined-poison",
+                                     "from": "orchestrator"})
+            # Failure framing, stamped before the save below — _notify_poison
+            # runs after it, so a set inside the notifier would never persist.
+            existing.last_alert_kind = ALERT_QUARANTINE
+            self.ledger.save(existing)
+            self._notify_poison(existing)
+            return None
+        if g.kind in ("poll", "capacity", "cooldown"):
+            return None
         agent = self.route(task.slug)
         if agent is None:
             return None
@@ -483,6 +517,63 @@ class Orchestrator:
             self._nudge(agent, a)
         self.ledger.save(a)
         return a
+
+    def _ledger_gate(self, existing: Assignment | None,
+                     now: float | None = None) -> LedgerGate:
+        """dispatch()'s dedup/poison/cooldown verdict on `existing`, with no side
+        effects — dispatch() performs the quarantine writes itself, and the queue
+        view (queue_snapshot) reads the same verdict to explain a wait. `now` is
+        resolved only for a FAILED/REJECTED row past the poison check, exactly
+        where dispatch() always resolved it."""
+        if existing and existing.state == DONE:
+            # already completed — never re-run (dedup even if the todo status
+            # wasn't marked done, e.g. a failed mark_done; this is what let a
+            # merged task re-run into a duplicate PR)
+            return LedgerGate("done")
+        if existing and not existing.is_terminal:
+            # Includes every AWAITING_HUMAN row, which is why parking is absolute:
+            # a parked task is skipped here no matter what its markdown says. Do
+            # NOT relax this (and do not add AWAITING_HUMAN to assignment.TERMINAL)
+            # — it is what keeps a PR review or a NEEDS_INPUT question waiting for
+            # the human who owes an answer. Un-parking is reconcile_unparked()'s
+            # job: it moves the row to a terminal state first, on evidence, and
+            # only then does it reach this line as re-dispatchable.
+            return LedgerGate("busy")
+        if existing and existing.state in (FAILED, REJECTED):
+            capacity = getattr(existing, "capacity_limited", False)
+            # A detached long_job in flight is a wait we asked for: not a defect,
+            # so it must never poison, and it clears by itself.
+            job_running = getattr(existing, "job_running", False)
+            # Ditto a run the checkout guard held back: it never started, so there
+            # is no evidence about the task at all. Counting that as a failure
+            # would let a busy sibling quarantine a perfectly healthy task.
+            checkout_busy = getattr(existing, "checkout_busy", False)
+            deferred = job_running or checkout_busy
+            if not (capacity or deferred) \
+                    and existing.refail_count >= self.poison_threshold \
+                    and not existing.kind.startswith("human"):
+                # poison task: don't retry a task that keeps failing forever — the
+                # tiered cooldown alone would re-dispatch it every 6h indefinitely.
+                # Capacity limits never poison — they aren't the task's fault.
+                return LedgerGate("poison", None, deferred, capacity)
+            now = now if now is not None else dt.datetime.now().timestamp()
+            # a usage/rate limit just needs to wait for capacity, not the escalating
+            # fail backoff (which is for genuinely broken tasks). A long_job poll is
+            # cheaper still — no agent is spawned — so it re-checks on a flat, short
+            # interval: the capacity backoff would leave a finished job idle for up
+            # to its full window before anyone noticed.
+            if deferred:
+                cooldown, kind = self.job_poll_cooldown_s, "poll"
+            elif capacity:
+                cooldown, kind = (self._capacity_cooldown(
+                    getattr(existing, "capacity_retry_count", 0)), "capacity")
+            else:
+                cooldown, kind = self._fail_cooldown(existing.refail_count), "cooldown"
+            started = _parse_ts(existing.updated_ts)
+            if now - started < cooldown:
+                return LedgerGate(kind, started + cooldown, deferred, capacity)
+            return LedgerGate("go", None, deferred, capacity)
+        return LedgerGate("go")
 
     @staticmethod
     def _checkout_key(payload: dict | None) -> str:
@@ -629,6 +720,34 @@ class Orchestrator:
         a.last_note = note
         self.ledger.save(a)
 
+    def _checkout_gate(self, t: Task, key: str, live: dict[str, list[Assignment]],
+                       cap: int) -> CheckoutGate:
+        """Is `t`'s checkout free given the in-flight rows in `live`? Pure read
+        (no ledger write, no print) — the serial dispatch loop and the queue view
+        share it. Per-repo cap / touches overlap first, then the global gradle cap.
+        """
+        held = live.get(key, [])
+        if held and (len(held) >= cap or not all(
+                self._can_run_concurrently(
+                    t.slug, t.payload or {}, o.task_id, o.payload or {})
+                for o in held)):
+            reason = self._hold_reason(t.slug, t.payload or {}, held, cap)
+            return CheckoutGate(WAIT_CHECKOUT_BUSY, held[0].task_id, reason)
+        # Global gradle-build ceiling (AC b): a dispatch-time cap on concurrent
+        # gradle-capable runs across ALL checkouts — a memory guard (8GB;
+        # [[runner-cgroup-memhigh-freeze-orphan-gradle]]) layered BELOW the
+        # per-repo cap above and SEPARATE from usage_guard's quota slots, double-
+        # counting neither (it counts live gradle RUNS only). Dormant at the
+        # default 0 (= unlimited); enforced only when > 0, so cap-1 behaviour is
+        # bit-for-bit (AC4). `live` already carries this tick's earlier
+        # dispatches, so the count holds across several gradle repos in one tick.
+        if self.max_parallel_gradle_builds > 0 and self._is_gradle_checkout(key):
+            gradle_runs = sum(len(rows) for k, rows in live.items()
+                              if self._is_gradle_checkout(k))
+            if gradle_runs >= self.max_parallel_gradle_builds:
+                return CheckoutGate(WAIT_GRADLE_CAP, gradle_runs=gradle_runs)
+        return CheckoutGate(None)
+
     def _dispatch_serial_per_checkout(self, runnable: list[Task]) -> list[Assignment]:
         """Dispatch, but never put two tasks in one checkout at the same time.
 
@@ -663,35 +782,20 @@ class Orchestrator:
         dispatched: list[Assignment] = []
         for t in runnable:
             key = self._checkout_key(t.payload)
-            held = live.get(key, [])
-            if held and (len(held) >= cap or not all(
-                    self._can_run_concurrently(
-                        t.slug, t.payload or {}, o.task_id, o.payload or {})
-                    for o in held)):
-                reason = self._hold_reason(t.slug, t.payload or {}, held, cap)
+            cg = self._checkout_gate(t, key, live, cap)
+            if cg.wait == WAIT_CHECKOUT_BUSY:
                 print(f"[orchestrator] {t.slug}: deferred — checkout "
-                      f"{key} is busy (serial per repo; {reason})")
+                      f"{key} is busy (serial per repo; {cg.reason})")
                 try:
-                    self._note_checkout_hold(t, key, held[0].task_id, reason)
+                    self._note_checkout_hold(t, key, cg.holder, cg.reason)
                 except OSError:
                     pass      # a cosmetic note must never break the dispatch loop
                 continue
-            # Global gradle-build ceiling (AC b): a dispatch-time cap on concurrent
-            # gradle-capable runs across ALL checkouts — a memory guard (8GB;
-            # [[runner-cgroup-memhigh-freeze-orphan-gradle]]) layered BELOW the
-            # per-repo cap above and SEPARATE from usage_guard's quota slots, double-
-            # counting neither (it counts live gradle RUNS only). Dormant at the
-            # default 0 (= unlimited); enforced only when > 0, so cap-1 behaviour is
-            # bit-for-bit (AC4). `live` already carries this tick's earlier
-            # dispatches, so the count holds across several gradle repos in one tick.
-            if self.max_parallel_gradle_builds > 0 and self._is_gradle_checkout(key):
-                gradle_runs = sum(len(rows) for k, rows in live.items()
-                                  if self._is_gradle_checkout(k))
-                if gradle_runs >= self.max_parallel_gradle_builds:
-                    print(f"[orchestrator] {t.slug}: deferred — global gradle-build "
-                          f"cap {self.max_parallel_gradle_builds} reached "
-                          f"({gradle_runs} live)")
-                    continue
+            if cg.wait == WAIT_GRADLE_CAP:
+                print(f"[orchestrator] {t.slug}: deferred — global gradle-build "
+                      f"cap {self.max_parallel_gradle_builds} reached "
+                      f"({cg.gradle_runs} live)")
+                continue
             a = self.dispatch(t)
             if a is None:
                 continue          # dedup/cooldown/unroutable: claims no checkout
@@ -2285,13 +2389,16 @@ class Orchestrator:
         usage_hold = self.usage_hold()
         # stop starting new work; in-flight replies below are still collected
         paused = self.paused()
-        hold = self.budget_exceeded() or paused or bool(usage_hold)
+        budget = self.budget_exceeded()
+        hold = budget or paused or bool(usage_hold)
         # `bypass_guard: true` lets one task through a COST hold — quota pacing or
         # the daily run budget — for work that is worth spending out of turn. It
         # deliberately does NOT override an explicit pause: that is a human saying
-        # stop, and a task file should not be able to countermand it.
-        runnable = tasks if not hold else (
-            [] if paused else [t for t in tasks if (t.payload or {}).get("bypass_guard")])
+        # stop, and a task file should not be able to countermand it. The verdict
+        # is hold_wait(), which the queue view shares.
+        runnable = tasks if not hold else [
+            t for t in tasks if hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
+                                          budget_exceeded=budget) is None]
         if hold and runnable:
             for t in runnable:
                 print(f"[orchestrator] {t.slug}: bypass_guard — dispatching despite "
@@ -2466,6 +2573,52 @@ def _check_divergence(root: Path, _run=None, *, threshold: int = 3) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def resolve_dispatch_limits() -> tuple:
+    """(daily_run_budget, max_parallel_per_repo, max_parallel_gradle_builds) —
+    the raw profile→env values `_main` builds the dispatching Orchestrator with.
+    Unfloored: callers apply max(1, …) / max(0, …) themselves. Shared with the
+    dashboard's queue view so it judges with the same limits the tick uses."""
+    # per-profile budget + per-repo concurrency cap from ~/.macp (the active
+    # profile owns cost governance). The cap defaults to 2 (concurrency on — leaf
+    # 5 flipped it from 1 now that worktree isolation + the touches judge landed)
+    # and is read via getattr, so a profile that has not added the field yet falls
+    # back to the same 2. It is a SUB-constraint of the global usage_guard slot
+    # pacing (#191), never a raise of the global ceiling.
+    budget = 40
+    cap = 2
+    gradle_cap = 0
+    try:
+        from todo_system import macp
+        prof = macp.load_profile(macp.default_profile())
+        if prof:
+            budget = prof.daily_run_budget
+            cap = getattr(prof, "max_parallel_per_repo", 2)
+            gradle_cap = getattr(prof, "max_parallel_gradle_builds", 0)
+    except Exception:
+        pass
+    # env override — a per-host knob layered over the profile field; wrapped so a
+    # malformed value is ignored, never crashing the daemon, and still floored at
+    # 1 by max(1, ...) in _main (a host can set it to 1 to force serial-per-repo).
+    import os
+    env_cap = os.environ.get("MACP_MAX_PARALLEL_PER_REPO")
+    if env_cap:
+        try:
+            cap = int(env_cap)
+        except ValueError:
+            pass
+    # Global gradle-build cap — the cross-checkout memory guard. Same profile→env
+    # ladder as the per-repo cap; default 0 = unlimited (dormant), so an older
+    # profile without the field and today's behaviour are unaffected. A malformed
+    # value is ignored and it is floored at 0 by max(0, ...) in _main (never negative).
+    env_gradle = os.environ.get("MACP_MAX_PARALLEL_GRADLE_BUILDS")
+    if env_gradle:
+        try:
+            gradle_cap = int(env_gradle)
+        except ValueError:
+            pass
+    return budget, cap, gradle_cap
+
+
 def _main(argv: list[str] | None = None) -> int:
     import argparse
     import json
@@ -2553,44 +2706,7 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"error: orchestrator lease held by {held.holder if held else '?'}")
             return 1
 
-    # per-profile budget + per-repo concurrency cap from ~/.macp (the active
-    # profile owns cost governance). The cap defaults to 2 (concurrency on — leaf
-    # 5 flipped it from 1 now that worktree isolation + the touches judge landed)
-    # and is read via getattr, so a profile that has not added the field yet falls
-    # back to the same 2. It is a SUB-constraint of the global usage_guard slot
-    # pacing (#191), never a raise of the global ceiling.
-    budget = 40
-    cap = 2
-    gradle_cap = 0
-    try:
-        from todo_system import macp
-        prof = macp.load_profile(macp.default_profile())
-        if prof:
-            budget = prof.daily_run_budget
-            cap = getattr(prof, "max_parallel_per_repo", 2)
-            gradle_cap = getattr(prof, "max_parallel_gradle_builds", 0)
-    except Exception:
-        pass
-    # env override — a per-host knob layered over the profile field; wrapped so a
-    # malformed value is ignored, never crashing the daemon, and still floored at
-    # 1 by max(1, ...) below (a host can set it to 1 to force serial-per-repo).
-    import os
-    env_cap = os.environ.get("MACP_MAX_PARALLEL_PER_REPO")
-    if env_cap:
-        try:
-            cap = int(env_cap)
-        except ValueError:
-            pass
-    # Global gradle-build cap — the cross-checkout memory guard. Same profile→env
-    # ladder as the per-repo cap; default 0 = unlimited (dormant), so an older
-    # profile without the field and today's behaviour are unaffected. A malformed
-    # value is ignored and it is floored at 0 by max(0, ...) below (never negative).
-    env_gradle = os.environ.get("MACP_MAX_PARALLEL_GRADLE_BUILDS")
-    if env_gradle:
-        try:
-            gradle_cap = int(env_gradle)
-        except ValueError:
-            pass
+    budget, cap, gradle_cap = resolve_dispatch_limits()
     orch = Orchestrator(open_mailbox(args.uri, base=base),
                         load_registry(args.registry, base=base),
                         Ledger(base / args.ledger), daily_run_budget=budget,
