@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import re
 import string
 from pathlib import Path
 from unittest import mock
@@ -217,3 +218,44 @@ def test_t_never_raises_on_bad_format_args(monkeypatch):
     monkeypatch.setenv("MACP_LANGUAGE", "en")
     assert i18n.t("hold.cap", wrong=1) == i18n.MESSAGES["en"]["hold.cap"]
     assert i18n.t("hold.cap", cap=3) == "cap reached — at most 3 concurrent runs per repo"
+
+
+# --- the dashboard fragment table ------------------------------------------------
+
+_HANGUL = re.compile("[가-힣]")
+# Characters that carry syntax where a fragment sits (markup, JS literals, comments).
+_SYNTAX = "'\"`\\<>{}$&@\n"
+
+
+def test_dashboard_ko_and_en_have_identical_key_sets():
+    assert set(i18n.DASHBOARD) == {"ko", "en"}
+    assert set(i18n.DASHBOARD["ko"]) == set(i18n.DASHBOARD["en"])
+    assert all(i18n.DASHBOARD["ko"].values())          # ko is the marker source text
+
+
+def test_dashboard_en_has_no_hangul():
+    for key, v in i18n.DASHBOARD["en"].items():
+        assert not _HANGUL.search(v), key
+
+
+def test_dashboard_ko_fragments_are_distinct():
+    ko = list(i18n.DASHBOARD["ko"].values())
+    assert len(ko) == len(set(ko))
+
+
+def test_dashboard_en_adds_no_syntax_characters():
+    # en may only carry the quote/bracket/brace characters its ko counterpart has,
+    # so swapping a fragment can't break the markup or script around it.
+    for key, ko in i18n.DASHBOARD["ko"].items():
+        en = i18n.DASHBOARD["en"][key]
+        assert sorted(c for c in en if c in _SYNTAX) == sorted(c for c in ko if c in _SYNTAX), key
+
+
+def test_dashboard_phrases_follows_ui_language(monkeypatch):
+    assert i18n.dashboard_phrases("ko") is i18n.DASHBOARD["ko"]
+    assert i18n.dashboard_phrases("en") is i18n.DASHBOARD["en"]
+    assert i18n.dashboard_phrases("xx") is i18n.DASHBOARD["en"]
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert i18n.dashboard_phrases() is i18n.DASHBOARD["ko"]
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert i18n.dashboard_phrases() is i18n.DASHBOARD["en"]
