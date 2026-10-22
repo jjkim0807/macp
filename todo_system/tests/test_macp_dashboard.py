@@ -1948,6 +1948,30 @@ class QueueCollectTests(unittest.TestCase):
         self.assertIn("todo", d)
         self.assertIn("active", d)
 
+    def test_queue_html_section_shell(self):
+        html = M.HTML
+        self.assertIn('id="c-queue"', html)
+        # right under 진행 중, before the 시스템 상세 card
+        self.assertLess(html.index('id="c-active"'), html.index('id="c-queue"'))
+        self.assertLess(html.index('id="c-queue"'), html.index('id="c-recent"'))
+        # collapsed by default: none of the three <details> carries `open`
+        for did in ("d-queue", "d-queue-upcoming", "d-queue-blocked"):
+            tag = re.search(r'<details id="%s"[^>]*>' % did, html).group(0)
+            self.assertNotIn(" open", tag, tag)
+        for sub in ("d-queue-upcoming", "d-queue-blocked"):
+            self.assertIn("$('%s').hidden=" % sub, html, sub)      # hidden when empty
+        for key in ("'queue'", "'queue-upcoming'", "'queue-blocked'"):
+            self.assertIn(key, html)
+        self.assertIn("'mdash.sec.'+s", html)
+        self.assertIn("fill('queue',q,queueRow,'큐 비어 있음')", html)   # no foldFill
+        self.assertNotIn("foldFill('queue'", html)
+        self.assertIn('data-open="task:${esca(r.slug)}"', html)
+        for w in ("next_tick", "checkout_busy", "gradle_cap", "usage_hold", "paused",
+                  "budget", "cooldown", "capacity"):
+            self.assertIn(w + ":[", html, w)                          # one badge per wait
+        self.assertNotIn("https://", html)
+        self.assertNotIn("http://", html)
+
     def test_collect_queue_writes_nothing(self):
         def tree():
             return sorted((p.relative_to(self.tmp).as_posix(),

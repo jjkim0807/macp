@@ -1547,6 +1547,7 @@ font-size:12px;font-weight:600}
 .rmeta{display:flex;align-items:center;justify-content:flex-end;gap:6px;
 flex:0 1 auto;min-width:0;flex-wrap:wrap}
 .age{color:var(--mut);font-size:12px;white-space:nowrap}
+.qdeps{white-space:normal;overflow-wrap:anywhere;text-align:right}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .badge{padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
 /* Badges: tint = semantic token at 15% over --card, text = the token darkened 25%
@@ -1672,6 +1673,22 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
     <button class="more" data-sec="active" hidden>더보기</button>
   </section>
 
+  <!-- 큐: 디스패치 대기 순서·사유 (서버 판정, 읽기 전용). 기본 접힘, 그룹 폴딩 없음. -->
+  <section class="card" id="c-queue">
+    <details id="d-queue">
+      <summary>큐 <span class="cnt" id="cnt-queue">0</span></summary>
+      <div class="list" id="queue"></div>
+      <details id="d-queue-upcoming" hidden style="margin-top:8px">
+        <summary>⏳ 예약됨 <span class="cnt" id="cnt-queue-upcoming">0</span></summary>
+        <div class="list" id="queue-upcoming"></div>
+      </details>
+      <details id="d-queue-blocked" hidden style="margin-top:8px">
+        <summary>🔗 선행 대기 <span class="cnt" id="cnt-queue-blocked">0</span></summary>
+        <div class="list" id="queue-blocked"></div>
+      </details>
+    </details>
+  </section>
+
   <!-- 이하 이력·참고·계측: 기본 접힘 '시스템 상세' 한 카드로 합침. 안의 기존
        <details>/<div id> 는 중첩으로 보존(id·cnt-* 앵커 불변). runs 는 '이력'에
        흡수되므로 cnt-runs/#runs 는 숨긴 자리표시로만 남긴다. -->
@@ -1756,6 +1773,21 @@ const runRow=r=>{const w=r.when||'';return `<div class="row clk" data-open="run:
 const recentRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.todo_status&&r.todo_status!=='open'?` <span class="age">(${esc(r.todo_status)})</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span></div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+' 전':'—'}</span></div>`;
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
+
+// 큐 (docs/dashboard-parity.md "큐"): the server judges `wait`; rows render in the
+// order received (tick order). Existing badge classes only — no new colours.
+const QW={next_tick:['다음 틱','b-run'],checkout_busy:['리포 사용중','b-def'],gradle_cap:['빌드 상한','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['예산','b-wait'],cooldown:['재시도 대기','b-gray'],capacity:['재시도 대기','b-gray']};
+const qwBadge=w=>{const m=QW[w]||[w||'?','b-gray'];return `<span class="badge ${m[1]}">${esc(m[0])}</span>`};
+const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'부터':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
+const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}부터</span></div></div>`;
+const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'선행 완료 — 언블락 대기'}</span></div></div>`;
+// Open/closed of the queue <details> survives reloads under the contract keys
+// mdash.sec.queue / mdash.sec.queue-upcoming / mdash.sec.queue-blocked.
+const QSEC={'d-queue':'queue','d-queue-upcoming':'queue-upcoming','d-queue-blocked':'queue-blocked'};
+const secKey=s=>'mdash.sec.'+s;
+function secMount(){for(const [id,s] of Object.entries(QSEC)){const el=$(id);if(!el)continue;
+  try{el.open=localStorage.getItem(secKey(s))==='1'}catch(_){}
+  el.addEventListener('toggle',()=>{try{localStorage.setItem(secKey(s),el.open?'1':'0')}catch(_){}})}}
 
 const fill=(id,list,render,emptyMsg)=>{$(id).innerHTML=list.length?list.map(render).join(''):empty(emptyMsg)};
 // Fold: within ONE section, rows sharing a non-empty `group` (count>=2) collapse into
@@ -1945,6 +1977,17 @@ function update(d){
   const abtn=document.querySelector('.more[data-sec="active"]');
   if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'접기':`더보기 (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
 
+  // 큐: server order as-is, no group folding (the order is the information).
+  const q=d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
+  $('cnt-queue').textContent=q.length;
+  fill('queue',q,queueRow,'큐 비어 있음');
+  $('cnt-queue-upcoming').textContent=qu.length;
+  $('cnt-queue-blocked').textContent=qb.length;
+  fill('queue-upcoming',qu,upcomingRow,'없음');
+  fill('queue-blocked',qb,blockedRow,'없음');
+  $('d-queue-upcoming').hidden=!qu.length;
+  $('d-queue-blocked').hidden=!qb.length;
+
   renderHistory(d);
   $('cnt-runs').textContent=d.runs.length;
   // small, non-showy: how many of the detail subsections have any content (0–4).
@@ -2018,6 +2061,7 @@ async function cp(el){try{await navigator.clipboard.writeText(el.dataset.cp);con
 function mount(){
   // delegated on document so it survives every leaf innerHTML swap
   themeApply(themeGet());                    // sync button label (pre-paint set data-theme)
+  secMount();                                // restore the queue sections' open state
   document.addEventListener('click',e=>{
     const tb=e.target.closest('#theme');if(tb){const i=THEMES.indexOf(themeGet());themeSet(THEMES[(i+1)%3]);return}
     const c=e.target.closest('.cp');if(c){e.stopPropagation();cp(c);return}
