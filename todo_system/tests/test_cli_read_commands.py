@@ -441,3 +441,29 @@ def test_queue_json_is_the_dashboard_rows(
     assert got == dash.collect_queue(
         db=db, assign=tmp_path / "Worker/assignments",
         registry=tmp_path / "Worker/agents/registry.yaml")
+
+
+def test_queue_resolves_vault_relative_task_paths_from_any_cwd(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    db = _queue_vault(vault)
+    (vault / "Todo/items/qx-auto.md").write_text(
+        "---\nstatus: open\nrepo: https://github.com/example-org/app.git\n---\n",
+        encoding="utf-8")
+    con = sqlite3.connect(str(db))
+    con.execute("UPDATE tasks SET path='Todo/items/qx-auto.md' WHERE slug='qx-auto'")
+    con.commit()
+    con.close()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    rc, out = _run(db, capsys, "queue", "--json")
+
+    assert rc == 0
+    assert json.loads(out)["queue"][0]["checkout"] == "app"   # md read via the vault
+    assert Path.cwd() == elsewhere                            # cwd restored

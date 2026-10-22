@@ -1673,22 +1673,40 @@ def _load_dashboard():
 
 def _queue_for_db(db: Path) -> dict:
     """The dashboard's own collect_queue, pointed at the vault that owns `db`
-    (`<vault>/Todo/todo.db`), so `queue --json` is the /api/status rows."""
-    vault = db.resolve().parent.parent
+    (`<vault>/Todo/todo.db`), so `queue --json` is the /api/status rows.
+
+    todo.db stores vault-relative task paths, which the loaders resolve against
+    the cwd — the dashboard chdirs to its vault in main(), so this does the same
+    for the duration of the read (restored after), from whatever cwd it runs in."""
+    import os
+
+    db = db.resolve()
+    vault = db.parent.parent
     try:
         st = json.loads((vault / "Worker" / "_state" / "usage_guard" / "latest.json")
                         .read_text(encoding="utf-8"))
         usage = st.get("decision") or None
     except Exception:
         usage = None
-    return _load_dashboard().collect_queue(
-        db=db, assign=vault / "Worker" / "assignments",
-        registry=vault / "Worker" / "agents" / "registry.yaml", usage=usage)
+    dash = _load_dashboard()
+    prev = os.getcwd()
+    os.chdir(vault)
+    try:
+        return dash.collect_queue(
+            db=db, assign=vault / "Worker" / "assignments",
+            registry=vault / "Worker" / "agents" / "registry.yaml", usage=usage)
+    finally:
+        os.chdir(prev)
 
 
 def cmd_queue(args: argparse.Namespace) -> int:
+    import contextlib
+
     try:
-        q = _queue_for_db(Path(args.db))
+        # load_dispatchable prints its skip lines to stdout; keep stdout pure
+        # (the table / the JSON document) and send those to stderr instead.
+        with contextlib.redirect_stdout(sys.stderr):
+            q = _queue_for_db(Path(args.db))
     except Exception as e:
         print(f"queue: dashboard module unavailable ({e})", file=sys.stderr)
         return 1
