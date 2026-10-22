@@ -349,6 +349,102 @@ leaf ⑥의 자동화 스위트(`test_state_store_git_ops.py`)가 된다.
 
 ---
 
+## ⑦ 네트워크 공유 백엔드(Cloud SQL) — 예약 슬롯
+
+external 축(본부 볼트 밖 SQLite)을 **다중 호스트가 네트워크로 공유**할 때의 자리. §①~⑥의
+SQLite 는 본부(primary host) 로컬 파일이라 다른 머신이 직접 열 수 없다 — 네트워크 공유가
+필요해지면 상세 후보 비교는 **§⑧(원격 워커 접근)**, 구현 leaf 는 **§⑥ 지도의 leaf ⑦** 이다.
+**상시 외부 SaaS DB(Supabase·Neon)는 금지**하고 유료 인프라는 **GCP Cloud SQL 만**
+([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]], [[Decisions/2026-10-13-macp-task-store]]),
+월 비용을 숫자로 밝히며(§⑧ (b) ~$10~25/월) 프로비저닝은 사람 결정이다. 이 절은 §⑥→§⑧ 번호
+점프를 막는 **예약 슬롯**으로, 새 설계 결정을 지어내지 않고 §⑧로 포워딩만 한다.
+
+---
+
+## ⑧ 원격 워커 접근 (external 모드에서 다른 머신의 러너가 같은 상태에 읽고/쓰기)
+
+§①~⑥은 external 모드의 상태를 **본부(primary host) 한 대의 볼트 밖 SQLite**
+(`~/.local/share/macp/state.sqlite`)에 두는 것으로 설계했다. 그런데 원격 호스트(Windows/WSL 등)의
+러너도 같은 상태를 읽고 써야 한다(사용자 요구: "외부 머신에서 동작하는 워커도 DB에 접근 가능해야").
+SQLite 파일은 로컬 파일 핸들이라 다른 머신이 직접 열 수 없으므로 네트워크 경로가 필요하다.
+
+**현행 원격 경로(baseline)** 는 **순수 git** 이다: `scripts/worker_remote_loop.sh` 가 볼트를 pull →
+`Worker/remote/<host>/inbox/*.md` 의 과제를 실행 → 결과(queue/run 산출물/episodes)를 push 하고,
+오케스트레이터 Runner 는 `scripts/orchestrator_runner_remote.sh:54-57` 로 `--uri "git://Worker/agents"`
+mailbox 를 쓴다(transport 는 전부 볼트 git). external 모드는 이 git-추적 상태를 볼트 밖으로 빼는 게
+목적이므로, 원격 접근도 "git 말고 무엇으로"를 정해야 한다.
+
+### 후보 비교표
+
+| 후보 | 비용(월 $) | 운영 부담 | 지연 | 오프라인 시 동작 | 보안 |
+|---|---|---|---|---|---|
+| **(a) 본부 HTTP 상태 API + 토큰** — SQLite 는 본부에만, 원격 러너가 HTTP(S)로 CRUD/claim 호출 | **$0**(본부 VM 상주, 추가 관리형 자원 없음) | 중 — 상태 API 서버(읽기/쓰기/claim)·인증·버전 관리 신규 | 낮음(네트워크 1홉) | **약함** — 본부 다운 시 못 닿음 → 로컬 큐로 degrade(아래) | 토큰(Secret Manager) + TLS, 선택적으로 Tailscale 테일넷 안에서만 리슨 |
+| (b) GCP Cloud SQL(Postgres) 각 호스트 직접 접속 | **~$10~25**([[Decisions/2026-10-13-macp-task-store]] C행; db-f1-micro~소형) | 높음 — 인스턴스·IAM·Auth Proxy·백업·스키마 마이그레이션 상시 운영 | 낮음~중 | 약함 — 외부 관리형 DB 의존(2026-09 Supabase 참사와 같은 SPOF 구조) | Cloud SQL IAM + Auth Proxy / 승인 네트워크 |
+| (c) 현행 git 동기화 유지 — external 은 **본부 전용**, 원격은 지금처럼 git inbox | **$0** | 낮음 — 이미 구축·운영 중(`worker_remote_loop.sh`) | 높음(pull/push 주기 = 수초~수분) | **강함** — git 은 비동기·오프라인 내성(못 닿으면 다음 틱에 이어붙음) | 기존 git 인증(토큰/SSH) 그대로 |
+| (a′) (a)를 Tailscale 등 메시 VPN 으로만 노출 | **$0**(무료 티어) | 중(+테일넷 ACL) | 낮음 | (a)와 동일 | 공개 IP 없음 — 테일넷 ACL 로 디바이스 단위 제한 |
+
+*비용 열은 관리형 자원의 월 과금만; 본부 VM 자체는 어느 후보든 상주하므로 공통 비용에서 뺐다.*
+
+### 권장안 + 이유
+
+**권장: (a) 본부 HTTP 상태 API + 토큰.** 단 **(c) git baseline 을 "상태 공유가 꼭 필요하지 않은 원격
+호스트"의 기본 fallback 으로 유지**하고, **(b) Cloud SQL 은 본부 단일 장애점이 실제 병목이 될 때만 가는
+사람-게이트 에스컬레이션**으로 둔다. 노출면을 줄이려면 (a)를 (a′)(Tailscale 변형)로 배치한다.
+
+근거(5열 + 프로젝트 prior):
+
+- **단일 SoT 유지**: (a)는 SQLite 권위 사본을 본부 한 곳에 그대로 둔다(§④의 "권위 사본은 SQLite,
+  `Worker/assignments/` 는 읽기전용 스냅샷"과 정합). (b)는 상태 SoT 를 또 하나의 상시 DB 로 옮겨 2026-09
+  Supabase 마비(큐 22일 정지)의 구조를 재현할 위험이 있다 — 상시 외부 DB 배제 방침
+  ([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]], [[Decisions/2026-10-13-macp-task-store]])과 충돌.
+- **유료 인프라는 사람 게이트**: (a)/(c)는 $0(본부 상주 자원만). (b)만 월 ~$10~25 과금 + Cloud SQL 상시
+  운영 — 부모 체인의 ⑦(원격 접근)이 human_gate 인 이유다. 실제 네트워크 노출·유료 프로비저닝은 **사람 결정**.
+- **오프라인 내성**: (c)는 강하고 (a)는 약하지만, (a)의 약점은 아래 "본부 장애 시 동작"의 로컬 큐 degrade 로
+  상쇄된다 — 쓰기를 로컬에 적재했다가 복구 시 flush 하면 (c)의 비동기 내성을 쓰기 경로에서 회복한다.
+- **운영 최소**: (a)는 본부 상주 VM 에 엔드포인트 하나를 더하는 수준. (b)의 Cloud SQL 상시 운영 대비 가볍다.
+- **md=SoT 불변**: 태스크 소스는 external 모드에서도 md(§①)이고, **상태 저장소만** 네트워크화한다 — (a)는
+  상태 CRUD 만 API 로 노출하고 태스크 편집 인터페이스(파일)는 안 건드린다.
+
+### 인증 방식
+
+권장안 (a)/(a′)에 정합하는 레이어:
+
+- **토큰**: 러너→본부 API 요청에 bearer 토큰, 토큰은 본부 **Secret Manager** 에 보관(리포·볼트에 평문 금지).
+  공개 리포 설계라 실제 토큰 값·엔드포인트 host 는 여기 안 적는다.
+- **Google ID 토큰 서버 검증**(대안/강화): 2026-09-25 결정의 표준 인증(Cloud Run + ID 토큰 서버 검증)과
+  동형 — API 가 호출자의 ID 토큰을 서버에서 검증.
+- **Tailscale ACL**(네트워크 레이어): API 를 테일넷에만 리슨시키고 디바이스 단위 ACL 로 제한 → 토큰이
+  유출돼도 공개 네트워크에서 도달 불가. (a′) 권장 배치의 핵심.
+
+### 본부 장애 시 원격 러너 동작
+
+(a)의 오프라인 약점을 메우는 핵심 규칙:
+
+1. **재시도(backoff)**: 상태 API 호출 실패 시 지수 backoff 로 재시도(현행 git push 가 3회 재시도하는 것과
+   동형 — `scripts/worker_remote_loop.sh:79-87`).
+2. **로컬 큐 적재 → 복구 시 flush**: 재시도 한계를 넘으면 원격 러너는 쓰기(상태 변경·claim 해제·결과)를
+   **로컬 append-only 아웃박스**(호스트 로컬 파일, 볼트 밖)에 적재하고 과제 진행을 멈춘다. 본부 복구가
+   감지되면 아웃박스를 순서대로 flush(멱등 upsert 라 중복 적용 안전). 이로써 쓰기 경로에서 (c)의 비동기
+   내성을 회복한다.
+3. **읽기 degrade**: 새 과제 claim 은 본부가 살아 있어야만 가능(claim 은 공유 상태 쓰기) → 본부 다운 중
+   원격은 **진행 중 과제만 마치고 신규는 안 집는다**(중복 실행 방지와 정합).
+
+### at-least-once · 중복 실행 방지 (lease/claim)
+
+- **claim = lease**: 러너가 과제를 집을 때 공유 상태(ledger 행 또는 전용 claims 테이블)에 **lease**
+  (소유자 host/run_id · 획득 ts · TTL 만료 ts)를 원자적으로 기록한다. 이미 유효 lease 가 있으면 다른
+  러너는 그 과제를 집지 않는다 → 동시 두 호스트의 중복 실행 방지.
+- **TTL 로 크래시 복구**: 러너가 과제 도중 죽으면 lease 가 TTL 만료되어 다른 러너가 재획득 가능. 이때
+  과제는 다시 실행될 수 있으나(at-least-once), 스테이지 파이프라인은 재시도=전체 재실행으로 재실행
+  안전하게 설계돼 있어 허용된다.
+- **mailbox 틈브스톤과의 관계**(`mailbox.py:47-55`): git 모드의 틈브스톤 핵은 "ack 삭제가 커밋 안 돼
+  git-restore 가 메시지를 부활시킨다"는 **git-추적 전송** 고유 문제다. 네트워크 백엔드에선 claim/ack 이
+  **DB 행 변이**(네트워크로 커밋)라 git 이 되돌릴 트리 상태가 없다 → claim 이 곧 영구 소비, 틈브스톤 보정
+  **불필요**(§①·§⑤가 external 모드에 대해 이미 내린 결론과 동일). at-least-once 전달(mailbox receive 가
+  메시지를 ≥1회 반환)은 유지되고, claim 의 멱등성(재집음 시 기존 lease 소유자 확인)이 중복 실행을 막는다.
+
+---
+
 ### 부록: 이 노트가 확정한 설계 결정 요약
 
 1. Mailbox 관계 = **구성(composition)**, 흡수 아님(§②).
