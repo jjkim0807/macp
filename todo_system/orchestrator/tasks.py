@@ -33,14 +33,9 @@ DISPATCHABLE_MODES = ("auto", "delegate", "quick", "discover")  # 5-stage / sing
 CLOSE_TRACE = "closed by orchestrator"
 
 
-def load_dispatchable(db_path: str | Path = DEFAULT_DB,
-                      only_auto: bool = True, *,
-                      now: dt.datetime | None = None) -> list[Task]:
-    """Open, non-parent leaves safe to auto-dispatch (worker_mode auto, delegate,
-    or quick). Manual / blocked / human-owned tasks are left out — humans get
-    their work via the brief and explicit dispatch. The StagedExecutor picks the
-    5-stage vs single-stage pipeline from worker_mode in the payload. `now`
-    pins the `not_before` clock (default: host-local now)."""
+def _open_leaf_rows(db_path: str | Path) -> tuple[list, bool, bool]:
+    """(rows, has_auto_merge, has_not_before) — every open, non-parent task row,
+    read-only. Shared by load_dispatchable and the queue-view loaders."""
     uri = f"file:{Path(db_path)}?mode=ro"
     con = sqlite3.connect(uri, uri=True)
     con.row_factory = sqlite3.Row
@@ -59,6 +54,18 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         ).fetchall()
     finally:
         con.close()
+    return rows, has_am, has_nb
+
+
+def load_dispatchable(db_path: str | Path = DEFAULT_DB,
+                      only_auto: bool = True, *,
+                      now: dt.datetime | None = None) -> list[Task]:
+    """Open, non-parent leaves safe to auto-dispatch (worker_mode auto, delegate,
+    or quick). Manual / blocked / human-owned tasks are left out — humans get
+    their work via the brief and explicit dispatch. The StagedExecutor picks the
+    5-stage vs single-stage pipeline from worker_mode in the payload. `now`
+    pins the `not_before` clock (default: host-local now)."""
+    rows, has_am, has_nb = _open_leaf_rows(db_path)
 
     tasks: list[Task] = []
     for r in rows:
@@ -164,6 +171,109 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
             payload["depends_on"] = depends_on
         tasks.append(Task(slug=r["slug"], payload=payload))
     return tasks
+
+
+# --- queue-view loaders (read-only; /api/status queue_upcoming / queue_blocked) --
+
+def load_upcoming(db_path: str | Path = DEFAULT_DB, *,
+                  now: dt.datetime | None = None) -> list[dict]:
+    """Tasks load_dispatchable would return but for a FUTURE `not_before`.
+
+    Same mode / strict-YAML / md-drift guards as load_dispatchable (silently —
+    it already prints the skip lines), then `not_before` still deferred.
+    `{"slug", "title", "path", "not_before"}`, earliest first."""
+    rows, _, has_nb = _open_leaf_rows(db_path)
+    if not has_nb:
+        return []
+    out: list[tuple] = []
+    for r in rows:
+        if (r["worker_mode"] or "") not in DISPATCHABLE_MODES:
+            continue
+        if not nb_gate.is_deferred(r["not_before"], now):
+            continue
+        fm, fm_err = (repos.frontmatter_with_error(r["path"]) if r["path"]
+                      else ({}, None))
+        if fm_err is not None:
+            continue
+        md_mode = repos.task_worker_mode_from_fm(fm) if r["path"] else None
+        if md_mode is not None and md_mode not in DISPATCHABLE_MODES:
+            continue
+        when = nb_gate.parse_not_before(r["not_before"]) or dt.datetime.max
+        out.append((when, {"slug": r["slug"], "title": r["title"],
+                           "path": r["path"] or "",
+                           "not_before": str(r["not_before"]).strip()}))
+    out.sort(key=lambda x: x[0])
+    return [row for _, row in out]
+
+
+def _dep_slug(v: str) -> str:
+    """`[[slug|alias]]` / `slug` -> `slug` (task_deps._clean's convention)."""
+    s = str(v).strip().strip("\"'").strip().strip("[]").strip()
+    return s.split("|", 1)[0].strip()
+
+
+def load_blocked(db_path: str | Path = DEFAULT_DB) -> list[dict]:
+    """Open, non-parent `worker_mode: blocked` tasks that declare `depends_on` —
+    the ones task_deps auto-unblocks once every predecessor is done.
+
+    `waiting_on` keeps only predecessors that are not done yet, with the same
+    done test as task_deps.resolve_unblocks: the DB OR the predecessor's own
+    markdown says `status: done` (a missing predecessor is not done).
+    `{"slug", "title", "path", "waiting_on"}` in DB order."""
+    rows, _, _ = _open_leaf_rows(db_path)
+    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    try:
+        status = {s: ((st or "").lower(), p or "")
+                  for s, st, p in con.execute("SELECT slug, status, path FROM tasks")}
+    finally:
+        con.close()
+
+    def done(dep: str) -> bool:
+        st, path = status.get(dep, ("", ""))
+        if st == "done":
+            return True
+        if not path:
+            return False
+        md = repos._frontmatter(path).get("status")
+        return str(md or "").strip().lower() == "done"
+
+    out: list[dict] = []
+    for r in rows:
+        if (r["worker_mode"] or "") != "blocked" or not r["path"]:
+            continue
+        fm, fm_err = repos.frontmatter_with_error(r["path"])
+        if fm_err is not None:
+            continue
+        md_mode = repos.task_worker_mode_from_fm(fm)
+        if md_mode is not None and md_mode != "blocked":
+            continue                     # md<->db drift: md already flipped
+        deps = [d for d in (_dep_slug(x) for x in repos.task_depends_on_from_fm(fm)) if d]
+        if not deps:
+            continue
+        out.append({"slug": r["slug"], "title": r["title"], "path": r["path"],
+                    "waiting_on": [d for d in deps if not done(d)]})
+    return out
+
+
+def task_meta(db_path: str | Path = DEFAULT_DB) -> dict[str, dict]:
+    """slug -> {"priority": float|None, "updated": str} for the queue rows.
+    Columns a DB predates read as None / ""."""
+    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        present = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+        cols = ["slug"] + [c for c in ("priority", "updated") if c in present]
+        rows = con.execute(f"SELECT {', '.join(cols)} FROM tasks").fetchall()
+    finally:
+        con.close()
+    out: dict[str, dict] = {}
+    for r in rows:
+        keys = r.keys()
+        out[r["slug"]] = {
+            "priority": r["priority"] if "priority" in keys else None,
+            "updated": str(r["updated"] or "") if "updated" in keys else "",
+        }
+    return out
 
 
 def parents_needing_review(db_path: str | Path = DEFAULT_DB) -> list[dict]:
