@@ -2,11 +2,15 @@
 # App test node (macp-app-test): an on-demand Android emulator host, separate from HQ.
 # n2-standard-4 spot + nested virtualization, normally STOPPED (disk only, ~$4/mo).
 # AVD api30 = android-30 google_apis x86_64, 1072x1448 @300dpi (Crema-like).
+# Override the node/zone with APP_TEST_NODE/APP_TEST_ZONE; pick a different AVD per run with `boot <avd>`.
 #
-#   scripts/app-test-node start                # start VM, wait for ssh
-#   scripts/app-test-node shot <apk> [wait_s]  # boot emulator, install+launch, pull screenshot
-#   scripts/app-test-node ssh '<cmd>'          # run a command on the node
-#   scripts/app-test-node stop                 # stop VM (always do this when done)
+#   scripts/app-test-node start                 # start VM, wait for ssh
+#   scripts/app-test-node shot <apk> [wait_s]   # boot emulator, install+launch, pull screenshot
+#   scripts/app-test-node boot [avd]            # boot the AVD only (idempotent) — for a scenario driver
+#   scripts/app-test-node push <local> <remote> # scp a local file to the node (~ expands on the node)
+#   scripts/app-test-node pull <remote> <local> # scp a node file back to the host
+#   scripts/app-test-node ssh '<cmd>'           # run a command on the node
+#   scripts/app-test-node stop                  # stop VM (always do this when done)
 #
 # Screenshots land in ./app-test-shots/<pkg>-<ts>.png. A spot preemption stops the VM
 # (termination action STOP); `start` again and retry once.
@@ -75,6 +79,37 @@ case "$cmd" in
     dst="$OUT/$pkg-$(date +%Y%m%dT%H%M%S).png"
     _scp_retry "$NODE:~/shot.png" "$dst"
     echo "$dst" ;;
+  boot)
+    # Boot the AVD only (no install/launch/screenshot) so a scenario driver
+    # (beta_smoke) can take over with its own adb calls. Idempotent: returns at
+    # once if sys.boot_completed is already 1. Same fire-and-forget launch as
+    # `shot`; `$avd` is spliced in locally (proven '"$var"' pattern).
+    avd=${1:-api30}
+    boot=$(_ssh_retry 'export ANDROID_SDK_ROOT=~/android
+      ~/android/platform-tools/adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r"') || boot=0
+    if [ "$boot" != 1 ]; then
+      _ssh_retry 'export ANDROID_SDK_ROOT=~/android
+        setsid sg kvm -c "~/android/emulator/emulator -avd '"$avd"' -no-window -no-audio -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect" </dev/null >~/emu.log 2>&1 &
+        disown'
+      t0=$(date +%s)
+      until [ "$boot" = 1 ]; do
+        sleep "$POLL_INTERVAL"
+        if [ $(( $(date +%s) - t0 )) -gt "$BOOT_TIMEOUT" ]; then
+          echo "boot timeout" >&2
+          _ssh_retry 'tail -20 ~/emu.log' >&2 || true
+          exit 1
+        fi
+        boot=$(_ssh_retry 'export ANDROID_SDK_ROOT=~/android
+          ~/android/platform-tools/adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r"') || boot=0
+      done
+    fi
+    echo "booted" ;;
+  push)
+    # local -> node. `~` on the remote side expands via the node's shell (as `shot` relies on).
+    _scp_retry "$1" "$NODE:$2" ;;
+  pull)
+    # node -> local.
+    _scp_retry "$NODE:$1" "$2" ;;
   *)
-    sed -n '2,13p' "$0"; exit 2 ;;
+    sed -n '2,16p' "$0"; exit 2 ;;
 esac
