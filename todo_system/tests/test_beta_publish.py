@@ -123,6 +123,7 @@ def env(tmp_path):
         lock_dir = tmp_path / "locks"
         notes_dir = tmp_path / "notes"
         clone = tmp_path / "clone"
+        smoke_alert = tmp_path / "smoke_alerts.json"
 
         @staticmethod
         def load_wm():
@@ -1267,3 +1268,142 @@ def test_build_argv_no_daemon_only_for_gradlew_and_once():
     assert build_argv({"build_cmd": ["./gradlew", "--no-daemon", "x"]}, []) == [
         "./gradlew", "--no-daemon", "x"]
     assert build_argv({"build_cmd": ["make", "beta"]}, []) == ["make", "beta"]
+
+
+# ===========================================================================
+# Smoke gate wiring (opt-in config["smoke"]) — AC2
+# ===========================================================================
+
+from todo_system.orchestrator import beta_smoke  # noqa: E402 — grouped with the smoke block
+
+
+def _add_smoke(env, smoke=None):
+    """Add a `smoke` block to REPO's config (so the gate turns on)."""
+    cfg = json.loads(env.config_path.read_text(encoding="utf-8"))
+    cfg["repos"][REPO]["smoke"] = smoke if smoke is not None else {"scenario": []}
+    env.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def _fake_smoke(result):
+    """A fake smoke_runner matching maybe_publish's call shape; records its calls
+    so a test can assert it was (not) invoked."""
+    calls: list[dict] = []
+
+    def runner(repo_name, repo_dir, sha, cfg, *, run=None, notify=None, progress=None):
+        calls.append({"repo": repo_name, "sha": sha, "cfg": cfg})
+        return result
+
+    runner.calls = calls                         # type: ignore[attr-defined]
+    return runner
+
+
+def _publish_smoke(env, run, smoke_runner, *, sha=SHA1, notify=None, task_path=None,
+                   progress=None):
+    return bp.maybe_publish(
+        REPO, env.clone, sha, {"outcome": "x"},
+        progress=progress or (lambda _m: None),
+        config_path=env.config_path, watermark_path=env.watermark_path,
+        lock_dir=env.lock_dir, notes_dir=env.notes_dir, task_path=task_path,
+        run=run, notify=notify or (lambda _m: None),
+        smoke_runner=smoke_runner, smoke_alert_path=env.smoke_alert)
+
+
+def test_no_smoke_config_never_calls_runner_and_distributes(env, monkeypatch):
+    """Byte-identical regression guard (AC2): a repo with no `smoke` block never
+    touches the smoke_runner and distributes + bumps exactly as before."""
+    # skippable must never even be consulted when there is no smoke block
+    monkeypatch.setattr(beta_smoke, "smoke_skippable",
+                        lambda *a, **k: pytest.fail("smoke_skippable called without a smoke block"))
+    run = FakeRun()
+    runner = _fake_smoke({"ok": True})
+    note = _publish_smoke(env, run, runner)
+    assert runner.calls == []                    # gate fully behind config.get("smoke")
+    assert run.has("appdistribution:distribute")
+    assert env.load_wm()["version_code"] == 76
+    assert "발행" in note
+
+
+def test_smoke_pass_distributes_and_bumps(env, monkeypatch):
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: False)
+    run = FakeRun()
+    runner = _fake_smoke({"ok": True, "kind": None, "detail": "smoke PASS"})
+    note = _publish_smoke(env, run, runner)
+    assert len(runner.calls) == 1
+    assert run.has("appdistribution:distribute")
+    assert env.load_wm()["version_code"] == 76
+    assert "발행" in note
+
+
+def test_smoke_fail_withholds_distribute_and_watermark(env, monkeypatch):
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: False)
+    run = FakeRun()
+    runner = _fake_smoke({"ok": False, "kind": "scenario", "detail": "skip: '운동' → '운동' (변화 없음)"})
+    notified: list[str] = []
+    task = env.clone.parent / "task.md"
+    task.parent.mkdir(parents=True, exist_ok=True)
+    task.write_text("# task\n\n## Progress Log\n", encoding="utf-8")
+
+    note = _publish_smoke(env, run, runner, notify=notified.append, task_path=task)
+
+    assert note is not None and "[베타 보류]" in note and "스모크 실패(scenario)" in note
+    assert not run.has("appdistribution:distribute")      # distribute WITHHELD
+    assert env.load_wm()["version_code"] == 75            # watermark UNCHANGED
+    assert len(notified) == 1                             # exactly one (throttled) alert
+    assert "베타 보류 — 스모크 실패(scenario)" in task.read_text(encoding="utf-8")
+
+
+def test_smoke_fail_does_not_raise(env, monkeypatch):
+    """The failure path returns a handled note (like the 0-tester abort), never
+    raises — so the runner never surfaces the merge as retryable."""
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: False)
+    runner = _fake_smoke({"ok": False, "kind": "crash", "detail": "FATAL=1 ANR=0"})
+    note = _publish_smoke(env, FakeRun(), runner)         # must not raise
+    assert "스모크 실패(crash)" in note
+
+
+def test_smoke_alert_throttled_second_failure_silent(env, monkeypatch):
+    """Two failures of the same (repo, kind) alert the human only once."""
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: False)
+    runner = _fake_smoke({"ok": False, "kind": "scenario", "detail": "x"})
+    notified: list[str] = []
+    _publish_smoke(env, FakeRun(), runner, sha=SHA1, notify=notified.append)
+    _publish_smoke(env, FakeRun(), runner, sha=SHA2, notify=notified.append)
+    assert len(notified) == 1                             # second (within 6h) suppressed
+
+
+def test_smoke_budget_trip_still_distributes(env, monkeypatch):
+    """A monthly-budget trip (kind budget) skips the gate but STILL distributes —
+    a cost ceiling must not block a month of betas."""
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: False)
+    run = FakeRun()
+    runner = _fake_smoke({"ok": False, "kind": "budget", "detail": "over cap"})
+    notified: list[str] = []
+    note = _publish_smoke(env, run, runner, notify=notified.append)
+    assert run.has("appdistribution:distribute")          # distribute proceeds
+    assert env.load_wm()["version_code"] == 76
+    assert notified == []                                 # run_smoke owns the budget alert
+    assert "발행" in note
+
+
+def test_smoke_skippable_trivial_diff_skips_gate_and_distributes(env, monkeypatch):
+    """A trivial diff since the last publish (prose/test/doc/resource) skips the
+    node round-trip and still distributes, logging the reason."""
+    _add_smoke(env)
+    monkeypatch.setattr(beta_smoke, "smoke_skippable", lambda *a, **k: True)
+    run = FakeRun()
+    runner = _fake_smoke({"ok": True})
+    task = env.clone.parent / "task2.md"
+    task.parent.mkdir(parents=True, exist_ok=True)
+    task.write_text("# task\n", encoding="utf-8")
+
+    _publish_smoke(env, run, runner, task_path=task)
+
+    assert runner.calls == []                             # gate skipped (no node round-trip)
+    assert run.has("appdistribution:distribute")
+    assert env.load_wm()["version_code"] == 76
+    assert "스모크 생략" in task.read_text(encoding="utf-8")

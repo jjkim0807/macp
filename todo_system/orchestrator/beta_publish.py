@@ -69,6 +69,7 @@ from pathlib import Path
 from .. import paths
 from ..kakao_format import compose_alert
 from .. import worker as _worker
+from . import beta_smoke
 from . import jobs
 
 # Engine root — paths.engine_root(): the repo root in a development checkout,
@@ -102,6 +103,10 @@ LOCK_DIR = _SCRATCH_ROOT / "Worker" / "_state" / "beta_locks"
 SWEEP_STATE_PATH = _SCRATCH_ROOT / "Worker" / "_state" / "beta_sweep.json"
 SWEEP_WORKTREE_DIR = _SCRATCH_ROOT / "Worker" / "_state" / "beta_worktrees"
 SWEEP_LOG_PATH = _SCRATCH_ROOT / "Worker" / "_state" / "beta_sweep.log"
+# Per-(repo, kind) smoke-failure alert throttle state (same gitignored scratch):
+# the gate can fail every sweep, but a human hears about one (repo, kind) at most
+# once per beta_smoke._ALERT_WINDOW_S. Reconstructible, never canon.
+SMOKE_ALERT_PATH = _SCRATCH_ROOT / "Worker" / "_state" / "beta_smoke_alerts.json"
 # Discovery is ~one ls-remote per configured repo; 15 min keeps that off every
 # ~5-min tick. A failed publish waits 6h before the same sha burns another build.
 SWEEP_MIN_INTERVAL_S = 900
@@ -668,6 +673,8 @@ def maybe_publish(
     commit_watermark: bool = True,
     vault_root: Path | str = _VAULT_DATA_ROOT,
     cumulative_notes: bool = False,
+    smoke_runner: Callable[..., dict] = beta_smoke.run_smoke,
+    smoke_alert_path: Path | str = SMOKE_ALERT_PATH,
 ) -> str | None:
     """Publish a beta for a just-merged app-repo PR, once, serialized, deduped.
 
@@ -768,6 +775,44 @@ def maybe_publish(
         subjects = collect_commit_subjects(repo_dir, diff_base, merge_sha, run=run) if diff_base else []
         notes = build_release_notes(payload, migration=migration, subjects=subjects)
         notes_file = _write_notes(notes, notes_dir, repo_name)
+
+        # 3b) Emulator smoke gate (opt-in via config["smoke"]): build the debug
+        #     APK on the on-demand node and run the scenario BEFORE distribute.
+        #     Placed AFTER the tester-count gate so a 0-tester repo never pays a
+        #     node round-trip, still inside the "build 뒤 distribute 앞" window.
+        #     A non-PASS WITHHOLDS distribute + the watermark bump (the merge
+        #     stands — only the deploy is held), returning a handled note like the
+        #     0-tester path so the runner never surfaces the merge as retryable.
+        #     The ONE exception is a monthly-budget trip (kind "budget"): the gate
+        #     is skipped and distribute proceeds (a cost ceiling must not block a
+        #     month of betas — run_smoke already fired the one monthly alert). A
+        #     trivial diff since the last publish (prose/test/doc/resource only)
+        #     skips the node and still distributes. The whole block is behind
+        #     config.get("smoke"), so a smoke-less repo is byte-identical.
+        smoke_cfg = config.get("smoke")
+        if smoke_cfg:
+            base = entry.get("last_published_sha")
+            if beta_smoke.smoke_skippable(repo_dir, base, merge_sha, run=run):
+                progress(f"beta-smoke: {repo_name} trivial diff — smoke skipped, distributing")
+                if task_path is not None:
+                    append_progress_log(task_path, "스모크 생략(문구/테스트/문서/리소스 변경만)")
+            else:
+                res = smoke_runner(repo_name, repo_dir, merge_sha, smoke_cfg,
+                                   run=run, notify=notify, progress=progress)
+                if not res.get("ok") and res.get("kind") != "budget":
+                    kind = res.get("kind") or "unknown"
+                    should_alert, new_state = beta_smoke.alert_throttled(
+                        _load_sweep_state(smoke_alert_path), repo_name, kind, time.time())
+                    note = (f"⚠️ [베타 보류] {repo_name} 스모크 실패({kind}): "
+                            f"{(res.get('detail') or '')[:120]} (main {merge_sha[:9]})")
+                    if should_alert:
+                        _save_sweep_state(smoke_alert_path, new_state)
+                        notify(compose_alert(note))
+                    if task_path is not None:
+                        append_progress_log(task_path, f"베타 보류 — 스모크 실패({kind})")
+                    progress(note)
+                    return note              # merge stands, deploy withheld, NO raise
+                # kind == "budget" (gate skipped) OR ok → fall through to distribute
 
         # 4) Distribute.
         apk = str(repo_dir / config["apk_path"])
