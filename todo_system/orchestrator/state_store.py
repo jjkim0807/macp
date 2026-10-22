@@ -38,6 +38,7 @@ __all__ = [
     "PlannerKV",
     "StateStore",
     "TodoCacheReader",
+    "open_state_store",
 ]
 
 
@@ -222,3 +223,24 @@ class GitStateStore(StateStore):
             db = self.todo_db_path or self.vault_root / "Todo" / "todo.db"
             self._todo_cache = GitTodoCacheReader(db)
         return self._todo_cache
+
+
+# ---------------------------------------------------------------------------
+# Composition entry point — routes on paths.state_backend() (leaf ③/§⑥)
+# ---------------------------------------------------------------------------
+
+
+def open_state_store(vault_root: str | Path | None = None) -> StateStore:
+    """Build the StateStore for the configured backend (design §③/§⑥).
+
+    ``git`` (the default) returns :class:`GitStateStore`; ``external`` is leaf
+    ④'s not-yet-built SQLite backend and raises ``NotImplementedError`` naming
+    it, rather than silently falling back to git.
+    """
+    backend = paths.state_backend()
+    if backend == "git":
+        return GitStateStore(vault_root)
+    raise NotImplementedError(
+        "state_backend='external' has no backend yet — see "
+        "docs/design/state-store.md leaf ④ (ExternalStateStore / state_store_sqlite.py)"
+    )
