@@ -1825,3 +1825,134 @@ class RoConnHelper(unittest.TestCase):
                 con.execute("SELECT * FROM no_such_table")  # raises mid-query
         with self.assertRaises(sqlite3.ProgrammingError):
             captured["con"].execute("SELECT 1")  # still closed despite the raise
+
+
+# ---- Queue (docs/dashboard-parity.md "큐") ----------------------------------
+
+_QUEUE_ROW_KEYS = ["slug", "title", "project", "group", "worker_mode", "priority",
+                   "checkout", "wait", "wait_text", "holder", "since"]
+_QUEUE_REPO = "https://github.com/example-org/app.git"
+
+
+def _install_queue_fixture(tc: unittest.TestCase) -> Path:
+    """A real-schema todo.db (cli.init_db) + registry + ledger under one tmp vault:
+    two auto tasks on one repo (the 2nd is held behind the 1st in the same tick),
+    one in flight, one with a future not_before, one blocked on an open task."""
+    from todo_system import cli
+    tmp = Path(tempfile.mkdtemp())
+    tc.addCleanup(shutil.rmtree, tmp, True)
+    for d in ("Todo/items", "Worker/assignments", "Worker/agents", "Worker/runs",
+              "Worker/_state"):
+        (tmp / d).mkdir(parents=True)
+    (tmp / "Worker/agents/registry.yaml").write_text(
+        "agents:\n  - id: w\n    kind: ai-local\n    projects: ['*']\n", encoding="utf-8")
+    items = tmp / "Todo" / "items"
+
+    def md(slug, extra=""):
+        p = items / f"{slug}.md"
+        p.write_text(f"---\nstatus: open\n{extra}---\n\n# {slug}\n", encoding="utf-8")
+        return str(p)
+
+    db = tmp / "Todo" / "todo.db"
+    con = cli.db_connect(db)
+    cli.init_db(con)
+    rows = [
+        ("qa-1-first", "First", "auto", md("qa-1-first", f"repo: {_QUEUE_REPO}\n"),
+         None, 70.0, "2026-01-02"),
+        ("qa-2-second", "Second", "auto", md("qa-2-second", f"repo: {_QUEUE_REPO}\n"),
+         None, None, "2026-01-03"),
+        ("qa-3-running", "Running", "auto", md("qa-3-running"), None, None, None),
+        ("qa-4-later", "Later", "auto", md("qa-4-later"), "2999-01-01 09:00", None, None),
+        ("qa-5-dep", "Dep", "manual", md("qa-5-dep"), None, None, None),
+        ("qa-6-blocked", "Blocked", "blocked",
+         md("qa-6-blocked", "worker_mode: blocked\ndepends_on:\n  - qa-5-dep\n"),
+         None, None, None),
+    ]
+    for slug, title, mode, path, nb, prio, upd in rows:
+        con.execute("INSERT INTO tasks (slug, title, path, status, worker_mode, not_before, "
+                    "priority, updated, imported_at, tags) "
+                    "VALUES (?,?,?,'open',?,?,?,?,'2026-01-01T00:00:00','todo')",
+                    (slug, title, path, mode, nb, prio, upd))
+    con.commit()
+    con.close()
+    (tmp / "Worker/assignments/qa-3-running.json").write_text(json.dumps(
+        {"task_id": "qa-3-running", "agent_id": "w", "corr_id": "c",
+         "state": "in_progress", "payload": {}}), encoding="utf-8")
+    for p in (mock.patch.object(M, "ASSIGN", tmp / "Worker/assignments"),
+              mock.patch.object(M, "RUNS", tmp / "Worker/runs"),
+              mock.patch.object(M, "STATE", tmp / "Worker/_state"),
+              mock.patch.object(M, "TODO_DB", db),
+              mock.patch.object(M, "ITEMS", items),
+              mock.patch.object(M, "SESSIONS", tmp / "Worker/_state"),
+              mock.patch.object(M, "REGISTRY", tmp / "Worker/agents/registry.yaml"),
+              mock.patch.object(M, "collect_deps", return_value=[]),
+              mock.patch.object(M, "_worker_running", return_value=[]),
+              mock.patch("todo_system.orchestrator.orchestrator.resolve_dispatch_limits",
+                         return_value=(40, 2, 0))):
+        p.start()
+        tc.addCleanup(p.stop)
+    return tmp
+
+
+class QueueCollectTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = _install_queue_fixture(self)
+
+    def test_rows_carry_exactly_the_contract_fields(self):
+        q = M.collect_queue()
+        self.assertEqual(sorted(q), sorted(M.QUEUE_KEYS))
+        self.assertEqual([r["slug"] for r in q["queue"]], ["qa-1-first", "qa-2-second"])
+        for r in q["queue"]:
+            self.assertEqual(list(r), _QUEUE_ROW_KEYS)
+        first, second = q["queue"]
+        self.assertEqual((first["wait"], first["priority"], first["since"]),
+                         ("next_tick", 70.0, "2026-01-02"))
+        self.assertEqual((second["wait"], second["holder"], second["checkout"]),
+                         ("checkout_busy", "qa-1-first", "app"))
+        self.assertEqual((first["project"], first["group"]), ("qa", "qa"))
+        self.assertEqual(q["queue_upcoming"], [
+            {"slug": "qa-4-later", "title": "Later", "project": "qa", "group": "qa",
+             "not_before": "2999-01-01 09:00"}])
+        self.assertEqual(q["queue_blocked"], [
+            {"slug": "qa-6-blocked", "title": "Blocked", "project": "qa", "group": "qa",
+             "waiting_on": ["qa-5-dep"]}])
+
+    def test_in_flight_task_is_not_in_the_queue(self):
+        slugs = {r["slug"] for r in M.collect_queue()["queue"]}
+        self.assertNotIn("qa-3-running", slugs)
+
+    def test_paused_and_usage_hold_come_from_state_reads(self):
+        (self.tmp / "Worker/_state/PAUSED").write_text("", encoding="utf-8")
+        self.assertEqual({r["wait"] for r in M.collect_queue()["queue"]}, {"paused"})
+        (self.tmp / "Worker/_state/PAUSED").unlink()
+        q = M.collect_queue(usage={"allowed": False, "reason": "weekly 97%"})
+        self.assertEqual({r["wait"] for r in q["queue"]}, {"usage_hold"})
+        self.assertIn("weekly 97%", q["queue"][0]["wait_text"])
+
+    def test_status_carries_the_three_keys_and_keeps_dispatchable(self):
+        d = M.collect_status()
+        for k in M.QUEUE_KEYS:
+            self.assertIsInstance(d[k], list)
+        self.assertEqual(len(d["queue"]), 2)
+        # todo.dispatchable keeps its meaning: load_dispatchable's count, in-flight included
+        self.assertEqual(d["todo"]["dispatchable"], 3)
+        for k in ("active", "attention", "human", "runs", "usage", "account"):
+            self.assertIn(k, d)
+
+    def test_exception_yields_empty_lists_for_all_three(self):
+        with mock.patch.object(M, "_compute_queue", side_effect=RuntimeError("boom")):
+            self.assertEqual(M.collect_queue(), {k: [] for k in M.QUEUE_KEYS})
+            d = M.collect_status()
+        for k in M.QUEUE_KEYS:
+            self.assertEqual(d[k], [])
+        self.assertIn("todo", d)
+        self.assertIn("active", d)
+
+    def test_collect_queue_writes_nothing(self):
+        def tree():
+            return sorted((p.relative_to(self.tmp).as_posix(),
+                           p.read_bytes() if p.is_file() else b"")
+                          for p in self.tmp.rglob("*"))
+        before = tree()
+        M.collect_queue()
+        self.assertEqual(tree(), before)

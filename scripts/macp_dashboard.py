@@ -1274,6 +1274,80 @@ def collect_account_slots() -> dict:
     return out
 
 
+# ---- Queue (docs/dashboard-parity.md "큐") ----------------------------------
+QUEUE_KEYS = ("queue", "queue_upcoming", "queue_blocked")
+
+
+def _usage_hold_of(usage: dict | None) -> str | None:
+    """The tick's usage_hold verdict, read from the guard's state file decision
+    (collect_usage) — never `Orchestrator.usage_hold()`, which refreshes usage
+    state. Same fallback string as that method."""
+    if not usage or usage.get("allowed", True):
+        return None
+    return usage.get("reason") or "usage guard blocked"
+
+
+def _compute_queue(*, db: Path, assign: Path, registry: Path, now: float,
+                   usage: dict | None) -> dict:
+    """The three queue lists. Every wait verdict comes from the orchestrator's own
+    gates (`Orchestrator.queue_snapshot`); this only assembles contract rows."""
+    from todo_system.orchestrator import tasks as T
+    from todo_system.orchestrator.assignment import Ledger
+    from todo_system.orchestrator.orchestrator import Orchestrator, resolve_dispatch_limits
+    from todo_system.orchestrator.registry import load_registry
+
+    budget, cap, gradle_cap = resolve_dispatch_limits()
+    orch = Orchestrator(None, load_registry(registry), Ledger(assign),
+                        notify=lambda *a, **k: None, daily_run_budget=budget,
+                        max_parallel_per_repo=max(1, int(cap)),
+                        max_parallel_gradle_builds=max(0, int(gradle_cap)))
+    snap = orch.queue_snapshot(T.load_dispatchable(db), now=now,
+                               paused=orch.paused(), usage_hold=_usage_hold_of(usage),
+                               budget_exceeded=orch.budget_exceeded())
+    with _ro_conn(Path(db)) as con:
+        labels = _project_labels(con.execute(
+            "SELECT slug, COALESCE(parent_slug,''), COALESCE(tags,'') FROM tasks")) \
+            if con is not None else {}
+    meta = T.task_meta(db)
+
+    def head(slug: str, title: str) -> dict:
+        project = labels.get(slug) or _project_of(slug, "", [])
+        return {"slug": slug, "title": title or "", "project": project,
+                "group": _group_of({"project": project})}
+
+    queue = []
+    for r in snap:
+        p, m = r["payload"], meta.get(r["slug"], {})
+        queue.append({**head(r["slug"], p.get("summary") or ""),
+                      "worker_mode": p.get("worker_mode") or "",
+                      "priority": m.get("priority"),
+                      "checkout": r["checkout"],
+                      "wait": r["wait"],
+                      "wait_text": r["wait_text"],
+                      "holder": r["holder"],
+                      "since": r["since"] or m.get("updated") or ""})
+    upcoming = [{**head(r["slug"], r["title"]), "not_before": r["not_before"]}
+                for r in T.load_upcoming(db, now=dt.datetime.fromtimestamp(now))]
+    blocked = [{**head(r["slug"], r["title"]), "waiting_on": r["waiting_on"]}
+               for r in T.load_blocked(db)]
+    return {"queue": queue, "queue_upcoming": upcoming, "queue_blocked": blocked}
+
+
+def collect_queue(*, db: Path | None = None, assign: Path | None = None,
+                  registry: Path | None = None, now: float | None = None,
+                  usage: dict | None = None) -> dict:
+    """/api/status `queue` / `queue_upcoming` / `queue_blocked` — what is waiting,
+    in tick order, and why. Read-only (no ledger/mailbox/usage writes, no
+    network). Fail-soft: any error yields `[]` for all three keys. `cli queue`
+    calls this same function, so the CLI and the web read identical rows."""
+    try:
+        return _compute_queue(db=Path(db or TODO_DB), assign=Path(assign or ASSIGN),
+                              registry=Path(registry or REGISTRY),
+                              now=time.time() if now is None else now, usage=usage)
+    except Exception:
+        return {k: [] for k in QUEUE_KEYS}
+
+
 def collect_status() -> dict:
     a = collect_assignments()
     tstatus = _todo_status_map()
@@ -1382,6 +1456,7 @@ def collect_status() -> dict:
         # object is attached HERE (not folded into it): /api/status.account.slots.
         "account": {**collect_account_runtime(collect_account()),
                     "slots": collect_account_slots()},
+        **collect_queue(usage=usage),
     }
 
 
