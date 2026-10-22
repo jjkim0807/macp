@@ -445,6 +445,121 @@ mailbox 를 쓴다(transport 는 전부 볼트 git). external 모드는 이 git-
 
 ---
 
+## ⑨ 외부 트래커 호환 (Jira · GitHub Issues · Linear)
+
+팀 환경에서 macp 태스크를 기존 트래커와 주고받기 위한 설계 초안(사용자 요구: "Jira 같은 기존 태스크
+관리 시스템과도 호환"). **md 가 정본**([[Decisions/2026-10-13-macp-task-store]])이라는 원칙은 유지하고,
+트래커는 그 **뷰/미러**로 둔다. 이 절은 설계 서술만 — 파서·클라이언트 배선은 §⑥ 지도의 '트래커 어댑터
+leaf'(⑧/⑧b/⑧c)가 맡는다.
+
+### TrackerAdapter 인터페이스 초안
+
+```python
+# docs/design: draft signatures only — §⑥ 지도의 '트래커 어댑터 leaf'(⑧/⑧b/⑧c)가 구현.
+from abc import ABC, abstractmethod
+
+class TrackerAdapter(ABC):
+    """외부 트래커 ↔ 태스크 md 브리지. transport-중립(아래 '혼합 transport' 참조)."""
+
+    @abstractmethod
+    def pull(self, since: str | None = None) -> list["TaskRecord"]:
+        """트래커 → macp(import). since = 증분 커서(트래커 updated_at 또는 webhook 델타).
+        멱등: 같은 external_ref 는 같은 TaskRecord 로(중복 생성 금지, upsert)."""
+
+    @abstractmethod
+    def push(self, task: "TaskRecord") -> str:
+        """macp → 트래커(export). 반환 = external_ref(예: 'jira:PROJ-123').
+        멱등: task 에 external_ref 가 이미 있으면 create 대신 update."""
+
+    @abstractmethod
+    def map_fields(self, remote: dict) -> dict: ...      # 트래커 필드 → frontmatter (아래 필드 매핑표)
+    @abstractmethod
+    def map_status(self, remote_status: str) -> str: ... # 트래커 상태 → task status (아래 상태 매핑표)
+
+# TaskRecord 는 새 저장소가 아니라 import/export 용 DTO — frontmatter dict + 본문 + external_ref.
+# 필드 정의·파서 배선은 후속 leaf. 여기선 설계 서술만.
+```
+
+**혼합 transport**: Jira·GitHub 은 **REST**, Linear 는 **GraphQL 전용**(아래 URL 표)이다. 따라서
+`TrackerAdapter` ABC 는 transport-중립(pull/push 는 중립 `TaskRecord` 를 주고받음)이고, 구상 어댑터가
+각자 전송을 소유한다 — Jira/GitHub 은 REST 클라이언트, Linear 는 GraphQL 클라이언트.
+
+### 필드 → frontmatter 매핑표
+
+| 공통 개념 | Jira (REST v3) | GitHub Issues | Linear (GraphQL) | → 태스크 frontmatter/본문 |
+|---|---|---|---|---|
+| 제목 | `fields.summary` | `title` | `Issue.title` | 본문 H1(`# 제목`) |
+| 설명/본문 | `fields.description`(ADF) | `body`(Markdown) | `Issue.description`(Markdown) | md 본문 |
+| 상태 | `fields.status.name` | `state`(open/closed) | `Issue.state`(workflow state) | `status`(아래 상태표) |
+| 라벨/태그 | `fields.labels[]` | `labels[].name` | `Issue.labels.nodes[].name` | `tags[]` |
+| 마감 | `fields.duedate` | 네이티브 없음(`milestone.due_on` 근사) | `Issue.dueDate` | `due`(YYYY-MM-DD) |
+| 우선순위 | `fields.priority.name` | 네이티브 없음(라벨 관행) | `Issue.priority`(0~4) | `priority`(0~100 정수) |
+| 담당자 | `fields.assignee.accountId` | `assignees[]` | `Issue.assignee` | 미매핑 — 단일 워커 모델이라 '미사용'(필요 시 후속 leaf) |
+| 외부 id | `key`(예 PROJ-123) | `number`(예 owner/repo#45) | `Issue.identifier`(예 ENG-123) | `external_ref`(아래) |
+
+> **본문 포맷 주의**: Jira 설명은 **ADF(Atlassian Document Format, JSON)** 라 md↔ADF 변환이 필요하다
+> (정확한 변환 라이브러리는 **미확인** — 후속 leaf 가 선택). GitHub `body`·Linear `description` 은
+> Markdown 이라 직통.
+
+### 상태 → 매핑표 (태스크 `status` + ledger 관계)
+
+태스크 md 에는 `status: open|done` **2값**만 있고(§① SoT), 오케스트레이션 상태(`assignment.py:18-27`:
+dispatched/accepted/in_progress/done/failed/rejected/awaiting_human/needs_input)는 **별개 공간**(워커가
+돌 때 ledger 에만 산다). **어댑터는 `status` 만 읽고/쓰며 ledger 상태는 건드리지 않는다** — ledger 는 내부
+오케스트레이션이 소유.
+
+| 트래커 상태 | Jira | GitHub | Linear(state.type) | → task `status` | ledger 관계(참고만) |
+|---|---|---|---|---|---|
+| 미착수 | To Do / Open | `open` | `backlog`/`unstarted` | `open` | 아직 ledger 없음(미디스패치) |
+| 진행중 | In Progress | `open`(+assignee) | `started` | `open` | 워커 실행 중이면 `in_progress` |
+| 완료 | Done | `closed`(completed) | `completed` | `done` | `done` |
+| 취소 | Won't Do / Cancelled | `closed`(not_planned) | `canceled` | `done`(+본문/tag 로 cancelled 표기) | `rejected` 유사 |
+
+### 동기화 방향 + 충돌 규칙
+
+- **import(가져오기, pull)**: 트래커 → md. 새 `external_ref` 는 새 `Todo/items/<slug>.md` 생성(배선은
+  후속 leaf), 기존 ref 는 매핑된 필드만 갱신.
+- **export(내보내기, push)**: md → 트래커. 새 태스크는 issue create 후 `external_ref` 기록,
+  `status: done` 은 트래커 close.
+- **양방향**: 위 둘을 주기적으로. **충돌 규칙 = md 우선**([[Decisions/2026-10-13-macp-task-store]]) —
+  트래커는 뷰이므로 동시 분기 편집 시 md 가 이기고 다음 export 가 트래커를 덮어쓴다(§4.2 의 "스냅샷은
+  읽기전용, 권위는 SQLite, 손 편집은 다음 export 가 덮어씀"과 같은 패턴).
+  - (정교화) 팀이 트래커-주도 상태 전이를 원하면 **필드별 소유**: 제목/본문/tags/due/priority = md 소유;
+    `status` 는 **monotonic "done 승격"**(어느 쪽이 done 이면 done, 재오픈은 md 에서만) — 양쪽에서 닫을
+    수 있으되 핑퐁을 막는다. 증분은 updated_at 비교로.
+
+### `external_ref` 저장 위치
+
+- **1차: 태스크 frontmatter 신규 필드 `external_ref`**. 단일 트래커: `external_ref: "jira:PROJ-123"`.
+  다중 provider: provider→id 맵 `external_ref: {jira: "PROJ-123", github: "owner/repo#45"}`. **필드
+  정의는 설계 서술만** — frontmatter 파서/CLI 배선은 후속 leaf(§⑥).
+- **보조(선택)**: external 백엔드에선 ledger `payload_json`(§③ 스키마)에 `external_ref` 를 미러링해
+  네트워크 백엔드의 빠른 역조회(ref→task_id)에 쓸 수 있다. 단 **SoT 는 md frontmatter** — payload 는
+  파생 인덱스.
+
+### webhook vs polling
+
+| 방식 | 지연 | 운영 | 본부 노출 | 오프라인 내성 | 비고 |
+|---|---|---|---|---|---|
+| **polling(1차 권장)** | 높음(주기) | 낮음(크론/워커 틱) | 불필요(아웃바운드만) | 강함(못 닿으면 다음 틱) | git 틱 모델과 동형, 공개 인바운드 엔드포인트 불필요 |
+| webhook | 낮음(실시간) | 높음(공개 수신 엔드포인트 + 서명 검증 + 재시도/중복 처리) | 필요(인바운드 HTTPS) | 약함(놓친 이벤트 재동기 필요) | 실시간 필수일 때만; 놓침 보정용 polling 백스톱 병행 |
+
+**1차 권장 = polling** — 오프라인 내성·공개 인바운드 엔드포인트 불필요가 §⑧의 offline-first 권장
+((a)/(c))과 같은 방향이다. webhook 은 실시간이 꼭 필요할 때만, 반드시 polling 백스톱과 함께.
+
+### API 공식 문서 URL
+
+WebFetch/WebSearch 로 2026-10-22 확인(확인 못 한 칸은 '미확인'):
+
+| 트래커 | API 종류 | 공식 문서 URL | 확인 |
+|---|---|---|---|
+| Jira Cloud | REST v3 (base `/rest/api/3/`, 설명=ADF) | `https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/` | 확인 |
+| GitHub Issues | REST | `https://docs.github.com/en/rest/issues` | 확인 |
+| Linear | **GraphQL 전용**(REST 아님) | `https://linear.app/developers` | 확인(구 `developers.linear.app/docs/…` 는 이리로 301 리다이렉트) |
+| Linear GraphQL 엔드포인트 | — | `https://api.linear.app/graphql` | **미확인**(개발자 허브는 확인했으나 엔드포인트 URL 을 페이지에 명시 안 함 — 널리 알려진 값) |
+
+---
+
 ### 부록: 이 노트가 확정한 설계 결정 요약
 
 1. Mailbox 관계 = **구성(composition)**, 흡수 아님(§②).
