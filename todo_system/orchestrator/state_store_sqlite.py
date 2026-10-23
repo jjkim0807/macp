@@ -51,13 +51,15 @@ from pathlib import Path
 from typing import Any
 
 from .assignment import Assignment, Ledger
-from .message import now_iso
+from .mailbox import Mailbox
+from .message import Envelope, now_iso
 from .state_store import PlannerKV
 
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "SCHEMA_VERSION",
     "SqliteLedger",
+    "SqliteMailbox",
     "SqlitePlannerKV",
 ]
 
@@ -235,3 +237,127 @@ class SqlitePlannerKV(PlannerKV):
         finally:
             con.close()
         return {k: json.loads(v) for k, v in rows}
+
+
+class SqliteMailbox(Mailbox):
+    """:class:`~todo_system.orchestrator.mailbox.Mailbox` on SQLite tables.
+
+    The base ``ack`` is pure orchestration over ``_load_cursor`` / ``_after_ack``
+    / ``_save_cursor`` / ``_prune_tombstones`` (``mailbox.py``), so overriding
+    the first three to hit the ``mailbox`` / ``mailbox_cursor`` tables preserves
+    the at-least-once + tombstone contract **without re-implementing ack**.
+    ``send`` / ``receive`` are file-coupled in the base, so they are overridden;
+    ``init_agent`` is a no-op (no inbox dir — rows are keyed by ``to_agent`` and
+    created on ``send``). With these seams overridden no reused base method ever
+    reads ``self.root``.
+
+    Like ``FileMailbox``, an acked row is DELETEd (consumption is permanent); the
+    tombstone the inherited ``ack`` still records is redundant here but kept so
+    the cursor shape stays identical to the git backend (§⑤ migration / parity).
+    """
+
+    def __init__(self, sqlite_path: str | Path):
+        # Sets self.root (unused) so the Mailbox contract holds; every seam that
+        # would read it is overridden below.
+        super().__init__(sqlite_path)
+        self.sqlite_path = Path(sqlite_path)
+
+    def init_agent(self, agent_id: str) -> None:
+        pass  # no inbox directory in SQLite
+
+    def send(self, msg: Envelope) -> Path:
+        con = _connect(self.sqlite_path)
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO mailbox"
+                " (msg_id, to_agent, type, task_id, corr_id, created_ts, envelope_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (msg.msg_id, msg.to, msg.type, msg.task_id, msg.corr_id,
+                 msg.ts, msg.to_json()),
+            )
+            con.commit()
+        finally:
+            con.close()
+        # External messages live in the DB, not a file; the -> Path signature is
+        # satisfied by the DB path. No production caller depends on send()'s
+        # return being an inbox file (routing is leaf ⑥); only tests read it.
+        return self.sqlite_path
+
+    def receive(self, agent_id: str) -> list[Envelope]:
+        """Unacked messages for ``agent_id``, FIFO by ``msg_id`` (ULID time
+        order). At-least-once: a message stays returned until ``ack``ed (its row
+        is present and its id is in neither ``seen`` nor the ack tombstones)."""
+        seen, acked = self._load_cursor(agent_id)
+        con = _connect(self.sqlite_path)
+        try:
+            rows = con.execute(
+                "SELECT msg_id, envelope_json FROM mailbox"
+                " WHERE to_agent=? ORDER BY msg_id",
+                (agent_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        out: list[Envelope] = []
+        for msg_id, envelope_json in rows:
+            if msg_id in seen or msg_id in acked:   # same filter as mailbox.py
+                continue
+            try:
+                out.append(Envelope.from_json(envelope_json))
+            except (json.JSONDecodeError, ValueError):
+                continue  # skip a malformed row; a later pass can still see it
+        return out
+
+    def _load_cursor(self, agent_id: str) -> tuple[set[str], dict[str, float]]:
+        con = _connect(self.sqlite_path)
+        try:
+            rows = con.execute(
+                "SELECT msg_id, status, acked_at FROM mailbox_cursor WHERE agent_id=?",
+                (agent_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        seen = {mid for mid, status, _ in rows if status == "seen"}
+        acked = {mid: float(acked_at) for mid, status, acked_at in rows
+                 if status == "acked" and acked_at is not None}
+        return seen, acked
+
+    def _save_cursor(self, agent_id: str, seen: set[str],
+                     acked: dict[str, float]) -> None:
+        # Rewrite the agent's cursor wholesale, mirroring the base's atomic
+        # cursor-file write. seen and acked are disjoint by the time ack() calls
+        # this, so no (agent_id, msg_id) PK collision.
+        con = _connect(self.sqlite_path)
+        try:
+            con.execute("DELETE FROM mailbox_cursor WHERE agent_id=?", (agent_id,))
+            con.executemany(
+                "INSERT INTO mailbox_cursor(agent_id, msg_id, status, acked_at)"
+                " VALUES (?, ?, 'seen', NULL)",
+                [(agent_id, mid) for mid in sorted(seen)],
+            )
+            con.executemany(
+                "INSERT INTO mailbox_cursor(agent_id, msg_id, status, acked_at)"
+                " VALUES (?, ?, 'acked', ?)",
+                [(agent_id, mid, ts) for mid, ts in sorted(acked.items())],
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _after_ack(self, agent_id: str, acked_ids: set[str]) -> set[str]:
+        """Delete the consumed rows and report them all gone — the FileMailbox
+        contract (``mailbox.py``: return everything consumed, whether a row was
+        present or already absent). The inherited ``ack`` then moves these ids to
+        tombstones and prunes them."""
+        ids = list(acked_ids)
+        if ids:
+            con = _connect(self.sqlite_path)
+            try:
+                placeholders = ",".join("?" * len(ids))
+                con.execute(
+                    f"DELETE FROM mailbox WHERE to_agent=? AND msg_id IN ({placeholders})",
+                    (agent_id, *ids),
+                )
+                con.commit()
+            finally:
+                con.close()
+        return set(acked_ids)

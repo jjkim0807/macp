@@ -17,8 +17,10 @@ import sqlite3
 
 import pytest
 
+from todo_system.orchestrator import message as m
 from todo_system.orchestrator import state_store_sqlite as sss
 from todo_system.orchestrator.assignment import DONE, IN_PROGRESS, Assignment
+from todo_system.orchestrator.message import Envelope
 
 
 @pytest.fixture
@@ -122,3 +124,66 @@ def test_sqlite_planner_kv_roundtrip(db):
     assert kv.all() == {
         "verdict": "exhausted", "todo_state_hash": "deadbeef",
         "unicode": "한글 값", "count": 3}
+
+
+# ---------------------------------------------------------------------------
+# SqliteMailbox — transport + base-ack reuse
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_mailbox_send_receive_ack(db):
+    sss._bootstrap(db)
+    mb = sss.SqliteMailbox(db)
+    mb.init_agent("agentX")                         # no-op, must not raise
+    msg = Envelope(to="agentX", type=m.TASK_ASSIGN, task_id="t1")
+    mb.send(msg)
+    got = mb.receive("agentX")
+    assert [e.msg_id for e in got] == [msg.msg_id]
+    assert got[0].to_json() == msg.to_json()        # byte-identical round-trip
+    # at-least-once: still returned before ack
+    assert [e.msg_id for e in mb.receive("agentX")] == [msg.msg_id]
+    mb.ack("agentX", msg)
+    assert mb.receive("agentX") == []               # not redelivered after ack
+
+
+def test_sqlite_mailbox_fifo_and_partial_ack(db):
+    sss._bootstrap(db)
+    mb = sss.SqliteMailbox(db)
+    m1 = Envelope(to="ag", type=m.TASK_ASSIGN, task_id="t1")
+    m2 = Envelope(to="ag", type=m.PING)
+    mb.send(m1)
+    mb.send(m2)
+    assert [e.msg_id for e in mb.receive("ag")] == [m1.msg_id, m2.msg_id]  # FIFO by msg_id
+    mb.ack("ag", m1)
+    assert [e.msg_id for e in mb.receive("ag")] == [m2.msg_id]             # only the unacked one
+    mb.ack("ag", m2)
+    assert mb.receive("ag") == []
+
+
+def test_sqlite_mailbox_per_agent_isolation(db):
+    sss._bootstrap(db)
+    mb = sss.SqliteMailbox(db)
+    mine = Envelope(to="me", type=m.PING)
+    theirs = Envelope(to="you", type=m.PING)
+    mb.send(mine)
+    mb.send(theirs)
+    assert [e.msg_id for e in mb.receive("me")] == [mine.msg_id]
+    # ack on "me" must not touch "you"'s row
+    mb.ack("me", mine)
+    assert mb.receive("me") == []
+    assert [e.msg_id for e in mb.receive("you")] == [theirs.msg_id]
+
+
+def test_at_least_once_crash_before_ack_redelivers(db):
+    sss._bootstrap(db)
+    # send + receive through one "process"
+    sent = Envelope(to="ag", type=m.TASK_ASSIGN, task_id="t1")
+    sss.SqliteMailbox(db).send(sent)
+    first = sss.SqliteMailbox(db).receive("ag")
+    assert [e.msg_id for e in first] == [sent.msg_id]
+    # crash BEFORE ack: a brand-new store/connection on the same file still sees it
+    redelivered = sss.SqliteMailbox(db).receive("ag")
+    assert [e.msg_id for e in redelivered] == [sent.msg_id]
+    # now ack through a fresh object; a later fresh object sees nothing
+    sss.SqliteMailbox(db).ack("ag", redelivered)
+    assert sss.SqliteMailbox(db).receive("ag") == []
