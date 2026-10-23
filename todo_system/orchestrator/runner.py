@@ -47,6 +47,7 @@ from . import worktree_sweep
 from .assignment import DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, KIND_AI_LOCAL, load_registry
+from .state_store import open_state_store
 
 ProgressFn = Callable[[str], None]
 # Called once, as soon as an executor knows which run directory this envelope
@@ -1703,7 +1704,15 @@ class Runner:
             if not msg.task_id:
                 return None
             ledger_root, vault_root = self._vault_layout()
-            row = Ledger(ledger_root).load(msg.task_id)
+            # Route through the configured backend when no explicit ledger dir was
+            # set: in git mode open_state_store(vault_root).ledger() is
+            # Ledger(vault_root/Worker/assignments) == Ledger(ledger_root), so this
+            # is byte-identical; external mode reads the SQLite ledger instead. An
+            # explicit ledger_root keeps the direct Ledger construction.
+            if self.ledger_root is None:
+                row = open_state_store(vault_root).ledger().load(msg.task_id)
+            else:
+                row = Ledger(ledger_root).load(msg.task_id)
             if row is not None and row.state == DONE:
                 return (f"ledger row already done (row corr={row.corr_id}, "
                         f"envelope corr={msg.corr_id})")
@@ -2284,7 +2293,14 @@ def _main(argv: list[str] | None = None) -> int:
         if not ok:
             print(f"hq-host guard: {reason}")
             return 3
-    runner = Runner(open_mailbox(args.uri, base=base), agent, make_executor(args.mode))
+    # Route the mailbox through the configured backend at the default URI: git
+    # mode is byte-identical to open_mailbox(default uri, base), external mode
+    # hands back the SQLite mailbox. A non-default --uri keeps open_mailbox.
+    if args.uri == f"git://{DEFAULT_ROOT}":
+        mailbox = open_state_store(base).mailbox()
+    else:
+        mailbox = open_mailbox(args.uri, base=base)
+    runner = Runner(mailbox, agent, make_executor(args.mode))
 
     if args.daemon:
         runner.run_forever(args.interval)
