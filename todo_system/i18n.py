@@ -1,9 +1,12 @@
-"""Engine log/CLI and dashboard text in the configured UI language (``paths.ui_language()``).
+"""Engine log/CLI, alert and dashboard text in the configured UI language (``paths.ui_language()``).
 
-``t(key, **fmt)`` is the one entry point for messages; the dashboard page's
-fragments live in :data:`DASHBOARD` (see :func:`dashboard_phrases`). Scope is
-human-facing text only — strings a parser reads back (stage-artifact headings,
-the ``없음`` sentinel) stay out of these tables.
+``t(key, **fmt)`` is the one entry point for messages — log/CLI lines and the
+Slack/Kakao alert and follow-up texts alike; the dashboard page's fragments live
+in :data:`DASHBOARD` (see :func:`dashboard_phrases`). Scope is human-facing text
+only — strings a parser reads back (stage-artifact headings, the ``없음``
+sentinel, alert event keys, ledger ``last_note`` texts) stay out of these
+tables. Callers resolve a message when they compose it, never at import, so a
+long-lived daemon follows a language change.
 
 There is no ko fallback: a key missing from the active language comes back as
 the key itself, so a gap shows up instead of silently printing Korean.
@@ -46,6 +49,79 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.human.parked": "검토/승인 대기",
         "dash.sms.apply": "SMS 릴레이 앱에 설정 적용",
         "dash.sms.title": "SMS 릴레이 설정",
+        # daily digest + route() merge suffix (kakao_format)
+        "digest.headline_fyi": "📮 macp 알림 요약 {n}건 — 조치 불필요",
+        "digest.headline_pending": "📮 macp 알림 요약 {n}건 — 결정 {k}건 대기",
+        "digest.empty_entry": "(빈 항목)",
+        "digest.merged": "외 {n}건 합침",
+        # human inbox nudges (orchestrator/human.py)
+        "human.head.assign": "🙋 새 할당이 도착했어요",
+        "human.head.query": "❓ 확인이 필요한 질문이 있어요",
+        "human.head.cancel": "🚫 할당이 취소됐어요",
+        "human.head.wake": "🔔 확인 요청 알림이에요",
+        "human.head.ping": "📡 핑",
+        "human.head.other": "✉️ 메시지가 도착했어요",
+        "human.headline": "{head} — 확인해주세요",
+        # follow-up digest notice + `followups human|approve|dismiss|reroute`
+        "followup.digest_head": "🙋 사람 결정 대기(followups human)",
+        "followup.none": "사람 결정 대기 없음",
+        "followup.waiting": "사람 결정 대기 {n}건",
+        "followup.section_next_steps": "다음 단계",
+        "followup.section_human_review": "사람이 검토해야 할 부분",
+        "followup.body": "본문: {text}",
+        "followup.approved_head": "승인됨 — planner 태스크화 대기 {n}건",
+        "followup.approved_at": "(승인 {ts})",
+        "followup.hint_approve": "승인:   {cli} approve <id>",
+        "followup.hint_dismiss": "기각:   {cli} dismiss <id> --reason <사유>",
+        "followup.hint_reroute": "재분류: {cli} reroute <id>   (rejected → 사람 결정 대기)",
+        "followup.approved_msg": (
+            "승인: {fid} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
+            "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
+            "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다."),
+        "followup.dismissed_msg": "기각: {fid} → done (dismissed: {reason})",
+        "followup.rerouted_msg": "재분류: {fid} → {status}",
+        # orchestrator alerts (Orchestrator._notify_* and reconcile_merged)
+        "alert.reason": "사유: {reason}",
+        "alert.account_switch": (
+            "🔁 Claude 계정 전환 {frm} → {to} ({reason}) — "
+            "다음 틱부터 새 계정으로 재디스패치됩니다"),
+        "alert.account_paused": (
+            "⏸ 모든 Claude 계정 사용 불가 ({frm}: {reason}) — 디스패치 PAUSED. "
+            "윈도 리셋·재로그인·macp account use 중 하나로 자동 해제"),
+        "alert.review_blocked": (
+            "⛔ 파이프라인이 선행 조건 미충족으로 멈췄어요 — "
+            "조건을 갖추거나 이 태스크를 접을지 판단해주세요"),
+        "alert.review_pr": "✅ 파이프라인 완료 · PR 열림(미머지) — 리뷰 후 머지해주세요",
+        "alert.review_result_no_pr": (
+            "✅ 정상 완료 · 머지할 PR 없음(0-commit) — 결과 확인 후 태스크를 닫아주세요"),
+        "alert.review_failure": "❌ PR 없음 · 머지할 것이 없어요 — 실패 원인 확인이 필요합니다",
+        "alert.result": "결과: {hint}",
+        "alert.no_pr_hint": "Worker/runs/ 아래 {task} 최신 run",
+        "alert.no_pr_hint_art": "Worker/runs/ 아래 {task} 최신 run 의 {art}",
+        "alert.orphaned": (
+            "🧨 이전 시도의 미푸시 커밋 {count}개가 되감겼어요 — "
+            "되살릴지 무시할지 판단해주세요"),
+        "alert.poison": (
+            "🚧 {n}회 재실패로 자동 재시도를 멈췄어요 — "
+            "원인 확인 후 수동 처리가 필요합니다"),
+        "alert.recent_reason": "최근 사유: {note}",
+        "alert.timeout_park": (
+            "⏱️ {n}회 연속 stage timeout으로 대기 전환 — "
+            "더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다"),
+        "alert.timeout_checkpointed": "작업은 origin worker 브랜치에 checkpoint됨(유실 아님)",
+        "alert.blocker_cancelled": (
+            "🔗 대기하던 상류 태스크가 취소돼 진행 불가 — "
+            "이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다"),
+        "alert.upstream": "상류: {blocker}",
+        "alert.propagate": (
+            "🔗 상류 '{proj}' 변경으로 하류 통합검증 {n}개를 만들었어요 — "
+            "검증 결과를 확인해주세요"),
+        "alert.parent_complete": (
+            "🧭 하위 작업이 모두 끝난 상위 태스크 {n}건이 아직 open이에요 — "
+            "닫을지 후속 작업을 추가할지 확인해주세요"),
+        "alert.closed_unmerged": (
+            "⚠️ delegate PR이 머지 없이 닫혔어요 — "
+            "다시 열지·재작업할지·접을지 판단해주세요"),
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -75,6 +151,78 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.human.parked": "awaiting review/approval",
         "dash.sms.apply": "Apply settings in the SMS Relay app",
         "dash.sms.title": "SMS relay setup",
+        "digest.headline_fyi": "📮 macp digest — {n} alert(s), no action needed",
+        "digest.headline_pending": "📮 macp digest — {n} alert(s), {k} decision(s) pending",
+        "digest.empty_entry": "(empty entry)",
+        "digest.merged": "+{n} more merged",
+        "human.head.assign": "🙋 New assignment arrived",
+        "human.head.query": "❓ A question needs your answer",
+        "human.head.cancel": "🚫 Assignment cancelled",
+        "human.head.wake": "🔔 Reminder to check in",
+        "human.head.ping": "📡 Ping",
+        "human.head.other": "✉️ A message arrived",
+        "human.headline": "{head} — please take a look",
+        # No colon, ≤ 41 chars: compose_digest groups on the first ":" and clips a
+        # singleton line to 60, which must still keep the "[<12-hex id>]" after it.
+        "followup.digest_head": "🙋 Decision pending (followups human)",
+        "followup.none": "no human decisions pending",
+        "followup.waiting": "{n} human decision(s) pending",
+        "followup.section_next_steps": "Next steps",
+        "followup.section_human_review": "Needs human review",
+        "followup.body": "text: {text}",
+        "followup.approved_head": "approved — {n} waiting for the planner to file a task",
+        "followup.approved_at": "(approved {ts})",
+        "followup.hint_approve": "approve: {cli} approve <id>",
+        "followup.hint_dismiss": "dismiss: {cli} dismiss <id> --reason <reason>",
+        "followup.hint_reroute": "reroute: {cli} reroute <id>   (rejected → awaiting a human)",
+        "followup.approved_msg": (
+            "approved: {fid} → open+approved. The next planner run injects it in the "
+            "human-approved block. The planner only runs on a run completion, a task "
+            "change or the 24h heartbeat, so on a quiet day this can take up to about "
+            "24 hours."),
+        "followup.dismissed_msg": "dismissed: {fid} → done (dismissed: {reason})",
+        "followup.rerouted_msg": "rerouted: {fid} → {status}",
+        "alert.reason": "reason: {reason}",
+        "alert.account_switch": (
+            "🔁 Claude account switched {frm} → {to} ({reason}) — "
+            "re-dispatching on the new account from the next tick"),
+        "alert.account_paused": (
+            "⏸ No Claude account usable ({frm}: {reason}) — dispatch PAUSED. "
+            "Lifts on its own after a window reset, a re-login or macp account use"),
+        "alert.review_blocked": (
+            "⛔ Pipeline stopped on an unmet precondition — "
+            "meet it or decide whether to drop this task"),
+        "alert.review_pr": "✅ Pipeline done · PR open (not merged) — review and merge it",
+        "alert.review_result_no_pr": (
+            "✅ Finished cleanly · no PR to merge (0 commits) — check the result and close the task"),
+        "alert.review_failure": "❌ No PR · nothing to merge — the failure cause needs a look",
+        "alert.result": "result: {hint}",
+        "alert.no_pr_hint": "latest run of {task} under Worker/runs/",
+        "alert.no_pr_hint_art": "{art} of the latest run of {task} under Worker/runs/",
+        "alert.orphaned": (
+            "🧨 {count} unpushed commit(s) from an earlier attempt were rewound — "
+            "decide whether to restore or ignore them"),
+        "alert.poison": (
+            "🚧 Auto-retry stopped after {n} repeated failures — "
+            "find the cause and handle it by hand"),
+        "alert.recent_reason": "last reason: {note}",
+        "alert.timeout_park": (
+            "⏱️ Parked after {n} consecutive stage timeouts — "
+            "decide whether to split it further or run it as a long_job"),
+        "alert.timeout_checkpointed": "work is checkpointed on the origin worker branch (not lost)",
+        "alert.blocker_cancelled": (
+            "🔗 An upstream task this one waited on was cancelled — "
+            "decide whether this task is still needed or should be cancelled too"),
+        "alert.upstream": "upstream: {blocker}",
+        "alert.propagate": (
+            "🔗 Upstream '{proj}' changed, so {n} downstream integration check(s) "
+            "were created — check their results"),
+        "alert.parent_complete": (
+            "🧭 {n} parent task(s) have all subtasks finished but are still open — "
+            "close them or add follow-up work"),
+        "alert.closed_unmerged": (
+            "⚠️ delegate PR was closed without merging — "
+            "decide whether to reopen, redo or drop it"),
     },
 }
 

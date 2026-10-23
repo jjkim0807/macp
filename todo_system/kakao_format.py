@@ -22,9 +22,10 @@ itself to fit BEFORE it reaches the script:
 stdlib-only ON PURPOSE: ``scripts/health_report.py`` and
 ``scripts/claude_auth_watch.py`` run under launchd's ``/usr/bin/python3`` (no uv,
 no venv, no PyYAML), so this module must never import a third-party package. It is
-a near-leaf: the one thing it imports from ``todo_system`` is the stdlib-only
-``paths`` resolver (which itself pulls in no third-party or project package), so it
-still loads under bare ``/usr/bin/python3``. ``human`` re-exports
+a near-leaf: the only things it imports from ``todo_system`` are the stdlib-only
+``paths`` resolver (which itself pulls in no third-party or project package) and
+``i18n`` (the message table, which pulls only ``paths``), so it still loads under
+bare ``/usr/bin/python3``. ``human`` re-exports
 :data:`KAKAO_TEXT_LIMIT` so orchestrator-side callers keep the single name
 ``human.KAKAO_TEXT_LIMIT`` to reference, while the two launchd scripts import this
 leaf directly.
@@ -39,7 +40,7 @@ import time as _time
 from collections.abc import Iterable
 from pathlib import Path
 
-from . import paths
+from . import i18n, paths
 
 # Slack's practical text budget (~4000 chars) now that Slack is the default
 # backend; the name is kept for compatibility (human.KAKAO_TEXT_LIMIT re-exports
@@ -238,7 +239,7 @@ def route(
         merged = int(ent.get("suppressed", 0)) if isinstance(ent, dict) else 0
         final = message
         if merged > 0:
-            suffix = f"\n외 {merged}건 합침"
+            suffix = "\n" + i18n.t("digest.merged", n=merged)
             if len(message) + len(suffix) <= KAKAO_TEXT_LIMIT:
                 final = message + suffix   # never at the cost of the headline
         state[event_key] = {"last_sent": now, "last_seen": now, "suppressed": 0}
@@ -275,12 +276,21 @@ def read_digest_entries(text: str) -> list[dict]:
     return entries
 
 
-# Mirrors todo_system.orchestrator.followups.HUMAN_DIGEST_HEAD's literal value
-# (duplicated, not imported — this module is a leaf per the module docstring:
-# launchd runs it under bare /usr/bin/python3 with no orchestrator package on
-# the path). Used only to detect entries that need a human decision, so the
-# digest headline never claims "조치 불필요" while one is waiting.
-_HUMAN_DECISION_HEAD = "🙋 사람 결정 대기(followups human)"
+# The ko value of todo_system.orchestrator.followups.HUMAN_DIGEST_HEAD. Both read
+# the i18n table rather than importing each other — this module is a leaf per the
+# module docstring (launchd runs it under bare /usr/bin/python3 with no
+# orchestrator package on the path), and i18n is the stdlib-only table both share.
+# Used only to detect entries that need a human decision, so the digest headline
+# never claims "no action needed" while one is waiting.
+_HUMAN_DECISION_HEAD = i18n.MESSAGES["ko"]["followup.digest_head"]
+
+
+def _human_decision_heads() -> tuple[str, ...]:
+    """The follow-up digest head in every language. A notice queued under one
+    language can be drained under the other, and it must still count."""
+    heads = {tbl["followup.digest_head"] for tbl in i18n.MESSAGES.values()
+             if tbl.get("followup.digest_head")}
+    return tuple(sorted(heads | {_HUMAN_DECISION_HEAD}))
 
 
 def compose_digest(entries: list[dict]) -> str:
@@ -291,20 +301,22 @@ def compose_digest(entries: list[dict]) -> str:
     logs/kakao_digest.sent.jsonl, and the headline always carries the count.
 
     If any entry is a parked human-decision follow-up (see
-    ``_HUMAN_DECISION_HEAD``), the headline swaps "조치 불필요" for the pending
-    decision count so that signal never gets buried in a digest that otherwise
-    reads as "nothing to do"."""
+    ``_human_decision_heads``, in either language), the headline swaps "no action
+    needed" for the pending decision count so that signal never gets buried in a
+    digest that otherwise reads as "nothing to do"."""
+    heads = _human_decision_heads()
     human_pending = sum(
         1 for e in entries
-        if str(e.get("msg") or "").strip().startswith(_HUMAN_DECISION_HEAD)
+        if str(e.get("msg") or "").strip().startswith(heads)
     )
     if human_pending:
-        headline = f"📮 macp 알림 요약 {len(entries)}건 — 결정 {human_pending}건 대기"
+        headline = i18n.t("digest.headline_pending", n=len(entries), k=human_pending)
     else:
-        headline = f"📮 macp 알림 요약 {len(entries)}건 — 조치 불필요"
+        headline = i18n.t("digest.headline_fyi", n=len(entries))
+    empty = i18n.t("digest.empty_entry")
     groups: dict[str, list[str]] = {}
     for e in entries:
-        msg = str(e.get("msg") or "").strip() or "(빈 항목)"
+        msg = str(e.get("msg") or "").strip() or empty
         first = msg.splitlines()[0]
         head = first.split(":", 1)[0].strip() or first
         groups.setdefault(head, []).append(first)

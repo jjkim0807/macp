@@ -32,7 +32,7 @@ from ..kakao_format import (  # noqa: F401
     compose_alert,
 )
 from .. import kakao_format as _kakao_format
-from .. import paths
+from .. import i18n, paths
 
 # Two roots, split the way beta_publish._ENGINE_ROOT / _VAULT_DATA_ROOT are.
 # _ENGINE_ROOT comes from paths.engine_root() (the repo root in a development
@@ -56,12 +56,14 @@ KAKAO_SCRIPT = _ENGINE_ROOT / "scripts" / "kakao_send.sh"
 # notify(text, link) -> None
 Notifier = Callable[[str, "str | None"], None]
 
-_HEADS = {
-    m.TASK_ASSIGN: "🙋 새 할당이 도착했어요",
-    m.QUERY: "❓ 확인이 필요한 질문이 있어요",
-    m.CANCEL: "🚫 할당이 취소됐어요",
-    m.WAKE: "🔔 확인 요청 알림이에요",
-    m.PING: "📡 핑",
+# i18n keys of each message type's nudge head; any other type gets
+# "human.head.other". Resolved per call so the nudge follows ui_language().
+_HEAD_KEYS = {
+    m.TASK_ASSIGN: "human.head.assign",
+    m.QUERY: "human.head.query",
+    m.CANCEL: "human.head.cancel",
+    m.WAKE: "human.head.wake",
+    m.PING: "human.head.ping",
 }
 
 
@@ -74,7 +76,8 @@ def compose_kakao(msg: m.Envelope, agent: Agent) -> str:
     Length is <= KAKAO_TEXT_LIMIT by construction (the old `text[:179]` bisected
     the summary mid-token; see macp-kakao-message-silent-truncation)."""
     p = msg.payload or {}
-    headline = _HEADS.get(msg.type, "✉️ 메시지가 도착했어요") + " — 확인해주세요"
+    head = i18n.t(_HEAD_KEYS.get(msg.type, "human.head.other"))
+    headline = i18n.t("human.headline", head=head)
     summary = (
         p.get("summary")
         or p.get("outcome")
