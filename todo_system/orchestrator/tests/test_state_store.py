@@ -15,7 +15,7 @@ import pytest
 from todo_system import worker
 from todo_system.orchestrator import message as m
 from todo_system.orchestrator import metrics
-from todo_system.orchestrator.assignment import DONE, Assignment, Ledger
+from todo_system.orchestrator.assignment import DONE, IN_PROGRESS, Assignment, Ledger
 from todo_system.orchestrator.mailbox import (
     DEFAULT_ROOT,
     FileMailbox,
@@ -292,3 +292,64 @@ def test_open_state_store_env_external_returns_sqlite_store(monkeypatch, vault, 
     assert isinstance(store, ExternalStateStore)
     assert store.vault_root == vault
     assert store.sqlite_path == tmp_path / "state.sqlite"
+
+
+# ---------------------------------------------------------------------------
+# Backend parity — the ledger + mailbox + planner_kv contract run as ONE suite
+# over both backends (acceptance #1). The git-specific pass-through assertions
+# above (isinstance GitMailbox, identical roots/paths) stay git-only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["git", "external"])
+def store(request, vault):
+    """One StateStore per backend, both on tmp paths.
+
+    git → a real repo (GitMailbox with no `origin`, so pull/push are no-ops) plus
+    an explicit planner path so it never writes worker.PLANNER_STATE_PATH.
+    external → ExternalStateStore on a tmp state.sqlite.
+    """
+    if request.param == "git":
+        _git_vault(vault)
+        return GitStateStore(vault, planner_state_path=vault / "planner_state.json")
+    return ExternalStateStore(sqlite_path=vault / "state.sqlite", vault_root=vault)
+
+
+def test_ledger_contract_parity(store):
+    live = Assignment(task_id="t-1", agent_id="a", corr_id="c1", state=IN_PROGRESS)
+    done = Assignment(task_id="t-0", agent_id="a", corr_id="c0", state=DONE)
+    store.ledger().save(live)
+    store.ledger().save(done)
+    assert store.ledger().load("t-1").to_json() == live.to_json()      # byte-identical
+    assert [a.task_id for a in store.ledger().all()] == ["t-0", "t-1"]  # ordered by task_id
+    assert store.ledger().active("t-0") is None                        # DONE is terminal
+    assert store.ledger().active("t-1").to_json() == live.to_json()
+    assert store.ledger().load("missing") is None
+
+
+def test_mailbox_contract_parity(store):
+    mb = store.mailbox()
+    mb.init_agent("agentX")
+    m1 = Envelope(to="agentX", type=m.TASK_ASSIGN, task_id="t1")
+    m2 = Envelope(to="agentX", type=m.PING)
+    mb.send(m1)
+    mb.send(m2)
+    got = mb.receive("agentX")
+    assert [e.msg_id for e in got] == [m1.msg_id, m2.msg_id]           # FIFO by msg_id
+    assert [e.to_json() for e in got] == [m1.to_json(), m2.to_json()]  # byte-identical
+    # at-least-once: re-receive before ack still returns both
+    assert [e.msg_id for e in mb.receive("agentX")] == [m1.msg_id, m2.msg_id]
+    mb.ack("agentX", m1)
+    assert [e.msg_id for e in mb.receive("agentX")] == [m2.msg_id]     # only the unacked one
+    mb.ack("agentX", m2)
+    assert mb.receive("agentX") == []
+
+
+def test_planner_kv_contract_parity(store):
+    kv = store.planner_kv()
+    assert kv.get("verdict") is None
+    kv.put("verdict", "continue")
+    kv.put("n", 3)
+    assert kv.get("verdict") == "continue"
+    assert kv.get("n") == 3
+    assert kv.all() == {"verdict": "continue", "n": 3}
