@@ -14,12 +14,20 @@ Two layers, both offline:
 
 from __future__ import annotations
 
+import base64
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
+
 from todo_system.trackers.base import (
     TaskRecord,
     append_progress_log,
     parse_frontmatter,
     upsert_task_record,
 )
+from todo_system.trackers.jira import JiraAdapter, TrackerError
 
 # --------------------------------------------------------------------------- #
 # md bridge: upsert / idempotency / conflict / monotonic status (no network)
@@ -158,3 +166,214 @@ def test_append_progress_log_creates_section_when_missing(tmp_path):
     out = append_progress_log(md, "first entry", today="2026-10-24")
     assert "## Progress Log" in out
     assert "- 2026-10-24: first entry" in out
+
+
+# --------------------------------------------------------------------------- #
+# Jira transport: pull/push round-trips against a local recording server
+# --------------------------------------------------------------------------- #
+
+TOKEN = "atlassian-tok-SUPERSECRET-xyz"  # the fixture secret — must never leak
+
+
+class RecordingJiraServer:
+    """A local Jira endpoint: records every request (path/method/auth/JSON body)
+    and replays scripted responses. Mirrors ``test_slack_send.RecordingSlackServer``
+    so the exact request bytes can be asserted without a real Jira site."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.search_issues: list[dict] = []
+        self.search_code = 200
+        self.transitions = {"transitions": [
+            {"id": "11", "name": "Start", "to": {"name": "In Progress"}},
+            {"id": "31", "name": "Mark done", "to": {"name": "Done"}},
+        ]}
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):  # silence stderr noise
+                pass
+
+            def _handle(self, method: str) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else None
+                except ValueError:
+                    body = None
+                server.requests.append({
+                    "method": method,
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "json": body,
+                })
+                code, payload = server._response_for(method, self.path)
+                if code == 204:
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def do_POST(self):
+                self._handle("POST")
+
+        self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def _response_for(self, method: str, path: str) -> tuple[int, dict]:
+        if method == "GET" and "/search" in path:
+            return self.search_code, {"issues": self.search_issues}
+        if method == "GET" and path.endswith("/transitions"):
+            return 200, self.transitions
+        if method == "POST" and path.endswith("/transitions"):
+            return 204, {}
+        if method == "POST" and path.endswith("/comment"):
+            return 201, {"id": "10000"}
+        return 200, {}
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def jira_server():
+    srv = RecordingJiraServer()
+    yield srv
+    srv.close()
+
+
+def _adapter(server: RecordingJiraServer) -> JiraAdapter:
+    return JiraAdapter(
+        base_url=server.base_url, project="PROJ",
+        email="dev@example.test", api_token=TOKEN,
+    )
+
+
+def _issue_fixture(**fields) -> dict:
+    base = {
+        "summary": "Fix the login bug",
+        "description": {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Users cannot log in."}]}]},
+        "status": {"name": "In Progress"},
+        "labels": ["backend", "urgent"],
+        "duedate": "2026-11-01",
+        "priority": {"name": "High"},
+        "updated": "2026-10-20T12:00:00.000+0000",
+    }
+    base.update(fields)
+    return {"key": "PROJ-123", "fields": base}
+
+
+def test_pull_roundtrip_then_upsert(jira_server, tmp_path):
+    jira_server.search_issues = [_issue_fixture()]
+    records = _adapter(jira_server).pull()
+
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.external_ref == "jira:PROJ-123"
+    assert rec.title == "Fix the login bug"
+    assert rec.body == "Users cannot log in."
+    assert rec.status == "open"                       # In Progress → open
+    assert rec.remote_updated_at == "2026-10-20T12:00:00.000+0000"
+    assert rec.frontmatter["due"] == "2026-11-01"
+    assert rec.frontmatter["priority"] == 70          # High → 70
+    assert rec.frontmatter["tags"] == ["backend", "urgent"]
+
+    result = upsert_task_record(rec, tmp_path / "items", today="2026-10-24")
+    fm, _ = parse_frontmatter(result.path.read_text(encoding="utf-8"))
+    assert fm["external_ref"] == "jira:PROJ-123"
+
+    search = [r for r in jira_server.requests if "/search" in r["path"]]
+    assert len(search) == 1 and search[0]["authorization"].startswith("Basic ")
+
+
+def test_pull_cancelled_status_adds_cancelled_tag(jira_server):
+    jira_server.search_issues = [_issue_fixture(status={"name": "Cancelled"}, labels=["backend"])]
+    rec = _adapter(jira_server).pull()[0]
+    assert rec.status == "done"                       # Cancelled → done
+    assert "cancelled" in rec.frontmatter["tags"]
+
+
+def test_push_transition_and_comment_bodies_match_mapping(jira_server):
+    task = TaskRecord(
+        external_ref="jira:PROJ-123", status="done",
+        pr_url="https://github.com/jjkim0807/macp/pull/5",
+    )
+    assert _adapter(jira_server).push(task) == "jira:PROJ-123"
+
+    reqs = jira_server.requests
+    get_trans = [r for r in reqs if r["method"] == "GET" and r["path"].endswith("/transitions")]
+    post_trans = [r for r in reqs if r["method"] == "POST" and r["path"].endswith("/transitions")]
+    comment = [r for r in reqs if r["method"] == "POST" and r["path"].endswith("/comment")]
+
+    assert len(get_trans) == 1
+    assert "/rest/api/3/issue/PROJ-123/transitions" in get_trans[0]["path"]
+    assert post_trans and post_trans[0]["json"] == {"transition": {"id": "31"}}  # the "Done" id
+    assert comment and comment[0]["json"]["body"]["type"] == "doc"               # minimal ADF
+    text_nodes = comment[0]["json"]["body"]["content"][0]["content"]
+    assert any("github.com/jjkim0807/macp/pull/5" in n.get("text", "") for n in text_nodes)
+
+
+def test_push_open_task_without_pr_is_noop(jira_server):
+    _adapter(jira_server).push(TaskRecord(external_ref="jira:PROJ-9", status="open"))
+    assert jira_server.requests == []                 # not done, no PR → nothing sent
+
+
+def test_optin_noop_without_config(jira_server, tmp_path, monkeypatch):
+    for var in ("MACP_JIRA_BASE_URL", "MACP_JIRA_PROJECT", "MACP_JIRA_EMAIL", "MACP_JIRA_API_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    adapter = JiraAdapter.from_config(vault_root=tmp_path, start=tmp_path)
+
+    assert adapter is None                            # no config → no adapter
+    assert jira_server.requests == []                 # zero network calls
+    assert not list(tmp_path.glob("**/*.md"))         # no md created
+
+
+def test_token_absent_from_md_and_stdout(jira_server, tmp_path, capsys):
+    jira_server.search_issues = [_issue_fixture()]
+    adapter = _adapter(jira_server)
+    records = adapter.pull()
+    result = upsert_task_record(records[0], tmp_path / "items", today="2026-10-24")
+    md_text = result.path.read_text(encoding="utf-8")
+    captured = capsys.readouterr()
+
+    assert TOKEN not in md_text
+    assert TOKEN not in (captured.out + captured.err)
+    # The server DID receive the token in a Basic header (auth really sent, not dropped).
+    auth = next(r["authorization"] for r in jira_server.requests if "/search" in r["path"])
+    decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+    assert decoded == f"dev@example.test:{TOKEN}"
+
+
+def test_error_message_carries_no_token(jira_server):
+    jira_server.search_code = 401
+    with pytest.raises(TrackerError) as excinfo:
+        _adapter(jira_server).pull()
+    msg = str(excinfo.value)
+    assert "401" in msg
+    assert TOKEN not in msg and "Basic" not in msg
+
+
+def test_map_fields_maps_priority_labels_due():
+    adapter = JiraAdapter(base_url="http://127.0.0.1:1", project="PROJ",
+                          email="e@x.test", api_token="t")
+    mapped = adapter.map_fields(
+        {"labels": ["a", "b"], "duedate": "2026-12-01", "priority": {"name": "Lowest"}})
+    assert mapped == {"tags": ["a", "b"], "due": "2026-12-01", "priority": 10}
+    assert adapter.map_fields({}) == {}               # nothing set when fields absent

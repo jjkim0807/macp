@@ -183,7 +183,7 @@ def _config_resolver(env_var: str, config_key: str, start: Path | None) -> str |
     env = os.environ.get(env_var)
     if env:
         return env
-    base = (start or paths.vault_root_or_cwd()).resolve()
+    base = (Path(start) if start is not None else paths.vault_root_or_cwd()).resolve()
     for d in (base, *base.parents):
         cfg = d / ".macp" / "config.toml"
         if cfg.is_file():
