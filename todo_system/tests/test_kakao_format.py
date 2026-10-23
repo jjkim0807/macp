@@ -171,3 +171,40 @@ def test_kakao_vault_dir_honoured_even_when_macp_vault_root_unset(monkeypatch, t
     monkeypatch.setenv("KAKAO_VAULT_DIR", str(kakao_dir))
     # The top-priority early return does not depend on MACP_VAULT_ROOT being set.
     assert kakao_format._vault_root() == kakao_dir
+
+
+# ---------------------------------------------------------------- ko golden
+# The digest headline, empty-entry marker and route()'s merge suffix, pinned byte
+# for byte as they read before they went through i18n.t().
+
+_KO_HUMAN_HEAD = "🙋 사람 결정 대기(followups human)"
+
+
+def _route_paths(tmp_path: Path) -> dict:
+    return {"dedup_path": tmp_path / "dedup.json", "digest_path": tmp_path / "digest.jsonl",
+            "log_path": tmp_path / "route.log"}
+
+
+def test_ko_digest_headline_without_a_pending_decision(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert kakao_format.compose_digest([{"msg": "⚠️ beta: built 12\nmore"}]) == (
+        "📮 macp 알림 요약 1건 — 조치 불필요\n· ⚠️ beta: built 12")
+
+
+def test_ko_digest_headline_with_a_pending_decision_and_an_empty_entry(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    out = kakao_format.compose_digest(
+        [{"msg": f"{_KO_HUMAN_HEAD}: [abcdef012345] demo"}, {"msg": ""}])
+    assert out == (
+        "📮 macp 알림 요약 2건 — 결정 1건 대기\n"
+        "· (빈 항목)\n"
+        f"· {_KO_HUMAN_HEAD}: [abcdef012345] demo")
+
+
+def test_ko_route_merge_suffix(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    kw = dict(event_key="k", **_route_paths(tmp_path))
+    assert kakao_format.route("alert", now=1000.0, **kw) == ("send", "alert")
+    assert kakao_format.route("alert", now=1010.0, **kw) == ("suppressed", None)
+    assert kakao_format.route("alert", now=1000.0 + kakao_format.DEDUP_WINDOW_S + 1, **kw) == (
+        "send", "alert\n외 1건 합침")

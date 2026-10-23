@@ -17,6 +17,9 @@ from pathlib import Path
 from unittest import mock
 
 from todo_system import cli, i18n
+from todo_system import kakao_format
+from todo_system.orchestrator import followups, human, stages, tasks
+from todo_system.orchestrator import message as m
 from todo_system.orchestrator import resume
 from todo_system.orchestrator.assignment import AWAITING_HUMAN, FAILED, Assignment, Ledger
 from todo_system.orchestrator.mailbox import FileMailbox
@@ -259,3 +262,258 @@ def test_dashboard_phrases_follows_ui_language(monkeypatch):
     assert i18n.dashboard_phrases() is i18n.DASHBOARD["ko"]
     monkeypatch.setenv("MACP_LANGUAGE", "en")
     assert i18n.dashboard_phrases() is i18n.DASHBOARD["en"]
+
+
+# --- alerts: ko golden ------------------------------------------------------------
+# Slack/Kakao alert bodies, pinned byte for byte as they read before they went
+# through i18n.t(). Fixtures are ASCII so the en tests below can reuse them: task
+# titles, slugs and blockers are data, not translated text.
+
+SLUG = "demo-task"
+FID = "abcdef012345"
+
+
+def _alert_orch(tmp: Path, monkeypatch) -> tuple[Orchestrator, list]:
+    """An Orchestrator whose alerts land in `sent` as (text, link): the router
+    always says send, and `_task_title` never reads a vault md."""
+    sent: list = []
+    reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+    orch = Orchestrator(FileMailbox(tmp / "agents"), reg, Ledger(tmp / "assignments"),
+                        notify=lambda text, link=None: sent.append((text, link)),
+                        alert_route=lambda text, **k: ("send", text))
+    monkeypatch.setattr(orch, "_task_title", lambda slug: slug)
+    return orch, sent
+
+
+def _row(**kw) -> Assignment:
+    return Assignment(task_id=SLUG, agent_id="w", corr_id="c", **kw)
+
+
+def _env(type_: str, **payload) -> m.Envelope:
+    return m.Envelope(to=m.ORCHESTRATOR, type=type_, frm="w", task_id=SLUG,
+                      payload=dict(payload))
+
+
+def _review_texts(orch, sent) -> dict[str, tuple]:
+    """The four `_notify_review` framings, keyed by branch."""
+    out = {}
+    orch._notify_review(_row(blocked_on="needs upstream merge"), _env(m.FAIL))
+    out["blocked"] = sent.pop()
+    orch._notify_review(_row(), _env(m.RESULT, pr_url="https://example.com/pr/1"))
+    out["pr"] = sent.pop()
+    orch._notify_review(_row(), _env(m.RESULT, run_dir="Worker/runs/r1", stages=["delegate"]))
+    out["result_run_dir"] = sent.pop()
+    orch._notify_review(_row(), _env(m.RESULT, stages=["delegate"]))
+    out["result_no_run_dir"] = sent.pop()
+    orch._notify_review(_row(), _env(m.FAIL))
+    out["failure"] = sent.pop()
+    return out
+
+
+def _account_texts(orch, sent, monkeypatch) -> tuple[str, str]:
+    from todo_system.macp import accounts
+    monkeypatch.setattr(accounts, "claim_paused_alert", lambda *a, **k: True)
+    orch._notify_account_switch(_row(), _env(m.FAIL, account_switch={
+        "from": "dev", "to": "alt", "reason": "usage"}))
+    switched = sent.pop()[0]
+    orch._notify_account_switch(_row(), _env(m.FAIL, account_switch={
+        "from": "dev", "to": None, "reason": "usage"}))
+    return switched, sent.pop()[0]
+
+
+def _misc_alert_texts(orch, sent) -> dict[str, str]:
+    out = {}
+    orch._notify_orphaned_commits(_row(), _env(m.FAIL, run_dir="Worker/runs/r1", orphaned_commits={
+        "shas": ["a" * 40, "b" * 40], "count": 2, "tip": "c" * 40, "branch": f"worker/{SLUG}"}))
+    out["orphaned"] = sent.pop()[0]
+    orch._notify_poison(_row(refail_count=3, last_note="boom on retry"))
+    out["poison"] = sent.pop()[0]
+    orch._notify_poison(_row(refail_count=3))
+    out["poison_no_note"] = sent.pop()[0]
+    orch._notify_timeout_park(_row(timeout_streak=2))
+    out["timeout_park"] = sent.pop()[0]
+    orch._notify_blocker_cancelled(_row(), "up-task")
+    out["blocker_cancelled"] = sent.pop()[0]
+    out["propagate"] = orch._compose_propagate_alert("core", ["a-check", "b-check"])
+    orch._notify_parent_complete([{"slug": "p1", "title": "Parent one"}, {"slug": "p2"}])
+    out["parent_complete"] = sent.pop()[0]
+    return out
+
+
+def _closed_unmerged_text(orch, sent, monkeypatch) -> tuple:
+    orch.ledger.save(_row(state=AWAITING_HUMAN, payload={"branch": f"worker/{SLUG}", "repo": "o/r"}))
+    monkeypatch.setattr(stages, "gh_pr_merged", lambda *a, **k: None)
+    monkeypatch.setattr(stages, "gh_pr_state", lambda *a, **k: "CLOSED")
+    monkeypatch.setattr(tasks, "task_status", lambda *a, **k: "open")
+    with contextlib.redirect_stdout(io.StringIO()):
+        orch.reconcile_merged()
+    return sent.pop()
+
+
+def _waiting_rec(**kw) -> dict:
+    rec = {"id": FID, "source_task": SLUG, "section": "다음 단계", "text": "do the thing",
+           "status": "awaiting_human", "human_reason": "needs a person"}
+    rec.update(kw)
+    return rec
+
+
+APPROVED_REC = {"id": "0123456789ab", "source_task": "other-task", "section": "다음 단계",
+                "text": "approved thing", "status": "open", "approved": True,
+                "approved_ts": "2026-10-23T10:00:00"}
+
+
+def _followup_files(tmp: Path, monkeypatch, *recs: dict) -> tuple[Path, Path]:
+    import json
+    fpath = tmp / "_state" / "followups.jsonl"
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    fpath.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs),
+                     encoding="utf-8")
+    monkeypatch.setattr(followups, "DIGEST_PATH", tmp / "logs" / "kakao_digest.jsonl")
+    monkeypatch.setattr(followups, "ROUTE_LOG_PATH", tmp / "logs" / "kakao_route.log")
+    return fpath, tmp / "_state" / "followups_rejected.jsonl"
+
+
+def _cli_replies(tmp: Path, monkeypatch) -> tuple[str, str, str]:
+    fpath, rpath = _followup_files(
+        tmp, monkeypatch, _waiting_rec(), _waiting_rec(id="111111111111"),
+        _waiting_rec(id="222222222222", status="done", resolution="rejected: old"))
+    rc1, approved = followups.approve(FID, path=fpath, rejections_path=rpath)
+    rc2, dismissed = followups.dismiss("111111111111", "not needed", path=fpath)
+    rc3, rerouted = followups.reroute("222222222222", path=fpath, rejections_path=rpath)
+    assert (rc1, rc2, rc3) == (0, 0, 0)
+    return approved, dismissed, rerouted
+
+
+def test_ko_review_alerts_are_byte_identical(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    got = _review_texts(orch, sent)
+    assert got["blocked"] == (
+        "⛔ 파이프라인이 선행 조건 미충족으로 멈췄어요 — 조건을 갖추거나 이 태스크를 접을지 판단해주세요\n"
+        f"📋 {SLUG}\n사유: needs upstream merge", None)
+    assert got["pr"] == (
+        f"✅ 파이프라인 완료 · PR 열림(미머지) — 리뷰 후 머지해주세요\n📋 {SLUG}",
+        "https://example.com/pr/1")
+    assert got["result_run_dir"] == (
+        "✅ 정상 완료 · 머지할 PR 없음(0-commit) — 결과 확인 후 태스크를 닫아주세요\n"
+        f"📋 {SLUG}\n결과: Worker/runs/r1/delegate.md", None)
+    assert got["result_no_run_dir"] == (
+        "✅ 정상 완료 · 머지할 PR 없음(0-commit) — 결과 확인 후 태스크를 닫아주세요\n"
+        f"📋 {SLUG}\n결과: Worker/runs/ 아래 {SLUG} 최신 run 의 delegate.md", None)
+    assert got["failure"] == (
+        "❌ PR 없음 · 머지할 것이 없어요 — 실패 원인 확인이 필요합니다\n"
+        f"📋 {SLUG}\nrun: Worker/runs/ 아래 {SLUG} 최신 run", None)
+
+
+def test_ko_account_alerts_are_byte_identical(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    switched, paused = _account_texts(orch, sent, monkeypatch)
+    assert switched == (
+        "🔁 Claude 계정 전환 dev → alt (usage) — 다음 틱부터 새 계정으로 재디스패치됩니다\n"
+        f"📋 {SLUG}")
+    assert paused == (
+        "⏸ 모든 Claude 계정 사용 불가 (dev: usage) — 디스패치 PAUSED. "
+        f"윈도 리셋·재로그인·macp account use 중 하나로 자동 해제\n📋 {SLUG}")
+
+
+def test_ko_other_orchestrator_alerts_are_byte_identical(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    got = _misc_alert_texts(orch, sent)
+    assert got["orphaned"] == (
+        "🧨 이전 시도의 미푸시 커밋 2개가 되감겼어요 — 되살릴지 무시할지 판단해주세요\n"
+        f"📋 {SLUG}\ntip cccccccc\ngit cherry-pick aaaaaaaa bbbbbbbb\n"
+        f"branch worker/{SLUG}\nrun Worker/runs/r1/stages.json")
+    assert got["poison"] == (
+        "🚧 3회 재실패로 자동 재시도를 멈췄어요 — 원인 확인 후 수동 처리가 필요합니다\n"
+        f"📋 {SLUG}\n최근 사유: boom on retry")
+    assert got["poison_no_note"] == (
+        f"🚧 3회 재실패로 자동 재시도를 멈췄어요 — 원인 확인 후 수동 처리가 필요합니다\n📋 {SLUG}")
+    assert got["timeout_park"] == (
+        "⏱️ 2회 연속 stage timeout으로 대기 전환 — 더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다\n"
+        f"📋 {SLUG}\n작업은 origin worker 브랜치에 checkpoint됨(유실 아님)")
+    assert got["blocker_cancelled"] == (
+        "🔗 대기하던 상류 태스크가 취소돼 진행 불가 — 이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다\n"
+        f"📋 {SLUG}\n상류: up-task")
+    assert got["propagate"] == (
+        "🔗 상류 'core' 변경으로 하류 통합검증 2개를 만들었어요 — 검증 결과를 확인해주세요\n"
+        "a-check, b-check")
+    assert got["parent_complete"] == (
+        "🧭 하위 작업이 모두 끝난 상위 태스크 2건이 아직 open이에요 — 닫을지 후속 작업을 추가할지 확인해주세요\n"
+        "- p1 (Parent one)\n- p2 (-)")
+
+
+def test_ko_closed_unmerged_alert_is_byte_identical(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    assert _closed_unmerged_text(orch, sent, monkeypatch) == (
+        f"⚠️ delegate PR이 머지 없이 닫혔어요 — 다시 열지·재작업할지·접을지 판단해주세요\n📋 {SLUG}",
+        None)
+
+
+def test_ko_followup_digest_notice_is_byte_identical(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert followups.HUMAN_DIGEST_HEAD == "🙋 사람 결정 대기(followups human)"
+    assert kakao_format._HUMAN_DECISION_HEAD == followups.HUMAN_DIGEST_HEAD
+    assert followups._digest_message(_waiting_rec()) == (
+        f"🙋 사람 결정 대기(followups human): [{FID}] {SLUG}\n"
+        "→ python -m todo_system.orchestrator.followups human\n"
+        "사유: needs a person")
+
+
+def test_ko_render_human_is_byte_identical(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    cli_ = followups.CLI
+    assert followups.render_human([]) == "사람 결정 대기 없음\n"
+    assert followups.render_human([_waiting_rec(), APPROVED_REC]) == (
+        "사람 결정 대기 1건\n"
+        "\n"
+        f"- [{FID}] from {SLUG} (다음 단계)\n"
+        "  본문: do the thing\n"
+        "  사유: needs a person\n"
+        "\n"
+        "승인됨 — planner 태스크화 대기 1건\n"
+        "- [0123456789ab] from other-task (승인 2026-10-23T10:00:00)\n"
+        "\n"
+        f"승인:   {cli_} approve <id>\n"
+        f"기각:   {cli_} dismiss <id> --reason <사유>\n"
+        f"재분류: {cli_} reroute <id>   (rejected → 사람 결정 대기)\n")
+    assert followups.render_human([APPROVED_REC]).startswith(
+        "사람 결정 대기 없음\n\n승인됨 — planner 태스크화 대기 1건\n")
+
+
+def test_ko_followup_cli_replies_are_byte_identical(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    approved, dismissed, rerouted = _cli_replies(tmp_path, monkeypatch)
+    assert approved == (
+        f"승인: {FID} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
+        "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
+        "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다.")
+    assert dismissed == "기각: 111111111111 → done (dismissed: not needed)"
+    assert rerouted == "재분류: 222222222222 → awaiting_human"
+
+
+HUMAN_KO_HEADS = {
+    m.TASK_ASSIGN: "🙋 새 할당이 도착했어요",
+    m.QUERY: "❓ 확인이 필요한 질문이 있어요",
+    m.CANCEL: "🚫 할당이 취소됐어요",
+    m.WAKE: "🔔 확인 요청 알림이에요",
+    m.PING: "📡 핑",
+    m.RESULT: "✉️ 메시지가 도착했어요",          # any other type: the default head
+}
+
+
+def _human_agent() -> Agent:
+    return Agent(id="human-1", kind="human", projects=["*"])
+
+
+def test_ko_human_nudges_are_byte_identical(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    for type_, head in HUMAN_KO_HEADS.items():
+        env = m.Envelope(to="human-1", type=type_, task_id=SLUG,
+                         payload={"summary": "please review"})
+        assert human.compose_kakao(env, _human_agent()) == (
+            f"{head} — 확인해주세요\n📋 {SLUG}\nplease review"), type_
+    bare = m.Envelope(to="human-1", type=m.RESULT)
+    assert human.compose_kakao(bare, _human_agent()) == "✉️ 메시지가 도착했어요 — 확인해주세요"
