@@ -5,6 +5,7 @@ be replaced by a `.macp/config.toml` in the vault.
 
 - [Finding the vault](#finding-the-vault)
 - [Environment variables](#environment-variables)
+- [Switching to the external state backend](#switching-to-the-external-state-backend)
 - [Usage pacing](#usage-pacing)
 - [Profiles and accounts](#profiles-and-accounts)
 - [Anthropic usage and cost](#anthropic-usage-and-cost)
@@ -54,6 +55,53 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `USAGE_GUARD_DISABLE` | `1` turns usage pacing off |
 | `USAGE_GUARD_*` | pacing thresholds (below) |
 | `ANTHROPIC_ADMIN_KEY` | Anthropic Admin API key for the usage/cost CLI |
+
+## Switching to the external state backend
+
+By default the orchestrator keeps its state as files in the vault (`git` backend). The
+`external` backend keeps the assignment ledger, the mailbox and the planner state in one
+SQLite file outside the vault instead. Moving a host over is a one-off copy with
+`todo_system.orchestrator.state_migrate`:
+
+1. **Stop** the orchestrator and runner, so nothing writes state during the copy.
+2. **Back up.** `<vault>/Worker/assignments/` is git-tracked, so a clean `git status` is
+   its backup. Copy `<vault>/Worker/agents/_state/` and `<vault>/Worker/planner_state.json`
+   (both untracked), and an existing `~/.local/share/macp/state.sqlite` if there is one.
+3. **Dry run.** This reads only the vault, prints the per-area counts and writes nothing:
+
+   ```bash
+   uv run python -m todo_system.orchestrator.state_migrate import --dry-run
+   ```
+
+4. **Import.** It copies `Worker/assignments/`, the inboxes and cursors under
+   `Worker/agents/`, and `Worker/planner_state.json`. It is safe to re-run: a second run
+   over the same vault changes nothing, a ledger row the database already has newer is
+   kept, and a message it already acknowledged is not brought back. On a remote host,
+   point `--planner-state` at that host's state file. `Todo/todo.db` is not copied (it
+   is rebuilt from the task files).
+
+   ```bash
+   uv run python -m todo_system.orchestrator.state_migrate import
+   ```
+
+5. **Switch.** Set `MACP_STATE_BACKEND=external` in the environment of every engine
+   process, or `state_backend = "external"` in `.macp/config.toml`. Set
+   `MACP_STATE_SQLITE_PATH` (key `state_sqlite_path`) as well if you do not use the
+   default path. Both commands above take `--sqlite-path` and `--vault-root` to match.
+6. **Check.** `sqlite3 ~/.local/share/macp/state.sqlite 'SELECT COUNT(*) FROM ledger'`
+   should equal `ledger` + `ledger_unchanged` + `ledger_kept_newer` from the import.
+   Then export and confirm the snapshot matches the files you started from:
+
+   ```bash
+   uv run python -m todo_system.orchestrator.state_migrate export
+   git status Worker/assignments    # no changes on a first switch
+   ```
+
+In external mode the database is authoritative and `Worker/assignments/` is a read-only
+snapshot written by `export` in the same format as before, so the dashboard keeps
+working. A hand edit there is overwritten by the next export. In git mode `export` does
+nothing unless you pass `--sqlite-path`. To roll back, unset `MACP_STATE_BACKEND` (git is
+the default) and the vault files are authoritative again.
 
 ## Usage pacing
 
