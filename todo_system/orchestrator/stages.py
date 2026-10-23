@@ -251,8 +251,8 @@ REMOTE_GATE_CLI = "macp-remote-gate"
 REMOTE_GATE_TOOL_RULE = f"Bash({REMOTE_GATE_CLI}:*)"
 REMOTE_GATE_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 
-# The on-demand emulator node (beta_smoke.run_smoke on macp-app-test) for a
-# pre-merge on-device check: `macp-emulator run --repo-dir <checkout> --sha <sha>
+# The on-demand emulator node (via beta_smoke.run_smoke) for a pre-merge
+# on-device check: `macp-emulator run --repo-dir <checkout> --sha <sha>
 # --scenario <json|name> [--seed owner|none]` builds→installs→(seed)→scenario→
 # logcat→always-stops and prints an aggregates-only result JSON. Same space-split
 # problem as SMS/BROWSER/REMOTE_GATE, so one PATH wrapper scripts/macp-emulator
