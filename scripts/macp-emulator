@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# macp-emulator — run ONE pre-merge on-device emulator scenario on the shared
+# on-demand node (todo_system.orchestrator.beta_smoke.run_smoke) and read back
+# ONLY an aggregates result JSON (rc · per-step durations · ANR/FATAL counts ·
+# max Skipped-frames · screenshot paths), from ANY directory. Worker stages run
+# in other repos' checkouts and their tool whitelist splits on spaces, so a rule
+# like `Bash(python3 -m todo_system...:*)` can never match; this wrapper gives
+# the whitelist one space-free name: `Bash(macp-emulator:*)`
+# (todo_system/orchestrator/stages.py EMULATOR_TOOL_RULE).
+#
+#   macp-emulator run --repo-dir <checkout> --sha <sha> --scenario <json|name> [--seed owner|none] [--owner <id>]
+#       build→install→(optional seed)→scenario→logcat→ALWAYS stop the node; print
+#       the aggregates-only result JSON to stdout; exit 0 PASS · 75 node busy
+#       (the shared lease is held by another owner) · 76 over the shared monthly
+#       cost cap · 1 a real failure (build/scenario/crash/node/config). Takes the
+#       SAME node lease the beta sweep uses (owner = $MACP_EMULATOR_OWNER = the
+#       run_id when run inside a stage), so a worker run and the sweep can never
+#       co-drive the node. Progress lines go to stderr; stdout is pure JSON.
+#   macp-emulator status    one JSON line: node lease state · month spend · cap · over_budget (READ-ONLY)
+#   macp-emulator stop      operator-only node teardown; refuses (exit 64) when invoked INSIDE a stage
+#
+# Install (once per host): copy to a dir on PATH, e.g.
+#   cp scripts/macp-emulator ~/.local/bin/macp-emulator && chmod +x ~/.local/bin/macp-emulator
+# The maintenance tick's sync_wrappers() keeps ~/.local/bin/macp-{sms,browser,remote-gate,emulator}
+# in sync whenever the engine checkout updates, so a manual copy is only the first install.
+# todo_system.orchestrator.emulator_cli uses only stdlib at import, so python3 is enough.
+# The node identity/zone and the owner-seed SOURCE path are read from the vault's
+# .macp/remote_gate.json (never hardcoded here); GCLOUD overrides the gcloud binary.
+MACP_REPO="${MACP_REPO:-$HOME/Projects/MaestroACP}"
+PY="$MACP_REPO/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+exec env PYTHONPATH="$MACP_REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" \
+  -m todo_system.orchestrator.emulator_cli "$@"
