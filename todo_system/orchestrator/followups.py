@@ -60,7 +60,7 @@ import re
 import sys
 from pathlib import Path
 
-from .. import kakao_format, paths
+from .. import i18n, kakao_format, paths
 
 # Live runtime state, all under gitignored trees (Worker/_state/, Todo/items/).
 # Reassigned wholesale by tests; every function that defaults to one reads the
@@ -89,9 +89,16 @@ ROUTE_LOG_PATH: Path | None = None
 STATUS_HUMAN = "awaiting_human"
 # First line of the digest notice. The fixed `…:` prefix is what compose_digest
 # groups on, so several parked items fold into one "×N" line, and the CLI hint
-# lives inside that key so it survives even the folded form.
-HUMAN_DIGEST_HEAD = "🙋 사람 결정 대기(followups human)"
+# lives inside that key so it survives even the folded form. The notice itself
+# uses human_digest_head() (the active language, resolved per call); this
+# constant stays the ko value for importers.
+HUMAN_DIGEST_HEAD = i18n.MESSAGES["ko"]["followup.digest_head"]
 CLI = "python -m todo_system.orchestrator.followups"
+
+
+def human_digest_head() -> str:
+    """HUMAN_DIGEST_HEAD in the active UI language."""
+    return i18n.t("followup.digest_head")
 
 # The report.md sections whose bullets are follow-ups. Both are captured on
 # purpose (Research Open-Q): "다음 단계" is the obvious one, but a
@@ -439,9 +446,9 @@ def _digest_message(rec: dict) -> str:
     construction."""
     task = kakao_format.clip_words(str(rec.get("source_task") or "-"), 60)
     return kakao_format.compose_alert(
-        f"{HUMAN_DIGEST_HEAD}: [{rec.get('id')}] {task}",
+        f"{human_digest_head()}: [{rec.get('id')}] {task}",
         [f"→ {CLI} human"],
-        tail=f"사유: {rec.get('human_reason') or '-'}")
+        tail=i18n.t("alert.reason", reason=rec.get("human_reason") or "-"))
 
 
 def _notify_awaiting(recs: list[dict]) -> bool:
@@ -588,9 +595,7 @@ def approve(fid: str, path: Path | None = None,
     rc, msg = _transition(fid, check, apply, path)
     if rc:
         return rc, msg
-    return 0, (f"승인: {fid} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
-               "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
-               "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다.")
+    return 0, i18n.t("followup.approved_msg", fid=fid)
 
 
 def dismiss(fid: str, reason: str,
@@ -608,7 +613,7 @@ def dismiss(fid: str, reason: str,
                    dismissed_ts=_now())
 
     rc, msg = _transition(fid, check, apply, path)
-    return (rc, msg) if rc else (0, f"기각: {fid} → done (dismissed: {reason})")
+    return (rc, msg) if rc else (0, i18n.t("followup.dismissed_msg", fid=fid, reason=reason))
 
 
 def reroute(fid: str, path: Path | None = None,
@@ -635,7 +640,7 @@ def reroute(fid: str, path: Path | None = None,
                    rejections_seen=seen, rerouted_ts=_now())
 
     rc, msg = _transition(fid, check, apply, path, after=_notify_awaiting)
-    return (rc, msg) if rc else (0, f"재분류: {fid} → {STATUS_HUMAN}")
+    return (rc, msg) if rc else (0, i18n.t("followup.rerouted_msg", fid=fid, status=STATUS_HUMAN))
 
 
 def render_human(recs: list[dict]) -> str:
@@ -644,26 +649,43 @@ def render_human(recs: list[dict]) -> str:
     waiting = [r for r in recs if r.get("status") == STATUS_HUMAN]
     approved = [r for r in recs if r.get("status") == "open" and r.get("approved")]
     if not waiting and not approved:
-        return "사람 결정 대기 없음\n"
-    out = [f"사람 결정 대기 {len(waiting)}건" if waiting else "사람 결정 대기 없음"]
+        return i18n.t("followup.none") + "\n"
+    out = [i18n.t("followup.waiting", n=len(waiting)) if waiting else i18n.t("followup.none")]
     for r in waiting:
+        text = kakao_format.clip_words(str(r.get("text") or ""), 100)
+        reason = kakao_format.clip_words(str(r.get("human_reason") or "-"), 300)
         out += [
             "",
-            f"- [{r.get('id')}] from {r.get('source_task')} ({r.get('section')})",
-            f"  본문: {kakao_format.clip_words(str(r.get('text') or ''), 100)}",
-            f"  사유: {kakao_format.clip_words(str(r.get('human_reason') or '-'), 300)}",
+            f"- [{r.get('id')}] from {r.get('source_task')} ({_section_label(r.get('section'))})",
+            "  " + i18n.t("followup.body", text=text),
+            "  " + i18n.t("alert.reason", reason=reason),
         ]
     if approved:
-        out += ["", f"승인됨 — planner 태스크화 대기 {len(approved)}건"]
+        out += ["", i18n.t("followup.approved_head", n=len(approved))]
         out += [f"- [{r.get('id')}] from {r.get('source_task')} "
-                f"(승인 {r.get('approved_ts') or '-'})" for r in approved]
+                + i18n.t("followup.approved_at", ts=r.get("approved_ts") or "-")
+                for r in approved]
     out += [
         "",
-        f"승인:   {CLI} approve <id>",
-        f"기각:   {CLI} dismiss <id> --reason <사유>",
-        f"재분류: {CLI} reroute <id>   (rejected → 사람 결정 대기)",
+        i18n.t("followup.hint_approve", cli=CLI),
+        i18n.t("followup.hint_dismiss", cli=CLI),
+        i18n.t("followup.hint_reroute", cli=CLI),
     ]
     return "\n".join(out) + "\n"
+
+
+# Display names of the recorded (canonical, Korean) section names. The record
+# keeps the canonical name; only the `followups human` listing shows it in the
+# active language. An unknown section is shown as recorded.
+_SECTION_LABEL_KEYS = {
+    NEXT_STEPS_HEADINGS[0]: "followup.section_next_steps",
+    HUMAN_REVIEW_HEADINGS[0]: "followup.section_human_review",
+}
+
+
+def _section_label(section) -> str:
+    key = _SECTION_LABEL_KEYS.get(section)
+    return i18n.t(key) if key else str(section)
 
 
 def _parse_dismiss(rest: list[str]) -> tuple[str, str] | None:
