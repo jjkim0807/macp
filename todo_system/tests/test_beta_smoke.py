@@ -428,7 +428,7 @@ class FakeNode:
 
 
 def _run_smoke(tmp_path, fake, *, cfg=None, remote_cfg=None, budget_usd=0.0,
-               notify=None, now=None):
+               notify=None, now=None, lock_holder=None):
     budget = tmp_path / "budget.json"
     if budget_usd:
         month = (now or dt.datetime.now().astimezone()).strftime("%Y-%m")
@@ -440,7 +440,7 @@ def _run_smoke(tmp_path, fake, *, cfg=None, remote_cfg=None, budget_usd=0.0,
         run=fake, node_script=tmp_path / "app-test-node",
         lock_path=tmp_path / "node.lock", result_root=tmp_path / "results",
         remote_cfg=remote_cfg if remote_cfg is not None else REMOTE_CFG,
-        budget_path=budget, notify=notify, now=now)
+        budget_path=budget, notify=notify, now=now, lock_holder=lock_holder)
 
 
 # --- AC1: success + always-stop --------------------------------------------
@@ -561,3 +561,117 @@ def test_run_smoke_seed_db_injected_before_scenario(tmp_path):
     res = _run_smoke(tmp_path, fake, cfg=cfg)
     assert res["ok"] is True
     assert "seed" in fake.ssh_kinds()                    # run-as cp happened
+
+
+# ===========================================================================
+# Phase 1 (emulator reuse seam) — lock_holder threading, locked flag, logcat agg
+# These keep the beta sweep byte-identical (defaults unchanged) while giving the
+# worker emulator CLI the three seams it needs: an attributable lock holder, a
+# machine-readable "node busy" signal, and the aggregate crash/jank counts.
+# ===========================================================================
+
+import os  # noqa: E402 — grouped with the Phase 1 emulator-seam block
+import socket  # noqa: E402
+
+
+def _advancing():
+    """A FakeNode whose scenario PASSes (title advances within the window)."""
+    return FakeNode(dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"),
+                           _dump("독서하기", "0:30")])
+
+
+def test_run_smoke_lock_holder_defaults_to_host_pid_and_threads_explicit(tmp_path, monkeypatch):
+    """Default ``lock_holder`` keeps the beta sweep's ``<host>:<pid>`` holder; an
+    explicit holder (the worker run_id) is what gets written into the shared lock
+    file. Spying on the Lease ctor pins the value without racing the release."""
+    seen: list = []
+    RealLease = bs.lease.Lease
+
+    def spy(path, holder=None, ttl=120.0):
+        obj = RealLease(path, holder=holder, ttl=ttl)
+        seen.append(obj)
+        return obj
+
+    monkeypatch.setattr(bs.lease, "Lease", spy)
+    res = _run_smoke(tmp_path, _advancing())
+    assert res["ok"] is True
+    assert seen[-1].holder == f"{socket.gethostname()}:{os.getpid()}"
+    res2 = _run_smoke(tmp_path, _advancing(), lock_holder="20261023T234436-macp-worker-emulator-access")
+    assert res2["ok"] is True
+    assert seen[-1].holder == "20261023T234436-macp-worker-emulator-access"
+
+
+def test_run_smoke_lock_contention_sets_locked_flag(tmp_path):
+    """A live foreign holder → zero node calls, ``kind == "node"`` (byte-identical
+    for maybe_publish), and the additive ``locked`` flag True (emulator CLI → 75)."""
+    squatter = lease.Lease(str(tmp_path / "node.lock"), holder="otherhost:999999", ttl=100_000)
+    assert squatter.acquire()
+    try:
+        fake = FakeNode()
+        res = _run_smoke(tmp_path, fake)
+        assert res["ok"] is False
+        assert res["kind"] == "node"
+        assert res["locked"] is True
+        assert fake.calls == []
+    finally:
+        squatter.release()
+
+
+def test_successful_run_is_not_marked_locked(tmp_path):
+    res = _run_smoke(tmp_path, _advancing())
+    assert res["ok"] is True
+    assert res["locked"] is False
+
+
+def test_scan_logcat_aggregates_counts_and_max_skipped():
+    assert bs.scan_logcat_aggregates("I/App: ok\nD/x: y\n") == {
+        "fatal": 0, "anr": 0, "max_skipped_frames": 0}
+    text = (
+        "I/App: started\n"
+        "E/AndroidRuntime: FATAL EXCEPTION: main\n"
+        "E/AndroidRuntime: FATAL EXCEPTION: bg-thread\n"
+        "E/ActivityManager: ANR in com.mulkko (com.mulkko/.Main)\n"
+        "I/Choreographer: Skipped 30 frames!  The application may be doing too much work.\n"
+        "I/Choreographer: Skipped 120 frames!\n"
+        "I/Choreographer: Skipped 7 frames!\n")
+    assert bs.scan_logcat_aggregates(text) == {"fatal": 2, "anr": 1, "max_skipped_frames": 120}
+    assert bs.scan_logcat_aggregates("") == {"fatal": 0, "anr": 0, "max_skipped_frames": 0}
+    assert bs.scan_logcat_aggregates(None) == {  # type: ignore[arg-type]
+        "fatal": 0, "anr": 0, "max_skipped_frames": 0}
+
+
+def test_scan_logcat_aggregates_uses_same_predicates_as_scan_logcat():
+    """The aggregate's FATAL/ANR counts must agree with scan_logcat's verdict, so
+    a crash the gate FAILs on is the same crash the aggregate reports."""
+    text = "I/App: x\nE/AndroidRuntime: FATAL EXCEPTION: main\n"
+    ok, detail = bs.scan_logcat(text)
+    agg = bs.scan_logcat_aggregates(text)
+    assert ok is False and "FATAL=1" in detail
+    assert agg["fatal"] == 1
+
+
+def test_run_smoke_pass_result_carries_logcat_aggregate(tmp_path):
+    fake = FakeNode(
+        dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"), _dump("독서하기", "0:30")],
+        logcat="I/App: started\nI/Choreographer: Skipped 42 frames!\nI/App: ok\n")
+    res = _run_smoke(tmp_path, fake)
+    assert res["ok"] is True
+    assert res["logcat"] == {"fatal": 0, "anr": 0, "max_skipped_frames": 42}
+    assert all(isinstance(v, int) for v in res["logcat"].values())
+
+
+def test_run_smoke_crash_result_carries_logcat_aggregate(tmp_path):
+    fake = FakeNode(
+        dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"), _dump("독서하기", "0:30")],
+        logcat="I/App: started\nE/AndroidRuntime: FATAL EXCEPTION: main\n")
+    res = _run_smoke(tmp_path, fake)
+    assert res["kind"] == "crash"
+    assert res["logcat"]["fatal"] == 1
+
+
+def test_run_smoke_build_failure_logcat_is_empty_dict(tmp_path):
+    """A failure before the device is reachable never scans a logcat, so the
+    aggregate is the stable empty dict, not a missing key."""
+    res = _run_smoke(tmp_path, FakeNode(build_rc=1))
+    assert res["kind"] == "build"
+    assert res["logcat"] == {}
