@@ -1169,6 +1169,59 @@ def pull_engine_checkout(
     return []
 
 
+# The space-free PATH wrappers a worker stage's allowed_tools can grant (one per
+# standing rule in stages._STANDING_RULES + SMS). Kept in sync below so a stage's
+# `Bash(macp-*:*)` rule always resolves to the CURRENT engine's script.
+_WRAPPER_NAMES = ("macp-sms", "macp-browser", "macp-remote-gate", "macp-emulator")
+_WRAPPER_BINDIR = Path("~/.local/bin").expanduser()
+
+
+def sync_wrappers(*, engine: Path | None = None,
+                  bindir: Path | None = None) -> list[str]:
+    """Copy the engine's PATH-wrapper scripts into ``~/.local/bin`` when a dest is
+    missing or its bytes differ, inside the maintenance tick right after the
+    engine checkout is pulled.
+
+    The motivating failure (2026-10-23): ``macp-remote-gate`` existed in the
+    engine's ``scripts/`` and was granted to stages, but had never been installed
+    on this host, so the stage hit ``exit 127`` (command not found). A
+    self-improvement PR that adds or edits a wrapper must reach ``~/.local/bin``
+    without a human running ``cp`` — the daemons about to restart onto the new
+    code should serve the new wrappers in the same tick.
+
+    Best-effort, mirroring :func:`pull_engine_checkout`: a per-file error is
+    collected and the loop continues; only the names actually (re)installed are
+    returned. Copies ONLY when the dest is absent or differs byte-for-byte, so a
+    steady state writes nothing (and leaves mtimes alone). ``engine`` / ``bindir``
+    are test seams; runtime calls pass nothing and get ``engine_root()/scripts``
+    → ``~/.local/bin``.
+    """
+    engine = Path(engine) if engine is not None else paths.engine_root()
+    bindir = Path(bindir).expanduser() if bindir is not None else _WRAPPER_BINDIR
+    synced: list[str] = []
+    try:
+        bindir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"wrapper-sync: cannot create {bindir} — {exc}")
+        return synced
+    for name in _WRAPPER_NAMES:
+        src = engine / "scripts" / name
+        dest = bindir / name
+        try:
+            if not src.is_file():
+                continue
+            src_bytes = src.read_bytes()
+            if dest.exists() and dest.read_bytes() == src_bytes:
+                continue
+            dest.write_bytes(src_bytes)
+            dest.chmod(0o755)
+            synced.append(name)
+        except OSError as exc:
+            print(f"wrapper-sync: {name} skipped — {exc}")
+            continue
+    return synced
+
+
 def _resolve_base_ref(repo_root: Path) -> str | None:
     """The ref a merged branch should already be contained in.
 
@@ -1823,6 +1876,15 @@ def cmd_maintenance() -> int:
                 rc = 1
         except Exception as exc:
             print(f"engine-pull: error — {exc}")
+            rc = 1
+        # New engine code is on disk; refresh the ~/.local/bin PATH wrappers from
+        # it in the same tick so a stage's `Bash(macp-*:*)` rule never hits a
+        # missing/stale wrapper (the 2026-10-23 macp-remote-gate exit 127 block).
+        try:
+            for name in sync_wrappers():
+                print(f"wrapper-sync: {name} (re)installed")
+        except Exception as exc:
+            print(f"wrapper-sync: error — {exc}")
             rc = 1
         # macp edits its own source; the daemons executing those edits are
         # resident and would otherwise never load them.

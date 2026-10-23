@@ -248,6 +248,7 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
     monkeypatch.setattr(worker, "sync_vault_state", rec("sync", 0))
     monkeypatch.setattr(worker, "rotate_logs", rec("rotate", []))
     monkeypatch.setattr(worker, "check_unapplied_migrations", rec("migrations", []))
+    monkeypatch.setattr(worker, "sync_wrappers", rec("wrappers", []))
     monkeypatch.setattr(worker, "restart_stale_daemons", rec("restart", []))
     monkeypatch.setattr(worker, "check_dispatch_silence", rec("silence", None))
     monkeypatch.setattr(worker, "check_work_starvation", rec("starvation", None))
@@ -258,14 +259,15 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
     monkeypatch.setattr(worker.browser_watch, "check_login_watch", boom)
     assert worker.cmd_maintenance() == 1
     assert called == ["autoclose", "sweep", "sync", "rotate", "migrations",
-                      "restart", "silence", "starvation"]
+                      "wrappers", "restart", "silence", "starvation"]
 
 
 def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
     for name in ("autoclose_stale_reviews_local", "sweep_remote_completed_runs",
                  "sync_vault_state"):
         monkeypatch.setattr(worker, name, lambda: 0)
-    for name in ("rotate_logs", "check_unapplied_migrations", "restart_stale_daemons"):
+    for name in ("rotate_logs", "check_unapplied_migrations", "restart_stale_daemons",
+                 "sync_wrappers"):
         monkeypatch.setattr(worker, name, lambda: [])
     for name in ("check_dispatch_silence", "check_work_starvation"):
         monkeypatch.setattr(worker, name, lambda: None)
