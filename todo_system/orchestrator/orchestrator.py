@@ -32,6 +32,7 @@ from .lease import Lease
 
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, Registry, load_registry
+from .state_store import open_state_store
 
 _IN_FLIGHT = (DISPATCHED, ACCEPTED, IN_PROGRESS)
 
@@ -2796,9 +2797,21 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
 
     budget, cap, gradle_cap = resolve_dispatch_limits()
-    orch = Orchestrator(open_mailbox(args.uri, base=base),
+    # Route the mailbox + ledger through the configured backend at default args:
+    # in git mode open_state_store(base).mailbox()/.ledger() are byte-identical to
+    # open_mailbox(default uri, base) / Ledger(base/DEFAULT_LEDGER); external mode
+    # hands back the SQLite mailbox/ledger. A non-default --uri/--ledger keeps the
+    # direct construction (and never builds the external store).
+    if args.uri == f"git://{DEFAULT_ROOT}" and args.ledger == DEFAULT_LEDGER:
+        store = open_state_store(base)
+        mailbox = store.mailbox()
+        ledger = store.ledger()
+    else:
+        mailbox = open_mailbox(args.uri, base=base)
+        ledger = Ledger(base / args.ledger)
+    orch = Orchestrator(mailbox,
                         load_registry(args.registry, base=base),
-                        Ledger(base / args.ledger), daily_run_budget=budget,
+                        ledger, daily_run_budget=budget,
                         max_parallel_per_repo=max(1, int(cap)),
                         max_parallel_gradle_builds=max(0, int(gradle_cap)),
                         default_uri=args.uri, mailbox_base=base)
