@@ -517,3 +517,169 @@ def test_ko_human_nudges_are_byte_identical(monkeypatch):
             f"{head} — 확인해주세요\n📋 {SLUG}\nplease review"), type_
     bare = m.Envelope(to="human-1", type=m.RESULT)
     assert human.compose_kakao(bare, _human_agent()) == "✉️ 메시지가 도착했어요 — 확인해주세요"
+
+
+# --- alerts: en -------------------------------------------------------------------
+# The same alerts with MACP_LANGUAGE=en. Every fixture above is ASCII, so any
+# Hangul left in the output came from the engine's own text.
+
+
+def _no_hangul(text: str, what: str = "") -> None:
+    assert not _HANGUL.search(text), f"{what}: {text!r}"
+
+
+def test_messages_en_has_no_hangul():
+    for key, v in i18n.MESSAGES["en"].items():
+        assert not _HANGUL.search(v), key
+
+
+# The three representative alerts (acceptance criterion: "대표 알림 3종").
+
+def test_en_review_blocked_alert_has_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    text, link = _review_texts(orch, sent)["blocked"]
+    assert text == (
+        "⛔ Pipeline stopped on an unmet precondition — meet it or decide whether to drop this task\n"
+        f"📋 {SLUG}\nreason: needs upstream merge")
+    assert link is None
+    _no_hangul(text)
+
+
+def test_en_poison_alert_has_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    text = _misc_alert_texts(orch, sent)["poison"]
+    assert text == (
+        "🚧 Auto-retry stopped after 3 repeated failures — find the cause and handle it by hand\n"
+        f"📋 {SLUG}\nlast reason: boom on retry")
+    _no_hangul(text)
+
+
+def test_en_followup_digest_notice_has_no_hangul(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    notice = followups._digest_message(_waiting_rec())
+    assert notice == (
+        f"🙋 Decision pending (followups human): [{FID}] {SLUG}\n"
+        "→ python -m todo_system.orchestrator.followups human\n"
+        "reason: needs a person")
+    digest = kakao_format.compose_digest([{"msg": notice}])
+    assert digest.splitlines()[0] == "📮 macp digest — 1 alert(s), 1 decision(s) pending"
+    assert f"[{FID}]" in digest
+    _no_hangul(notice)
+    _no_hangul(digest)
+
+
+# The rest of the in-scope alerts.
+
+def test_en_other_review_framings_have_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    got = _review_texts(orch, sent)
+    assert got["pr"] == (
+        f"✅ Pipeline done · PR open (not merged) — review and merge it\n📋 {SLUG}",
+        "https://example.com/pr/1")
+    assert got["result_run_dir"][0].endswith("\nresult: Worker/runs/r1/delegate.md")
+    assert got["result_no_run_dir"][0].endswith(
+        f"\nresult: delegate.md of the latest run of {SLUG} under Worker/runs/")
+    assert got["failure"][0] == (
+        "❌ No PR · nothing to merge — the failure cause needs a look\n"
+        f"📋 {SLUG}\nrun: latest run of {SLUG} under Worker/runs/")
+    for branch, (text, _link) in got.items():
+        _no_hangul(text, branch)
+
+
+def test_en_account_alerts_have_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    switched, paused = _account_texts(orch, sent, monkeypatch)
+    assert switched.startswith("🔁 Claude account switched dev → alt (usage) — ")
+    assert paused.startswith("⏸ No Claude account usable (dev: usage) — dispatch PAUSED.")
+    _no_hangul(switched, "switch")
+    _no_hangul(paused, "paused")
+
+
+def test_en_other_orchestrator_alerts_have_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    got = _misc_alert_texts(orch, sent)
+    assert got["orphaned"].startswith("🧨 2 unpushed commit(s) from an earlier attempt")
+    assert got["timeout_park"].splitlines()[-1] == (
+        "work is checkpointed on the origin worker branch (not lost)")
+    assert got["blocker_cancelled"].splitlines()[-1] == "upstream: up-task"
+    assert got["propagate"].startswith("🔗 Upstream 'core' changed, so 2 downstream")
+    assert got["parent_complete"].startswith("🧭 2 parent task(s) have all subtasks finished")
+    for kind, text in got.items():
+        _no_hangul(text, kind)
+
+
+def test_en_closed_unmerged_alert_has_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    orch, sent = _alert_orch(tmp_path, monkeypatch)
+    text, _link = _closed_unmerged_text(orch, sent, monkeypatch)
+    assert text == (
+        "⚠️ delegate PR was closed without merging — decide whether to reopen, redo or drop it\n"
+        f"📋 {SLUG}")
+    _no_hangul(text)
+
+
+def test_en_render_human_has_no_hangul(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert followups.render_human([]) == "no human decisions pending\n"
+    out = followups.render_human([_waiting_rec(), APPROVED_REC])
+    assert out.splitlines()[:6] == [
+        "1 human decision(s) pending",
+        "",
+        f"- [{FID}] from {SLUG} (Next steps)",
+        "  text: do the thing",
+        "  reason: needs a person",
+        "",
+    ]
+    assert "- [0123456789ab] from other-task (approved 2026-10-23T10:00:00)" in out
+    _no_hangul(out)
+    _no_hangul(followups.render_human([APPROVED_REC]), "approved only")
+    _no_hangul(followups.render_human([_waiting_rec(section="사람이 검토해야 할 부분")]),
+               "review section")
+
+
+def test_en_followup_cli_replies_have_no_hangul(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    approved, dismissed, rerouted = _cli_replies(tmp_path, monkeypatch)
+    assert approved.startswith(f"approved: {FID} → open+approved. ")
+    assert dismissed == "dismissed: 111111111111 → done (dismissed: not needed)"
+    assert rerouted == "rerouted: 222222222222 → awaiting_human"
+    for text in (approved, dismissed, rerouted):
+        _no_hangul(text)
+
+
+def test_en_human_nudges_have_no_hangul(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    for type_ in HUMAN_KO_HEADS:
+        env = m.Envelope(to="human-1", type=type_, task_id=SLUG,
+                         payload={"summary": "please review"})
+        text = human.compose_kakao(env, _human_agent())
+        assert text.splitlines()[0].endswith(" — please take a look"), type_
+        _no_hangul(text, type_)
+    bare = m.Envelope(to="human-1", type=m.RESULT)
+    assert human.compose_kakao(bare, _human_agent()) == "✉️ A message arrived — please take a look"
+
+
+def test_digest_counts_a_decision_queued_in_the_other_language(monkeypatch):
+    for queued, drained, pending in (("ko", "en", "1 decision(s) pending"),
+                                     ("en", "ko", "결정 1건 대기")):
+        monkeypatch.setenv("MACP_LANGUAGE", queued)
+        notice = followups._digest_message(_waiting_rec())
+        monkeypatch.setenv("MACP_LANGUAGE", drained)
+        digest = kakao_format.compose_digest([{"msg": notice}, {"msg": "⚠️ beta: built"}])
+        assert digest.splitlines()[0].endswith(pending), (queued, drained)
+
+
+def test_alert_text_resolves_language_at_call_time(monkeypatch):
+    rec = _waiting_rec()
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert followups._digest_message(rec).startswith(followups.HUMAN_DIGEST_HEAD)
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    assert followups._digest_message(rec).startswith(i18n.MESSAGES["en"]["followup.digest_head"])
+    assert followups.human_digest_head() == "🙋 Decision pending (followups human)"
+    monkeypatch.setenv("MACP_LANGUAGE", "ko")
+    assert followups.human_digest_head() == followups.HUMAN_DIGEST_HEAD

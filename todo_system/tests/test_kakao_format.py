@@ -19,6 +19,9 @@ from todo_system.kakao_format import (
     clip_words,
     compose_alert,
 )
+from todo_system import i18n
+from todo_system.kakao_format import compose_digest
+from todo_system.orchestrator import followups
 
 # The 2026-09-16 19:42 [검토요청] macp-dashboard-public-access blocker, verbatim.
 BLOCKER_1942 = (
@@ -208,3 +211,80 @@ def test_ko_route_merge_suffix(monkeypatch, tmp_path):
     assert kakao_format.route("alert", now=1010.0, **kw) == ("suppressed", None)
     assert kakao_format.route("alert", now=1000.0 + kakao_format.DEDUP_WINDOW_S + 1, **kw) == (
         "send", "alert\n외 1건 합침")
+
+
+# ---------------------------------------------------------------- clip parity ko/en
+# The length budget is language-blind: the same ASCII inputs clip the same way
+# whichever language the engine's own text is in.
+
+_LANGS = pytest.mark.parametrize("lang", ["ko", "en"])
+_LONG_SLUG = " ".join(f"part{i:02d}-of-a-very-long-slug" for i in range(12))   # ~300 chars
+_LONG_REASON = " ".join([BLOCKER_1942] * 15)                                  # > 4000 chars
+_FID = "abcdef012345"
+
+
+def _parked(**kw) -> dict:
+    rec = {"id": _FID, "source_task": _LONG_SLUG, "human_reason": _LONG_REASON,
+           "status": "awaiting_human"}
+    rec.update(kw)
+    return rec
+
+
+@_LANGS
+def test_followup_digest_notice_clips_the_same_in_both_languages(monkeypatch, lang):
+    monkeypatch.setenv("MACP_LANGUAGE", lang)
+    msg = followups._digest_message(_parked())
+    first = msg.splitlines()[0]
+    assert len(msg) <= KAKAO_TEXT_LIMIT
+    assert first.startswith(f"{followups.human_digest_head()}: [{_FID}] ")
+    assert len(first.split(f"[{_FID}] ", 1)[1]) <= 60          # slug capped at 60
+    assert msg.endswith("…")                                    # tail clipped, marked
+    kept = msg.splitlines()[-1][:-1].split()
+    assert kept[1:] == _LONG_REASON.split()[: len(kept) - 1]   # whole words only
+
+
+@_LANGS
+def test_digest_singleton_keeps_the_followup_id_in_both_languages(monkeypatch, lang):
+    monkeypatch.setenv("MACP_LANGUAGE", lang)
+    digest = compose_digest([{"msg": followups._digest_message(_parked())}])
+    line = digest.splitlines()[1]
+    assert len(line) <= 60
+    assert f"[{_FID}]" in line
+
+
+@_LANGS
+def test_digest_overflow_drops_whole_lines_in_both_languages(monkeypatch, lang):
+    monkeypatch.setenv("MACP_LANGUAGE", lang)
+    entries = [{"msg": f"alert-{i:03d} " + "word " * 30} for i in range(400)]
+    digest = compose_digest(entries)
+    lines = digest.splitlines()
+    assert len(digest) <= KAKAO_TEXT_LIMIT
+    assert 1 < len(lines) < 401                                 # some dropped, never cut
+    assert all(len(line) <= 60 for line in lines[1:])
+    assert lines[0] == i18n.t("digest.headline_fyi", n=400)
+
+
+@_LANGS
+def test_route_merge_suffix_is_dropped_at_the_limit_in_both_languages(monkeypatch, tmp_path, lang):
+    monkeypatch.setenv("MACP_LANGUAGE", lang)
+    kw = dict(event_key="k", dedup_path=tmp_path / "d.json",
+              digest_path=tmp_path / "q.jsonl", log_path=tmp_path / "r.log")
+    later = 1000.0 + kakao_format.DEDUP_WINDOW_S + 1
+    full = "x" * (KAKAO_TEXT_LIMIT - 3)
+    kakao_format.route(full, now=1000.0, **kw)
+    kakao_format.route(full, now=1010.0, **kw)
+    assert kakao_format.route(full, now=later, **kw) == ("send", full)   # suffix would overflow
+    kakao_format.route("short", now=later + 1, **kw)
+    _, final = kakao_format.route("short", now=later + 2 * kakao_format.DEDUP_WINDOW_S, **kw)
+    assert final == "short\n" + i18n.t("digest.merged", n=1)
+
+
+@_LANGS
+def test_alert_headline_survives_an_overlong_tail_in_both_languages(monkeypatch, lang):
+    monkeypatch.setenv("MACP_LANGUAGE", lang)
+    head = i18n.t("alert.review_blocked")
+    out = compose_alert(head, ["📋 demo-task"],
+                        tail=i18n.t("alert.reason", reason=" ".join([BLOCKER_1942] * 30)))
+    assert len(out) <= KAKAO_TEXT_LIMIT
+    assert out.splitlines()[0] == head
+    assert out.endswith("…")
