@@ -1096,9 +1096,13 @@ class StagedExecutor(ClaudeCodeExecutor):
                         r = stages.run_stage_subprocess(
                             argv, cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
                             # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
-                            # is built before run_id exists, so the browser lease owner
-                            # (= run_id, browser stages only) is layered on here.
-                            env=stages.with_browser_owner(stage, stage_env, run_id),
+                            # is built before run_id exists, so the browser AND emulator
+                            # lease owners (= run_id, their own stages only) are layered
+                            # on here — each strips its key on every other stage.
+                            env=stages.with_emulator_owner(
+                                stage,
+                                stages.with_browser_owner(stage, stage_env, run_id),
+                                run_id),
                             timeout=stage_timeout, progress=progress)
                     except subprocess.TimeoutExpired as e:
                         # The stage cap fired. BEFORE this catch, TimeoutExpired escaped

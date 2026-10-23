@@ -251,24 +251,43 @@ REMOTE_GATE_CLI = "macp-remote-gate"
 REMOTE_GATE_TOOL_RULE = f"Bash({REMOTE_GATE_CLI}:*)"
 REMOTE_GATE_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 
+# The on-demand emulator node (beta_smoke.run_smoke on macp-app-test) for a
+# pre-merge on-device check: `macp-emulator run --repo-dir <checkout> --sha <sha>
+# --scenario <json|name> [--seed owner|none]` builds→installs→(seed)→scenario→
+# logcat→always-stops and prints an aggregates-only result JSON. Same space-split
+# problem as SMS/BROWSER/REMOTE_GATE, so one PATH wrapper scripts/macp-emulator
+# gets one space-free rule. Node identity/zone and the owner-seed source live in
+# the vault's .macp/ (remote_gate.json), never in engine code. Unlike the other
+# three standing rules, delegate does NOT get it (an on-device check is a
+# verify/implement concern, not an admin/research one — AC#2).
+EMULATOR_CLI = "macp-emulator"
+EMULATOR_TOOL_RULE = f"Bash({EMULATOR_CLI}:*)"
+EMULATOR_TOOL_STAGES = ("implement", "verify", "quick")
+# The emulator node lease holder (beta_smoke's shared _NODE_LOCK): a run's
+# emulator stages get the run_id here (with_emulator_owner), mirroring
+# BROWSER_OWNER_ENV, so a stage's take of the SAME node lock the beta sweep uses
+# is attributable and the two can never co-drive the node.
+EMULATOR_OWNER_ENV = "MACP_EMULATOR_OWNER"
+
 # Rules every listed stage keeps even when a task supplies its own allowed_tools.
 _STANDING_RULES = ((SMS_TOOL_RULE, SMS_TOOL_STAGES),
                    (BROWSER_TOOL_RULE, BROWSER_TOOL_STAGES),
-                   (REMOTE_GATE_TOOL_RULE, REMOTE_GATE_TOOL_STAGES))
+                   (REMOTE_GATE_TOOL_RULE, REMOTE_GATE_TOOL_STAGES),
+                   (EMULATOR_TOOL_RULE, EMULATOR_TOOL_STAGES))
 
 STAGE_TOOLS = {
     "research": "Read Write",
     "plan": "Read Write",
     "implement": "Read Edit Write Bash(git:*) Bash(uv:*) Bash(npm:*) Bash(pnpm:*) "
                  f"Bash(node:*) Bash(npx:*) Bash(pytest:*) {SMS_TOOL_RULE} "
-                 f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE}",
+                 f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}",
     "verify": (f"Read Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
-               f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE}"),
+               f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}"),
     "report": "Read Write Edit Bash(git:*) Bash(gh:*)",
     "delegate": ("Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*) "
                  f"{SMS_TOOL_RULE} {BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE}"),
     "quick": (f"Read Edit Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
-              f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE}"),
+              f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}"),
     # No Edit: discover reads a throwaway clone and WRITES exactly two files (the
     # episode report + its artifact). The shell set is what "run the project"
     # needs — the CI runner set plus file inspection and a way to bound a
@@ -458,6 +477,28 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             f"handle at once) and read the result back with `{REMOTE_GATE_CLI} poll "
             f"<handle>` / `{REMOTE_GATE_CLI} result <handle>` — the heavy wall-clock "
             "runs on the node, outside this stage's timeout window.\n")
+    if stage in EMULATOR_TOOL_STAGES:
+        # The on-demand emulator-node check, on the metadata rather than the
+        # worker-*.md prompt under .claude/** (unwriteable by a headless stage),
+        # same as the BROWSER/REMOTE_GATE lines above.
+        meta.append(
+            f"- **On-device emulator check ({EMULATOR_CLI})**: ONLY when the task's "
+            "frontmatter/acceptance asks for a real on-device run (advisory "
+            "`emulator: true`) — a UI/behaviour change whose correctness a unit test "
+            f"cannot show. Run `{EMULATOR_CLI} run --repo-dir <checkout> --sha <sha> "
+            "--scenario <json|name> [--seed owner|none]`: it takes the SHARED beta-sweep "
+            "node lease (owner = your run_id, already in `$"
+            f"{EMULATOR_OWNER_ENV}`), builds→installs→(seeds)→runs the scenario→scans "
+            "logcat→ALWAYS stops the node, and prints an aggregates-only result JSON "
+            "(rc · per-step durations · ANR/FATAL counts · max Skipped-frames · "
+            "screenshot paths). SKIP it for a simple/non-visual change; for MANY "
+            "changes at once leave it to the beta-sweep smoke gate rather than one "
+            "scenario here. Exit 75 = node busy (someone else holds the lease — wait "
+            "or stop), 76 = over the shared monthly budget. On any non-zero exit, or "
+            "if the live node / gcloud / `.macp/remote_gate.json` is unreachable from "
+            "this stage, write `blocked_on:` naming the missing precondition and stop "
+            "— do NOT fake a result. Aggregates only: never copy the seed DB, "
+            "screenshots, or dumps into run.log / the commit / the PR.\n")
     if repo:
         meta.append(f"- repo: `{repo}`\n")
         if working_dir:
@@ -2737,4 +2778,18 @@ def with_browser_owner(stage: str, env: dict, owner: str) -> dict:
         out[BROWSER_OWNER_ENV] = owner
     else:
         out.pop(BROWSER_OWNER_ENV, None)
+    return out
+
+
+def with_emulator_owner(stage: str, env: dict, owner: str) -> dict:
+    """The emulator-node twin of :func:`with_browser_owner`: EMULATOR_TOOL_STAGES
+    (implement/verify/quick — NOT delegate) get `owner` (= the run_id) under
+    EMULATOR_OWNER_ENV so `macp-emulator run` takes the shared node lock as this
+    run; every other stage has the key stripped so no stale owner leaks from the
+    runner's own env. Never mutates `env`."""
+    out = dict(env)
+    if stage in EMULATOR_TOOL_STAGES:
+        out[EMULATOR_OWNER_ENV] = owner
+    else:
+        out.pop(EMULATOR_OWNER_ENV, None)
     return out
