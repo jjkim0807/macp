@@ -8,6 +8,7 @@
 | [Running 24/7](running.md) | daemons, systemd and launchd units, the dashboard, several hosts |
 | [Configuration](configuration.md) | environment variables, usage pacing, accounts, Anthropic usage |
 | [Troubleshooting](troubleshooting.md) | a task is not dispatched, a stage fails, the queue is stuck |
+| [External trackers](trackers.md) | syncing tasks with Jira (opt-in): config, field/status mapping, the md-wins conflict rule |
 | [Security](../SECURITY.md) | what a worker can do, and how to contain it — before the first live run |
 | [scripts/README.md](../scripts/README.md) | what each script in `scripts/` is for |
 | [design/](design/) | design notes for work in progress |

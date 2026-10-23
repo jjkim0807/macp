@@ -1853,6 +1853,66 @@ def cmd_unified(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_tracker(args: argparse.Namespace) -> int:
+    """Sync tasks with an external tracker (Jira) — opt-in; md stays the SoT (§⑨).
+
+    Thin dispatcher like `cmd_resume`: the `trackers` package is imported *inside*
+    this function so importing `cli` never imports `trackers` (the top-level import
+    block stays byte-identical, there is no circular import, and the engine-isolation
+    legs keep their current import path). With no tracker config the adapter is None
+    and this is a no-op — no network call, no md written. `ROOT`/`ITEMS_DIR` are read
+    at call time so a test can point them at a tmp vault.
+
+    `pull` upserts tracker issues into `Todo/items/` (idempotent). `push` reads the
+    ledger **read-only** (`Ledger(...).all()`) for `state == done` tasks whose md
+    carries a `jira:` `external_ref`, and sends each the task's merged PR URL; it
+    never writes the ledger.
+    """
+    from .trackers.base import TaskRecord, upsert_task_record
+    from .trackers.jira import JiraAdapter
+
+    adapter = JiraAdapter.from_config(vault_root=ROOT)
+    if adapter is None:
+        print(
+            "tracker: no Jira config — set .macp/config.toml jira_base_url/jira_project "
+            "+ .secrets/jira.json (or MACP_JIRA_* env). Nothing to do."
+        )
+        return 0
+
+    if args.tracker_command == "pull":
+        records = adapter.pull(since=args.since)
+        for rec in records:
+            result = upsert_task_record(rec, ITEMS_DIR)
+            print(f"  {result.action}: {result.path.name} ({rec.external_ref})")
+        print(f"tracker pull: {len(records)} issue(s)")
+        return 0
+
+    if args.tracker_command == "push":
+        from .orchestrator.assignment import DONE, Ledger
+
+        ledger = Ledger(ROOT / "Worker" / "assignments")
+        pushed = 0
+        for a in ledger.all():
+            if a.state != DONE:
+                continue
+            task_md = ITEMS_DIR / f"{a.task_id}.md"
+            if not task_md.exists():
+                continue
+            fm, _ = parse_frontmatter(task_md.read_text(encoding="utf-8"))
+            ext = fm.get("external_ref")
+            if not (isinstance(ext, str) and ext.startswith("jira:")):
+                continue
+            pr_url = (a.payload or {}).get("pr_url")
+            adapter.push(TaskRecord(external_ref=ext, status="done", pr_url=pr_url))
+            print(f"  pushed: {ext}")
+            pushed += 1
+        print(f"tracker push: {pushed} task(s)")
+        return 0
+
+    print("tracker: unknown subcommand", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="second-brain todo system (SQLite + Markdown sync)")
     parser.add_argument("--db", default=str(DB_PATH), help="Path to SQLite DB file")
@@ -2019,6 +2079,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_resume.add_argument("--note", help="Why this resume was reserved")
     p_resume.set_defaults(func=cmd_resume)
+
+    p_tracker = sub.add_parser(
+        "tracker",
+        help="Sync tasks with an external tracker (Jira) — opt-in; md stays source of truth",
+    )
+    tracker_sub = p_tracker.add_subparsers(dest="tracker_command", required=True)
+    p_tracker_pull = tracker_sub.add_parser(
+        "pull", help="Import tracker issues into Todo/items (idempotent upsert)")
+    p_tracker_pull.add_argument(
+        "--since", help="Only issues updated at/after this tracker-native cursor (e.g. 2026-10-01)")
+    tracker_sub.add_parser("push", help="Push done tasks (+ merged PR URL) to the tracker")
+    p_tracker.set_defaults(func=cmd_tracker)
 
     return parser
 
