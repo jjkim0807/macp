@@ -84,15 +84,32 @@ def _newer(a: str, b: str) -> bool:
     return ta is not None and tb is not None and ta > tb
 
 
+def _mtime_iso(f: Path) -> str:
+    """The file's mtime as local ISO-8601 — a stand-in for a missing timestamp
+    that, unlike ``now_iso()``, is the same on every run."""
+    return (dt.datetime.fromtimestamp(f.stat().st_mtime).astimezone()
+            .replace(microsecond=0).isoformat())
+
+
 def _read_assignments(root: Path) -> tuple[list[Assignment], int]:
-    """Every parseable row, filename-sorted like ``Ledger.all``; the rest counted."""
+    """Every parseable row, filename-sorted like ``Ledger.all``; the rest counted.
+
+    A row from an older build without ``created_ts`` / ``updated_ts`` gets the
+    file's mtime instead of the dataclass's ``now_iso()`` default, so a rerun
+    reads the same row and import stays idempotent.
+    """
     if not root.is_dir():
         return [], 0
     rows: list[Assignment] = []
     skipped = 0
     for f in sorted(root.glob("*.json")):
         try:
-            rows.append(Assignment.from_json(f.read_text(encoding="utf-8")))
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for key in ("created_ts", "updated_ts"):
+                    if key not in data:
+                        data[key] = _mtime_iso(f)
+            rows.append(Assignment.from_json(json.dumps(data)))
         except _BAD_ROW:
             skipped += 1
     return rows, skipped
@@ -133,11 +150,9 @@ def _load_envelope(agent_id: str, f: Path) -> tuple[Envelope | None, bool]:
     d["to"] = agent_id
     if not d.get("ts"):
         try:
-            mtime = f.stat().st_mtime
+            d["ts"] = _mtime_iso(f)
         except OSError:
             return None, False
-        d["ts"] = (dt.datetime.fromtimestamp(mtime).astimezone()
-                   .replace(microsecond=0).isoformat())
     try:
         return Envelope.from_dict(d), rewritten
     except (ValueError, KeyError, TypeError):
