@@ -61,6 +61,15 @@ The **control plane** (orchestrator, planner, ledger) decides; the **data plane*
 directory you own: tasks, memory, run records, secrets. This repository is the engine
 and holds no personal data. [How it works](docs/concepts.md) has the full picture.
 
+Orchestration state — the assignment ledger, the mailboxes and the planner's notes —
+is **git-backed by default**, living in the vault tree (`Worker/assignments/`,
+`Worker/agents/`) so a second host can take over from git alone. Setting
+`MACP_STATE_BACKEND=external` (or `state_backend = "external"` in `.macp/config.toml`)
+instead keeps it in a host-local SQLite file outside the vault tree
+(`~/.local/share/macp/state.sqlite`, overridable with `MACP_STATE_SQLITE_PATH`), so a
+stray `git checkout`/`reset`/`stash` can never resurrect an acked message or rewind
+the ledger; the derived `todo.db` task cache is unaffected either way.
+
 ## Try it in five minutes
 
 No agent is called and nothing leaves your machine. You need Linux or macOS,

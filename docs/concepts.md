@@ -72,6 +72,18 @@ Ledger states: `dispatched`, `accepted`, `in_progress`, `done`, `failed`, `rejec
 orchestrator owns it. To change what happens to a task, edit its markdown or reply
 through the human CLI.
 
+By default this state is **git-backed**: the ledger lives in the vault tree as
+`Worker/assignments/*.json` and the mailboxes as `Worker/agents/*/inbox/*.json`,
+committed and synced like everything else, so a second host can take over from git
+alone. An **opt-in external backend** (`MACP_STATE_BACKEND=external`, or
+`state_backend = "external"` in `.macp/config.toml`) instead keeps the ledger,
+mailbox and planner state in a single host-local SQLite file *outside* the vault
+tree (`~/.local/share/macp/state.sqlite` by default, overridable with
+`MACP_STATE_SQLITE_PATH`). That removes the one git-manipulation hazard the git
+backend carries — a stray `checkout`, `reset --hard` or `stash` in the vault can no
+longer resurrect an already-acked message or rewind the ledger. `todo.db` is a
+derived cache of the task markdown and is **not** migrated either way.
+
 ## The staged pipeline
 
 | Stage | Reads | Writes | Job |
