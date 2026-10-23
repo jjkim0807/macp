@@ -1035,7 +1035,9 @@ class Orchestrator:
         if run_dir:
             base = f"Worker/runs/{Path(run_dir).name}"
             return f"{base}/{art}" if art else base
-        return f"Worker/runs/ 아래 {a.task_id} 최신 run" + (f" 의 {art}" if art else "")
+        if art:
+            return i18n.t("alert.no_pr_hint_art", task=a.task_id, art=art)
+        return i18n.t("alert.no_pr_hint", task=a.task_id)
 
     def _task_title(self, slug: str) -> str:
         """Best-effort human title for line 2 of an alert — the task md's first
@@ -1103,8 +1105,7 @@ class Orchestrator:
         reason = str(sw.get("reason") or "capacity")
         lines = [f"📋 {self._task_title(a.task_id)}"]
         if to:
-            headline = (f"🔁 Claude 계정 전환 {frm} → {to} ({reason}) — "
-                        "다음 틱부터 새 계정으로 재디스패치됩니다")
+            headline = i18n.t("alert.account_switch", frm=frm, to=to, reason=reason)
             self._notify_routed(human.compose_alert(headline, lines), None,
                                 event_key=f"account-switch:{frm}:{to}",
                                 cooldown_s=REVIEW_RENOTIFY_COOLDOWN_S)
@@ -1116,8 +1117,7 @@ class Orchestrator:
             first = True                 # a broken guard must not lose the alert
         if not first:
             return
-        headline = (f"⏸ 모든 Claude 계정 사용 불가 ({frm}: {reason}) — 디스패치 PAUSED. "
-                    "윈도 리셋·재로그인·macp account use 중 하나로 자동 해제")
+        headline = i18n.t("alert.account_paused", frm=frm, reason=reason)
         self._notify_routed(human.compose_alert(headline, lines), None,
                             event_key="account-paused", cooldown_s=REVIEW_RENOTIFY_COOLDOWN_S)
 
@@ -1151,20 +1151,20 @@ class Orchestrator:
         tail = ""
         if blocker:
             a.last_alert_kind = ALERT_BLOCKED
-            headline = ("⛔ 파이프라인이 선행 조건 미충족으로 멈췄어요 — "
-                        "조건을 갖추거나 이 태스크를 접을지 판단해주세요")
-            tail = f"사유: {blocker}"   # English blocker → word-clipped tail; run/PR has the full text
+            headline = i18n.t("alert.review_blocked")
+            # English blocker → word-clipped tail; run/PR has the full text
+            tail = i18n.t("alert.reason", reason=blocker)
         elif pr:
             a.last_alert_kind = ALERT_REVIEW_PR
-            headline = "✅ 파이프라인 완료 · PR 열림(미머지) — 리뷰 후 머지해주세요"
+            headline = i18n.t("alert.review_pr")
             link = pr
         elif msg.type == m.RESULT:
             a.last_alert_kind = ALERT_RESULT_NO_PR
-            headline = "✅ 정상 완료 · 머지할 PR 없음(0-commit) — 결과 확인 후 태스크를 닫아주세요"
-            lines.append(f"결과: {self._no_pr_artifact_hint(a, p)}")
+            headline = i18n.t("alert.review_result_no_pr")
+            lines.append(i18n.t("alert.result", hint=self._no_pr_artifact_hint(a, p)))
         else:
             a.last_alert_kind = ALERT_FAILURE_SUSPECTED
-            headline = "❌ PR 없음 · 머지할 것이 없어요 — 실패 원인 확인이 필요합니다"
+            headline = i18n.t("alert.review_failure")
             lines.append(f"run: {self._no_pr_artifact_hint(a, p)}")
         text = human.compose_alert(headline, lines, tail=tail)
         # Immediate — a human judgement is the whole point. The event key pins
@@ -1219,8 +1219,7 @@ class Orchestrator:
         # cherry-pick command ride as WHOLE lines only (compose_alert drops a line
         # that would overflow, never bisects it), so a truncated sha can never
         # masquerade as a usable one, and the full set is always in stages.json.
-        headline = (f"🧨 이전 시도의 미푸시 커밋 {count}개가 되감겼어요 — "
-                    "되살릴지 무시할지 판단해주세요")
+        headline = i18n.t("alert.orphaned", count=count)
         lines = [
             f"📋 {self._task_title(a.task_id)}",
             f"tip {tip}" if tip else "",
@@ -1234,10 +1233,9 @@ class Orchestrator:
     def _notify_poison(self, a: Assignment) -> None:
         """A task quarantined after repeated failures — hand it to a human instead
         of retrying forever. One ping; never break dispatch on a notify failure."""
-        headline = (f"🚧 {a.refail_count}회 재실패로 자동 재시도를 멈췄어요 — "
-                    "원인 확인 후 수동 처리가 필요합니다")
-        text = human.compose_alert(headline, [f"📋 {self._task_title(a.task_id)}"],
-                                   tail=f"최근 사유: {a.last_note}" if a.last_note else "")
+        headline = i18n.t("alert.poison", n=a.refail_count)
+        tail = i18n.t("alert.recent_reason", note=a.last_note) if a.last_note else ""
+        text = human.compose_alert(headline, [f"📋 {self._task_title(a.task_id)}"], tail=tail)
         self._notify_routed(text, None, event_key=f"poison:{a.task_id}")
 
     def _notify_timeout_park(self, a: Assignment) -> None:
@@ -1245,10 +1243,9 @@ class Orchestrator:
         that keeps getting cut at the same stage. Hand it to a human. The commits
         are safe on origin (checkpoint_push), so this is a 'too big for one stage'
         alert, not a loss alert. One ping; never break collect on a notify failure."""
-        headline = (f"⏱️ {a.timeout_streak}회 연속 stage timeout으로 대기 전환 — "
-                    "더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다")
+        headline = i18n.t("alert.timeout_park", n=a.timeout_streak)
         lines = [f"📋 {self._task_title(a.task_id)}",
-                 "작업은 origin worker 브랜치에 checkpoint됨(유실 아님)"]
+                 i18n.t("alert.timeout_checkpointed")]
         text = human.compose_alert(headline, lines)
         self._notify_routed(text, None, event_key=f"timeout-park:{a.task_id}")
 
@@ -1257,9 +1254,8 @@ class Orchestrator:
         deliver the precondition, so the task cannot proceed — but it may also no
         longer be wanted, and only a human can say which. One ping; never break
         dispatch on a notify failure."""
-        headline = ("🔗 대기하던 상류 태스크가 취소돼 진행 불가 — "
-                    "이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다")
-        lines = [f"📋 {self._task_title(a.task_id)}", f"상류: {blocker}"]
+        headline = i18n.t("alert.blocker_cancelled")
+        lines = [f"📋 {self._task_title(a.task_id)}", i18n.t("alert.upstream", blocker=blocker)]
         text = human.compose_alert(headline, lines)
         self._notify_routed(text, None, event_key=f"blocker-cancelled:{a.task_id}")
 
@@ -1373,8 +1369,7 @@ class Orchestrator:
         """Self-limiting alert for downstream integration-checks just created. The
         count + the ask are in the headline; the slug list rides as a word-clipped
         tail (each slug is one whitespace-free token, so it is never bisected)."""
-        headline = (f"🔗 상류 '{proj}' 변경으로 하류 통합검증 {len(created)}개를 만들었어요 — "
-                    "검증 결과를 확인해주세요")
+        headline = i18n.t("alert.propagate", proj=proj, n=len(created))
         return human.compose_alert(headline, tail=", ".join(created))
 
     def _propagate_downstream(self, slug: str) -> None:
@@ -1685,8 +1680,7 @@ class Orchestrator:
                                 a.history.append({"ts": m.now_iso(), "type": _CLOSED_UNMERGED,
                                                   "from": "orchestrator"})
                                 text = human.compose_alert(
-                                    "⚠️ delegate PR이 머지 없이 닫혔어요 — "
-                                    "다시 열지·재작업할지·접을지 판단해주세요",
+                                    i18n.t("alert.closed_unmerged"),
                                     [f"📋 {self._task_title(a.task_id)}"])
                                 self._notify_routed(
                                     text, event_key=f"closed-unmerged:{a.task_id}")
@@ -2029,8 +2023,7 @@ class Orchestrator:
     def _notify_parent_complete(self, rows: list[dict]) -> None:
         """One ping listing parents whose children are all finished. Never break
         the tick on a notify failure."""
-        headline = (f"🧭 하위 작업이 모두 끝난 상위 태스크 {len(rows)}건이 아직 open이에요 — "
-                    "닫을지 후속 작업을 추가할지 확인해주세요")
+        headline = i18n.t("alert.parent_complete", n=len(rows))
         row_lines = [f"- {r['slug']} ({r.get('title') or '-'})" for r in rows]
         text = human.compose_alert(headline, row_lines)
         # Immediate (a close/keep judgement is being asked); no event key —
