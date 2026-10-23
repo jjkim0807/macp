@@ -76,11 +76,11 @@ class BrowserToolWiringTest(unittest.TestCase):
     def test_task_override_keeps_the_rule(self):
         self.assertEqual(stages._safe_tools("implement", "Read,Bash(gcloud:*)"),
                          ["Read", "Bash(gcloud:*)", stages.SMS_TOOL_RULE, RULE,
-                          stages.REMOTE_GATE_TOOL_RULE])
+                          stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE])
         # Already listed by the task: exactly once.
         self.assertEqual(stages._safe_tools("implement", f"Read,{RULE}"),
                          ["Read", RULE, stages.SMS_TOOL_RULE,
-                          stages.REMOTE_GATE_TOOL_RULE])
+                          stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE])
         # Stages a task cannot widen still return their own default untouched.
         self.assertEqual(stages._safe_tools("verify", "Read,Bash(gcloud:*)"),
                          stages.STAGE_TOOLS["verify"].split())
