@@ -233,14 +233,14 @@ class GitStateStore(StateStore):
 def open_state_store(vault_root: str | Path | None = None) -> StateStore:
     """Build the StateStore for the configured backend (design §③/§⑥).
 
-    ``git`` (the default) returns :class:`GitStateStore`; ``external`` is leaf
-    ④'s not-yet-built SQLite backend and raises ``NotImplementedError`` naming
-    it, rather than silently falling back to git.
+    ``git`` (the default) returns :class:`GitStateStore`; ``external`` returns
+    leaf ④'s :class:`~todo_system.orchestrator.state_store_sqlite.ExternalStateStore`
+    (host-local SQLite outside the vault tree). The external module is imported
+    lazily, so the default path never loads it.
     """
     backend = paths.state_backend()
     if backend == "git":
         return GitStateStore(vault_root)
-    raise NotImplementedError(
-        "state_backend='external' has no backend yet — see "
-        "docs/design/state-store.md leaf ④ (ExternalStateStore / state_store_sqlite.py)"
-    )
+    from .state_store_sqlite import ExternalStateStore
+
+    return ExternalStateStore(vault_root=vault_root)

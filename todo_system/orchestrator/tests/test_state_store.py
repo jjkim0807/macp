@@ -31,6 +31,7 @@ from todo_system.orchestrator.state_store import (
     TodoCacheReader,
     open_state_store,
 )
+from todo_system.orchestrator.state_store_sqlite import ExternalStateStore
 
 
 @pytest.fixture
@@ -283,7 +284,11 @@ def test_open_state_store_default_returns_git_store(monkeypatch, vault):
     assert result.vault_root == vault
 
 
-def test_open_state_store_env_external_raises_not_implemented(monkeypatch, vault):
+def test_open_state_store_env_external_returns_sqlite_store(monkeypatch, vault, tmp_path):
     monkeypatch.setenv("MACP_STATE_BACKEND", "external")
-    with pytest.raises(NotImplementedError):
-        open_state_store(vault)
+    # Explicit tmp path so this never writes the default host state.sqlite.
+    monkeypatch.setenv("MACP_STATE_SQLITE_PATH", str(tmp_path / "state.sqlite"))
+    store = open_state_store(vault)
+    assert isinstance(store, ExternalStateStore)
+    assert store.vault_root == vault
+    assert store.sqlite_path == tmp_path / "state.sqlite"

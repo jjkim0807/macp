@@ -50,14 +50,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .. import paths
 from .assignment import Assignment, Ledger
 from .mailbox import Mailbox
 from .message import Envelope, now_iso
-from .state_store import PlannerKV
+from .state_store import GitTodoCacheReader, PlannerKV, StateStore, TodoCacheReader
 
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "SCHEMA_VERSION",
+    "ExternalStateStore",
     "SqliteLedger",
     "SqliteMailbox",
     "SqlitePlannerKV",
@@ -361,3 +363,57 @@ class SqliteMailbox(Mailbox):
             finally:
                 con.close()
         return set(acked_ids)
+
+
+class ExternalStateStore(StateStore):
+    """The external backend: one host-local SQLite file, built by composition.
+
+    Mirrors :class:`~todo_system.orchestrator.state_store.GitStateStore` — the
+    sub-surfaces are built on first use and cached per instance. The schema is
+    bootstrapped in ``__init__`` so a freshly-pointed path is usable at once.
+    todo_cache reuses the git backend's ``GitTodoCacheReader`` unchanged (todo.db
+    is a derived md cache, not migrated — design §②).
+    """
+
+    def __init__(
+        self,
+        sqlite_path: str | Path | None = None,
+        vault_root: str | Path | None = None,
+        todo_db_path: str | Path | None = None,
+    ):
+        self.sqlite_path = (
+            Path(sqlite_path) if sqlite_path is not None
+            else paths.state_sqlite_path()
+        )
+        # Same resolution as GitStateStore, for the todo_cache db default below.
+        self.vault_root = (
+            Path(vault_root) if vault_root is not None
+            else paths.vault_root(start=paths.vault_search_start())
+        )
+        self.todo_db_path = todo_db_path
+        _bootstrap(self.sqlite_path)
+        self._ledger: Ledger | None = None
+        self._mailbox: Mailbox | None = None
+        self._planner_kv: PlannerKV | None = None
+        self._todo_cache: TodoCacheReader | None = None
+
+    def ledger(self) -> Ledger:
+        if self._ledger is None:
+            self._ledger = SqliteLedger(self.sqlite_path)
+        return self._ledger
+
+    def mailbox(self) -> Mailbox:
+        if self._mailbox is None:
+            self._mailbox = SqliteMailbox(self.sqlite_path)
+        return self._mailbox
+
+    def planner_kv(self) -> PlannerKV:
+        if self._planner_kv is None:
+            self._planner_kv = SqlitePlannerKV(self.sqlite_path)
+        return self._planner_kv
+
+    def todo_cache(self) -> TodoCacheReader:
+        if self._todo_cache is None:
+            db = self.todo_db_path or self.vault_root / "Todo" / "todo.db"
+            self._todo_cache = GitTodoCacheReader(db)
+        return self._todo_cache

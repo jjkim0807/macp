@@ -13,14 +13,17 @@ vault.
 
 from __future__ import annotations
 
+import multiprocessing
 import sqlite3
 
 import pytest
 
 from todo_system.orchestrator import message as m
 from todo_system.orchestrator import state_store_sqlite as sss
-from todo_system.orchestrator.assignment import DONE, IN_PROGRESS, Assignment
+from todo_system.orchestrator.assignment import DONE, IN_PROGRESS, Assignment, Ledger
+from todo_system.orchestrator.mailbox import Mailbox
 from todo_system.orchestrator.message import Envelope
+from todo_system.orchestrator.state_store import PlannerKV, StateStore, TodoCacheReader
 
 
 @pytest.fixture
@@ -187,3 +190,66 @@ def test_at_least_once_crash_before_ack_redelivers(db):
     # now ack through a fresh object; a later fresh object sees nothing
     sss.SqliteMailbox(db).ack("ag", redelivered)
     assert sss.SqliteMailbox(db).receive("ag") == []
+
+
+# ---------------------------------------------------------------------------
+# ExternalStateStore assembly + WAL two-process concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_external_store_sub_surfaces_are_the_abc_types(db):
+    store = sss.ExternalStateStore(sqlite_path=db, vault_root=db.parent)
+    assert isinstance(store, StateStore)
+    assert isinstance(store.ledger(), Ledger)
+    assert isinstance(store.mailbox(), Mailbox)
+    assert isinstance(store.planner_kv(), PlannerKV)
+    assert isinstance(store.todo_cache(), TodoCacheReader)
+    # cached per instance (like GitStateStore)
+    assert store.ledger() is store.ledger()
+    assert store.mailbox() is store.mailbox()
+    assert store.planner_kv() is store.planner_kv()
+    assert store.todo_cache() is store.todo_cache()
+
+
+def test_external_store_bootstraps_on_construction(db):
+    assert not db.exists()
+    sss.ExternalStateStore(sqlite_path=db, vault_root=db.parent)
+    assert db.exists()                              # __init__ bootstrapped the schema
+
+
+def _writer_proc(sqlite_path, prefix, count):
+    """Child entry point for the two-process WAL test. Module-level so the
+    ``spawn`` start method can pickle it by qualified name. Opens its OWN
+    ExternalStateStore on the shared file and writes `count` ledger rows; a
+    "database is locked" would raise and exit the child non-zero, which the
+    parent asserts against."""
+    store = sss.ExternalStateStore(sqlite_path=sqlite_path, vault_root=sqlite_path.parent)
+    ledger = store.ledger()
+    for i in range(count):
+        ledger.save(Assignment(
+            task_id=f"{prefix}-{i}", agent_id="w", corr_id=f"c-{i}", state=IN_PROGRESS))
+
+
+def test_wal_two_process_concurrent_writes(db):
+    # Parent bootstraps first, so the child opens an existing DB (its own
+    # re-bootstrap is then a cheap IF NOT EXISTS no-op under the write lock).
+    ledger = sss.ExternalStateStore(sqlite_path=db, vault_root=db.parent).ledger()
+    n = 40
+    ctx = multiprocessing.get_context("spawn")
+    child = ctx.Process(target=_writer_proc, args=(db, "child", n))
+    child.start()
+    try:
+        for i in range(n):                          # parent writes concurrently
+            ledger.save(Assignment(
+                task_id=f"parent-{i}", agent_id="w", corr_id=f"c-{i}", state=IN_PROGRESS))
+        child.join(timeout=60)
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=10)
+    # WAL + busy_timeout serialized the two writers with no OperationalError.
+    assert child.exitcode == 0
+    task_ids = {a.task_id for a in ledger.all()}
+    assert task_ids == (
+        {f"parent-{i}" for i in range(n)} | {f"child-{i}" for i in range(n)})
+    assert len(task_ids) == 2 * n                   # every row from both processes landed
