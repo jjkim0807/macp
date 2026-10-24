@@ -706,3 +706,20 @@ def test_archive_creates_missing_result_dir_with_real_git(tmp_path):
     remote = bs._archive_and_push(run, "node-script", repo, sha, result_dir, {}, 10**9)
     assert (result_dir / "src.tar.gz").is_file()
     assert remote
+
+
+def test_node_build_script_lets_the_shell_expand_tilde():
+    # 2026-10-24 real round-trip: `tar -xzf "~/mk-smoke-src.tar.gz"` — a quoted ~
+    # is literal, so the node build died with "Cannot open". The tarball path must
+    # reach the node shell unquoted so ~ expands.
+    from todo_system.orchestrator import beta_smoke as bs
+    seen = []
+
+    def run(argv, *, cwd=None, env=None, timeout=None):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "/x/app-debug.apk\n", "")
+
+    bs._build_debug_apk(run, "node", "a" * 40, "~/mk-smoke-src.tar.gz", {}, {}, 10**9)
+    script = seen[0][-1]
+    assert "tar -xzf ~/mk-smoke-src.tar.gz" in script
+    assert '"~/' not in script

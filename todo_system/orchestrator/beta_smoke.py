@@ -598,6 +598,19 @@ def _archive_and_push(run: Runner, node_script: Path | str, repo_dir: Path | str
     return remote_tar
 
 
+def _save_build_log(env: dict, cp, keep: int = 80) -> None:
+    """Keep the last ``keep`` lines of a failed node build in ``<result_dir>/build.log``
+    (beside screens/, never in the result JSON) so a red build can be diagnosed
+    without another paid node round-trip. Best-effort."""
+    try:
+        out = Path(env.get("APP_TEST_OUT", ".")).parent / "build.log"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        text = ((getattr(cp, "stdout", "") or "") + "\n" + (getattr(cp, "stderr", "") or ""))
+        out.write_text("\n".join(text.splitlines()[-keep:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _build_debug_apk(run: Runner, node_script: Path | str, sha: str, remote_tar: str,
                      smoke_cfg: dict, env: dict, deadline: float) -> str:
     """Extract the tarball into a per-sha dir on the node and build the debug APK.
@@ -608,13 +621,16 @@ def _build_debug_apk(run: Runner, node_script: Path | str, sha: str, remote_tar:
     script = (
         "set -e; "
         f'd="{bdir}"; mkdir -p "$d"; '
-        f'tar -xzf "{remote_tar}" -C "$d"; cd "$d"; '
+        # Unquoted on purpose: remote_tar starts with `~/`, which the node shell
+        # expands only outside quotes (quoted, tar looked for a literal "~" dir).
+        f'tar -xzf {remote_tar} -C "$d"; cd "$d"; '
         'printf "sdk.dir=%s\\n" "$HOME/android" > local.properties; '
         f'./gradlew {task} --no-daemon; '
         "find \"$d\" -path '*/build/outputs/apk/*' -name '*debug*.apk' | head -1")
     b = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
     if getattr(b, "returncode", 1) != 0:
-        raise SmokeError("build", f"debug 빌드 실패 (rc={getattr(b, 'returncode', None)})")
+        _save_build_log(env, b)
+        raise SmokeError("build", f"debug 빌드 실패 (rc={getattr(b, 'returncode', None)}) — build.log")
     apk = _last_line(b)
     if not apk.endswith(".apk"):
         raise SmokeError("build", "debug APK 산출물 없음")
