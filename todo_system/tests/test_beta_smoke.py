@@ -675,3 +675,34 @@ def test_run_smoke_build_failure_logcat_is_empty_dict(tmp_path):
     res = _run_smoke(tmp_path, FakeNode(build_rc=1))
     assert res["kind"] == "build"
     assert res["logcat"] == {}
+
+
+def test_archive_creates_missing_result_dir_with_real_git(tmp_path):
+    # 2026-10-24 first real node round-trip: result_dir did not exist yet, so
+    # `git archive -o <result_dir>/src.tar.gz` exited 128 before any node work.
+    import subprocess
+    from todo_system.orchestrator import beta_smoke as bs
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)  # noqa: E731
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (repo / "f.txt").write_text("x\n")
+    g("add", "f.txt")
+    g("commit", "-qm", "c")
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    result_dir = tmp_path / "results" / f"repo-{sha[:12]}"
+    assert not result_dir.exists()
+    calls = []
+
+    def run(argv, *, cwd=None, env=None, timeout=None):
+        if argv[:2] == ["git", "archive"]:
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    remote = bs._archive_and_push(run, "node-script", repo, sha, result_dir, {}, 10**9)
+    assert (result_dir / "src.tar.gz").is_file()
+    assert remote

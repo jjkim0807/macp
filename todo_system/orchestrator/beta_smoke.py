@@ -584,6 +584,9 @@ def _archive_and_push(run: Runner, node_script: Path | str, repo_dir: Path | str
     """``git archive`` the merged sha locally, ship the tarball to the node, and
     return the node-side tarball path. Infra failure → ``SmokeError("node")``."""
     tar = result_dir / "src.tar.gz"
+    # `git archive -o` does not create parent dirs: without this the first smoke of
+    # every new sha failed with rc=128 (found by the first real round-trip, 10-24).
+    Path(result_dir).mkdir(parents=True, exist_ok=True)
     a = run(["git", "archive", "--format=tar.gz", "-o", str(tar), sha],
             cwd=str(repo_dir), timeout=_remaining(deadline))
     if getattr(a, "returncode", 1) != 0:
