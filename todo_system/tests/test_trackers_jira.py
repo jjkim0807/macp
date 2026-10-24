@@ -313,7 +313,7 @@ def test_pull_cancelled_status_adds_cancelled_tag(jira_server):
 def test_push_transition_and_comment_bodies_match_mapping(jira_server):
     task = TaskRecord(
         external_ref="jira:PROJ-123", status="done",
-        pr_url="https://github.com/jjkim0807/macp/pull/5",
+        pr_url="https://github.com/example/repo/pull/5",
     )
     assert _adapter(jira_server).push(task) == "jira:PROJ-123"
 
@@ -327,7 +327,7 @@ def test_push_transition_and_comment_bodies_match_mapping(jira_server):
     assert post_trans and post_trans[0]["json"] == {"transition": {"id": "31"}}  # the "Done" id
     assert comment and comment[0]["json"]["body"]["type"] == "doc"               # minimal ADF
     text_nodes = comment[0]["json"]["body"]["content"][0]["content"]
-    assert any("github.com/jjkim0807/macp/pull/5" in n.get("text", "") for n in text_nodes)
+    assert any("github.com/example/repo/pull/5" in n.get("text", "") for n in text_nodes)
 
 
 def test_push_open_task_without_pr_is_noop(jira_server):
