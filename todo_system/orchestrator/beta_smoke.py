@@ -458,7 +458,10 @@ _DEFAULT_POLL_INTERVAL_S = 1.0
 # emulator SDK and the per-sha build dir live under $HOME, mirroring the node
 # script's own `shot` and remote_gate's `$HOME/rg-src`.
 _ADB = "~/android/platform-tools/adb"
-_AAPT2 = "~/android/build-tools/*/aapt2"
+# The newest build-tools' aapt2. A bare `build-tools/*/aapt2` glob expands to
+# EVERY installed version, so the second path became an argument to the first
+# ("unknown subcommand", first real round-trip 2026-10-24).
+_AAPT2 = "$(ls -1d ~/android/build-tools/*/aapt2 | sort -V | tail -1)"
 _DEFAULT_GRADLE_TASK = ":app:assembleDebug"
 
 
@@ -598,12 +601,12 @@ def _archive_and_push(run: Runner, node_script: Path | str, repo_dir: Path | str
     return remote_tar
 
 
-def _save_build_log(env: dict, cp, keep: int = 80) -> None:
+def _save_build_log(env: dict, cp, keep: int = 80, name: str = "build.log") -> None:
     """Keep the last ``keep`` lines of a failed node build in ``<result_dir>/build.log``
     (beside screens/, never in the result JSON) so a red build can be diagnosed
     without another paid node round-trip. Best-effort."""
     try:
-        out = Path(env.get("APP_TEST_OUT", ".")).parent / "build.log"
+        out = Path(env.get("APP_TEST_OUT", ".")).parent / name
         out.parent.mkdir(parents=True, exist_ok=True)
         text = ((getattr(cp, "stdout", "") or "") + "\n" + (getattr(cp, "stderr", "") or ""))
         out.write_text("\n".join(text.splitlines()[-keep:]) + "\n", encoding="utf-8")
@@ -652,7 +655,8 @@ def _install_and_launch(run: Runner, node_script: Path | str, apk: str,
         'echo "$pkg"')
     r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
     if getattr(r, "returncode", 1) != 0:
-        raise SmokeError("node", f"설치/실행 실패 (rc={getattr(r, 'returncode', None)})")
+        _save_build_log(env, r, name="install.log")
+        raise SmokeError("node", f"설치/실행 실패 (rc={getattr(r, 'returncode', None)}) — install.log")
     return _last_line(r) or pkg
 
 

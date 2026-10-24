@@ -723,3 +723,10 @@ def test_node_build_script_lets_the_shell_expand_tilde():
     script = seen[0][-1]
     assert "tar -xzf ~/mk-smoke-src.tar.gz" in script
     assert '"~/' not in script
+
+
+def test_aapt2_picks_one_build_tools_version():
+    # 2026-10-24 real round-trip: two build-tools dirs → the glob expanded to two
+    # aapt2 paths and the second was read as a subcommand.
+    from todo_system.orchestrator import beta_smoke as bs
+    assert "tail -1" in bs._AAPT2 and "sort -V" in bs._AAPT2
