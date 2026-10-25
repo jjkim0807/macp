@@ -117,14 +117,67 @@ def _iso_age(ts: str) -> str:
     return f"{int(s / 86400)}d"
 
 
+_PGREP_RECORD_RE = re.compile(r"^\d+ ")
+
+
+def _vault_stage_markers(vault: Path, runs: Path) -> tuple[str, ...]:
+    """Substrings that tie a stage argv to THIS vault: the orchestrator's absolute
+    run_dir prefix (stages.py run metadata "- run_dir: `<RUNS>/<run-id>`") and the
+    legacy worker.py "- vault_root: `<VAULT>`" line (its run_dir is relative).
+
+    The trailing separator / closing backtick keep a sibling vault whose path only
+    adds a suffix (`/x/vault2`) from matching `/x/vault`. The resolved forms are
+    added when they differ, so a symlinked MACP_VAULT_ROOT resolved on one side
+    only still matches.
+    """
+    def _resolved(p: Path) -> Path:
+        try:
+            return p.resolve()
+        except OSError:
+            return p
+
+    cands = [f"{runs}{os.sep}", f"vault_root: `{vault}`",
+             f"{_resolved(runs)}{os.sep}", f"vault_root: `{_resolved(vault)}`"]
+    return tuple(dict.fromkeys(cands))
+
+
+def _count_vault_stages(out: str, markers: tuple[str, ...]) -> int:
+    """Count `pgrep -af "claude -p"` process records whose text carries a marker.
+
+    Counted per process RECORD, not per line: a stage argv is the whole multi-line
+    prompt and run_dir sits in the metadata block near its END. A pgrep that prints
+    argv newlines raw splits one process over many lines, so a per-line
+    `"claude -p" in line and RUNS in line` test would count zero real stages. A
+    record starts at a `<pid> ` line containing "claude -p"; later lines that do
+    not start a record are its continuation.
+    """
+    records: list[list[str]] = []
+    for line in out.splitlines():
+        if _PGREP_RECORD_RE.match(line) and "claude -p" in line:
+            records.append([line])
+        elif records:
+            records[-1].append(line)
+    return sum(1 for rec in records
+               if any(m in "\n".join(rec) for m in markers))
+
+
 def _worker_running() -> list[str]:
-    """One marker per claude stage process running right now (best-effort via pgrep).
+    """One marker per claude stage process of THIS vault running right now
+    (best-effort via pgrep).
 
     `-a`, NOT `-l`: with `-f`, procps-ng's `-l` prints only the process NAME, so a
     live Implement stage comes back as "1696592 claude" — the `"claude -p" in line`
     filter below never matched and `worker_busy` was pinned False forever. The badge
     therefore read "유휴 (idle)" even with a stage 28 minutes into its run (observed
     2026-09-20). `-a` prints the full command line, which is what the filter needs.
+
+    Scoped to this dashboard's VAULT: pgrep sees every `claude -p` on the host, so
+    an empty scratch vault read "worker running — 3 claude stage(s)" from other
+    vaults' processes (discovery 2026-10-25 smoke 2). A process counts only if its
+    argv carries one of `_vault_stage_markers(VAULT, RUNS)`. Brief runs and model
+    probes (`claude -p ok`) carry no run_dir, so they are deliberately NOT counted —
+    the badge means "a worker stage of this vault is running". Counting is per
+    process record, not per line (see `_count_vault_stages`).
 
     The matched command lines are NOT returned: a stage's argv carries the entire
     prompt, and the caller only takes bool() of this. One sanitized marker per match
@@ -135,7 +188,7 @@ def _worker_running() -> list[str]:
                              text=True, timeout=5).stdout
     except Exception:
         return []
-    return ["claude -p" for line in out.splitlines() if "claude -p" in line]
+    return ["claude -p"] * _count_vault_stages(out, _vault_stage_markers(VAULT, RUNS))
 
 
 # ---- worker-state derivation (why "idle"?) ---------------------------------
