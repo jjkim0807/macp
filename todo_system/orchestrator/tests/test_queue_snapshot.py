@@ -107,6 +107,23 @@ class QueueSnapshotTest(unittest.TestCase):
         self.assertEqual(r["checkout"], "app")
         self.assertIn("`beta`", r["wait_text"])
 
+    def test_checkout_gate_skips_own_inflight_assignment(self):
+        # The task's own in-flight run must never defer itself as
+        # "checkout busy" — only a SIBLING holding the checkout can.
+        t = Task("alpha", {"repo": REPO})
+        self_held = Assignment(task_id="alpha", agent_id="w", corr_id="c",
+                               payload={"repo": REPO})
+        cg = self.orch._checkout_gate(t, REPO, {REPO: [self_held]}, cap=1)
+        self.assertIsNone(cg.wait)
+
+    def test_checkout_gate_still_holds_for_a_real_sibling(self):
+        t = Task("alpha", {"repo": REPO})
+        sibling = Assignment(task_id="beta", agent_id="w", corr_id="c",
+                             payload={"repo": REPO})
+        cg = self.orch._checkout_gate(t, REPO, {REPO: [sibling]}, cap=1)
+        self.assertEqual(cg.wait, "checkout_busy")
+        self.assertEqual(cg.holder, "beta")
+
     def test_gradle_cap(self):
         self.orch = self._make(max_parallel_gradle_builds=1)
         self._save("beta", A.IN_PROGRESS, {"repo": GRADLE_B})

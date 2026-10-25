@@ -747,7 +747,7 @@ class Orchestrator:
         (no ledger write, no print) — the serial dispatch loop and the queue view
         share it. Per-repo cap / touches overlap first, then the global gradle cap.
         """
-        held = live.get(key, [])
+        held = [o for o in live.get(key, []) if o.task_id != t.slug]
         if held and (len(held) >= cap or not all(
                 self._can_run_concurrently(
                     t.slug, t.payload or {}, o.task_id, o.payload or {})
