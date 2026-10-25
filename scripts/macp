@@ -13,7 +13,19 @@
 # file ships under todo_system/_engine/scripts/, which is never on PATH — and
 # the project CLI there is `<venv>/bin/python -m todo_system.macp`. The
 # MACP_REPO / exec lines below are unchanged by that decision.
-MACP_REPO="${MACP_REPO:-$HOME/Projects/MaestroACP}"
-PY="$MACP_REPO/.venv/bin/python"
-[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
-exec env PYTHONPATH="$MACP_REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m todo_system.macp "$@"
+# Interpreter + import root (2026-10-25): prefer the ENGINE checkout the daemons run
+# from (MACP_ENGINE_ROOT, default ~/Projects/macp). Since the public split the vault
+# no longer contains todo_system/ — its .venv holds a pinned, older engine — so the
+# old "PYTHONPATH=vault" form silently ran stale code (macp-emulator: "No module
+# named todo_system.orchestrator.emulator_cli" until the vault pin was bumped).
+# Fallback order: engine checkout → vault venv (installed engine) → python3.
+MACP_REPO="${MACP_REPO:-${MACP_VAULT_ROOT:-$HOME/Projects/MaestroACP}}"
+MACP_ENGINE_ROOT="${MACP_ENGINE_ROOT:-$HOME/Projects/macp}"
+if [ -x "$MACP_ENGINE_ROOT/.venv/bin/python" ] && [ -d "$MACP_ENGINE_ROOT/todo_system" ]; then
+  PY="$MACP_ENGINE_ROOT/.venv/bin/python"; ROOT="$MACP_ENGINE_ROOT"
+else
+  PY="$MACP_REPO/.venv/bin/python"; ROOT="$MACP_REPO"
+  [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+fi
+export MACP_VAULT_ROOT="${MACP_VAULT_ROOT:-$MACP_REPO}"
+exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m todo_system.macp "$@"
