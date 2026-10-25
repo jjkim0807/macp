@@ -1236,13 +1236,49 @@ class WorkerRunningDetection(unittest.TestCase):
     every line was "1696592 claude" and the `"claude -p" in line` filter matched
     nothing — `worker_busy` could never be True. These tests pin the flags and both
     output shapes so a revert to `-l` fails here instead of silently on the dashboard.
+
+    2026-10-25: scoped to THIS vault. pgrep sees every `claude -p` on the host, so an
+    empty scratch vault read "worker running — 3 claude stage(s)" from other vaults'
+    stages. A process now counts only if its argv carries this vault's absolute
+    run_dir prefix (or the legacy `vault_root:` line). Hermetic: VAULT/RUNS point at
+    a temp dir.
     """
 
-    # What `pgrep -af "claude -p"` actually prints (argv joined, prompt truncated here).
-    AF_LINE = ("1696592 claude -p You are the **Implement agent (I)** of an autonomous "
-               "implementation worker pipeline.")
     # What `pgrep -fl "claude -p"` printed instead — name only, no flags, no prompt.
     FL_LINE = "1696592 claude"
+    RUN_ID = "20490102T030000-demo"
+
+    def setUp(self):
+        self.vault = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.vault, True)
+        self.runs = self.vault / "Worker" / "runs"
+        for name, val in (("VAULT", self.vault), ("RUNS", self.runs)):
+            p = mock.patch.object(M, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def af_line(self, pid=1696592, runs=None):
+        """What `pgrep -af "claude -p"` prints when argv newlines are escaped:
+        one line per process, prompt truncated here, run metadata at the end."""
+        runs = self.runs if runs is None else runs
+        return (f"{pid} claude -p You are the **Implement agent (I)** of an autonomous "
+                f"implementation worker pipeline. # Run metadata - run_id: `{self.RUN_ID}` "
+                f"- run_dir: `{runs}/{self.RUN_ID}` - stage: `implement`")
+
+    def af_multiline(self, pid=1696592, runs=None):
+        """Raw-newline form: the run_dir line sits many lines after the head line,
+        and some prompt lines start with a digit (must not open a new record)."""
+        runs = self.runs if runs is None else runs
+        return "\n".join([
+            f"{pid} claude -p You are the **Implement agent (I)** of an autonomous",
+            "implementation worker pipeline.",
+            "1. Read requirements",
+            "2. Read the plan",
+            "# Run metadata (injected by orchestrator)",
+            f"- run_id: `{self.RUN_ID}`",
+            f"- run_dir: `{runs}/{self.RUN_ID}`",
+            "- stage: `implement`",
+        ])
 
     def _run_with(self, stdout):
         captured = {}
@@ -1263,13 +1299,77 @@ class WorkerRunningDetection(unittest.TestCase):
         self.assertNotIn("l", flags, "-l prints the process NAME only — the 2026-09-20 idle-badge bug")
 
     def test_running_stage_is_detected(self):
-        found, _ = self._run_with(self.AF_LINE + "\n")
+        found, _ = self._run_with(self.af_line() + "\n")
         self.assertTrue(found, "a live `claude -p` stage must make worker_busy truthy")
         self.assertEqual(found, ["claude -p"], "prompt text must not leak into the return value")
 
     def test_two_stages_counted_separately(self):
-        found, _ = self._run_with(self.AF_LINE + "\n" + self.AF_LINE.replace("1696592", "1696593") + "\n")
+        found, _ = self._run_with(self.af_line() + "\n" + self.af_line(1696593) + "\n")
         self.assertEqual(len(found), 2)
+
+    def test_multiline_argv_stage_is_detected(self):
+        found, _ = self._run_with(self.af_multiline() + "\n")
+        self.assertEqual(found, ["claude -p"])
+
+    def test_two_multiline_stages_counted_separately(self):
+        found, _ = self._run_with(self.af_multiline() + "\n" + self.af_multiline(1696593) + "\n")
+        self.assertEqual(len(found), 2)
+
+    def test_other_vault_stage_does_not_count(self):
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, other, True)
+        other_runs = other / "Worker" / "runs"
+        found, _ = self._run_with(self.af_line(runs=other_runs) + "\n"
+                                  + self.af_multiline(1696593, runs=other_runs) + "\n")
+        self.assertEqual(found, [])
+
+    def test_prefix_sibling_vault_does_not_count(self):
+        sibling_runs = Path(str(self.vault) + "2") / "Worker" / "runs"
+        found, _ = self._run_with(self.af_line(runs=sibling_runs) + "\n")
+        self.assertEqual(found, [])
+
+    def test_brief_and_probe_without_run_dir_do_not_count(self):
+        found, _ = self._run_with(
+            "4242 claude -p ok\n"
+            "4243 claude -p Write today's daily brief to Todo/Briefings/2049-01-02.md\n")
+        self.assertEqual(found, [])
+
+    def test_mixed_counts_only_this_vault(self):
+        other_runs = Path(str(self.vault) + "-other") / "Worker" / "runs"
+        probe = "4242 claude -p ok"
+        single = "\n".join([self.af_line(), self.af_line(1696593, runs=other_runs), probe])
+        found, _ = self._run_with(single + "\n")
+        self.assertEqual(len(found), 1)
+        # Multi-line: our record first, the other vault's AFTER it — its continuation
+        # lines must not be credited to our record, nor ours to theirs.
+        multi = "\n".join([probe, self.af_multiline(), self.af_multiline(1696593, runs=other_runs)])
+        found, _ = self._run_with(multi + "\n")
+        self.assertEqual(len(found), 1)
+        # Reverse order: the other vault first, then a probe, then nothing of ours.
+        multi = "\n".join([self.af_multiline(1696593, runs=other_runs), probe])
+        found, _ = self._run_with(multi + "\n")
+        self.assertEqual(found, [])
+
+    def test_legacy_vault_root_marker_counts(self):
+        legacy = (f"1696592 claude -p You are the Implement agent. - run_dir: "
+                  f"`Worker/runs/{self.RUN_ID}` - vault_root: `{self.vault}` - stage: `implement`")
+        found, _ = self._run_with(legacy + "\n")
+        self.assertEqual(found, ["claude -p"])
+        sibling = legacy.replace(f"`{self.vault}`", f"`{self.vault}2`")
+        found, _ = self._run_with(sibling + "\n")
+        self.assertEqual(found, [])
+
+    def test_markers_include_resolved_form(self):
+        link_parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, link_parent, True)
+        link = link_parent / "vault-link"
+        link.symlink_to(self.vault)
+        markers = M._vault_stage_markers(link, link / "Worker" / "runs")
+        self.assertIn(f"{link}/Worker/runs/", markers)
+        self.assertIn(f"{self.vault.resolve()}/Worker/runs/", markers)
+        self.assertIn(f"vault_root: `{link}`", markers)
+        self.assertIn(f"vault_root: `{self.vault.resolve()}`", markers)
+        self.assertEqual(len(markers), len(set(markers)))
 
     def test_name_only_output_does_not_count(self):
         # The shape the old flags produced. Kept as documentation of the failure mode:
