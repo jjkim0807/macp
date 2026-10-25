@@ -20,6 +20,9 @@ standalone.env
 # 체크아웃 설치의 런타임 스크래치(beta 잠금·스윕 상태·gradle 레지스트리 — beta_publish._SCRATCH_ROOT,
 # stages._GRADLE_SCRATCH_ROOT). 볼트에서와 같이 커밋되지 않게.
 Worker/_state/
+# the vault skeleton too: tests run with MACP_VAULT_ROOT=vault-template and the
+# orchestrator writes runtime state there (divergence.json was committed by #28).
+vault-template/Worker/_state/
 # 자격증명·로컬 설정 — 엔진 체크아웃에서 실행하다 생겨도 커밋되지 않게(볼트 .secrets/ 와 같은 부류)
 .secrets/
 .env
