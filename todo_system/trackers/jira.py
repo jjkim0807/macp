@@ -28,6 +28,7 @@ from pathlib import Path
 from .base import (
     TaskRecord,
     TrackerAdapter,
+    TrackerError,
     adf_doc,
     extract_adf_text,
     is_cancelled_status,
@@ -49,11 +50,6 @@ _PULL_FIELDS = "summary,description,status,labels,duedate,priority,updated"
 
 # A transition whose target (or own name) reads as one of these closes the issue.
 _DONE_TRANSITION_TARGETS = frozenset({"done", "closed", "resolved", "complete", "completed"})
-
-
-class TrackerError(RuntimeError):
-    """A Jira request failed. The message carries only method / path / status —
-    never the Authorization header, token, or response body (secret hygiene)."""
 
 
 class JiraAdapter(TrackerAdapter):

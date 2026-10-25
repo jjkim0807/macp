@@ -87,6 +87,11 @@ class TrackerAdapter(ABC):
         """Tracker status → task ``status`` (the §⑨ status table)."""
 
 
+class TrackerError(RuntimeError):
+    """A tracker request failed. The message carries only provider / method / path /
+    status — never the Authorization header, token, or response body (secret hygiene)."""
+
+
 # --------------------------------------------------------------------------- #
 # Status mapping (§⑨ status table) — shared across adapters
 # --------------------------------------------------------------------------- #
@@ -227,21 +232,68 @@ def load_jira_credentials(vault_root: Path | None = None) -> tuple[str, str] | N
     email = os.environ.get("MACP_JIRA_EMAIL", "").strip()
     token = os.environ.get("MACP_JIRA_API_TOKEN", "").strip()
     if not (email and token):
-        try:
-            root = Path(vault_root) if vault_root is not None else paths.vault_root_or_cwd()
-        except paths.VaultRootError:
-            root = None
-        if root is not None:
-            try:
-                data = json.loads((root / ".secrets" / "jira.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = {}
-            if isinstance(data, dict):
-                email = email or str(data.get("email", "")).strip()
-                token = token or str(data.get("api_token", "")).strip()
+        data = _read_secrets_json("jira.json", vault_root)
+        email = email or str(data.get("email", "")).strip()
+        token = token or str(data.get("api_token", "")).strip()
     if email and token:
         return email, token
     return None
+
+
+def github_issues_repo(start: Path | None = None) -> str | None:
+    """Resolve the GitHub Issues target repo (``owner/repo``), else None.
+
+    ``MACP_GITHUB_ISSUES_REPO`` env → nearest ``.macp/config.toml``
+    ``github_issues_repo`` key → None. None means "not configured" (opt-in no-op) —
+    deliberately **not** defaulted from ``paths.repo_slug`` (that is the vault repo,
+    and defaulting to it would switch sync on unasked). ``start`` is the test seam.
+    """
+    return _config_resolver("MACP_GITHUB_ISSUES_REPO", "github_issues_repo", start)
+
+
+def github_api_url(start: Path | None = None) -> str | None:
+    """Resolve the GitHub REST API base URL override, else None.
+
+    ``MACP_GITHUB_API_URL`` env → nearest ``.macp/config.toml`` ``github_api_url`` key
+    → None (the adapter then uses ``https://api.github.com``; GitHub Enterprise Server
+    is ``https://<host>/api/v3``). ``start`` is the test seam.
+    """
+    return _config_resolver("MACP_GITHUB_API_URL", "github_api_url", start)
+
+
+def load_github_token(vault_root: Path | None = None) -> str | None:
+    """Return the GitHub Issues token, else None.
+
+    Reads ``MACP_GITHUB_TOKEN`` env first, falling back to
+    ``<vault>/.secrets/github.json`` (``{"token": ...}``). Returns None when neither
+    supplies one — the opt-in no-op case. The generic ``GITHUB_TOKEN`` env and the
+    ``gh`` CLI token are **deliberately not read**: picking up an ambient token would
+    switch sync on without anyone configuring it. The token is **returned, never
+    logged**; callers keep it out of messages/stdout/md.
+
+    ``vault_root`` overrides the ``.secrets`` anchor (the test seam).
+    """
+    token = os.environ.get("MACP_GITHUB_TOKEN", "").strip()
+    if not token:
+        token = str(_read_secrets_json("github.json", vault_root).get("token", "")).strip()
+    return token or None
+
+
+def _read_secrets_json(filename: str, vault_root: Path | None) -> dict:
+    """Read ``<vault>/.secrets/<filename>`` as a JSON object, else ``{}``.
+
+    A missing vault root, unreadable file, invalid JSON, or a non-object document
+    all read as ``{}`` (→ "not configured"), never an exception.
+    """
+    try:
+        root = Path(vault_root) if vault_root is not None else paths.vault_root_or_cwd()
+    except paths.VaultRootError:
+        return {}
+    try:
+        data = json.loads((root / ".secrets" / filename).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # --------------------------------------------------------------------------- #
