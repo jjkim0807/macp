@@ -1550,6 +1550,69 @@ class GroupOf(unittest.TestCase):
         self.assertEqual(M._group_of({"project": "x", "slug": "y", "state": "z"}), "x")
 
 
+class WorkerBusyScopedToVaultStatus(unittest.TestCase):
+    """/api/status for an EMPTY vault while another vault's stages run on the host
+    (discovery 2026-10-25 smoke 2: a scratch vault read "worker running — 3 claude
+    stage(s)"). `_worker_running` is NOT stubbed — only pgrep's stdout is canned —
+    so the real filter feeds worker_busy and the worker_state ladder. Hermetic:
+    every vault path points at a temp dir; the host profile's budget is forced off."""
+
+    def setUp(self):
+        self.vault = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.vault, True)
+        self.runs = self.vault / "Worker" / "runs"
+        paths = {"VAULT": self.vault, "RUNS": self.runs,
+                 "ASSIGN": self.vault / "Worker" / "assignments",
+                 "STATE": self.vault / "Worker" / "_state",
+                 "TODO_DB": self.vault / "Todo" / "todo.db",
+                 "ITEMS": self.vault / "Todo" / "items",
+                 "SESSIONS": self.vault / "Memory" / "sessions",
+                 "REGISTRY": self.vault / "Worker" / "agents" / "registry.yaml"}
+        stubs = {"collect_assignments": [], "_todo_status_map": {}, "_title_map": {},
+                 "_project_map": {}, "collect_human": [], "collect_runs": [],
+                 "collect_deps": [], "collect_agents": [], "collect_todo": {},
+                 "collect_usage": None, "collect_account": {},
+                 "collect_account_runtime": {}, "collect_account_slots": {},
+                 "collect_queue": {}}
+        patches = [mock.patch.object(M, k, v) for k, v in paths.items()]
+        patches += [mock.patch.object(M, k, return_value=v) for k, v in stubs.items()]
+        patches.append(mock.patch("todo_system.macp.config.load_profile",
+                                  side_effect=RuntimeError("no profile in tests")))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _stage(self, pid, runs):
+        return (f"{pid} claude -p You are the **Implement agent (I)**. # Run metadata "
+                f"- run_dir: `{runs}/20490102T030000-demo` - stage: `implement`")
+
+    def _status_with_pgrep(self, stdout):
+        real_run = M.subprocess.run
+
+        def fake_run(argv, *a, **kw):
+            if argv and argv[0] == "pgrep":
+                return types.SimpleNamespace(stdout=stdout)
+            return real_run(argv, *a, **kw)
+
+        with mock.patch.object(M.subprocess, "run", side_effect=fake_run):
+            return M.collect_status()
+
+    def test_other_vault_stage_leaves_empty_vault_idle(self):
+        other_runs = Path(str(self.vault) + "-other") / "Worker" / "runs"
+        sibling_runs = Path(str(self.vault) + "2") / "Worker" / "runs"
+        d = self._status_with_pgrep("\n".join([self._stage(101, other_runs),
+                                               self._stage(102, sibling_runs),
+                                               "103 claude -p ok"]) + "\n")
+        self.assertIs(d["worker_busy"], False)
+        self.assertNotEqual(d["worker_state"], "running", d["worker_state_detail"])
+
+    def test_this_vault_stage_still_reads_running(self):
+        # Positive control: the same path through collect_status DOES see our stage.
+        d = self._status_with_pgrep(self._stage(101, self.runs) + "\n")
+        self.assertIs(d["worker_busy"], True)
+        self.assertEqual(d["worker_state"], "running", d["worker_state_detail"])
+
+
 class GroupStampingHermetic(unittest.TestCase):
     """collect_status() stamps a str `group` (computed by _group_of) on EVERY
     human/attention/active row. Injected rows guarantee the three sections are
