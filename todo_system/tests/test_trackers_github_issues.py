@@ -1,16 +1,15 @@
-"""Tests for the GitHub Issues adapter + the Jira/GitHub tracker contract (design §⑨).
+"""Tests for the GitHub Issues adapter + the tracker contract on GitHub (design §⑨).
 
 Two layers, both offline against one local ``RecordingTrackerServer``
 (``127.0.0.1:0``, the ``test_trackers_jira.RecordingJiraServer`` pattern plus
-``PATCH``), which serves the GitHub Issues routes **and** the Jira routes:
+``PATCH``), which serves the GitHub Issues routes:
 
 * **GitHub transport** (``github_issues.GitHubIssuesAdapter``) — pull mapping and PR
   filtering, idempotent upsert, push close/comment request bodies, the opt-in
   ``from_config`` gate, and token secrecy, asserted on the exact request bytes.
-* **Tracker contract** — the behaviour every :class:`TrackerAdapter` owes the md
-  bridge, parameterized over ``[jira]`` and ``[github]``. Self-contained on purpose:
-  ``todo_system/tests`` is not a package, so importing ``test_trackers_jira``'s server
-  would depend on pytest's import mode.
+* **Tracker contract** — the shared ``_tracker_contract.py`` assertions, run here as
+  ``[github]`` (Jira runs them in ``test_trackers_jira.py``, Linear in
+  ``test_trackers_linear.py``), loaded by path so pytest's import mode doesn't matter.
 
 Everything runs against ``tmp_path`` — never the real vault (the session-scoped
 ``_real_vault_untouched`` conftest guard backs this up).
@@ -18,56 +17,60 @@ Everything runs against ``tmp_path`` — never the real vault (the session-scope
 
 from __future__ import annotations
 
-import base64
 import importlib
+import importlib.util
 import json
+import sys
 import threading
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 from todo_system.trackers import base, jira
 from todo_system.trackers.base import (
     TaskRecord,
-    TrackerAdapter,
     TrackerError,
     parse_frontmatter,
     upsert_task_record,
 )
 from todo_system.trackers.github_issues import GitHubIssuesAdapter
-from todo_system.trackers.jira import JiraAdapter
 
-GH_TOKEN = "ghp-fixture-SUPERSECRET-gh"            # fixture secrets — must never leak
-JIRA_TOKEN = "atlassian-fixture-SUPERSECRET-jira"
-PR_URL = "https://github.com/example/repo/pull/5"
+
+def _load_contract():
+    name = "macp_tracker_contract"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).with_name("_tracker_contract.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[name]
+
+
+_contract = _load_contract()
+
+GH_TOKEN = "ghp-fixture-SUPERSECRET-gh"            # fixture secret — must never leak
+PR_URL = _contract.PR_URL
 
 GH_ENV = ("MACP_GITHUB_ISSUES_REPO", "MACP_GITHUB_API_URL", "MACP_GITHUB_TOKEN")
-JIRA_ENV = ("MACP_JIRA_BASE_URL", "MACP_JIRA_PROJECT", "MACP_JIRA_EMAIL", "MACP_JIRA_API_TOKEN")
 
 
 # --------------------------------------------------------------------------- #
-# Recording server (GitHub + Jira routes)
+# Recording server (GitHub routes)
 # --------------------------------------------------------------------------- #
 
 
 class RecordingTrackerServer:
     """A local tracker endpoint: records every request and replays scripted
-    responses for both the GitHub Issues and the Jira REST routes."""
+    responses for the GitHub Issues REST routes."""
 
     def __init__(self) -> None:
         self.requests: list[dict] = []
         self.gh_issues: list[dict] = []
-        self.jira_issues: list[dict] = []
         self.fail_code: int | None = None
-        self.transitions = {"transitions": [
-            {"id": "11", "name": "Start", "to": {"name": "In Progress"}},
-            {"id": "31", "name": "Mark done", "to": {"name": "Done"}},
-        ]}
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -127,15 +130,6 @@ class RecordingTrackerServer:
                 return 200, {}
             if method == "POST" and route.endswith("/comments"):
                 return 201, {"id": 1}
-            return 200, {}
-        if method == "GET" and "/search" in route:
-            return 200, {"issues": self.jira_issues}
-        if method == "GET" and route.endswith("/transitions"):
-            return 200, self.transitions
-        if method == "POST" and route.endswith("/transitions"):
-            return 204, {}
-        if method == "POST" and route.endswith("/comment"):
-            return 201, {"id": "10000"}
         return 200, {}
 
     @property
@@ -159,13 +153,6 @@ def _gh_adapter(server: RecordingTrackerServer) -> GitHubIssuesAdapter:
     return GitHubIssuesAdapter("example/repo", GH_TOKEN, base_url=server.base_url)
 
 
-def _jira_adapter(server: RecordingTrackerServer) -> JiraAdapter:
-    return JiraAdapter(
-        base_url=server.base_url, project="PROJ",
-        email="dev@example.test", api_token=JIRA_TOKEN,
-    )
-
-
 def _gh_issue(**kw) -> dict:
     issue = {
         "number": 7,
@@ -183,19 +170,6 @@ def _gh_issue(**kw) -> dict:
 
 def _gh_pr_item() -> dict:
     return _gh_issue(number=8, title="A pull request", pull_request={"url": "x"})
-
-
-def _jira_issue() -> dict:
-    return {"key": "PROJ-123", "fields": {
-        "summary": "Fix the login bug",
-        "description": {"type": "doc", "version": 1, "content": [
-            {"type": "paragraph", "content": [{"type": "text", "text": "Users cannot log in."}]}]},
-        "status": {"name": "In Progress"},
-        "labels": ["backend"],
-        "duedate": "2026-11-01",
-        "priority": {"name": "High"},
-        "updated": "2026-10-20T12:00:00.000+0000",
-    }}
 
 
 def _query(path: str) -> dict[str, list[str]]:
@@ -429,108 +403,32 @@ def test_jira_tracker_error_is_shared():
 
 
 # --------------------------------------------------------------------------- #
-# Tracker contract — parameterized over Jira and GitHub
+# Tracker contract — shared assertions (_tracker_contract.py) on GitHub
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class Case:
-    name: str
-    server: RecordingTrackerServer
-    adapter: TrackerAdapter
-    token: str
-    seed: Callable[[], None]
-    ref_prefix: str
-    done_ref: str
-    env_vars: tuple[str, ...]
-    from_config: Callable[..., object]
-
-    def auth_carries_token(self, auth: str) -> bool:
-        scheme, _, value = auth.partition(" ")
-        if scheme == "Basic":
-            return base64.b64decode(value).decode("utf-8").endswith(f":{self.token}")
-        return scheme == "Bearer" and value == self.token
-
-
-@pytest.fixture(params=["jira", "github"])
-def contract(request, server) -> Case:
-    if request.param == "jira":
-        def seed() -> None:
-            server.jira_issues = [_jira_issue()]
-
-        return Case(
-            name="jira", server=server, adapter=_jira_adapter(server), token=JIRA_TOKEN,
-            seed=seed, ref_prefix="jira:", done_ref="jira:PROJ-123",
-            env_vars=JIRA_ENV, from_config=JiraAdapter.from_config,
-        )
-
+@pytest.fixture(params=["github"])
+def contract(request, server):
     def seed() -> None:
         server.gh_issues = [_gh_issue(), _gh_pr_item()]
 
-    return Case(
+    return _contract.Case(
         name="github", server=server, adapter=_gh_adapter(server), token=GH_TOKEN,
-        seed=seed, ref_prefix="github:", done_ref="github:example/repo#7",
-        env_vars=GH_ENV, from_config=GitHubIssuesAdapter.from_config,
+        seed=seed, fail=lambda code: setattr(server, "fail_code", code),
+        ref_prefix="github:", done_ref="github:example/repo#7",
+        env_vars=GH_ENV + ("GITHUB_TOKEN",), from_config=GitHubIssuesAdapter.from_config,
+        auth_carries_token=_contract.bearer_or_basic(GH_TOKEN),
     )
 
 
-def test_contract_is_tracker_adapter(contract):
-    assert isinstance(contract.adapter, TrackerAdapter)
-
-
-def test_contract_pull_upsert_idempotent(contract, tmp_path):
-    contract.seed()
-    items = tmp_path / "items"
-    first = [upsert_task_record(r, items, today="2026-10-25") for r in contract.adapter.pull()]
-    second = [upsert_task_record(r, items, today="2026-10-26") for r in contract.adapter.pull()]
-
-    assert [r.action for r in first] == ["created"]
-    assert [r.action for r in second] == ["unchanged"]
-    assert len(list(items.glob("*.md"))) == 1
-    fm, _ = parse_frontmatter(first[0].path.read_text(encoding="utf-8"))
-    assert str(fm["external_ref"]).startswith(contract.ref_prefix)
-
-
-def test_contract_push_open_without_pr_is_noop(contract):
-    ref = contract.adapter.push(TaskRecord(external_ref=contract.done_ref, status="open"))
-    assert ref == contract.done_ref
-    assert contract.server.requests == []
-
-
-def test_contract_push_done_with_pr_returns_ref_and_sends_pr_url(contract):
-    task = TaskRecord(external_ref=contract.done_ref, status="done", pr_url=PR_URL)
-    assert contract.adapter.push(task) == contract.done_ref
-    assert any(PR_URL in json.dumps(r["json"]) for r in contract.server.requests if r["json"])
-
-
-def test_contract_from_config_none_without_config(contract, tmp_path, monkeypatch):
-    for var in contract.env_vars + ("GITHUB_TOKEN",):
-        monkeypatch.delenv(var, raising=False)
-    assert contract.from_config(vault_root=tmp_path, start=tmp_path) is None
-    assert contract.server.requests == []
-    assert not list(tmp_path.glob("**/*.md"))
-
-
-def test_contract_token_absent_from_md_and_output(contract, tmp_path, capsys):
-    contract.seed()
-    result = upsert_task_record(contract.adapter.pull()[0], tmp_path / "items", today="2026-10-25")
-    md_text = result.path.read_text(encoding="utf-8")
-    captured = capsys.readouterr()
-
-    assert contract.token not in md_text
-    assert contract.token not in (captured.out + captured.err)
-    # The server DID receive the token (auth really sent, not dropped).
-    assert contract.auth_carries_token(contract.server.requests[0]["authorization"])
-
-
-def test_contract_http_error_hides_token(contract):
-    contract.server.fail_code = 401
-    with pytest.raises(TrackerError) as excinfo:
-        contract.adapter.pull()
-    msg = str(excinfo.value)
-    assert "401" in msg
-    assert contract.token not in msg
-    assert "Basic" not in msg and "Bearer" not in msg
+test_contract_is_tracker_adapter = _contract.test_contract_is_tracker_adapter
+test_contract_pull_upsert_idempotent = _contract.test_contract_pull_upsert_idempotent
+test_contract_push_open_without_pr_is_noop = _contract.test_contract_push_open_without_pr_is_noop
+test_contract_push_done_with_pr_returns_ref_and_sends_pr_url = (
+    _contract.test_contract_push_done_with_pr_returns_ref_and_sends_pr_url)
+test_contract_from_config_none_without_config = _contract.test_contract_from_config_none_without_config
+test_contract_token_absent_from_md_and_output = _contract.test_contract_token_absent_from_md_and_output
+test_contract_http_error_hides_token = _contract.test_contract_http_error_hides_token
 
 
 # --------------------------------------------------------------------------- #
