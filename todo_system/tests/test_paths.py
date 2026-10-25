@@ -921,19 +921,45 @@ def test_script_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, stem,
         assert getattr(mod, attr) != Path("/bogus")
 
 
-def test_claude_auth_watch_rc_label_follows_label_prefix(monkeypatch):
-    """RC_LABEL is resolved (env → install config → neutral), not a literal —
-    the watchdog/upgrade siblings re-declare their own, auth_watch's is the one
-    its restart/status hints use."""
+def _tmp_vault(root, prefix=None):
+    """A throwaway vault whose .macp/config.toml carries ``prefix`` as its
+    label_prefix key, or no key at all when ``prefix`` is None."""
+    macp = root / ".macp"
+    macp.mkdir(parents=True)
+    body = f'label_prefix = "{prefix}"\n' if prefix else "# no label_prefix key\n"
+    (macp / "config.toml").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_claude_auth_watch_rc_label_follows_label_prefix(monkeypatch, tmp_path):
+    """RC_LABEL is resolved (env → the resolved vault's config → neutral), not a
+    literal — the watchdog/upgrade siblings re-declare their own, auth_watch's is
+    the one its restart/status hints use. MACP_VAULT_ROOT is pinned to tmp_path in
+    every case: the script anchors the config lookup at VAULT, so a runner env
+    pointing at a live vault with its own label_prefix key used to leak in."""
+    keyed = _tmp_vault(tmp_path / "keyed", "com.hostleak.")
+    neutral = _tmp_vault(tmp_path / "neutral")
     with monkeypatch.context() as m:
+        m.setenv("HOME", str(tmp_path / "home"))
+        m.setenv("MACP_VAULT_ROOT", str(keyed))
         m.setenv("MACP_LABEL_PREFIX", "com.example.")
         mod = _load_script_module("claude_auth_watch")
         assert mod.RC_LABEL == "com.example.claude-remote-control"
     with monkeypatch.context() as m:
+        m.setenv("HOME", str(tmp_path / "home"))
+        m.setenv("MACP_VAULT_ROOT", str(keyed))
         m.delenv("MACP_LABEL_PREFIX", raising=False)
         mod = _load_script_module("claude_auth_watch")
-        install = Path(mod.__file__).resolve().parents[1]
-        assert mod.RC_LABEL == f"{paths.label_prefix(start=install)}claude-remote-control"
+        assert mod.VAULT == keyed
+        assert mod.RC_LABEL == "com.hostleak.claude-remote-control"
+    with monkeypatch.context() as m:
+        m.setenv("HOME", str(tmp_path / "home"))
+        m.setenv("MACP_VAULT_ROOT", str(neutral))
+        m.delenv("MACP_LABEL_PREFIX", raising=False)
+        mod = _load_script_module("claude_auth_watch")
+        assert mod.VAULT == neutral
+        assert mod.RC_LABEL == "com.macp.claude-remote-control"
+        assert mod.RC_LABEL == f"{paths.label_prefix(start=mod.VAULT)}claude-remote-control"
 
 
 # --- kakao_digest_send: KAKAO_VAULT_DIR keeps priority over the resolver (묶음 B) --
