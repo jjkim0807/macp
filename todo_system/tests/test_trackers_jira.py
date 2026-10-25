@@ -10,14 +10,19 @@ Two layers, both offline:
   ``RecordingJiraServer`` (``127.0.0.1:0``, mirrors ``test_slack_send.py``) so
   pull/push round-trips, the opt-in no-op, and token secrecy are asserted on the
   exact bytes without ever reaching a real Jira site.
+* **Tracker contract** — the shared ``_tracker_contract.py`` assertions, run here as
+  ``[jira]`` against ``RecordingJiraServer`` (loaded by path, import-mode independent).
 """
 
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +33,21 @@ from todo_system.trackers.base import (
     upsert_task_record,
 )
 from todo_system.trackers.jira import JiraAdapter, TrackerError
+
+
+def _load_contract():
+    name = "macp_tracker_contract"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).with_name("_tracker_contract.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[name]
+
+
+_contract = _load_contract()
+
 
 # --------------------------------------------------------------------------- #
 # md bridge: upsert / idempotency / conflict / monotonic status (no network)
@@ -377,3 +397,34 @@ def test_map_fields_maps_priority_labels_due():
         {"labels": ["a", "b"], "duedate": "2026-12-01", "priority": {"name": "Lowest"}})
     assert mapped == {"tags": ["a", "b"], "due": "2026-12-01", "priority": 10}
     assert adapter.map_fields({}) == {}               # nothing set when fields absent
+
+
+# --------------------------------------------------------------------------- #
+# Tracker contract — shared assertions (_tracker_contract.py) on Jira
+# --------------------------------------------------------------------------- #
+
+JIRA_ENV = ("MACP_JIRA_BASE_URL", "MACP_JIRA_PROJECT", "MACP_JIRA_EMAIL", "MACP_JIRA_API_TOKEN")
+
+
+@pytest.fixture(params=["jira"])
+def contract(request, jira_server):
+    def seed() -> None:
+        jira_server.search_issues = [_issue_fixture()]
+
+    return _contract.Case(
+        name="jira", server=jira_server, adapter=_adapter(jira_server), token=TOKEN,
+        seed=seed, fail=lambda code: setattr(jira_server, "search_code", code),
+        ref_prefix="jira:", done_ref="jira:PROJ-123",
+        env_vars=JIRA_ENV + ("GITHUB_TOKEN",), from_config=JiraAdapter.from_config,
+        auth_carries_token=_contract.bearer_or_basic(TOKEN),
+    )
+
+
+test_contract_is_tracker_adapter = _contract.test_contract_is_tracker_adapter
+test_contract_pull_upsert_idempotent = _contract.test_contract_pull_upsert_idempotent
+test_contract_push_open_without_pr_is_noop = _contract.test_contract_push_open_without_pr_is_noop
+test_contract_push_done_with_pr_returns_ref_and_sends_pr_url = (
+    _contract.test_contract_push_done_with_pr_returns_ref_and_sends_pr_url)
+test_contract_from_config_none_without_config = _contract.test_contract_from_config_none_without_config
+test_contract_token_absent_from_md_and_output = _contract.test_contract_token_absent_from_md_and_output
+test_contract_http_error_hides_token = _contract.test_contract_http_error_hides_token
