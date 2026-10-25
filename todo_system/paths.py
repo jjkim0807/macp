@@ -55,6 +55,8 @@ orchestrator and runner have to read them while running from outside the vault.
 ``vault_root_or_cwd()`` is ``vault_root()`` with a cwd fallback, used to resolve
 *relative CLI arguments* (``--ledger Worker/assignments``) against the vault
 rather than against wherever the process happened to start.
+``browser_mcp_server()`` uses the same anchor for the opt-in macp-browser MCP
+server path, with no default (unset = no MCP wiring in the stage argv).
 
 ``vault_search_start()`` is the ``start=`` anchor the engine modules hand to
 ``vault_root()`` for their import-time constants: the engine root in a checkout
@@ -412,6 +414,39 @@ def worker_root(start: Path | None = None) -> Path:
             break
 
     return Path(_DEFAULT_WORKER_ROOT).expanduser()
+
+
+def browser_mcp_server(start: Path | None = None) -> Path | None:
+    """Resolve the macp-browser MCP server script the browser stages launch.
+
+    Resolution order mirrors :func:`worker_root`:
+
+    1. ``MACP_BROWSER_MCP_SERVER`` environment variable, if set and non-empty.
+    2. The ``browser_mcp_server`` key of the nearest ``.macp/config.toml``.
+    3. ``None`` — no MCP wiring. The feature is opt-in, so a host (or an external
+       user) that configures nothing gets stage argv byte-identical to what it
+       was before this knob existed.
+
+    Both configured forms go through ``expanduser()``. The path is returned as
+    configured; whether it exists is the caller's question
+    (``stages.browser_mcp_server`` treats a missing file as unset).
+
+    Like :func:`worker_root`, the config search starts at
+    :func:`vault_root_or_cwd`, is resolved **per call**, and ``start`` overrides
+    the anchor as the test seam.
+    """
+    env = os.environ.get("MACP_BROWSER_MCP_SERVER")
+    if env:
+        return Path(env).expanduser()
+
+    base = (start or vault_root_or_cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "browser_mcp_server")
+            return Path(key).expanduser() if key else None
+
+    return None
 
 
 _DEFAULT_STATE_BACKEND = "git"
