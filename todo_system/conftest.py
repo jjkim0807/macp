@@ -83,12 +83,44 @@ doctor and runner test) reads those same three seams plus its own
 ``REGISTRY_DIR``, which the fixture also points into the tmp dir, so it can
 never remove a real worktree or gradle-registry dir.
 
+The ``auto`` tick's own side effects — ``orchestrator main auto`` reaches three
+things no test may do for real. ``usage_hold()`` calls ``usage_guard.check()``,
+whose ``get_snapshot`` sends a GET to the Anthropic OAuth usage endpoint (its
+rate limit is shared with every Claude CLI on the account) and writes
+``Worker/_state/usage_guard/latest.json`` and ``fetch.lock`` under the vault root
+even when the fetch fails. ``_pull_main`` and ``_check_divergence`` run a real
+``git fetch origin main`` in the vault, which rewrites ``FETCH_HEAD``, and the
+latter writes ``Worker/_state/divergence.json`` there. ``usage_hold`` swallows
+every exception, so a test reaching all of this still passed.
+``_auto_side_effects_isolated`` closes it for every test:
+
+* ``usage_guard._fetch_usage`` / ``_fetch_usage_for`` raise
+  ``RealUsageFetchBlocked``, a plain RuntimeError, so ``get_snapshot`` takes the
+  same failure path it takes offline. A test that patches them itself wins.
+* ``usage_guard._state_path`` is wrapped: an answer under the real state dir
+  becomes a tmp dir (``fetch*.lock`` derive from its parent and follow). It is a
+  wrapper and not only ``USAGE_GUARD_STATE_DIR``, which is set as well for
+  spawned processes, because ``test_usage_guard.py``'s ``_clean_usage_guard_env``
+  deletes every ``USAGE_GUARD_*`` env after this fixture runs. A test that sets
+  its own env or patches ``usage_guard.ROOT`` gets the real answer unchanged.
+* ``orchestrator._pull_main`` / ``_check_divergence`` do nothing when no ``_run``
+  is injected (``_check_divergence`` returns a state dict of the real shape and
+  writes no file). With an injected ``_run`` the real function runs, so their own
+  tests are untouched.
+
+Opt back in with ``@pytest.mark.real_usage_fetch`` (real fetch functions; the
+state redirect stays) or ``@pytest.mark.real_vault_git`` (real git functions),
+on a test, class or method. Limits: a spawned process sees only the env
+redirect, not the fetch or git block, and a test that reloads either module
+(``importlib.reload``) gets the real functions back for the rest of that test.
+
 Bare ``python -m unittest`` never loads this file, so it gets none of these layers.
 """
 
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import os
 import sys
 import types
@@ -97,8 +129,9 @@ from typing import NamedTuple
 
 import pytest
 
-from todo_system import cli, worker
+from todo_system import cli, usage_guard, worker
 from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
+from todo_system.orchestrator import orchestrator as _orch_mod
 
 # (module, attribute) of every real runtime file a test is known to reach. Read
 # at CALL time by _runtime_paths_isolated, so emptying it in memory switches the
@@ -316,6 +349,33 @@ class _RuntimePathTripwire:
 _TRIPWIRE = _RuntimePathTripwire(_REAL_RUNTIME.values(), trees=tuple(_LIVE_MAILBOX_ROOTS))
 sys.addaudithook(_TRIPWIRE)
 
+# The auto tick's real seams, captured at import — before any fixture or test
+# can rebind them — so the guard wraps the real functions, never a leftover patch.
+# The state dir is the one usage_guard built from its ROOT, like _RUNTIME_ANCHORS.
+_REAL_FETCH_USAGE = usage_guard._fetch_usage
+_REAL_FETCH_USAGE_FOR = usage_guard._fetch_usage_for
+_REAL_UG_STATE_PATH = usage_guard._state_path
+_REAL_UG_STATE_DIR = os.path.realpath(usage_guard.ROOT / "Worker" / "_state" / "usage_guard")
+_REAL_PULL_MAIN = _orch_mod._pull_main
+_REAL_CHECK_DIVERGENCE = _orch_mod._check_divergence
+
+
+class RealUsageFetchBlocked(RuntimeError):
+    """Raised by the guard in place of a real usage fetch.
+
+    Deliberately not ``never_swallow``: every caller is fail-open (``get_snapshot``
+    records the error, ``usage_hold`` swallows it), and a test reaching the guard
+    must see the same no-data path production takes when offline.
+    """
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "real_usage_fetch: lift the conftest block on usage_guard._fetch_usage*")
+    config.addinivalue_line(
+        "markers", "real_vault_git: lift the conftest no-op on orchestrator._pull_main/"
+                   "_check_divergence called without _run")
+
 
 @pytest.fixture(autouse=True)
 def _kakao_isolated(tmp_path, monkeypatch):
@@ -388,6 +448,50 @@ def _disk_guard_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(worktree_sweep, "REGISTRY_DIR", base / "gradle-registry")
 
 
+@pytest.fixture(autouse=True)
+def _auto_side_effects_isolated(request, tmp_path_factory, monkeypatch):
+    # See the module docstring. A test's own monkeypatch/mock.patch runs after
+    # this, so a test that patches any of these seams still wins.
+    redirect = tmp_path_factory.mktemp("usage-guard")
+
+    def _guarded_state_path():
+        path = _REAL_UG_STATE_PATH()
+        if os.path.realpath(path.parent) == _REAL_UG_STATE_DIR:
+            return redirect / path.name
+        return path
+
+    monkeypatch.setattr(usage_guard, "_state_path", _guarded_state_path)
+    monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(redirect))   # for spawned processes
+
+    if request.node.get_closest_marker("real_usage_fetch") is None:
+        def _blocked_fetch(*_args, **_kwargs):
+            raise RealUsageFetchBlocked(
+                "real usage fetch blocked by todo_system/conftest.py "
+                "(mark the test real_usage_fetch to lift it)")
+
+        monkeypatch.setattr(usage_guard, "_fetch_usage", _blocked_fetch)
+        monkeypatch.setattr(usage_guard, "_fetch_usage_for", _blocked_fetch)
+
+    if request.node.get_closest_marker("real_vault_git") is None:
+        def _guarded_pull_main(root, _run=None, **kwargs):
+            if _run is None:
+                return None
+            return _REAL_PULL_MAIN(root, _run, **kwargs)
+
+        def _guarded_check_divergence(root, _run=None, *, threshold=3):
+            if _run is None:
+                return {
+                    "ahead": 0, "behind": 0, "consecutive_behind": 0,
+                    "threshold": threshold, "alert": False,
+                    "updated": _dt.datetime.now().isoformat(timespec="seconds"),
+                    "last_detail": "blocked by todo_system/conftest.py",
+                }
+            return _REAL_CHECK_DIVERGENCE(root, _run, threshold=threshold)
+
+        monkeypatch.setattr(_orch_mod, "_pull_main", _guarded_pull_main)
+        monkeypatch.setattr(_orch_mod, "_check_divergence", _guarded_check_divergence)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _real_runtime_untouched():
     """Fail the run on any tripwire record, or on a real queue.lock / todo.db
@@ -432,3 +536,16 @@ def runtime_redirect_target():
 @pytest.fixture
 def runtime_tripwire():
     return _TRIPWIRE
+
+
+@pytest.fixture
+def real_auto_side_effects():
+    """The unguarded auto-tick seams and the real usage_guard state dir."""
+    return types.MappingProxyType({
+        "fetch_usage": _REAL_FETCH_USAGE,
+        "fetch_usage_for": _REAL_FETCH_USAGE_FOR,
+        "ug_state_path": _REAL_UG_STATE_PATH,
+        "ug_state_dir": _REAL_UG_STATE_DIR,
+        "pull_main": _REAL_PULL_MAIN,
+        "check_divergence": _REAL_CHECK_DIVERGENCE,
+    })
