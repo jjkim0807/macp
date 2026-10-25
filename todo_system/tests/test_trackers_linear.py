@@ -8,10 +8,9 @@ reduced to a single ``POST /graphql`` route dispatched on ``operationName``):
   push lookup/update/comment request bodies, GraphQL ``errors`` handling, the opt-in
   ``from_config`` gate, and key secrecy, asserted on the exact request JSON.
 * **Tracker contract** — the seven ``test_contract_*`` checks every
-  :class:`TrackerAdapter` owes the md bridge, mirrored here as ``[linear]``. Mirrored
-  rather than imported: ``todo_system/tests`` is not a package, so importing
-  ``test_trackers_github_issues``'s fixtures would depend on pytest's import mode, and
-  its server has no GraphQL route.
+  :class:`TrackerAdapter` owes the md bridge: the shared ``_tracker_contract.py``
+  assertions, run here as ``[linear]`` (loaded by path so pytest's import mode doesn't
+  matter; the fixture supplies the GraphQL server).
 
 The fixture responses are **not** real recordings — there are no live credentials —
 but hand-written replicas of Linear's response shapes (``data.issues.nodes[]``,
@@ -25,28 +24,41 @@ Everything runs against ``tmp_path`` — never the real vault (the session-scope
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
+import sys
 import threading
 import urllib.request
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 from todo_system.trackers import base, linear
 from todo_system.trackers.base import (
     TaskRecord,
-    TrackerAdapter,
     TrackerError,
     parse_frontmatter,
     upsert_task_record,
 )
 from todo_system.trackers.linear import LinearAdapter
 
+
+def _load_contract():
+    name = "macp_tracker_contract"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).with_name("_tracker_contract.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[name]
+
+
+_contract = _load_contract()
+
 LINEAR_KEY = "lin_api_fixture-SUPERSECRET-linear"   # fixture secret — must never leak
-PR_URL = "https://github.com/example/repo/pull/5"
+PR_URL = _contract.PR_URL
 ISSUE_UUID = "issue-uuid-0001"
 
 LINEAR_ENV = ("MACP_LINEAR_TEAM", "MACP_LINEAR_API_URL", "MACP_LINEAR_API_KEY")
@@ -507,96 +519,32 @@ def test_linear_tracker_error_is_shared():
 
 
 # --------------------------------------------------------------------------- #
-# Tracker contract — mirrored on Linear (same names/assertions as the Jira/GitHub set)
+# Tracker contract — shared assertions (_tracker_contract.py) on Linear
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class Case:
-    name: str
-    server: RecordingLinearServer
-    adapter: TrackerAdapter
-    token: str
-    seed: Callable[[], None]
-    ref_prefix: str
-    done_ref: str
-    env_vars: tuple[str, ...]
-    from_config: Callable[..., object]
-
-    def auth_carries_token(self, auth: str) -> bool:
-        # Linear personal API keys travel unprefixed; accept a Bearer form too.
-        return auth == self.token or auth == f"Bearer {self.token}"
-
-
 @pytest.fixture(params=["linear"])
-def contract(request, server) -> Case:
+def contract(request, server):
     def seed() -> None:
         server.issues = [_issue()]
 
-    return Case(
+    return _contract.Case(
         name="linear", server=server, adapter=_adapter(server), token=LINEAR_KEY,
-        seed=seed, ref_prefix="linear:", done_ref="linear:ENG-123",
-        env_vars=LINEAR_ENV, from_config=LinearAdapter.from_config,
+        seed=seed, fail=lambda code: setattr(server, "fail_code", code),
+        ref_prefix="linear:", done_ref="linear:ENG-123",
+        env_vars=LINEAR_ENV + ("LINEAR_API_KEY",), from_config=LinearAdapter.from_config,
+        auth_carries_token=_contract.bare_or_bearer(LINEAR_KEY),
     )
 
 
-def test_contract_is_tracker_adapter(contract):
-    assert isinstance(contract.adapter, TrackerAdapter)
-
-
-def test_contract_pull_upsert_idempotent(contract, tmp_path):
-    contract.seed()
-    items = tmp_path / "items"
-    first = [upsert_task_record(r, items, today="2026-10-25") for r in contract.adapter.pull()]
-    second = [upsert_task_record(r, items, today="2026-10-26") for r in contract.adapter.pull()]
-
-    assert [r.action for r in first] == ["created"]
-    assert [r.action for r in second] == ["unchanged"]
-    assert len(list(items.glob("*.md"))) == 1
-    fm, _ = parse_frontmatter(first[0].path.read_text(encoding="utf-8"))
-    assert str(fm["external_ref"]).startswith(contract.ref_prefix)
-
-
-def test_contract_push_open_without_pr_is_noop(contract):
-    ref = contract.adapter.push(TaskRecord(external_ref=contract.done_ref, status="open"))
-    assert ref == contract.done_ref
-    assert contract.server.requests == []
-
-
-def test_contract_push_done_with_pr_returns_ref_and_sends_pr_url(contract):
-    task = TaskRecord(external_ref=contract.done_ref, status="done", pr_url=PR_URL)
-    assert contract.adapter.push(task) == contract.done_ref
-    assert any(PR_URL in json.dumps(r["json"]) for r in contract.server.requests if r["json"])
-
-
-def test_contract_from_config_none_without_config(contract, tmp_path, monkeypatch):
-    for var in contract.env_vars + ("LINEAR_API_KEY",):
-        monkeypatch.delenv(var, raising=False)
-    assert contract.from_config(vault_root=tmp_path, start=tmp_path) is None
-    assert contract.server.requests == []
-    assert not list(tmp_path.glob("**/*.md"))
-
-
-def test_contract_token_absent_from_md_and_output(contract, tmp_path, capsys):
-    contract.seed()
-    result = upsert_task_record(contract.adapter.pull()[0], tmp_path / "items", today="2026-10-25")
-    md_text = result.path.read_text(encoding="utf-8")
-    captured = capsys.readouterr()
-
-    assert contract.token not in md_text
-    assert contract.token not in (captured.out + captured.err)
-    # The server DID receive the token (auth really sent, not dropped).
-    assert contract.auth_carries_token(contract.server.requests[0]["authorization"])
-
-
-def test_contract_http_error_hides_token(contract):
-    contract.server.fail_code = 401
-    with pytest.raises(TrackerError) as excinfo:
-        contract.adapter.pull()
-    msg = str(excinfo.value)
-    assert "401" in msg
-    assert contract.token not in msg
-    assert "Basic" not in msg and "Bearer" not in msg
+test_contract_is_tracker_adapter = _contract.test_contract_is_tracker_adapter
+test_contract_pull_upsert_idempotent = _contract.test_contract_pull_upsert_idempotent
+test_contract_push_open_without_pr_is_noop = _contract.test_contract_push_open_without_pr_is_noop
+test_contract_push_done_with_pr_returns_ref_and_sends_pr_url = (
+    _contract.test_contract_push_done_with_pr_returns_ref_and_sends_pr_url)
+test_contract_from_config_none_without_config = _contract.test_contract_from_config_none_without_config
+test_contract_token_absent_from_md_and_output = _contract.test_contract_token_absent_from_md_and_output
+test_contract_http_error_hides_token = _contract.test_contract_http_error_hides_token
 
 
 # --------------------------------------------------------------------------- #
