@@ -3,7 +3,7 @@
 A tracker (Jira, GitHub Issues, Linear, …) is a **view/mirror** of the task
 markdown, which stays the source of truth ([[Decisions/2026-10-13-macp-task-store]]).
 This package holds the transport-neutral contract (:mod:`.base`) and one concrete
-adapter per provider (:mod:`.jira`, :mod:`.github_issues`). The package import
+adapter per provider (:mod:`.jira`, :mod:`.github_issues`, :mod:`.linear`). The package import
 itself loads only :mod:`.base` — adapters are imported explicitly by their callers.
 
 Stdlib-only on purpose: the adapters ship inside the public engine, so nothing
@@ -28,8 +28,11 @@ from .base import (
     is_cancelled_status,
     jira_base_url,
     jira_project,
+    linear_api_url,
+    linear_team,
     load_github_token,
     load_jira_credentials,
+    load_linear_api_key,
     map_status_name,
     parse_frontmatter,
     set_scalar,
@@ -49,8 +52,11 @@ __all__ = [
     "is_cancelled_status",
     "jira_base_url",
     "jira_project",
+    "linear_api_url",
+    "linear_team",
     "load_github_token",
     "load_jira_credentials",
+    "load_linear_api_key",
     "map_status_name",
     "parse_frontmatter",
     "set_scalar",

@@ -279,6 +279,44 @@ def load_github_token(vault_root: Path | None = None) -> str | None:
     return token or None
 
 
+def linear_team(start: Path | None = None) -> str | None:
+    """Resolve the Linear team key (e.g. ``ENG``), else None.
+
+    ``MACP_LINEAR_TEAM`` env → nearest ``.macp/config.toml`` ``linear_team`` key →
+    None. None means "not configured" (opt-in no-op) — pull is always scoped to one
+    team so an unscoped workspace is never imported. ``start`` is the test seam.
+    """
+    return _config_resolver("MACP_LINEAR_TEAM", "linear_team", start)
+
+
+def linear_api_url(start: Path | None = None) -> str | None:
+    """Resolve the Linear GraphQL endpoint override, else None.
+
+    ``MACP_LINEAR_API_URL`` env → nearest ``.macp/config.toml`` ``linear_api_url`` key
+    → None (the adapter then uses ``https://api.linear.app/graphql``). ``start`` is
+    the test seam.
+    """
+    return _config_resolver("MACP_LINEAR_API_URL", "linear_api_url", start)
+
+
+def load_linear_api_key(vault_root: Path | None = None) -> str | None:
+    """Return the Linear personal API key, else None.
+
+    Reads ``MACP_LINEAR_API_KEY`` env first, falling back to
+    ``<vault>/.secrets/linear.json`` (``{"api_key": ...}``). Returns None when neither
+    supplies one — the opt-in no-op case. The generic ``LINEAR_API_KEY`` env is
+    **deliberately not read**: picking up an ambient key would switch sync on without
+    anyone configuring it. The key is **returned, never logged**; callers keep it out
+    of messages/stdout/md.
+
+    ``vault_root`` overrides the ``.secrets`` anchor (the test seam).
+    """
+    key = os.environ.get("MACP_LINEAR_API_KEY", "").strip()
+    if not key:
+        key = str(_read_secrets_json("linear.json", vault_root).get("api_key", "")).strip()
+    return key or None
+
+
 def _read_secrets_json(filename: str, vault_root: Path | None) -> dict:
     """Read ``<vault>/.secrets/<filename>`` as a JSON object, else ``{}``.
 
