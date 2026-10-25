@@ -11,8 +11,8 @@ is the regression-safe contract.
 What the gate does on the shared on-demand emulator node ``macp-app-test`` (via
 ``scripts/app-test-node``): start the node (one preemption retry) → ship a
 ``git archive`` tarball of the merged sha → build the debug APK ON THE NODE →
-boot the AVD → install → (optional) seed a prebuilt DB via ``run-as <pkg> cp``
-(debuggable build required) → run a tap/wait/expect scenario parsed from the
+boot the AVD → install → (optional) seed a prebuilt DB (adb push → force-stop →
+WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a tap/wait/expect scenario parsed from the
 repo's ``smoke`` config → scan logcat for ``FATAL EXCEPTION`` / ``ANR`` → pull
 screenshots → **always stop the node**. A non-PASS withholds ``distribute`` and
 the watermark bump (the merge still stands); the one exception is a monthly-budget
@@ -463,6 +463,15 @@ _ADB = "~/android/platform-tools/adb"
 # ("unknown subcommand", first real round-trip 2026-10-24).
 _AAPT2 = "$(ls -1d ~/android/build-tools/*/aapt2 | sort -V | tail -1)"
 _DEFAULT_GRADLE_TASK = ":app:assembleDebug"
+# Owner-seed temp copies: the node-host landing spot of `app-test-node push` (~
+# expands on the node, so it must stay unquoted) and the device staging path
+# `run-as` copies from. Both are removed by the seed script's EXIT trap.
+_SEED_NODE_PATH = "~/mk-smoke-seed.db"
+_SEED_DEVICE_PATH = "/data/local/tmp/mk-smoke-seed.db"
+# pkg / db_name are interpolated into a node shell AND a device `sh -c`, so they
+# are allow-listed: no quotes, spaces, `/` or a leading `.` (no `..` escape).
+_PKG_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+_DB_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
 
 def _remaining(deadline: float) -> float:
@@ -660,12 +669,53 @@ def _install_and_launch(run: Runner, node_script: Path | str, apk: str,
     return _last_line(r) or pkg
 
 
+def _seed_script(pkg: str, db_name: str) -> str:
+    """The node-side shell script that moves the pushed seed from the node host
+    onto the device and into the app's databases dir. Pure, so the command order
+    and quoting can be pinned without a fake node.
+
+    Order: EXIT trap (removes both temp copies on success AND failure — the seed
+    is personal data and a stopped spot VM keeps its disk) → ``adb push`` to the
+    device's ``/data/local/tmp`` → ``am force-stop`` (the app launched by
+    :func:`_install_and_launch` must not hold the DB open) → drop ``-wal``/
+    ``-shm``/``-journal`` (else SQLite replays a stale WAL over the seed) →
+    ``run-as cp``, falling back to piping the file through stdin when SELinux
+    stops the app uid opening ``/data/local/tmp`` → ``test -s`` (a 0-byte copy
+    would smoke-test an empty app) → relaunch.
+
+    ``~`` stays OUTSIDE quotes at the node-shell level so the node expands it (the
+    trap body is re-parsed when it fires, so it expands there too); the device
+    side only ever sees ``/data/local/tmp`` and ``/data/data`` paths."""
+    db = f"/data/data/{pkg}/databases/{db_name}"
+    dev = _SEED_DEVICE_PATH
+    return (
+        "set -e; "
+        f"trap 'rm -f {_SEED_NODE_PATH}; {_ADB} shell rm -f {dev} >/dev/null 2>&1' EXIT; "
+        f"{_ADB} push {_SEED_NODE_PATH} {dev} >/dev/null; "
+        f"{_ADB} shell am force-stop {pkg}; "
+        f"{_ADB} shell \"run-as {pkg} sh -c 'mkdir -p /data/data/{pkg}/databases && "
+        f"rm -f {db}-wal {db}-shm {db}-journal'\"; "
+        f"{_ADB} shell \"run-as {pkg} cp {dev} {db}\" || "
+        f"{_ADB} shell \"cat {dev} | run-as {pkg} sh -c 'cat > {db}'\"; "
+        f"{_ADB} shell \"run-as {pkg} sh -c 'test -s {db}'\"; "
+        f"{_ADB} shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+
+
 def _seed_db(run: Runner, node_script: Path | str, pkg: str, smoke_cfg: dict,
              result_dir: Path, env: dict, deadline: float) -> None:
-    """Optional: push a prebuilt DB and ``run-as <pkg> cp`` it into the app's
-    databases dir (needs a debuggable build). ``smoke.seed`` is
-    ``{"source": <HQ path>, "db_name": <file>}``; absent → no-op. A seed failure →
+    """Optional: put a prebuilt DB into the app's databases dir and relaunch it
+    (needs a debuggable build). ``smoke.seed`` is
+    ``{"source": <HQ path>, "db_name": <file>}``; absent → no-op (zero node
+    calls, so repos without a seed are byte-identical). A seed failure →
     ``SmokeError("node")`` (a half-seeded app would smoke-test the wrong state).
+
+    Two node calls: ``app-test-node push`` (HQ → node host ``~``), then one ssh
+    running :func:`_seed_script` (node host → device ``/data/local/tmp`` →
+    force-stop → WAL cleared → ``run-as cp`` → non-empty check → relaunch). The
+    first cut ran ``run-as cp ~/…`` straight from the node path, which the device
+    never had, after the app had already launched. ``pkg``/``db_name`` are
+    validated before any call; the source path only ever reaches the push argv,
+    never the device script, an error detail or the result.
 
     The full JSON-backup→DB transform (id-preserving placeholder names) is a
     deferred follow-up; this first cut takes a prebuilt SQLite file."""
@@ -674,13 +724,14 @@ def _seed_db(run: Runner, node_script: Path | str, pkg: str, smoke_cfg: dict,
         return
     src = str(seed["source"])
     db_name = str(seed.get("db_name") or "app.db")
-    remote_db = "~/mk-smoke-seed.db"
-    p = _node(run, node_script, "push", src, remote_db, env=env, timeout=_remaining(deadline))
+    if not _PKG_RE.match(pkg or ""):
+        raise SmokeError("node", "시드 설정 오류 — pkg 형식")
+    if not _DB_NAME_RE.match(db_name):
+        raise SmokeError("node", "시드 설정 오류 — db_name 형식")
+    p = _node(run, node_script, "push", src, _SEED_NODE_PATH, env=env, timeout=_remaining(deadline))
     if getattr(p, "returncode", 1) != 0:
         raise SmokeError("node", f"시드 DB 전송 실패 (rc={getattr(p, 'returncode', None)})")
-    script = (f'{_ADB} shell "run-as {pkg} cp {remote_db} '
-              f'/data/data/{pkg}/databases/{db_name}"')
-    r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
+    r = _ssh(run, node_script, _seed_script(pkg, db_name), env=env, timeout=_remaining(deadline))
     if getattr(r, "returncode", 1) != 0:
         raise SmokeError("node", f"시드 DB 주입 실패 (rc={getattr(r, 'returncode', None)})")
 
