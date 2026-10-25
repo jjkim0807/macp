@@ -1,15 +1,16 @@
-# External task trackers (Jira, GitHub Issues)
+# External task trackers (Jira, GitHub Issues, Linear)
 
 macp can mirror tasks to and from an external tracker. **The task markdown under
 `Todo/items/` stays the source of truth** — the tracker is a view. Sync is
 **opt-in**: with no tracker configured, `tracker pull` / `tracker push` do nothing
 and make no network call.
 
-There are two adapters: **Jira Cloud (REST v3)** (`todo_system/trackers/jira.py`)
-and **GitHub Issues (REST)** (`todo_system/trackers/github_issues.py`, see
-[GitHub Issues](#github-issues) below). The contract
-(`todo_system/trackers/base.py`) is transport-neutral, so a Linear (GraphQL) adapter
-is a follow-up leaf on the same interface. Design: `docs/design/state-store.md` §⑨.
+There are three adapters: **Jira Cloud (REST v3)** (`todo_system/trackers/jira.py`),
+**GitHub Issues (REST)** (`todo_system/trackers/github_issues.py`, see
+[GitHub Issues](#github-issues) below) and **Linear (GraphQL)**
+(`todo_system/trackers/linear.py`, see [Linear](#linear) below). The contract
+(`todo_system/trackers/base.py`) is transport-neutral — Linear is the GraphQL proof
+that it holds beyond REST. Design: `docs/design/state-store.md` §⑨.
 
 ## Configure (Jira)
 
@@ -180,6 +181,104 @@ also stay in `tags`, so nothing is lost.
 | `closed` / `completed` (or no reason) | `done` |
 | `closed` / `not_planned` or `duplicate` | `done` (+ `cancelled` tag) |
 
+## Linear
+
+The Linear adapter follows the same contract, opt-in gate, md-wins conflict rule
+and secret hygiene as Jira and GitHub. It speaks **GraphQL only** — every call is one
+`POST` of `{"operationName", "query", "variables"}` to a single endpoint. Official
+developer docs: `https://linear.app/developers` (checked 2026-10-22 in design §⑨;
+not re-checked in this leaf, which had no web access).
+
+### Configure
+
+Two non-secret settings, resolved env → nearest `.macp/config.toml` → unset:
+
+| Setting | `.macp/config.toml` key | Env override |
+|---|---|---|
+| Team key (e.g. `ENG`) — pull is always scoped to this team | `linear_team` | `MACP_LINEAR_TEAM` |
+| GraphQL endpoint (default `https://api.linear.app/graphql`) | `linear_api_url` | `MACP_LINEAR_API_URL` |
+
+The default endpoint is the widely documented value but was **not** confirmed on an
+official page when this adapter was written (design §⑨ marks it unverified); override
+it with `linear_api_url` if Linear's docs say otherwise.
+
+The API key is **secret** and lives only in `.secrets/` or the environment:
+
+- `<vault>/.secrets/linear.json` → `{"api_key": "…"}`, **or**
+- env `MACP_LINEAR_API_KEY`.
+
+Use a **personal API key** (Linear → Settings → API). It is sent as the raw header
+`Authorization: <key>` (no `Bearer` prefix). The generic `LINEAR_API_KEY` env is
+**deliberately not picked up** — an ambient key must not switch sync on. If the team
+is missing or not a bare `[A-Za-z0-9_]+` key, or there is no API key, the adapter is
+never built and sync is a no-op (no network call).
+
+Every request sends `Authorization`, `Content-Type: application/json`,
+`Accept: application/json` and a `User-Agent`; the per-call timeout is
+`LINEAR_TIMEOUT_S`.
+
+### Use
+
+The `tracker pull` / `tracker push` CLI is still wired to Jira only; like GitHub, the
+Linear adapter is a library API for now:
+
+```python
+from pathlib import Path
+
+from todo_system.trackers.base import upsert_task_record
+from todo_system.trackers.linear import LinearAdapter
+
+adapter = LinearAdapter.from_config()   # None when not configured
+if adapter is not None:
+    for record in adapter.pull(since="2026-10-01"):
+        upsert_task_record(record, Path("Todo/items"))
+```
+
+`pull` runs the `MacpPullIssues` query —
+`issues(filter: {team: {key: {eq: <team>}}, updatedAt: {gte: <since>}}, first: 100,
+orderBy: updatedAt)` — with the `updatedAt` filter only when `since` is given (a bare
+`YYYY-MM-DD` is sent as `YYYY-MM-DDT00:00:00Z`). Nodes without an `identifier` are
+skipped.
+
+`push` acts only on a task whose `external_ref` is `linear:<TEAM>-<N>`:
+
+1. `MacpIssueForPush` — `issue(id: "<TEAM>-<N>")` reads the issue UUID and its team's
+   workflow states;
+2. `status: done` → `MacpIssueComplete` — `issueUpdate(id, input: {stateId})` moving the
+   issue to the team's `completed`-type state with the **lowest `position`**;
+3. a merged PR URL → `MacpCommentCreate` — `commentCreate(input: {issueId, body})` with
+   `body = "macp: PR merged — <PR URL>"`.
+
+Neither done nor a PR URL → no request. A ref that is not `linear:<TEAM>-<N>` raises
+`TrackerError` (no request sent) when there is something to push. An unknown issue, a
+team with no `completed` state (checked before any update is sent), a mutation that
+returns `success: false`, an HTTP error, or a GraphQL `errors` array (even on HTTP 200)
+all raise `TrackerError`.
+
+### Field mapping (Linear → md)
+
+| Concept | Linear (GraphQL `Issue`) | → task md |
+|---|---|---|
+| Title | `title` | body H1 (`# …`) |
+| Description | `description` (Markdown) | md body, verbatim |
+| Status | `state.type` | `status` (table below) |
+| Labels | `labels.nodes[].name` | `tags[]` |
+| Due | `dueDate` | `due` (YYYY-MM-DD) |
+| Priority | `priority` (0–4) | `priority` (1 Urgent 90 / 2 High 70 / 3 Medium 50 / 4 Low 30; 0 No priority → not mapped) |
+| Identifier | `identifier` (e.g. `ENG-123`) | `external_ref: linear:ENG-123` |
+| Assignee | `assignee` | not mapped (single-worker model) |
+
+### Status mapping (Linear)
+
+Linear lets each team name its workflow states freely, so the mapping keys on the
+fixed `state.type`, not the state name:
+
+| `state.type` | → task `status` |
+|---|---|
+| `backlog` / `unstarted` / `started` (and `triage` or anything unknown) | `open` |
+| `completed` | `done` |
+| `canceled` | `done` (+ `cancelled` tag) |
+
 ## Limits
 
 - **ADF is best-effort.** Jira v3 descriptions and comments are ADF (JSON), and there
@@ -187,14 +286,14 @@ also stay in `tags`, so nothing is lost.
   concatenates ADF text nodes into plain text; `push` wraps the PR URL in a minimal
   ADF document. Rich formatting (tables, panels, mentions) is lost on the way in.
 - **Polling, not webhooks.** No inbound HTTPS endpoint; latency is the tick interval.
-- **Two providers.** Jira + GitHub Issues; Linear is a follow-up leaf on the same
-  `TrackerAdapter` interface.
+- **Three providers.** Jira + GitHub Issues + Linear on the same `TrackerAdapter`
+  interface.
 - **The CLI is Jira-wired.** `tracker pull` / `tracker push` drive Jira only; GitHub
-  Issues is a library API until a CLI provider switch lands.
-- **One scalar `external_ref` per task** (`jira:…` or `github:…`) — no multi-provider
-  map, so a task mirrors to one tracker.
-- **No issue creation on push.** Both adapters only update issues that already carry
-  an `external_ref`.
+  Issues and Linear are library APIs until a CLI provider switch lands.
+- **One scalar `external_ref` per task** (`jira:…`, `github:…` or `linear:…`) — no
+  multi-provider map, so a task mirrors to one tracker.
+- **No issue creation on push.** None of the adapters create issues; they only update
+  issues that already carry an `external_ref`.
 - **GitHub: single page.** `pull` fetches one page of 100 (most recently updated
   first) and does not follow `Link` pagination; use `since` to stay within it.
 - **GitHub: push always closes as `completed`.** Closing as `not_planned` from a
@@ -204,7 +303,20 @@ also stay in `tags`, so nothing is lost.
   `2026-03-10` is current — checked 2026-10-25). Bump `GITHUB_API_VERSION` before then.
 - **GitHub: due is the milestone's `due_on`**, and priority comes from label
   conventions — GitHub has neither natively.
+- **Linear: single page.** `pull` fetches one page of 100 issues (`orderBy: updatedAt`)
+  and does not follow cursor pagination; use `since` to stay within it.
+- **Linear: personal API key only.** OAuth access tokens (`Authorization: Bearer …`)
+  are not supported.
+- **Linear: push picks the lowest-position `completed` state.** Moving a `cancelled`
+  task to a `canceled` state is a follow-up.
+- **Linear: priority 0 (No priority) is not mapped** — the md `priority` stays empty.
+- **Linear: schema not verified against the live API.** The four GraphQL documents
+  (`PULL_QUERY`, `ISSUE_QUERY`, `UPDATE_MUTATION`, `COMMENT_MUTATION` in
+  `todo_system/trackers/linear.py`) and the default endpoint were written without live
+  credentials and tested only against a hand-built offline fixture; check them against
+  Linear's schema on first real use.
 - **Transport is stdlib `urllib.request`** with a per-call timeout (`JIRA_TIMEOUT_S`,
-  `GITHUB_TIMEOUT_S`); no third-party HTTP client. Errors surface as the shared
-  `TrackerError` (`todo_system/trackers/base.py`) carrying only provider / method /
-  path / HTTP status — never the token or Authorization header.
+  `GITHUB_TIMEOUT_S`, `LINEAR_TIMEOUT_S`); no third-party HTTP client. Errors surface
+  as the shared `TrackerError` (`todo_system/trackers/base.py`) carrying only provider /
+  method / path (or GraphQL operation) / HTTP status / GraphQL error code — never the
+  token, Authorization header, response body or GraphQL error message.
