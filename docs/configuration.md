@@ -9,6 +9,7 @@ be replaced by a `.macp/config.toml` in the vault.
 - [Usage pacing](#usage-pacing)
 - [Profiles and accounts](#profiles-and-accounts)
 - [Anthropic usage and cost](#anthropic-usage-and-cost)
+- [Browser MCP server](#browser-mcp-server)
 - [Notifications and other integrations](#notifications-and-other-integrations)
 
 ## Finding the vault
@@ -33,6 +34,7 @@ in the skeleton, and the matching environment variable wins:
 # language     = "en"             # UI language for log/CLI text: en | ko (MACP_LANGUAGE)
 # state_backend      = "git"      # orchestrator state backend: git | external (MACP_STATE_BACKEND)
 # state_sqlite_path  = "~/.local/share/macp/state.sqlite"  # external backend's db path (MACP_STATE_SQLITE_PATH)
+# browser_mcp_server = "/path/to/macp-browser/mcp/server.mjs"  # macp-browser MCP server for browser stages (MACP_BROWSER_MCP_SERVER)
 ```
 
 Without `timezone`, calendar events use the host's own IANA zone. If the host does not
@@ -49,6 +51,7 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `MACP_LANGUAGE` | UI language for engine log/CLI text, `en` or `ko` (key `language`; default `en`; other values read as `en`) |
 | `MACP_STATE_BACKEND` | orchestrator state backend: `git` (default) or `external` (key `state_backend`) |
 | `MACP_STATE_SQLITE_PATH` | external backend's SQLite path (key `state_sqlite_path`; default `$XDG_DATA_HOME/macp/state.sqlite`, else `~/.local/share/macp/state.sqlite`) |
+| `MACP_BROWSER_MCP_SERVER` | macp-browser MCP server script for the browser stages (key `browser_mcp_server`; default unset = no MCP wiring; `MACP_BROWSER_NODE` picks the node binary, default `node`). See [Browser MCP server](#browser-mcp-server) |
 | `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
 | `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |
@@ -167,6 +170,45 @@ without spaces in its name:
 cp scripts/macp-anthropic-usage ~/.local/bin/ && chmod +x ~/.local/bin/macp-anthropic-usage
 # allow Bash(macp-anthropic-usage:*) in the task's allowed_tools
 ```
+
+## Browser MCP server
+
+The macp-browser folder ships a stdio MCP server (`mcp/server.mjs`) that attaches to the
+logged-in Chrome once and takes the browser lease itself on the first tool call. It is
+off by default. To turn it on for worker stages, point the engine at the script:
+
+```toml
+browser_mcp_server = "/path/to/macp-browser/mcp/server.mjs"
+```
+
+(or set `MACP_BROWSER_MCP_SERVER`). When the path names an existing file, the
+implement, verify, quick and delegate stages get:
+
+- `--mcp-config` with an inline server definition whose env sets
+  `MACP_BROWSER_OWNER` to the run id, so the stage's lease owner is the run;
+- `--strict-mcp-config`, so a user-scope registration of the same server (below) is
+  not loaded into the stage as a second copy without the run's owner;
+- `mcp__macp-browser__*` at the end of the allowed tools, also when a task supplies
+  its own `allowed_tools`;
+- one run-metadata line telling the stage to use the MCP tools first and keep the
+  `macp-browser` wrapper for compatibility.
+
+The `Bash(macp-browser:*)` wrapper rule and its lease/scratch lines stay as they are.
+research, plan, report and discover never get the server. With the key unset, or the
+path pointing at a missing file, stage argv is byte-identical to a host without this
+feature. `MACP_BROWSER_NODE` names the node binary when `node` is not on the
+runner's `PATH`.
+
+Interactive Claude Code sessions register the same server themselves, with their
+own session id as the owner:
+
+```bash
+claude mcp add --scope user macp-browser \
+  --env MACP_BROWSER_OWNER=<your-session-id> \
+  -- node /path/to/macp-browser/mcp/server.mjs
+```
+
+That registration does not reach worker stages, which run with `--strict-mcp-config`.
 
 ## Notifications and other integrations
 
