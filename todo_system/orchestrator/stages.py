@@ -240,6 +240,21 @@ BROWSER_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 # stages get the run_id here (with_browser_owner), so implement → verify of one
 # run are one owner and the stage can `lease acquire` without inventing an id.
 BROWSER_OWNER_ENV = "MACP_BROWSER_OWNER"
+# macp-browser v2: a long-lived stdio MCP server (`node <dir>/mcp/server.mjs`)
+# that attaches to the same Chrome once and takes the lease itself on first call.
+# Opt-in via paths.browser_mcp_server (env/config key, no default): only when it
+# names an existing file do BROWSER_MCP_STAGES get `--mcp-config` (owner =
+# run_id in the server's env) and BROWSER_MCP_TOOL_RULE; otherwise argv is
+# byte-identical to before. The Bash wrapper rule above stays for compatibility.
+# `--strict-mcp-config` rides along so a user-scope registration of the same
+# server (interactive sessions, docs/configuration.md) can't load a second,
+# ownerless copy into a stage — no stage allows any other mcp__ tool anyway.
+BROWSER_MCP_SERVER_NAME = "macp-browser"
+BROWSER_MCP_TOOL_RULE = f"mcp__{BROWSER_MCP_SERVER_NAME}__*"
+BROWSER_MCP_STAGES = BROWSER_TOOL_STAGES
+# The node binary, same knob the macp-browser wrapper honours (node isn't
+# always on the runner's PATH).
+BROWSER_MCP_NODE_ENV = "MACP_BROWSER_NODE"
 
 # The remote-gate executor (todo_system.orchestrator.remote_gate, CLAUDE delegate
 # note below) for a verification command too heavy/memory-bound for one stage:
@@ -345,7 +360,35 @@ def strip_frontmatter(text: str) -> str:
 TASK_TOOLS_STAGES = ("implement",)
 
 
-def _safe_tools(stage: str, task_tools: str | None = None) -> list[str]:
+def browser_mcp_server(stage: str) -> Path | None:
+    """The configured macp-browser MCP server script for `stage`, or None.
+
+    None unless `stage` is a BROWSER_MCP_STAGES stage and
+    paths.browser_mcp_server() names an existing file — a path left pointing at
+    a removed checkout falls back to the wrapper-only argv instead of launching a
+    dead server. Never raises: a broken config must not break dispatch."""
+    if stage not in BROWSER_MCP_STAGES:
+        return None
+    try:
+        server = paths.browser_mcp_server()
+        return server if server is not None and server.is_file() else None
+    except Exception:
+        return None
+
+
+def browser_mcp_config(server: Path, run_id: str) -> str:
+    """The inline `--mcp-config` JSON for one stage: the macp-browser server
+    with the run_id as its lease owner. Holds a path and the run_id only."""
+    cfg = {"mcpServers": {BROWSER_MCP_SERVER_NAME: {
+        "command": os.environ.get(BROWSER_MCP_NODE_ENV) or "node",
+        "args": [str(server)],
+        "env": {BROWSER_OWNER_ENV: run_id},
+    }}}
+    return json.dumps(cfg, sort_keys=True, separators=(",", ":"))
+
+
+def _safe_tools(stage: str, task_tools: str | None = None, *,
+                browser_mcp: bool = False) -> list[str]:
     """The stage's tool whitelist, optionally replaced by the task's own.
 
     `allowed_tools` in task frontmatter did nothing in the v2 staged pipeline:
@@ -358,7 +401,8 @@ def _safe_tools(stage: str, task_tools: str | None = None) -> list[str]:
     The forbidden check applies to the task-supplied list too — that is the
     property that makes honouring it safe at all. A task list still keeps
     SMS_TOOL_RULE and BROWSER_TOOL_RULE, so a task needs no allowed_tools edit
-    to read a 2FA code or use the logged-in Chrome.
+    to read a 2FA code or use the logged-in Chrome. `browser_mcp` (the MCP
+    server is configured) appends BROWSER_MCP_TOOL_RULE last on either path.
     """
     tools = STAGE_TOOLS[stage]
     if task_tools and stage in TASK_TOOLS_STAGES:
@@ -368,6 +412,9 @@ def _safe_tools(stage: str, task_tools: str | None = None) -> list[str]:
         for rule, rule_stages in _STANDING_RULES:
             if stage in rule_stages and rule not in tools.split():
                 tools = f"{tools} {rule}"
+    if (browser_mcp and stage in BROWSER_MCP_STAGES
+            and BROWSER_MCP_TOOL_RULE not in tools.split()):
+        tools = f"{tools} {BROWSER_MCP_TOOL_RULE}"
     for bad in FORBIDDEN_TOOL_SUBSTRINGS:
         if bad in tools:
             raise ValueError(f"forbidden tool in {stage} whitelist: {bad}")
@@ -429,6 +476,8 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     the stage's tool whitelist and turn budget. `tier` is the task's model tier
     (model_select.classify_tier); None means the heavy ladder."""
     prompt = strip_frontmatter(load_stage_prompt(stage))
+    mcp_server = browser_mcp_server(stage)
+    mcp_on = mcp_server is not None
     meta = [
         "\n\n---\n\n# Run metadata (injected by orchestrator)\n\n",
         f"- run_id: `{run_id}`\n",
@@ -443,7 +492,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         # available" and stopped probing. This line is the decided whitelist
         # itself and comes after the prompt, so it wins any disagreement.
         f"- allowed tools (authoritative, overrides any list in the prompt "
-        f"above): {' '.join(_safe_tools(stage, allowed_tools))}\n",
+        f"above): {' '.join(_safe_tools(stage, allowed_tools, browser_mcp=mcp_on))}\n",
     ]
     if stage in BROWSER_TOOL_STAGES:
         # The worker-*.md prompts live under .claude/**, which a headless stage
@@ -463,6 +512,22 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "that never waits on the default lease — and `scratch release` when done. "
             "Reserve the default (logged-in) profile lease for work that needs the "
             "logged-in cookies.\n")
+        if mcp_on:
+            # Only when the MCP server is wired into this argv, so an unconfigured
+            # host's prompt stays byte-identical.
+            meta.append(
+                f"- **Browser: MCP tools first, wrapper for compatibility "
+                f"({BROWSER_MCP_SERVER_NAME} MCP server)**: prefer the "
+                f"`{BROWSER_MCP_TOOL_RULE}` tools (browser_navigate / browser_snapshot "
+                "with element refs / browser_click / browser_type / browser_wait_for / "
+                "browser_tabs / browser_take_screenshot) over "
+                f"`{BROWSER_CLI} probe|steps|text` — they take the lease as owner "
+                f"`{run_id}` on first call, release it when idle or at exit, and touch "
+                f"only tabs they opened. The `{BROWSER_CLI}` wrapper lines above stay "
+                "for compatibility (lease status, scratch, login-check, or when an MCP "
+                "tool is unavailable). A tool reporting logged-out or a lease held by "
+                "someone else means stop and write `blocked_on:` — never log in, never "
+                "take the lease.\n")
     if stage in REMOTE_GATE_TOOL_STAGES:
         # A gate command too heavy for one stage (overruns the cap, or won't finish
         # inside the runner cgroup's memory — e.g. a full Robolectric/Gradle suite)
@@ -532,12 +597,17 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     argv = ["claude", "-p", full,
             "--model", stage_model(stage, tier), "--effort", stage_effort(stage, tier),
             "--max-turns", str(STAGE_MAX_TURNS[stage])]
+    if mcp_on:
+        # --mcp-config is variadic like --allowed-tools, so a --flag must follow
+        # it; --strict-mcp-config is that flag (why strict: BROWSER_MCP_SERVER_NAME).
+        argv += ["--mcp-config", browser_mcp_config(mcp_server, run_id),
+                 "--strict-mcp-config"]
     if usage_enabled():
         # Names the transcript stage_usage reads the usage back from — fresh per
         # invocation, so one id is one stage run. Ahead of --allowed-tools, which
         # is variadic: nothing should depend on where its list ends.
         argv += [SESSION_ID_FLAG, str(uuid.uuid4())]
-    argv += ["--allowed-tools", *_safe_tools(stage, allowed_tools)]
+    argv += ["--allowed-tools", *_safe_tools(stage, allowed_tools, browser_mcp=mcp_on)]
     wr = Path(worker_root) if worker_root else paths.worker_root()
     if wr.exists():
         argv += ["--add-dir", str(wr)]
