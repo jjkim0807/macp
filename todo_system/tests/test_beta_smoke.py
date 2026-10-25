@@ -334,8 +334,9 @@ class FakeNode:
     def __init__(self, *, dumps=None, logcat="I/App: started\nI/App: ok\n",
                  start_rcs=(0,), build_rc=0, install_rc=0,
                  apk="app/build/outputs/apk/debug/app-debug.apk", pkg="com.mulkko",
-                 raise_on=None, raise_exc=None):
+                 raise_on=None, raise_exc=None, seed_rc=0):
         self.calls: list[dict] = []
+        self.seed_rc = seed_rc
         self.dumps = list(dumps) if dumps else [_dump("운동하기", "0:30")]
         self._dump_i = 0
         self.logcat = logcat
@@ -413,6 +414,8 @@ class FakeNode:
                 return cp(0, d)
             if ssh_kind == "logcat":
                 return cp(0, self.logcat)
+            if ssh_kind == "seed":
+                return cp(self.seed_rc, "")
             return cp(0, "")
         return cp(0, "")
 
@@ -561,6 +564,139 @@ def test_run_smoke_seed_db_injected_before_scenario(tmp_path):
     res = _run_smoke(tmp_path, fake, cfg=cfg)
     assert res["ok"] is True
     assert "seed" in fake.ssh_kinds()                    # run-as cp happened
+
+
+# --- owner seed: device-side order, quoting, fallback, failure ---------------
+
+import re  # noqa: E402 — grouped with the owner-seed block
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+FAKE_SEED_SRC = "/tmp/fake-owner/seed.db"
+SEED_CFG = {"seed": {"source": FAKE_SEED_SRC, "db_name": "mulkko.db"}}
+
+
+def _seed_direct(fake, tmp_path, cfg=None, pkg="com.mulkko"):
+    bs._seed_db(fake, tmp_path / "app-test-node", pkg, cfg if cfg is not None else SEED_CFG,
+                tmp_path, env={}, deadline=time.monotonic() + 60)
+
+
+def _seed_ssh_script(fake) -> str:
+    scripts = [c["argv"][3] for c in fake.calls
+               if fake._token(c["argv"]) == "ssh" and fake._ssh_kind(c["argv"][3]) == "seed"]
+    assert len(scripts) == 1, scripts
+    return scripts[0]
+
+
+def test_seed_db_command_order_and_quoting(tmp_path):
+    fake = FakeNode()
+    _seed_direct(fake, tmp_path)
+    assert len(fake.calls) == 2                          # one push + one ssh, nothing else
+    assert fake.calls[0]["argv"] == ["bash", str(tmp_path / "app-test-node"), "push",
+                                     FAKE_SEED_SRC, "~/mk-smoke-seed.db"]
+    script = _seed_ssh_script(fake)
+    needles = [
+        "adb push ~/mk-smoke-seed.db /data/local/tmp/mk-smoke-seed.db",
+        "am force-stop com.mulkko",
+        "databases/mulkko.db-wal",
+        "databases/mulkko.db-shm",
+        "run-as com.mulkko cp /data/local/tmp/mk-smoke-seed.db "
+        "/data/data/com.mulkko/databases/mulkko.db",
+        "test -s /data/data/com.mulkko/databases/mulkko.db",
+        "monkey -p com.mulkko -c android.intent.category.LAUNCHER",
+    ]
+    pos = [script.index(n) for n in needles]
+    assert pos == sorted(pos), list(zip(needles, pos))
+    # the EXIT trap comes first and removes both exact temp copies
+    assert script.startswith("set -e; trap '")
+    trap_body = script.split("'", 2)[1]
+    assert "rm -f ~/mk-smoke-seed.db" in trap_body
+    assert "rm -f /data/local/tmp/mk-smoke-seed.db" in trap_body
+    # `~` is never quoted at the node-shell level (outside the trap body), so the
+    # node expands it; the device side never sees a node-host path
+    rest = script.replace(trap_body, "")
+    assert not re.search(r"[\"']~", rest)
+    assert not re.search(r"run-as[^;|]*~", rest)
+    assert FAKE_SEED_SRC not in script
+    assert "rm -rf" not in script
+
+
+def test_seed_db_falls_back_to_stdin_pipe(tmp_path):
+    fake = FakeNode()
+    _seed_direct(fake, tmp_path)
+    script = _seed_ssh_script(fake)
+    cp_at = script.index("run-as com.mulkko cp ")
+    fallback = ("|| ~/android/platform-tools/adb shell \"cat /data/local/tmp/mk-smoke-seed.db | "
+                "run-as com.mulkko sh -c 'cat > /data/data/com.mulkko/databases/mulkko.db'\"")
+    assert script.index(fallback) > cp_at
+    assert script.index(fallback) < script.index("test -s")
+
+
+@pytest.mark.parametrize("cfg", [{}, {"seed": {}}, {"seed": {"db_name": "x.db"}}])
+def test_seed_db_no_seed_is_zero_calls(tmp_path, cfg):
+    fake = FakeNode()
+    _seed_direct(fake, tmp_path, cfg=cfg)
+    assert fake.calls == []
+
+
+def test_seed_db_push_failure_is_node_error_without_ssh(tmp_path):
+    calls: list[list[str]] = []
+
+    def run(argv, *, cwd=None, env=None, timeout=None):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1 if argv[2] == "push" else 0, "", "")
+
+    with pytest.raises(bs.SmokeError) as ei:
+        _seed_direct(run, tmp_path)
+    assert ei.value.kind == "node"
+    assert "전송" in ei.value.detail
+    assert FAKE_SEED_SRC not in ei.value.detail
+    assert [c[2] for c in calls] == ["push"]             # no device script after a failed push
+
+
+@pytest.mark.parametrize("field,value", [
+    ("db_name", "x; rm -f y"), ("db_name", "../x.db"), ("db_name", "a/b.db"),
+    ("db_name", "x'.db"), ("pkg", "com.x; reboot"), ("pkg", ""),
+])
+def test_seed_db_rejects_unsafe_names_before_any_call(tmp_path, field, value):
+    fake = FakeNode()
+    cfg = {"seed": {"source": FAKE_SEED_SRC, "db_name": value if field == "db_name" else "m.db"}}
+    pkg = value if field == "pkg" else "com.mulkko"
+    with pytest.raises(bs.SmokeError) as ei:
+        _seed_direct(fake, tmp_path, cfg=cfg, pkg=pkg)
+    assert ei.value.kind == "node"
+    assert field in ei.value.detail
+    assert fake.calls == []
+
+
+def test_run_smoke_seed_runs_after_install_before_first_dump_and_never_leaks_source(tmp_path):
+    cfg = {**SMOKE_CFG, **SEED_CFG}
+    fake = FakeNode(dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"),
+                           _dump("독서하기", "0:30")])
+    res = _run_smoke(tmp_path, fake, cfg=cfg)
+    assert res["ok"] is True
+    kinds = fake.ssh_kinds()
+    assert kinds.index("install") < kinds.index("seed") < kinds.index("dump")
+    assert kinds.count("seed") == 1
+    assert FAKE_SEED_SRC not in json.dumps(res, ensure_ascii=False)
+    assert FAKE_SEED_SRC not in (Path(res["result_dir"]) / "result.json").read_text(encoding="utf-8")
+    # the source path reaches the node only as the push argv
+    hits = [c["argv"] for c in fake.calls if FAKE_SEED_SRC in " ".join(c["argv"])]
+    assert hits == [["bash", str(tmp_path / "app-test-node"), "push",
+                     FAKE_SEED_SRC, "~/mk-smoke-seed.db"]]
+
+
+def test_run_smoke_seed_failure_is_kind_node_and_stops(tmp_path):
+    cfg = {**SMOKE_CFG, **SEED_CFG}
+    fake = FakeNode(seed_rc=1)
+    res = _run_smoke(tmp_path, fake, cfg=cfg)
+    assert res["ok"] is False
+    assert res["kind"] == "node"
+    assert "시드" in res["detail"]
+    assert FAKE_SEED_SRC not in res["detail"]
+    assert "stop" in fake.tokens()
+    assert "dump" not in fake.ssh_kinds()                # the scenario never ran
 
 
 # ===========================================================================
