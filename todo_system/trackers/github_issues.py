@@ -42,7 +42,8 @@ from .base import (
 # Per-call HTTP timeout — bounded like jira.JIRA_TIMEOUT_S (design §②).
 GITHUB_TIMEOUT_S = 30
 
-# The REST API version header GitHub pins responses to.
+# The REST API version header GitHub pins responses to. 2022-11-28 is accepted by
+# github.com until 2028-03-10 and by GitHub Enterprise Server; 2026-03-10 is newer.
 GITHUB_API_VERSION = "2022-11-28"
 
 DEFAULT_API_URL = "https://api.github.com"

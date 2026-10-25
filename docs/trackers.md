@@ -1,16 +1,17 @@
-# External task trackers (Jira)
+# External task trackers (Jira, GitHub Issues)
 
 macp can mirror tasks to and from an external tracker. **The task markdown under
 `Todo/items/` stays the source of truth** — the tracker is a view. Sync is
 **opt-in**: with no tracker configured, `tracker pull` / `tracker push` do nothing
 and make no network call.
 
-Today there is one adapter, **Jira Cloud (REST v3)**. The contract
-(`todo_system/trackers/base.py`) is transport-neutral, so GitHub Issues (REST) and
-Linear (GraphQL) adapters are follow-up leaves on the same interface. Design:
-`docs/design/state-store.md` §⑨.
+There are two adapters: **Jira Cloud (REST v3)** (`todo_system/trackers/jira.py`)
+and **GitHub Issues (REST)** (`todo_system/trackers/github_issues.py`, see
+[GitHub Issues](#github-issues) below). The contract
+(`todo_system/trackers/base.py`) is transport-neutral, so a Linear (GraphQL) adapter
+is a follow-up leaf on the same interface. Design: `docs/design/state-store.md` §⑨.
 
-## Configure
+## Configure (Jira)
 
 Two non-secret settings, resolved env → nearest `.macp/config.toml` → unset (the
 same ladder as `repo_slug` / `state_backend` in `paths.py`):
@@ -31,7 +32,7 @@ Jira Cloud uses HTTP Basic auth with `email:api_token`. Create an API token at
 project, **or** credentials are missing, the adapter is never built and sync is a
 no-op.
 
-## Run
+## Run (Jira)
 
 ```bash
 # Import tracker issues into Todo/items/ (idempotent upsert). --since is optional.
@@ -60,7 +61,7 @@ the ledger.
 | Issue key | `key` (e.g. `PROJ-123`) | `external_ref: jira:PROJ-123` |
 | Assignee | `fields.assignee` | not mapped (single-worker model) |
 
-## Status mapping
+## Status mapping (Jira)
 
 | Tracker status | → task `status` |
 |---|---|
@@ -89,6 +90,96 @@ On an existing task, `pull`:
 A repeated pull of an unchanged remote rewrites nothing (the new content is written
 only when it differs), so it never duplicates a task or churns the file.
 
+## GitHub Issues
+
+The GitHub adapter follows the same contract, opt-in gate, md-wins conflict rule
+and secret hygiene as Jira. Official REST reference:
+`https://docs.github.com/en/rest/issues` (checked 2026-10-25) — issues
+(`…/rest/issues/issues`) and comments (`…/rest/issues/comments`).
+
+### Configure
+
+Two non-secret settings, resolved env → nearest `.macp/config.toml` → unset:
+
+| Setting | `.macp/config.toml` key | Env override |
+|---|---|---|
+| Target repo (`owner/repo`) | `github_issues_repo` | `MACP_GITHUB_ISSUES_REPO` |
+| API base URL (default `https://api.github.com`; GitHub Enterprise Server `https://<host>/api/v3`) | `github_api_url` | `MACP_GITHUB_API_URL` |
+
+The token is **secret** and lives only in `.secrets/` or the environment:
+
+- `<vault>/.secrets/github.json` → `{"token": "…"}`, **or**
+- env `MACP_GITHUB_TOKEN`.
+
+Use a fine-grained personal access token scoped to the target repo with
+**Issues: read and write**. The generic `GITHUB_TOKEN` env and the `gh auth` token
+are **deliberately not picked up** — an ambient token must not switch sync on. If
+the repo is missing or not `owner/repo`, or there is no token, the adapter is never
+built and sync is a no-op (no network call).
+
+Every request sends `Authorization: Bearer <token>`,
+`Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28` and a
+`User-Agent`; the per-call timeout is `GITHUB_TIMEOUT_S`.
+
+### Use
+
+The `tracker pull` / `tracker push` CLI is still wired to Jira only; a CLI provider
+switch is a follow-up. For now the GitHub adapter is a library API:
+
+```python
+from pathlib import Path
+
+from todo_system.trackers.base import upsert_task_record
+from todo_system.trackers.github_issues import GitHubIssuesAdapter
+
+adapter = GitHubIssuesAdapter.from_config()   # None when not configured
+if adapter is not None:
+    for record in adapter.pull(since="2026-10-01"):
+        upsert_task_record(record, Path("Todo/items"))
+```
+
+`pull` reads `GET /repos/{owner}/{repo}/issues` with `state=all`, `sort=updated`,
+`direction=desc`, `per_page=100` and the optional `since` (a bare `YYYY-MM-DD` is sent
+as `YYYY-MM-DDT00:00:00Z`). That endpoint also returns pull requests; items with a
+`pull_request` key are skipped.
+
+`push` acts only on a task whose `external_ref` is `github:owner/repo#N` — the repo in
+the ref is the target, not the configured one:
+
+- `status: done` → `PATCH /repos/{owner}/{repo}/issues/{N}` with
+  `{"state": "closed", "state_reason": "completed"}`;
+- a merged PR URL → `POST /repos/{owner}/{repo}/issues/{N}/comments` with
+  `{"body": "macp: PR merged — <PR URL>"}`;
+- neither → no request. A ref that is not `github:owner/repo#N` raises
+  `TrackerError` (no request sent) when there is something to push.
+
+### Field mapping (GitHub → md)
+
+| Concept | GitHub Issues (REST) | → task md |
+|---|---|---|
+| Title | `title` | body H1 (`# …`) |
+| Body | `body` (Markdown) | md body, verbatim |
+| Status | `state` + `state_reason` | `status` (table below) |
+| Labels | `labels[].name` | `tags[]` |
+| Due | `milestone.due_on` | `due` (date part, YYYY-MM-DD) — an approximation |
+| Priority | priority labels (below) | `priority` |
+| Issue number | `number` | `external_ref: github:owner/repo#N` |
+| Assignees | `assignees` | not mapped (single-worker model) |
+
+GitHub has no native priority, so it is read from label conventions
+(case-insensitive): `priority:<name>`, `priority/<name>` or `priority-<name>` with
+`<name>` = highest 90 / high 70 / medium 50 / low 30 / lowest 10, and `P0` 90 / `P1` 70
+/ `P2` 50 / `P3` 30 / `P4` 10. When several match, the highest wins. Priority labels
+also stay in `tags`, so nothing is lost.
+
+### Status mapping (GitHub)
+
+| `state` / `state_reason` | → task `status` |
+|---|---|
+| `open` | `open` |
+| `closed` / `completed` (or no reason) | `done` |
+| `closed` / `not_planned` or `duplicate` | `done` (+ `cancelled` tag) |
+
 ## Limits
 
 - **ADF is best-effort.** Jira v3 descriptions and comments are ADF (JSON), and there
@@ -96,8 +187,24 @@ only when it differs), so it never duplicates a task or churns the file.
   concatenates ADF text nodes into plain text; `push` wraps the PR URL in a minimal
   ADF document. Rich formatting (tables, panels, mentions) is lost on the way in.
 - **Polling, not webhooks.** No inbound HTTPS endpoint; latency is the tick interval.
-- **One provider.** Jira only; GitHub Issues / Linear are follow-up leaves on the
-  same `TrackerAdapter` interface.
-- **Transport is stdlib `urllib.request`** with a per-call timeout (`JIRA_TIMEOUT_S`);
-  no third-party HTTP client. Errors surface as `TrackerError` carrying only
-  method / path / HTTP status — never the token or Authorization header.
+- **Two providers.** Jira + GitHub Issues; Linear is a follow-up leaf on the same
+  `TrackerAdapter` interface.
+- **The CLI is Jira-wired.** `tracker pull` / `tracker push` drive Jira only; GitHub
+  Issues is a library API until a CLI provider switch lands.
+- **One scalar `external_ref` per task** (`jira:…` or `github:…`) — no multi-provider
+  map, so a task mirrors to one tracker.
+- **No issue creation on push.** Both adapters only update issues that already carry
+  an `external_ref`.
+- **GitHub: single page.** `pull` fetches one page of 100 (most recently updated
+  first) and does not follow `Link` pagination; use `since` to stay within it.
+- **GitHub: push always closes as `completed`.** Closing as `not_planned` from a
+  `cancelled` tag is a follow-up.
+- **GitHub: pinned to REST API version `2022-11-28`.** It is the version GitHub
+  Enterprise Server also accepts; github.com supports it until 2028-03-10 (the newer
+  `2026-03-10` is current — checked 2026-10-25). Bump `GITHUB_API_VERSION` before then.
+- **GitHub: due is the milestone's `due_on`**, and priority comes from label
+  conventions — GitHub has neither natively.
+- **Transport is stdlib `urllib.request`** with a per-call timeout (`JIRA_TIMEOUT_S`,
+  `GITHUB_TIMEOUT_S`); no third-party HTTP client. Errors surface as the shared
+  `TrackerError` (`todo_system/trackers/base.py`) carrying only provider / method /
+  path / HTTP status — never the token or Authorization header.
