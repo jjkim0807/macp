@@ -287,6 +287,35 @@ def test_seed_owner_injects_source_from_config_and_never_leaks_it(tmp_path, caps
     assert "owner_seed_source" not in out        # nor the config key that named it
 
 
+def test_seed_owner_pushes_source_then_device_sequence(tmp_path, capsys):
+    secret = "/hq/private/owner-backup/mulkko.db"
+    fake = _advancing()
+    rc = _run_cli(tmp_path, fake, seed="owner",
+                  scenario=_scenario_file(tmp_path, {**SMOKE_CFG, "seed": {"db_name": "mulkko.db"}}),
+                  remote_cfg={**REMOTE_CFG, "owner_seed_source": secret})
+    assert rc == ec.EXIT_OK
+    capsys.readouterr()
+    # the source reaches the node ONLY as the host→node push argv
+    pushes = [c["argv"] for c in fake.calls if fake._token(c["argv"]) == "push"
+              and c["argv"][3] == secret]
+    assert pushes == [["bash", str(tmp_path / "app-test-node"), "push", secret,
+                       "~/mk-smoke-seed.db"]]
+    ssh = [c["argv"][3] for c in fake.calls if fake._token(c["argv"]) == "ssh"]
+    assert all(secret not in s for s in ssh)
+    seed = [s for s in ssh if fake._ssh_kind(s) == "seed"]
+    assert len(seed) == 1
+    for needle in ("adb push ~/mk-smoke-seed.db /data/local/tmp/mk-smoke-seed.db",
+                   "am force-stop com.mulkko", "mulkko.db-wal",
+                   "run-as com.mulkko cp /data/local/tmp/mk-smoke-seed.db "
+                   "/data/data/com.mulkko/databases/mulkko.db",
+                   "monkey -p com.mulkko"):
+        assert needle in seed[0], needle
+    results = list((tmp_path / "results").rglob("result.json"))
+    assert results
+    for p in results:
+        assert secret not in p.read_text(encoding="utf-8")
+
+
 def test_seed_owner_without_source_is_a_config_error(tmp_path, capsys):
     fake = FakeNode()
     rc = _run_cli(tmp_path, fake, seed="owner", remote_cfg=dict(REMOTE_CFG))
