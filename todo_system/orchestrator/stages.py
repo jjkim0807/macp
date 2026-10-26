@@ -942,6 +942,36 @@ def ff_default_branch(repo_dir: Path) -> str:
     return f"long-job sync: {default} {before[:7]} -> {after[:7]}" if after != before else ""
 
 
+def sync_for_long_job(repo_dir: Path) -> str:
+    """Bring the tree a NEW long job will run in up to origin's default branch.
+
+    Since per-run worktrees (`repos.ensure_worktree`), the job's tree is a
+    DETACHED worktree cut from the shared clone's HEAD — and nothing advances
+    that HEAD before the long-job gate (it runs before branch prep). So
+    `ff_default_branch`, which only acts on a clone sitting ON its default
+    branch, became a silent no-op and a job whose script landed in an earlier
+    PR died "No such file" again (2026-10-27, ai-stock-trading
+    financial-level-measurement-v3-resume ran on a 13-day-old c0d9052, 16
+    commits behind, and `collect_financials.py` from #215 did not exist).
+
+    Detached + clean → fetch the default branch and re-detach at its tip. On a
+    branch → the old `ff_default_branch` behaviour (a worker branch or local
+    edits are never touched). Returns a one-line note, "" when nothing moved."""
+    repo_dir = Path(repo_dir)
+    if _git(repo_dir, "symbolic-ref", "-q", "HEAD").returncode == 0:
+        return ff_default_branch(repo_dir)
+    default = default_branch(repo_dir)
+    if _git(repo_dir, "status", "--porcelain").stdout.strip():
+        return "long-job sync: detached worktree has local changes — not moved"
+    before = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+    if _git(repo_dir, "fetch", "origin", default).returncode != 0:
+        return f"long-job sync: fetch origin {default} failed — running on {before[:7]}"
+    if _git(repo_dir, "checkout", "-q", "--detach", f"origin/{default}").returncode != 0:
+        return f"long-job sync: cannot move to origin/{default} — running on {before[:7]}"
+    after = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+    return f"long-job sync: detached {before[:7]} -> origin/{default} {after[:7]}" if after != before else ""
+
+
 def current_branch(repo_dir: Path) -> str:
     """The branch HEAD is on, or `""` when there is no answer.
 

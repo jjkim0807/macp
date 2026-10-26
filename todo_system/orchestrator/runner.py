@@ -510,7 +510,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # run's PR started on the pre-merge tree and died "No such file"
                 # three times into quarantine (2026-10-05, ai-stock-trading
                 # all-pair-sweep-finish vs #159).
-                note = stages.ff_default_branch(sync_repo)
+                note = stages.sync_for_long_job(sync_repo)
                 if note:
                     progress(note)
             started = jobs.start(task_id, payload["long_job"], working_dir)
