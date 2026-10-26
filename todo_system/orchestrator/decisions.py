@@ -109,7 +109,7 @@ def _normalize_slug(value) -> str:
 
     Bare (`ai-stock-trading-5-strategy-ai`, 7 refs across 2 files), wikilink
     (`[[withdrawal-process]]`, 8 refs in the 2026-05-19 decision), and aliased
-    wikilink (`[[slug|표시 제목]]`, the form `Todo/Todo.md` writes) all collapse
+    wikilink (`[[slug|display title]]`, the form `Todo/Todo.md` writes) all collapse
     to the bare slug. A path prefix (`[[Todo/items/slug]]`) and a `.md` suffix
     are stripped too, so a link copied out of the index still resolves.
 
@@ -151,7 +151,7 @@ def _task_status(items_dir: str | Path, slug: str) -> str | None:
 def _classify_item(item, items_dir: str | Path) -> tuple[str, dict]:
     """`(kind, fields)` for one entry of an `action_items` list."""
     if not isinstance(item, dict):
-        # A bare string list (`- 스파이크 돌리기`) is the likeliest near-miss
+        # A bare string list (`- run the spike`) is the likeliest near-miss
         # migration. Carrying the raw text keeps the report actionable.
         return "unparseable", {"note": f"항목이 매핑이 아님: {item!r}"}
 

@@ -46,8 +46,8 @@ The ONLY recursive delete in this module is `shutil.rmtree` inside
 `remove_registry`, confined to one plain-named, non-symlink child of the registry
 dir. Worktrees go only through `git worktree remove`. Fail-open: the sweep
 returns [] on any unexpected error and never raises into the doctor tick.
-Silent when nothing is past the window; otherwise one `정리 완료/보류/제외` line
-per entry it judged.
+Silent when nothing is past the window; otherwise one `정리 완료/보류/제외`
+(cleaned up / held / excluded) line per entry it judged.
 """
 
 from __future__ import annotations

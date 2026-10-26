@@ -303,8 +303,8 @@ def build_release_notes(payload: dict, *, migration: bool,
     migration backup warning, when present, is deliberately the FIRST line.
 
     ``subjects`` are commit subjects of everything this release carries — the
-    catch-up sweep's release can span several merges, and "베타 업데이트" would tell
-    a tester nothing about which of them they are installing. Empty (the
+    catch-up sweep's release can span several merges, and "베타 업데이트" (beta
+    update) would tell a tester nothing about which of them they are installing. Empty (the
     merge-time default) leaves the note byte-identical to the single-merge form.
     """
     headline = ""
@@ -394,7 +394,7 @@ def parse_tester_count(output: str, group_alias: str) -> int | None:
 
 def parse_release_id(output: str) -> str | None:
     """The Firebase release id from distribute output (console URL, else a
-    parenthesized token). ``None`` when absent — the note then reads ``릴리즈 -``."""
+    parenthesized token). ``None`` when absent — the note then reads ``릴리즈 -`` (release -)."""
     m = re.search(r"/releases/([A-Za-z0-9]+)", output)
     if m:
         return m.group(1)
@@ -430,7 +430,7 @@ def stage_build_files(repo_dir: Path | str, copy_files: dict[str, str], *,
     """Copy build inputs that are not in git into the clone before the build.
 
     ``copy_files`` maps a repo-relative destination to a vault-relative source,
-    e.g. ``{".secrets/mulkko.json": ".secrets/mulkko.json"}``. 물꼬's Supabase
+    e.g. ``{".secrets/mulkko.json": ".secrets/mulkko.json"}``. Mulkko's Supabase
     backup section only exists in a build that finds that gitignored file; the
     worker clone the runner publishes from never has it, so an automatic beta
     would silently ship with the backup section hidden. A missing source raises
@@ -468,10 +468,10 @@ def build_prop_args(config: dict, *, vault_root: Path | str = _VAULT_DATA_ROOT) 
     ``.secrets/advote.json``). ``build_props`` maps a **gradle property name** to the
     **JSON key** whose value fills it: ``{"advote.endpoint": "endpoint"}`` reads key
     ``"endpoint"`` and emits ``-Padvote.endpoint=<that value>`` — a key-*name* map,
-    never the value. DripCoffee's in-app 건의 only reaches the advote endpoint when
-    the APK carries these properties; the orchestrator VM's worker clone has no
-    ``.secrets/``, so without this the beta silently falls back to a share-sheet —
-    the same class of fault copy_files fixed for 물꼬's backup section.
+    never the value. DripCoffee's in-app feedback feature only reaches the advote
+    endpoint when the APK carries these properties; the orchestrator VM's worker
+    clone has no ``.secrets/``, so without this the beta silently falls back to a
+    share-sheet — the same class of fault copy_files fixed for Mulkko's backup section.
 
     A repo that declares neither key gets ``[]`` — the argv is byte-identical
     (regression-safe). A missing file, an unreadable / non-object JSON, or a mapped
@@ -732,9 +732,10 @@ def maybe_publish(
 
         # 2) Tester Count > 0 or abort — never distribute to an unconfirmed group.
         #    An unparseable listing is almost always a transient firebase-tools / npx
-        #    failure, not an empty group (DanceMirror 2026-10-06: "테스터 확인불가 —
-        #    테스터 추가 필요" while the group held 2 testers), so it gets one retry and,
-        #    if still unreadable, an alert that says "lookup failed", never "add testers".
+        #    failure, not an empty group (DanceMirror 2026-10-06: "tester lookup
+        #    failed — need to add testers" while the group held 2 testers), so it gets
+        #    one retry and, if still unreadable, an alert that says "lookup failed",
+        #    never "add testers".
         g = None
         for _ in range(2):
             g = run(group_list_argv(config), cwd=str(repo_dir), timeout=_FIREBASE_TIMEOUT)
@@ -779,7 +780,7 @@ def maybe_publish(
         # 3b) Emulator smoke gate (opt-in via config["smoke"]): build the debug
         #     APK on the on-demand node and run the scenario BEFORE distribute.
         #     Placed AFTER the tester-count gate so a 0-tester repo never pays a
-        #     node round-trip, still inside the "build 뒤 distribute 앞" window.
+        #     node round-trip, still inside the "after build, before distribute" window.
         #     A non-PASS WITHHOLDS distribute + the watermark bump (the merge
         #     stands — only the deploy is held), returning a handled note like the
         #     0-tester path so the runner never surfaces the merge as retryable.
