@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -1166,6 +1167,152 @@ def pull_engine_checkout(
     ).returncode != 0:
         return ["engine-pull: uv sync 실패"]
     print(f"engine-pull: pulled {before} -> {after} + uv sync")
+    return []
+
+
+def _vault_engine_pin(vault: Path) -> str | None:
+    """The macp commit the vault's own ``uv.lock`` pins, or None.
+
+    Only a vault that declares macp as a git dependency has one: its lock entry
+    reads ``source = { git = "<url>#<40-hex sha>" }``. Detection is the lock's
+    shape alone — never a URL or vault name — so registry / editable / path
+    sources, a missing ``pyproject.toml`` or ``uv.lock``, and an unparsable lock
+    all come back None.
+    """
+    if not (vault / "pyproject.toml").is_file() or not (vault / "uv.lock").is_file():
+        return None
+    try:
+        data = tomllib.loads((vault / "uv.lock").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    for entry in data.get("package", []):
+        if not isinstance(entry, dict) or entry.get("name") != "macp":
+            continue
+        source = entry.get("source")
+        git = source.get("git") if isinstance(source, dict) else None
+        if not isinstance(git, str) or "#" not in git:
+            return None
+        sha = git.rsplit("#", 1)[1]
+        # Same 40-hex shape as a tree oid; reused rather than duplicated.
+        return sha if _TREE_OID_RE.match(sha) else None
+    return None
+
+
+def bump_vault_engine_pin(
+    *,
+    engine: Path | None = None,
+    vault: Path | None = None,
+    run: Callable = subprocess.run,
+) -> list[str]:
+    """Move the vault's macp git pin up to the engine checkout's HEAD.
+
+    A vault that pins macp as a git dependency in its own ``pyproject.toml``
+    runs whatever commit ``uv.lock`` recorded every time someone does
+    ``uv run python -m todo_system.cli …`` there — :func:`pull_engine_checkout`
+    moves the daemons' checkout, not that pin, so the vault drifted 56 commits
+    behind. Each tick this compares the pinned sha with the engine checkout's
+    HEAD and, when the pin is strictly behind, runs ``uv lock --upgrade-package
+    macp`` → ``uv sync`` → ``git add uv.lock`` → a commit limited to ``uv.lock``.
+    Pushing is left to :func:`sync_vault_state`, so the commit leaves with the
+    next vault sync.
+
+    Skipped with one log line when the vault HEAD is not ``main``, when
+    ``pyproject.toml`` / ``uv.lock`` have uncommitted changes, or when the index
+    differs from HEAD (a commit would sweep that in — the 2026-09-25 reverse-diff
+    accident). Only those two files count as dirty: the vault always carries
+    ``Worker/`` runtime churn, and a whole-tree check would skip forever. No-op
+    with zero subprocess calls when the vault has no macp git pin (wheel installs,
+    ``vault-template``) or there is no separate engine checkout to compare with.
+    A pin that is ahead of or diverged from the engine checkout is left alone —
+    the engine catches up first. ``uv`` missing from PATH is a quiet skip.
+
+    Once ``uv lock`` has run, any failure restores ``uv.lock`` from HEAD, so a
+    half-done bump can neither trip the dirty check on every later tick nor
+    leave a staged file that makes vault-sync defer everything.
+
+    Returns failure reasons (empty on success and every skip / no-op), the same
+    contract as :func:`pull_engine_checkout`. ``engine`` / ``vault`` / ``run``
+    are test seams; runtime calls pass nothing.
+    """
+    engine = Path(engine) if engine else paths.engine_root()
+    vault = Path(vault) if vault else ROOT
+    old = _vault_engine_pin(vault)
+    if old is None:
+        return []
+    if engine == vault or not (engine / ".git").exists() or not (vault / ".git").exists():
+        return []
+
+    def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+        return run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_S,
+        )
+
+    def _uv(*args: str) -> subprocess.CompletedProcess:
+        return run(
+            ["uv", *args],
+            cwd=str(vault),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_UV_SYNC_TIMEOUT_S,
+        )
+
+    def _restore() -> None:
+        # Best effort: the returned reason already reports the failure.
+        _git(vault, "checkout", "HEAD", "--", "uv.lock")
+
+    if _git(vault, "branch", "--show-current").stdout.strip() != "main":
+        print("vault-pin: skip — 볼트 HEAD가 main이 아님")
+        return []
+    if _git(vault, "status", "--porcelain", "--", "pyproject.toml", "uv.lock").stdout.strip():
+        print("vault-pin: skip — pyproject.toml/uv.lock dirty")
+        return []
+    if _git(vault, "diff", "--cached", "--quiet").returncode != 0:
+        print("vault-pin: skip — index가 HEAD와 다름")
+        return []
+
+    head_proc = _git(engine, "rev-parse", "HEAD")
+    head = head_proc.stdout.strip()
+    if head_proc.returncode != 0 or not head or head == old:
+        return []
+    # rc 0 only when the pin is a strict ancestor of the engine HEAD; 1 (ahead /
+    # diverged) or 128 (unknown object) means there is nothing safe to follow.
+    if _git(engine, "merge-base", "--is-ancestor", old, head).returncode != 0:
+        return []
+
+    try:
+        if _uv("lock", "-q", "--upgrade-package", "macp").returncode != 0:
+            _restore()
+            return ["vault-pin: uv lock 실패"]
+    except FileNotFoundError:
+        print("vault-pin: skip — uv 없음")
+        return []
+    # `diff --quiet` rc 0 = the lock did not move (origin not there yet) — no
+    # sync, no commit; the next tick asks again.
+    if _git(vault, "diff", "--quiet", "--", "uv.lock").returncode == 0:
+        return []
+    try:
+        if _uv("sync", "-q").returncode != 0:
+            _restore()
+            return ["vault-pin: uv sync 실패"]
+    except FileNotFoundError:
+        _restore()
+        print("vault-pin: skip — uv 없음")
+        return []
+
+    new = _vault_engine_pin(vault) or head
+    if _git(vault, "add", "uv.lock").returncode != 0:
+        _restore()
+        return ["vault-pin: git add 실패"]
+    msg = f"chore: bump macp pin {old[:7]} -> {new[:7]}"
+    if _git(vault, "commit", "-q", "-m", msg, "--", "uv.lock").returncode != 0:
+        _restore()
+        return ["vault-pin: commit 실패"]
+    print(f"vault-pin: {old[:7]} -> {new[:7]} committed (push는 vault-sync가)")
     return []
 
 
