@@ -575,7 +575,7 @@ def render_focus_markdown_sqlite(
     for row in rows:
         # Worker-owned tasks (worker_mode: auto/delegate) are the worker
         # pipeline's responsibility (Worker/queue.json + Dashboard "🤖 Worker
-        # Agent 현황"), not the human's — keep them out of the human buckets
+        # Agent status"), not the human's — keep them out of the human buckets
         # entirely so FOCUS/NOW only ever shows what a person needs to act on.
         if _is_worker_owned(row["worker_mode"]):
             worker_owned.append(row)
