@@ -152,7 +152,7 @@ class ClaudeCodeExecutor:
         Overridden by the observable variant to stream instead of capture."""
         r = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=1800,
-                           # worker.py와 같은 이유로 장수 토큰 주입 (파일 없으면 무변경).
+                           # Inject the long-lived token for the same reason as worker.py (no-op if the file is absent).
                            env=claude_env())
         return r.returncode, {"stdout_tail": r.stdout[-500:]}
 
@@ -462,7 +462,7 @@ class StagedExecutor(ClaudeCodeExecutor):
             # commits nothing by design, so "auto_merge:false → park for a
             # human to merge" has nothing to park for. Without this the first
             # discover run (dancemirror, 2026-09-11) sat in awaiting_human as
-            # "정상 완료 — 머지할 PR 없음, 태스크를 닫아주세요" until a human replied.
+            # "정상 완료 — 머지할 PR 없음, 태스크를 닫아주세요" (normal completion — no PR to merge, please close the task) until a human replied.
             return False, False
         review = cls._review_required(payload) or not cls._payload_auto_merge(payload)
         return review, (cls.auto_merge and not review)
@@ -646,7 +646,7 @@ class StagedExecutor(ClaudeCodeExecutor):
         # overturns the extra's `review_required=False`, so it is strictly
         # conditional — a clean run (no key in the sink) changes nothing. The note
         # rides as the summary, which apply_reply reads into last_note (the "사유"
-        # the dashboard's parked row shows).
+        # (reason) the dashboard's parked row shows).
         if sink.get("review_required"):
             outcome.payload["review_required"] = True
             if sink.get("review_note"):

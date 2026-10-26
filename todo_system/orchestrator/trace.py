@@ -94,7 +94,7 @@ def _origin_line(stage: str, name: str, kind: str, detail: str | None) -> str:
         # nothing claims an author (run.log has no frontmatter at all; some
         # artifacts have one without run_id). A successful inheritance always
         # leaves a stamp, so its absence points at 'own' — but a pre-stamp run or
-        # a failed stamp looks identical from here, hence 추정 rather than 단정.
+        # a failed stamp looks identical from here, hence presumption rather than certainty.
         return (f"- `{name}` ({stage}) — 출처 표시 없음: **이번 런 생성으로 추정** "
                 "(상속이면 스탬프가 남으므로 — 단 스탬프 도입 이전 런이면 확증 불가)")
     return f"- `{name}` ({stage}) — {_ORIGIN_TEXT[kind]}"
