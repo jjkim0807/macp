@@ -1,32 +1,42 @@
-"""조건부 지연 재개(resume-when) — "볼트가 커밋 X를 반영한 뒤에 이 태스크를 재디스패치하라".
+"""Conditional deferred resume (resume-when) — "redispatch this task once the vault has commit X".
 
-2026-09-25 `ai-stock-trading-lowturnover-ic-to-sharpe`가 awaiting_human으로 멈췄다.
-태스크 md에 `long_job`을 붙여 볼트 main에 push했지만 `tasks.py`는 payload의
-`long_job`을 **라이브 볼트 체크아웃의 md**에서 읽고, 그 체크아웃은 다른 볼트 태스크의
-워커 브랜치에 올라가 있었다. 그 상태로 assignment를 되돌리면 `long_job` 없이 전체
-파이프라인이 다시 돈다. 그래서 사람이 `/tmp/lt-reset.sh`(1분 폴링 → 조건 충족 시
-`Worker/assignments/<slug>.json` 수동 편집)를 손으로 띄워야 했고, 그 임시 스크립트는
-권한 분류기에 막혀 승인까지 받아야 했다. 이 패턴(태스크 md 수정 → 볼트 동기화 대기 →
-재개)은 반복된다. 이 모듈이 그 감시 스크립트를 macp 기능으로 흡수한다.
+2026-09-25 `ai-stock-trading-lowturnover-ic-to-sharpe` stalled on
+awaiting_human. The task md had `long_job` attached and was pushed to the
+vault's main, but `tasks.py` reads payload's `long_job` from the **live
+vault checkout's md**, and that checkout was sitting on another vault
+task's worker branch. Reverting the assignment in that state would have
+re-run the whole pipeline without `long_job`. So a human had to hand-run
+`/tmp/lt-reset.sh` (poll every minute → hand-edit
+`Worker/assignments/<slug>.json` once the condition was met), and that
+throwaway script even had to clear the permission classifier for approval.
+This pattern (edit task md → wait for vault sync → resume) keeps repeating.
+This module absorbs that watch script as a macp feature.
 
-예약 레코드는 `Worker/_state/pending_resumes/<slug>.json`에 산다. `Worker/_state/`는
-gitignored(`.gitignore:139`)라서 이 레코드는 **호스트 로컬 런타임 상태**다 — 두 호스트가
-같은 볼트를 push하므로, "이 체크아웃의 HEAD가 어디까지 왔는가"에 걸린 예약을 커밋하면
-다른 호스트가 남의 조건을 소비하게 된다.
+Reservation records live in `Worker/_state/pending_resumes/<slug>.json`.
+`Worker/_state/` is gitignored (`.gitignore:139`), so these records are
+**host-local runtime state** — since two hosts push the same vault,
+committing a reservation pinned to "how far has this checkout's HEAD gotten"
+would let another host consume someone else's condition.
 
-설계 제약:
+Design constraints:
 
-- **stdlib만.** 이 코드는 오케스트레이터 틱 경로에서 돌고, 틱은 베어 `python3`로도
-  떠야 한다(`assignment.py`·`session_log`와 같은 제약).
-- **판정은 순수 함수로.** `evaluate()`는 I/O를 하지 않는다 — git 결과와 ledger 상태를
-  인자로 받는다. 그래서 각 분기가 실제 git 없이 단위 테스트된다.
-- **모든 불확실은 "아직 아님"(`WAIT`)으로 fail-safe.** git이 실패했는지, sha가 정말
-  조상이 아닌지 구분할 수 없을 때 재개하면 조건 없이 파이프라인을 다시 사는 셈이다.
-  단 하나의 예외가 **만료**다: 깨진/지난 만료 시각은 무한 대기가 아니라 폐기로 간다.
-  "조용히 남아 있지 않는다"가 인수조건이다.
-- **경로는 전부 인자로 주입.** `vault_root`는 모든 공개 함수의 필수 인자다(틱은
-  `ledger.root.parent.parent`, CLI는 `paths.vault_root()`). 모듈이 루트를 스스로
-  계산하지 않으므로 테스트가 `tmp_path`를 벗어날 수 없다.
+- **stdlib only.** This code runs on the orchestrator's tick path, and the
+  tick must also start under a bare `python3` (the same constraint as
+  `assignment.py`·`session_log`).
+- **Judgment is a pure function.** `evaluate()` does no I/O — it takes git
+  results and ledger state as arguments. So each branch is unit-tested
+  without real git.
+- **Every uncertainty fails safe to "not yet" (`WAIT`).** When it's
+  impossible to tell whether git failed, or whether a sha is really not an
+  ancestor, resuming anyway would unconditionally re-run the pipeline. The
+  one exception is **expiry**: a broken or past expiry time goes to
+  discard, not infinite wait. "Does not silently linger" is the acceptance
+  criterion.
+- **All paths are injected as arguments.** `vault_root` is a required
+  argument of every public function (the tick passes
+  `ledger.root.parent.parent`, the CLI passes `paths.vault_root()`). The
+  module never computes the root itself, so tests can never escape
+  `tmp_path`.
 """
 
 from __future__ import annotations
@@ -40,22 +50,23 @@ from .assignment import AWAITING_HUMAN, FAILED, RESUMED_SCHEDULED
 
 DEFAULT_EXPIRE_HOURS = 24
 
-# 재개를 받아줄 수 있는 상태. AWAITING_HUMAN은 `TERMINAL`에 없고(그래야 dispatch가
-# 파킹된 행을 멋대로 다시 돌리지 않는다) FAILED는 정상 재시도 경로다.
+# States that can accept a resume. AWAITING_HUMAN is not in `TERMINAL` (so
+# dispatch doesn't casually re-run a parked row on its own) and FAILED is the
+# normal retry path.
 RESUMABLE_STATES = frozenset({AWAITING_HUMAN, FAILED})
 
-# evaluate()의 반환값
-RESUME = "resume"    # 세 조건 모두 충족 — 지금 재개한다
-WAIT = "wait"        # 아직 아님(또는 판정 불가) — 레코드를 남겨두고 다음 틱에 다시 본다
-STALE = "stale"      # 누가 이미 재개했거나 done — assignment를 건드리지 않고 예약만 폐기
-EXPIRED = "expired"  # 만료 — assignment 미변경, 예약 폐기 + 경보 1회
+# evaluate()'s return values
+RESUME = "resume"    # all three conditions met — resume now
+WAIT = "wait"        # not yet (or can't judge) — keep the record, re-check next tick
+STALE = "stale"      # someone already resumed it or it's done — discard the reservation, leave assignment alone
+EXPIRED = "expired"  # expired — assignment unchanged, discard the reservation + alert once
 
-# 한 스윕에서 같은 원인의 스킵 줄을 몇 개까지 찍을지 (orchestrator._SKIP_LINE_CAP과 같은 값).
+# How many skip lines with the same cause to print in one sweep (same value as orchestrator._SKIP_LINE_CAP).
 _SKIP_LINE_CAP = 3
 
 
 class ResumeError(RuntimeError):
-    """예약을 받을 수 없다 — CLI가 이것을 비0 종료로 바꾼다."""
+    """The reservation cannot be accepted — the CLI turns this into a non-zero exit."""
 
 
 def resume_dir(vault_root: str | Path) -> Path:
@@ -67,8 +78,9 @@ def record_path(vault_root: str | Path, slug: str) -> Path:
 
 
 def _now() -> dt.datetime:
-    """tz-aware 현재 시각. `message.now_iso()`와 같은 모양을 쓴다 — ledger의
-    `updated_ts`는 `dt.datetime.fromisoformat`으로 파싱되므로 offset이 붙어야 한다."""
+    """tz-aware current time. Uses the same shape as `message.now_iso()` —
+    ledger's `updated_ts` is parsed with `dt.datetime.fromisoformat`, so an
+    offset must be attached."""
     return dt.datetime.now().astimezone().replace(microsecond=0)
 
 
@@ -77,10 +89,10 @@ def _iso(when: dt.datetime) -> str:
 
 
 def _parse_ts(value, *, tz) -> dt.datetime | None:
-    """ISO 문자열을 tz-aware datetime으로. 파싱 불가면 None.
+    """Parse an ISO string into a tz-aware datetime. None if it can't be parsed.
 
-    naive 값은 `tz`를 붙여 준다 — 사람이 손으로 쓴 레코드 하나가 비교에서
-    TypeError를 내며 스윕을 흔들게 두지 않는다.
+    A naive value gets `tz` attached — so one hand-written record doesn't
+    throw a TypeError during comparison and rattle the whole sweep.
     """
     if not isinstance(value, str) or not value.strip():
         return None
@@ -94,11 +106,12 @@ def _parse_ts(value, *, tz) -> dt.datetime | None:
 
 
 def is_expired(record: dict, now: dt.datetime) -> bool:
-    """만료 여부. `expires_ts`가 없거나 깨졌으면 **만료로 본다**.
+    """Whether this has expired. If `expires_ts` is missing or broken, it **counts as expired**.
 
-    깨진 만료 시각을 "무한 대기"로 읽으면 아무도 지우지 않는 예약이 영원히 남아
-    조용히 조건을 기다린다 — 인수조건이 금지하는 상태다. 되살릴 수 없는 레코드는
-    폐기하고 사람에게 알리는 쪽이 안전하다.
+    Reading a broken expiry time as "wait forever" means a reservation
+    nobody clears sits silently waiting on its condition forever — a state
+    the acceptance criteria forbid. It's safer to discard a record that
+    can't be recovered and alert a human.
     """
     expires = _parse_ts(record.get("expires_ts"), tz=now.tzinfo)
     if expires is None:
@@ -108,21 +121,25 @@ def is_expired(record: dict, now: dt.datetime) -> bool:
 
 def evaluate(record: dict, *, branch: str | None, head_contains: bool | None,
              state: str | None, now: dt.datetime) -> str:
-    """"지금 재개해도 되는가"를 판정하는 **순수 함수**. I/O 없음.
+    """A **pure function** that judges "is it okay to resume now". No I/O.
 
-    판정 순서가 이 함수의 본질이다:
+    The judgment order is the essence of this function:
 
-    1. **만료를 최우선으로** 본다. 만료된 예약이 조건을 마침내 충족했다고 조용히
-       실행되면 사람이 24시간 전에 건 예약이 지금 파이프라인을 사는 셈이다.
-    2. `branch != "main"` → `WAIT`. `branch is None`(= git 실패)도 `WAIT`다.
-       라이브 체크아웃이 남의 워커 브랜치에 있으면 태스크 md도 그 브랜치 것이고,
-       바로 그것이 이 기능이 존재하는 이유(원래 사고)다.
-    3. `after_commit`이 있는데 `head_contains is not True` → `WAIT`.
-       `None`(판정 불가)을 `False`(조상 아님)와 한 덩어리로 묶는 것이 아니라,
-       둘 다 "아직 아님"으로 보낸다 — 어느 쪽이든 재개하면 안 되므로.
-    4. state가 `awaiting_human`/`failed`가 아니면 → `STALE`. 누가 이미 재개했거나
-       done이다. assignment를 건드리는 것이 오히려 해가 된다.
-    5. 그 외 → `RESUME`.
+    1. **Check expiry first.** If an expired reservation silently runs
+       because its condition was finally met, a reservation a human set 24
+       hours ago ends up re-running the pipeline right now.
+    2. `branch != "main"` → `WAIT`. `branch is None` (= git failed) is also
+       `WAIT`. If the live checkout is on someone else's worker branch, the
+       task md belongs to that branch too — which is exactly why this
+       feature exists (the original incident).
+    3. If `after_commit` is set but `head_contains is not True` → `WAIT`.
+       Rather than lumping `None` (can't judge) together with `False` (not
+       an ancestor), both go to "not yet" — because neither case should
+       resume.
+    4. If state isn't `awaiting_human`/`failed` → `STALE`. Someone already
+       resumed it, or it's done. Touching the assignment would only cause
+       harm.
+    5. Otherwise → `RESUME`.
     """
     if is_expired(record, now):
         return EXPIRED
@@ -138,12 +155,14 @@ def evaluate(record: dict, *, branch: str | None, head_contains: bool | None,
 def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = None,
              expire_hours: float = DEFAULT_EXPIRE_HOURS, note: str = "",
              now: dt.datetime | None = None) -> Path:
-    """예약 레코드를 쓴다. 받을 수 없는 예약은 `ResumeError`로 거부한다.
+    """Write a reservation record. A reservation that can't be accepted is
+    rejected with `ResumeError`.
 
-    `Todo/items/<slug>.md`와 `Worker/assignments/<slug>.json`이 **둘 다** 있어야
-    한다: md만 있으면 재개할 대상 자체가 없고(아직 한 번도 디스패치되지 않았다),
-    assignment만 있으면 dispatch가 태스크를 만들지 못해 재개가 헛돈다. 어느 쪽이
-    없는지 메시지에 적는다 — 사람이 오타와 "아직 안 돌았다"를 구분해야 한다.
+    **Both** `Todo/items/<slug>.md` and `Worker/assignments/<slug>.json`
+    must exist: if only the md exists, there's nothing to resume (it has
+    never been dispatched); if only the assignment exists, dispatch never
+    created the task and resuming is futile. The message states which one
+    is missing — a human needs to tell apart a typo from "hasn't run yet".
     """
     root = Path(vault_root)
     slug = (slug or "").strip()
@@ -182,9 +201,9 @@ def _git(root: Path, args: list[str], _run=None, *, timeout: float = 30):
 
 
 def current_branch(root: str | Path, _run=None) -> str | None:
-    """라이브 체크아웃의 현재 브랜치. 알 수 없으면 `None`(= 호출자는 대기).
+    """The live checkout's current branch. `None` if unknown (= caller should wait).
 
-    `_pull_main`의 HEAD==main 가드와 같은 형태다(`orchestrator.py:1680`).
+    Same shape as `_pull_main`'s HEAD==main guard (`orchestrator.py:1680`).
     """
     try:
         p = _git(Path(root), ["rev-parse", "--abbrev-ref", "HEAD"], _run)
@@ -196,12 +215,15 @@ def current_branch(root: str | Path, _run=None) -> str | None:
 
 
 def head_contains(root: str | Path, sha: str, _run=None) -> bool | None:
-    """`sha`가 HEAD의 조상인가. `True`/`False`/`None`(판정 불가).
+    """Is `sha` an ancestor of HEAD. `True`/`False`/`None` (can't tell).
 
-    rc 1과 그 밖의 rc를 **구분하는 것이 핵심**이다. `git merge-base --is-ancestor`는
-    조상이 아니면 rc 1, 존재하지 않는 ref면 rc 128로 죽는다. 둘을 한 덩어리로
-    `False`로 뭉개면 "아직 볼트에 오지 않은 sha"가 영구 거절로 읽히고, 반대로 둘 다
-    `True` 쪽으로 뭉개면 조건 없이 재개된다. 없는 sha는 "아직 모른다"가 정답이다.
+    **Distinguishing rc 1 from every other rc is the whole point.**
+    `git merge-base --is-ancestor` exits rc 1 when it's not an ancestor, and
+    dies with rc 128 for a ref that doesn't exist. Lumping both into
+    `False` makes "a sha that hasn't reached the vault yet" read as a
+    permanent rejection; lumping both into `True` resumes unconditionally
+    either way. For a sha that doesn't exist, "don't know yet" is the
+    correct answer.
     """
     if not sha:
         return None
@@ -219,12 +241,14 @@ def head_contains(root: str | Path, sha: str, _run=None) -> bool | None:
 
 def load_records(vault_root: str | Path) -> tuple[list[tuple[Path, dict]],
                                                   list[tuple[Path, str]]]:
-    """(읽힌 레코드, 읽지 못한 레코드) 두 목록.
+    """Two lists: (records read, records that failed to read).
 
-    파싱 실패한 파일은 **지우지 않는다**. 의도를 복구할 수 없는 파일을 조용히
-    삭제하면 사람이 건 예약이 흔적 없이 사라진다 — 호출자가 한 줄 로그로 드러내고
-    사람이 손으로 판단하게 둔다. dict가 아닌 JSON(리스트·숫자)도 읽지 못한 것으로
-    센다: 아래의 `record.get`이 AttributeError로 터지는 것보다 낫다.
+    A file that fails to parse is **never deleted**. Silently deleting a
+    file whose intent can't be recovered would make a human's reservation
+    vanish without a trace — the caller surfaces it with a one-line log and
+    leaves the judgment call to a human. JSON that isn't a dict (a list, a
+    number) also counts as unreadable: better than letting the `record.get`
+    below blow up with an AttributeError.
     """
     good: list[tuple[Path, dict]] = []
     bad: list[tuple[Path, str]] = []
@@ -251,10 +275,12 @@ def load_records(vault_root: str | Path) -> tuple[list[tuple[Path, dict]],
 class _Tally:
     """Caps repeated identical skip lines within ONE sweep.
 
-    `orchestrator._SkipTally`와 같은 역할·같은 상한이지만 **import하지 않는다**:
-    `orchestrator`가 이 모듈을 부르므로 반대 방향 import는 순환이 된다. 스윕마다
-    새로 만들고 함께 버린다 — 틱을 넘어 사는 tally는 두 번째 틱부터 조용해지고,
-    그건 홍수를 막는 게 아니라 홍수가 **안 보이게** 만드는 것이다.
+    Plays the same role with the same cap as `orchestrator._SkipTally`, but
+    **does not import it**: `orchestrator` calls this module, so importing
+    in the reverse direction would be circular. A fresh one is made each
+    sweep and discarded with it — a tally that outlives a tick goes quiet
+    starting from the second tick, and that doesn't stop the flood, it just
+    makes the flood **invisible**.
     """
 
     def __init__(self, emit, cap: int = _SKIP_LINE_CAP):
@@ -281,33 +307,40 @@ def _default_log(msg: str) -> None:
 def consume(ledger, vault_root: str | Path, *, backdate_s: float,
             now: dt.datetime | None = None, notify=None, log=None,
             _run=None) -> list[str]:
-    """예약 레코드를 소비한다. 재개된 slug 목록을 돌려준다. **절대 raise하지 않는다.**
+    """Consume reservation records. Returns the list of resumed slugs. **Never raises.**
 
-    이 함수는 오케스트레이터 틱의 dispatch **앞**에서 돌기 때문에, 여기서 올라간
-    예외 하나가 그 틱의 디스패치 전체를 멈춘다. 그래서 바깥에 한 겹, 레코드마다 한 겹
-    `try/except`를 두고 스킵은 `_Tally`로 상한을 둔 채 로그만 남긴다
-    (`reconcile_unparked`의 per-row 격리와 같은 구조 — 한 행의 결함이 그 뒤로 정렬된
-    모든 행을 조용히 굶기던 사고를 막은 그 구조다).
+    This function runs **before** the orchestrator tick's dispatch, so a
+    single exception raised here would stop that whole tick's dispatch. So
+    there's one outer `try/except` and one per record, skips are capped via
+    `_Tally` with only a log left behind (the same structure as
+    `reconcile_unparked`'s per-row isolation — the structure that stopped
+    the incident where one bad row silently starved every row queued after
+    it).
 
-    `RESUME`일 때 손대는 필드는 인수조건이 명시한 **4개 + 기록 2개**뿐이다:
+    When the verdict is `RESUME`, the only fields touched are the
+    **4 the acceptance criteria name + 2 history entries**:
 
-        refail_count = 0  →  state = FAILED  →  blocked_on = ""  →  updated_ts = 과거
+        refail_count = 0  →  state = FAILED  →  blocked_on = ""  →  updated_ts = backdated
 
-    **순서가 중요하다.** `refail_count`를 먼저 0으로 내리지 않고 `state`만 FAILED로
-    바꾸면 다음 틱의 dispatch가 누적된 refail을 보고 곧바로 재격리(poison
-    quarantine)한다. `blocked_on`이 남아 있으면 re-dispatch 머신 자체가 멈춘다.
-    `updated_ts`를 과거로 백데이트하는 이유는 dispatch가 거기에 fail 쿨다운을 앵커하기
-    때문이다(`orchestrator.py:357`) — 지금 시각을 찍으면 사람의 "지금 재개"가 한 쿨다운
-    창을 더 기다린다. 백데이트 폭은 상수로 박지 않고 호출자가 `backdate_s`로 준다:
-    오케스트레이터만이 자기 쿨다운 상한을 안다.
+    **Order matters.** Flipping `state` to FAILED before first dropping
+    `refail_count` to 0 makes the next tick's dispatch see the accumulated
+    refail count and immediately re-quarantine it (poison quarantine). If
+    `blocked_on` is left set, the re-dispatch machine itself stays stopped.
+    `updated_ts` is backdated because dispatch anchors the fail cooldown
+    there (`orchestrator.py:357`) — stamping the current time would make a
+    human's "resume now" wait through one more cooldown window. The
+    backdate width isn't a baked-in constant; the caller supplies it via
+    `backdate_s`: only the orchestrator knows its own cooldown cap.
 
-    `timeout_streak`·`timed_out`·`capacity_*`·`job_running`·`checkout_busy`는 **손대지
-    않는다**(스코프 밖). 그래서 `timeout_streak >= 2`가 남은 행은 재개돼도 다음
-    `collect()`에서 곧바로 재파킹될 수 있다 — 알려진 한계이고 `Worker/README.md`에
-    적어 두었다.
+    `timeout_streak`·`timed_out`·`capacity_*`·`job_running`·`checkout_busy`
+    are **left untouched** (out of scope). So a row that still has
+    `timeout_streak >= 2` can get re-parked immediately by the next
+    `collect()` even after being resumed — a known limitation, written down
+    in `Worker/README.md`.
 
-    `notify(msg, event_key=...)`는 선택이다. 알림 실패가 재개를 되돌리지 않도록
-    ledger 저장 **뒤**에 부르고, 그 자체도 삼킨다.
+    `notify(msg, event_key=...)` is optional. It's called **after** the
+    ledger save, so a notification failure never undoes the resume, and the
+    call itself swallows its own errors.
     """
     resumed: list[str] = []
     emit = log or _default_log
@@ -317,7 +350,7 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
         tally = _Tally(emit)
         records, unreadable = load_records(root)
         for path, cause in unreadable:
-            # 지우지 않는다 — 사람이 건 예약의 의도를 복구할 수 없으므로 드러내고 남긴다.
+            # Not deleted — a human's reservation intent can't be recovered, so surface and keep it.
             tally.record(f"{path.name} (읽기 실패, 보존)", cause)
         for path, record in records:
             try:
@@ -327,7 +360,7 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                 if is_expired(record, moment):
                     verdict = EXPIRED
                 elif a is None:
-                    # ledger에 행이 없으면 재개할 대상이 없다 — 예약만 폐기한다.
+                    # No ledger row means there's nothing to resume — discard the reservation only.
                     verdict = STALE
                 else:
                     verdict = evaluate(
@@ -339,8 +372,8 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                     )
 
                 if verdict == WAIT:
-                    # 레코드 유지. 조건이 뭐였는지 매 틱 한 줄씩 남긴다 — digest 알림에
-                    # 묻히더라도 run 로그에는 "왜 아직 안 돌았나"가 보여야 한다.
+                    # Keep the record. Leave one line per tick on what the condition was —
+                    # even if it's buried under digest alerts, the run log must show "why hasn't it run yet".
                     emit(f"{slug}: 아직 아님 — 대기 유지 "
                          f"(after_commit={sha or '-'}, expires={record.get('expires_ts')})")
                     continue
@@ -365,7 +398,7 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                                     f"{sha or 'HEAD'}를 반영해 재디스패치합니다",
                             f"resume:{slug}", emit)
                 elif verdict == STALE:
-                    # assignment는 건드리지 않는다. 누가 이미 재개했거나 done이다.
+                    # Leave the assignment alone. Someone already resumed it, or it's done.
                     path.unlink(missing_ok=True)
                     state = getattr(a, "state", None)
                     emit(f"{slug}: state={state or '행 없음'} — 이미 처리됨, "
@@ -381,13 +414,13 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                 tally.record(path.name, f"{type(e).__name__}: {e}")
         tally.flush()
     except Exception as e:
-        # 바깥 그물: load_records·경로 계산·로거 자체가 실패해도 틱으로 올리지 않는다.
+        # Outer net: even if load_records·path computation·the logger itself fails, don't raise into the tick.
         emit(f"sweep aborted: {type(e).__name__}: {e}")
     return resumed
 
 
 def _notify(notify, msg: str, event_key: str, emit) -> None:
-    """알림은 곁가지다 — 실패해도 이미 저장된 재개를 되돌리지 않는다."""
+    """Notification is a side effect — a failure does not undo a resume already saved."""
     if notify is None:
         return
     try:
