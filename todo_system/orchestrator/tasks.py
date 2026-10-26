@@ -49,6 +49,12 @@ def _open_leaf_rows(db_path: str | Path) -> tuple[list, bool, bool]:
             cols += ", auto_merge"
         if has_nb:
             cols += ", not_before"
+        # Carry `priority` into the row so load_dispatchable can put it on the
+        # dispatch payload (the runner fills its parallel slots highest-first).
+        # Read-only here — the ORDER BY below already sorts on it; a column-less
+        # DB just omits it and the payload falls back to None (lowest).
+        if "priority" in present:
+            cols += ", priority"
         # Dispatch order = priority, highest first (NULL last), then insertion
         # order. Until 2026-10-26 there was no ORDER BY at all, so the runner's
         # few parallel slots went to whichever rows SQLite happened to return
@@ -141,6 +147,13 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
             # frontmatter auto_merge → runner honors it (0 = park PR for human
             # review). Missing column / NULL defaults to True. See runner.py.
             "auto_merge": (r["auto_merge"] != 0) if has_am else True,
+            # Dispatch priority → the runner reorders received envelopes so a
+            # late high-priority TASK_ASSIGN fills a free slot ahead of earlier
+            # low/none ones (runner._by_priority). Raw DB value (int/float/None);
+            # None = lowest. A column-less DB (r.keys() guard) or a NULL yields
+            # None, never an IndexError. Always present — both payloads must show
+            # `priority` — so it is a base key, not a conditional append.
+            "priority": (r["priority"] if "priority" in r.keys() else None),
         }
         long_job = repos.task_long_job_from_fm(fm)
         if long_job:            # gated on a detached job; see orchestrator/jobs.py

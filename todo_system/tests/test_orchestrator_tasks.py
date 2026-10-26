@@ -70,6 +70,7 @@ def _base(slug: str, path: str, *, worker_mode: str = "auto", auto_merge: bool =
         "branch": f"worker/{slug}",
         "task_path": path,
         "auto_merge": auto_merge,
+        "priority": None,
     }
 
 
@@ -108,6 +109,7 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
             "branch": "worker/ext",
             "task_path": ext,
             "auto_merge": False,
+            "priority": None,
             "long_job": "python3 collect.py",
             "bypass_guard": True,
             "allowed_tools": "Read,Edit",
@@ -130,6 +132,7 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
             "branch": "worker/vault",
             "task_path": "",
             "auto_merge": True,
+            "priority": None,
         }
         self.assertEqual(by_slug["vault"], expected_vault)
         self.assertEqual(list(by_slug["vault"].keys()), list(expected_vault.keys()))
