@@ -1,65 +1,82 @@
-"""advote 사용자 건의 → macp 파이프라인 다리.
+"""Bridge from advote user suggestions to the macp pipeline.
 
-advote가 받아 트리아지한 인앱 건의를 폴링해 (a) advote 티켓으로 승격시키고,
-(b) ``Todo/items/dc-fb-<YYMMDD>-<id>.md`` 에 **승인 대기(`worker_mode: blocked`)**
-태스크로 떨어뜨리고, (c) 사람이 `auto`로 풀면 기존 5단계 파이프라인이 구현·PR·머지·
-베타 발행까지 가며, (d) 태스크/런 상태 변화를 advote 티켓 상태로 **역보고(PR URL 포함)**
-한다. advote 쪽 코드는 건드리지 않는다 — 다리는 전적으로 이 볼트 안에 있다.
+Polls the in-app suggestions that advote has received and triaged, then (a) promotes
+them to advote tickets, (b) drops them into ``Todo/items/dc-fb-<YYMMDD>-<id>.md`` as
+**awaiting-approval (`worker_mode: blocked`)** tasks, (c) once a human releases one to
+`auto`, the existing 5-stage pipeline carries it through implementation, PR, merge and
+beta publish, and (d) **reports task/run state changes back** to the advote ticket
+status (including the PR URL). The advote side's code is not touched — the bridge
+lives entirely inside this vault.
 
-advote **투표 앱 안건**(``origin == "voting_app"``)도 같은 경로를 탄다. 득표 수가
-태스크 ``priority`` 가 되고(:func:`vote_priority` — 득표에 단조 증가·``[40, 90]`` 범위;
-득표 없는 인앱 건의는 기존 severity 규칙 유지), 저위험 화이트리스트(copy/cosmetic/
-config)이면서 득표가 임계(:data:`ADVOTE_AUTO_VOTES`) 이상인 안건만 ``worker_mode:
-auto`` 로 떨어져 **사람 승인 없이** 파이프라인이 돈다(:func:`approval_mode`). 그 밖은
-전부 ``blocked`` — 로직·권한·결제·데이터 수집 카테고리는 득표가 아무리 많아도 사람
-승인을 거치고, 인젝션 의심은 위 (b) 와 똑같이 ``held`` 로 태스크를 아예 만들지 않는다.
-안건 진행은 (d) 의 티켓 status 와 **별도 필드**(``proposal_status``)로, 안건 status
-(``accepted`` 태스크 생성 → ``in_progress`` 디스패치 → ``shipped`` 머지+베타 발행
-[베타 versionCode 포함] / ``rejected`` 실패)를 역보고한다(:func:`map_proposal_status`).
+advote **voting-app proposals** (``origin == "voting_app"``) take the same path. The
+vote count becomes the task ``priority`` (:func:`vote_priority` — monotonically
+increasing in votes, within ``[40, 90]``; in-app suggestions without votes keep the
+existing severity rule). Only proposals that are in the low-risk whitelist
+(copy/cosmetic/config) and whose votes meet the threshold (:data:`ADVOTE_AUTO_VOTES`)
+are dropped as ``worker_mode: auto``, so the pipeline runs **without human approval**
+(:func:`approval_mode`). Everything else is ``blocked`` — the logic, permission,
+payment and data-collection categories go through human approval no matter how many
+votes they have, and a suspected injection, exactly as in (b) above, is ``held`` and
+no task is created at all. Proposal progress is reported back in a **separate field**
+(``proposal_status``) from the ticket status of (d): the proposal status
+(``accepted`` task created → ``in_progress`` dispatched → ``shipped`` merged + beta
+published [including the beta versionCode] / ``rejected`` failed) is reported back by
+:func:`map_proposal_status`.
 
-**멀티 테넌트** — 다리는 테넌트 표(``_TENANTS``)를 순서대로 돈다. DripCoffee가 테넌트 0
-(시크릿 ``admin_key``, 슬러그 ``dc-fb-``; 기존 출력과 바이트 동일)이고 DanceMirror가
-테넌트 1(시크릿 ``dancemirror_admin_key``, 슬러그 ``dm-fb-``, 로컬 게이트 2개)이다.
-모든 테넌트는 한 endpoint를 공유하고 admin key가 곧 테넌트 범위다. 키가 없는 테넌트는
-폴링 자체를 건너뛰고(fail-open), 한 테넌트의 폴 실패는 다른 테넌트를 막지 않는다.
-원장 행에는 DripCoffee 외 테넌트만 ``tenant`` 표식이 붙고(표식 없는 레거시 행 =
-DripCoffee), 역보고(티켓·안건 status)와 베타 versionCode 조회는 그 행의 테넌트 키·리포로
-라우팅된다. 투표 안건 우선순위·자동 승인 규칙은 테넌트와 무관하게 똑같이 적용된다.
+**Multi-tenant** — the bridge walks the tenant table (``_TENANTS``) in order.
+DripCoffee is tenant 0 (secret ``admin_key``, slug ``dc-fb-``; byte-identical to the
+previous output) and DanceMirror is tenant 1 (secret ``dancemirror_admin_key``, slug
+``dm-fb-``, 2 local gates). All tenants share one endpoint, and the admin key itself is
+the tenant scope. A tenant with no key skips polling entirely (fail-open), and one
+tenant's poll failure does not block the others. Only non-DripCoffee tenants get a
+``tenant`` marker on their ledger rows (a legacy row with no marker = DripCoffee), and
+reporting back (ticket and proposal status) and the beta versionCode lookup are routed
+to that row's tenant key and repo. The voting-proposal priority and auto-approval
+rules apply identically regardless of tenant.
 
-설계 원형은 :mod:`todo_system.orchestrator.beta_publish`:
+The design template is :mod:`todo_system.orchestrator.beta_publish`:
 
-* **주입 가능한 부수효과 씨임** — HTTP(`http_get=`/`http_post=`)와 git(`run=`)과
-  알림(`notify=`)이 전부 인자다. 그래서 유닛 테스트는 네트워크·git 없이 돌고
-  실제 볼트를 절대 만지지 않는다(모든 경로도 인자화되어 `tmp_path`에 머문다).
-* **fail-open** — `.secrets/advote.json`이 없으면 조용한 no-op(`None` 반환)이고,
-  네트워크/응답 오류는 로그만 남기고 tick은 계속된다. 건의 다리는 오케스트레이터를
-  절대 멈추면 안 된다.
-* **stdlib만** — HTTP는 `urllib`뿐, 새 파이썬 의존성 0개.
+* **Injectable side-effect seams** — HTTP (`http_get=`/`http_post=`), git (`run=`) and
+  notifications (`notify=`) are all arguments. So the unit tests run with no network
+  or git and never touch the real vault (every path is parameterized too and stays in
+  `tmp_path`).
+* **fail-open** — a missing `.secrets/advote.json` is a quiet no-op (returns `None`),
+  and network/response errors only leave a log line while the tick goes on. The
+  suggestion bridge must never stop the orchestrator.
+* **stdlib only** — HTTP is just `urllib`; zero new Python dependencies.
 
-두 갈래 상태 파일:
+Two kinds of state file:
 
-* ``<vault>/.macp/advote_bridge_state.json`` — **커밋되는** 멱등성 원장
-  (``beta_watermarks.json``과 같은 부류 — 엔진 패키지 밖 볼트 데이터라 공개 export
-  범위에도 들지 않는다). ``suggestions[<id>]`` 에 티켓/슬러그/상태를
-  남겨 같은 건의를 몇 번 읽어도 티켓·태스크가 하나만 생긴다. ``ticket_id``를 ``slug``
-  보다 **먼저** 기록해 티켓은 생겼는데 태스크 write가 깨진 중간 상태도 재진입 안전하다.
-  이 파일은 ``VAULT_SYNC_PATHS``(Worker/Memory/Todo items)에 없고 allowed-dirty도
-  아니라, 더럽힌 채 두면 5분 큐 워커가 정지한다([[worker-queue-stall-on-uncommitted-vault-files]]).
-  그래서 변경이 있을 때만 즉시 인라인 커밋한다(:func:`_commit_state`, beta_publish의
-  ``_commit_watermark`` 미러). 단, 스테이지가 이 트리를 워커 브랜치로 체크아웃해 둔
-  동안 커밋하면 원장이 main 밖 브랜치에 갇히므로, ``sync_vault_state``와 똑같이
-  **HEAD==main일 때만** 폴링·변경·커밋하고 아니면 이번 tick은 연기한다.
-* ``Worker/_state/advote_bridge_poll.json`` — 최소 폴링 간격 타이머(gitignore된 런타임
-  상태). 매 10분 폴은 여기만 건드리므로 커밋되는 원장이 헛되이 더러워지지 않는다.
+* ``<vault>/.macp/advote_bridge_state.json`` — the **committed** idempotency ledger
+  (same family as ``beta_watermarks.json`` — it is vault data outside the engine
+  package, so it is not in the public export scope either). It records the
+  ticket/slug/state in ``suggestions[<id>]``, so no matter how many times the same
+  suggestion is read, only one ticket and one task are created. ``ticket_id`` is
+  recorded **before** ``slug``, so even the intermediate state where the ticket was
+  created but the task write broke is safe to re-enter.
+  This file is not in ``VAULT_SYNC_PATHS`` (Worker/Memory/Todo items) and is not
+  allowed-dirty either, so leaving it dirty stops the 5-minute queue worker
+  ([[worker-queue-stall-on-uncommitted-vault-files]]).
+  So it is committed inline immediately, only when there is a change
+  (:func:`_commit_state`, mirroring beta_publish's ``_commit_watermark``). However,
+  committing while a stage has this tree checked out on a worker branch would trap
+  the ledger on a branch off main, so, exactly like ``sync_vault_state``, it polls,
+  changes and commits **only when HEAD==main**, and otherwise defers this tick.
+* ``Worker/_state/advote_bridge_poll.json`` — the minimum-poll-interval timer
+  (gitignored runtime state). The every-10-minute poll touches only this file, so the
+  committed ledger does not get dirtied for nothing.
 
-보안 — advote 설계가 "the agent never receives raw suggestion text"를 고수하는 이유
-그대로: **낯선 사용자 건의 원문은 절대 에이전트 지시로 들어가지 않는다.** 태스크 본문은
-트리아지 요약이고, 원문은 ``## 사용자 원문 (신뢰하지 않는 데이터 …)`` 펜스 안에 증거로만
-싣는다(펜스는 원문의 백틱보다 길게 잡아 탈출 불가). ``injectionAttempt``면 태스크를
-아예 만들지 않고 원장에 ``held: injection``으로 남기고 다이제스트 한 줄만 보낸다.
-티켓 category는 advote의 위험도 게이트(copy만 자동머지 후보)라 알 수 없는 값은 **가장
-넓은(=가장 안전한) `feature`** 로 매핑하고, 진짜 트리아지 카테고리는 태스크 frontmatter의
-``advote_category``에 따로 보존한다.
+Security — for the very reason the advote design holds to "the agent never receives
+raw suggestion text": **a stranger's raw suggestion text never enters the agent's
+instructions.** The task body is the triage summary, and the raw text is carried only
+as evidence inside the ``## 사용자 원문 (신뢰하지 않는 데이터 …)`` fence (the fence is made
+longer than any backtick run in the raw text, so it cannot be escaped). On
+``injectionAttempt`` no task is created at all; the ledger records ``held: injection``
+and only a single digest line is sent.
+The ticket category is advote's risk gate (only copy is an auto-merge candidate), so
+an unknown value is mapped to **the broadest (= safest) `feature`**, and the real
+triage category is preserved separately in the task frontmatter's
+``advote_category``.
 """
 
 from __future__ import annotations
