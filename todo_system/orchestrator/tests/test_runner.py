@@ -2316,6 +2316,93 @@ class RunnerParallelTest(unittest.TestCase):
         self.assertEqual(self.runner._inflight_acct, {})               # no assignment made
 
 
+class RunnerInboxPriorityOrderTest(unittest.TestCase):
+    """poll_parallel fills its few free slots highest-priority-first, not purely
+    in inbox arrival (ULID) order: a late high-priority TASK_ASSIGN starts ahead
+    of earlier low/none-priority ones, while priority-less envelopes keep arrival
+    order (macp — 러너 inbox를 priority 순으로 집기)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mb = FileMailbox(self.tmp / "agents")
+        self.agent = _agent()
+        self.ex = _GatedExecutor()
+        self.runner = Runner(self.mb, self.agent, self.ex, log=lambda *_: None)
+        self._hb = mock.patch.multiple("todo_system.worker",
+                                       runner_heartbeat_start=mock.DEFAULT,
+                                       runner_heartbeat_clear=mock.DEFAULT)
+        self._hb.start()
+        self._mem = mock.patch.object(runner_mod, "_mem_available_mb", return_value=None)
+        self._mem.start()
+
+    def tearDown(self):
+        self.ex.release.set()
+        self._wait_idle()
+        self._mem.stop()
+        self._hb.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _wait_idle(self, timeout=5.0):
+        import time as _t
+        end = _t.time() + timeout
+        while self.runner._inflight and _t.time() < end:
+            _t.sleep(0.01)
+
+    def _wait_started(self, n, timeout=5.0):
+        import time as _t
+        end = _t.time() + timeout
+        while len(self.ex.started) < n and _t.time() < end:
+            _t.sleep(0.01)
+
+    def _assign(self, task_id, priority, repo):
+        # Distinct repo per msg → distinct per-run worktree keys (no collision).
+        # send order == ULID order == inbox arrival order. priority None is sent
+        # as an OLD envelope: no `priority` key at all (the pre-change dispatch).
+        payload = {"task_path": f"Todo/items/{task_id}.md", "repo": repo}
+        if priority is not None:
+            payload["priority"] = priority
+        self.mb.send(m.Envelope(to=self.agent.id, type=m.TASK_ASSIGN,
+                                task_id=task_id, payload=payload))
+
+    def test_late_high_priority_envelope_starts_before_earlier_low_ones(self):
+        # The acceptance criterion: arrival (ULID) order 40, None, 95 into ONE
+        # free slot. FIFO starts the first-arrived (40); priority ordering starts
+        # the 95. slots=1 → exactly one run starts and the loop breaks on
+        # running>=slots, so the single-element ex.started is deterministic.
+        self._assign("t-low", 40, "https://example.com/low.git")
+        self._assign("t-none", None, "https://example.com/none.git")
+        self._assign("t-urgent", 95, "https://example.com/urgent.git")
+        self.assertEqual(self.runner.poll_parallel(1), 1)
+        self._wait_started(1)
+        self.assertEqual(self.ex.started, ["t-urgent"])
+
+    def test_by_priority_desc_null_last_stable_within_each_group(self):
+        def env(task_id, priority, *, has_key=True):
+            payload = {"priority": priority} if has_key else {}
+            return m.Envelope(to="x", type=m.TASK_ASSIGN, task_id=task_id,
+                              payload=payload)
+        # Arrival a=40, b=(no priority key), c=95, d=40, e=None. Expect 95 first;
+        # the two 40s keep arrival order a,d; the priority-less b and the
+        # explicit-None e stay last in arrival order b,e — proving priority-desc,
+        # NULL-last, AND "priority 없는 옛 envelope은 도착 순 유지".
+        msgs = [env("a", 40), env("b", None, has_key=False), env("c", 95),
+                env("d", 40), env("e", None)]
+        out = runner_mod._by_priority(msgs)
+        self.assertEqual([x.task_id for x in out], ["c", "a", "d", "b", "e"])
+        # Stable sort must not mutate its input.
+        self.assertEqual([x.task_id for x in msgs], ["a", "b", "c", "d", "e"])
+
+    def test_bool_priority_is_treated_as_none(self):
+        def env(task_id, priority):
+            return m.Envelope(to="x", type=m.TASK_ASSIGN, task_id=task_id,
+                              payload={"priority": priority})
+        out = runner_mod._by_priority([env("real", 10), env("tt", True), env("ff", False)])
+        self.assertEqual([x.task_id for x in out], ["real", "tt", "ff"])
+        self.assertIsNone(runner_mod._envelope_priority(env("b", True)))
+        self.assertIsNone(runner_mod._envelope_priority(env("s", "high")))
+        self.assertEqual(runner_mod._envelope_priority(env("r", 7)), 7)
+
+
 class NewIdThreadSafetyTest(unittest.TestCase):
     def test_no_duplicate_ids_across_threads(self):
         import threading

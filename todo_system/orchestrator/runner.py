@@ -1542,6 +1542,30 @@ def _truthy(v) -> bool:
     return str(v).strip().lower() not in _FALSEY
 
 
+def _envelope_priority(msg) -> float | None:
+    """The sortable `priority` carried on a dispatch payload, or None (= lowest,
+    the default for old envelopes dispatched before the field existed and for
+    control messages). bool is an int subclass but is never a real priority, so
+    exclude it. Any other non-numeric value is treated as None, never raises."""
+    p = (msg.payload or {}).get("priority")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        return None
+    return p
+
+
+def _by_priority(msgs: list) -> list:
+    """Received envelopes re-ordered highest-priority-first, None last, with
+    arrival order preserved inside each equal group. mailbox.receive() already
+    returns ULID (arrival-time) order, so one STABLE sort is the whole job: a
+    late high-priority TASK_ASSIGN starts ahead of earlier low/none-priority
+    ones, while priority-less envelopes (old dispatches, control messages) keep
+    their arrival order. Pure on the local list — safe to call outside the lock."""
+    def key(msg):
+        p = _envelope_priority(msg)
+        return (0, -p) if p is not None else (1, 0.0)
+    return sorted(msgs, key=key)
+
+
 class Runner:
     # Class-level defaults that make the drain guard INERT rather than absent.
     # A Runner assembled without __init__ (tests build them with __new__ and set
@@ -1921,6 +1945,14 @@ class Runner:
                 _worker.runner_heartbeat_start()   # keep the busy flag fresh
             msgs = self.mailbox.receive(self.agent.id)
             inflight_counts = Counter(a for a in self._inflight_acct.values() if a)
+        # Fill the few free slots highest-priority-first, not purely in arrival
+        # (ULID) order: a late high-priority TASK_ASSIGN should start ahead of
+        # earlier low/none-priority ones. Stable, so priority-less envelopes (old
+        # dispatches, control messages) keep arrival order. Pure on the local
+        # list → outside the lock. Nothing else in the loop changes; control
+        # messages (priority None) sort to the tail but are still handled inline
+        # and consume no slot.
+        msgs = _by_priority(msgs)
         handled = 0
         for msg in msgs:
             with self._lock:
