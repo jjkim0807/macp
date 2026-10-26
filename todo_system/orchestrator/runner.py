@@ -1553,7 +1553,23 @@ def _envelope_priority(msg) -> float | None:
     return p
 
 
-def _by_priority(msgs: list) -> list:
+def _db_priorities() -> dict:
+    """task_id -> priority from todo.db, for envelopes whose payload predates the
+    `priority` field. Fail-open: any trouble (no vault, no DB, old schema) -> {}.
+    Without it, an urgent task dispatched before the field existed sat behind
+    every older low-priority envelope (2026-10-26: mulkko-134 @95, dispatched
+    19:01, queued behind three priority-40..65 envelopes after macp#68)."""
+    try:
+        from . import tasks as _tasks
+        db = paths.vault_root_or_cwd() / _tasks.DEFAULT_DB
+        if not db.is_file():
+            return {}
+        return {slug: meta.get("priority") for slug, meta in _tasks.task_meta(db).items()}
+    except Exception:
+        return {}
+
+
+def _by_priority(msgs: list, fallback: dict | None = None) -> list:
     """Received envelopes re-ordered highest-priority-first, None last, with
     arrival order preserved inside each equal group. mailbox.receive() already
     returns ULID (arrival-time) order, so one STABLE sort is the whole job: a
@@ -1562,6 +1578,10 @@ def _by_priority(msgs: list) -> list:
     their arrival order. Pure on the local list — safe to call outside the lock."""
     def key(msg):
         p = _envelope_priority(msg)
+        if p is None and fallback:
+            fb = fallback.get(getattr(msg, "task_id", None))
+            if isinstance(fb, (int, float)) and not isinstance(fb, bool):
+                p = fb
         return (0, -p) if p is not None else (1, 0.0)
     return sorted(msgs, key=key)
 
@@ -1952,7 +1972,11 @@ class Runner:
         # list → outside the lock. Nothing else in the loop changes; control
         # messages (priority None) sort to the tail but are still handled inline
         # and consume no slot.
-        msgs = _by_priority(msgs)
+        # Envelopes dispatched before payloads carried `priority` fall back to
+        # the task's todo.db priority (read only when such an envelope exists).
+        need_fb = any(m_.type == m.TASK_ASSIGN and _envelope_priority(m_) is None
+                      for m_ in msgs)
+        msgs = _by_priority(msgs, _db_priorities() if need_fb else None)
         handled = 0
         for msg in msgs:
             with self._lock:

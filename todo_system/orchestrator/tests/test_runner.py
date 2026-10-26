@@ -2403,6 +2403,33 @@ class RunnerInboxPriorityOrderTest(unittest.TestCase):
         self.assertEqual(runner_mod._envelope_priority(env("r", 7)), 7)
 
 
+class EnvelopePriorityDbFallbackTest(unittest.TestCase):
+    def _env(self, task_id, payload):
+        return m.Envelope(to="x", type=m.TASK_ASSIGN, task_id=task_id, payload=payload)
+
+    def test_priority_less_envelope_uses_db_priority(self):
+        # Arrival: old-low (no key, db 40), old-urgent (no key, db 95), new (payload 60).
+        msgs = [self._env("old-low", {}), self._env("old-urgent", {}),
+                self._env("new", {"priority": 60})]
+        out = runner_mod._by_priority(msgs, {"old-low": 40.0, "old-urgent": 95.0})
+        self.assertEqual([x.task_id for x in out], ["old-urgent", "new", "old-low"])
+
+    def test_payload_priority_wins_over_db(self):
+        msgs = [self._env("a", {"priority": 10}), self._env("b", {})]
+        out = runner_mod._by_priority(msgs, {"a": 99.0, "b": 50.0})
+        self.assertEqual([x.task_id for x in out], ["b", "a"])
+
+    def test_unknown_or_bad_db_value_stays_none(self):
+        msgs = [self._env("x", {}), self._env("y", {"priority": 5})]
+        out = runner_mod._by_priority(msgs, {"x": True})
+        self.assertEqual([x.task_id for x in out], ["y", "x"])
+
+    def test_db_priorities_fail_open_without_db(self):
+        with mock.patch.object(runner_mod.paths, "vault_root_or_cwd",
+                          return_value=Path(tempfile.mkdtemp())):
+            self.assertEqual(runner_mod._db_priorities(), {})
+
+
 class NewIdThreadSafetyTest(unittest.TestCase):
     def test_no_duplicate_ids_across_threads(self):
         import threading
