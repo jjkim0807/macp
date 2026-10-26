@@ -126,13 +126,13 @@ DEFAULT_LEASE = "Worker/orchestrator.lock"
 # closes: a FAILURE framing followed by a benign close is a false alarm and
 # gets self-recorded (see _record_false_alarm). These strings land in the
 # git-tracked assignment JSON — treat them as wire format.
-ALERT_BLOCKED = "blocked"                       # 차단됨 — 선행 조건 미충족
-ALERT_REVIEW_PR = "review-pr"                   # PR 열림, 리뷰/머지 대기
-ALERT_RESULT_NO_PR = "result-no-pr"             # 정상 완료, 0-commit
-ALERT_FAILURE_SUSPECTED = "failure-suspected"   # 실패 원인 확인 필요
-ALERT_QUARANTINE = "quarantine"                 # 반복 실패 격리
-ALERT_TIMEOUT_PARK = "timeout-park"             # 2회 연속 stage timeout — 이어가기 불가
-ALERT_CLOSED_UNMERGED = "closed-unmerged"       # delegate PR을 머지 없이 닫음 — 판단 필요
+ALERT_BLOCKED = "blocked"                       # blocked — precondition unmet
+ALERT_REVIEW_PR = "review-pr"                   # PR open, awaiting review/merge
+ALERT_RESULT_NO_PR = "result-no-pr"             # completed normally, 0-commit
+ALERT_FAILURE_SUSPECTED = "failure-suspected"   # suspected failure, needs investigation
+ALERT_QUARANTINE = "quarantine"                 # quarantined after repeated failures
+ALERT_TIMEOUT_PARK = "timeout-park"             # 2 consecutive stage timeouts — cannot continue
+ALERT_CLOSED_UNMERGED = "closed-unmerged"       # delegate PR closed without merging — needs a decision
 # History-type stamp reconcile_merged leaves on a parked delegate row whose PR a
 # human CLOSED without merging — the one-time "it will never merge, decide" alert's
 # park-once guard, sibling to _MERGED_BUT_BLOCKED. Also wire format (git-tracked
@@ -153,7 +153,7 @@ FAILURE_ALERT_KINDS = frozenset({ALERT_FAILURE_SUSPECTED, ALERT_QUARANTINE})
 # The same task re-parking on the same gate re-fires _notify_review every time
 # the re-dispatch machine buys another run — 2026-08-18 that meant 10 review
 # pings in a day, half of them the same task on the same gate. Within this
-# window such repeats merge into one delivery ("외 N건" on the window's next
+# window such repeats merge into one delivery ("+N more" on the window's next
 # send). Keyed per (framing, task): a REAL state change (blocked → PR open)
 # changes the framing and therefore alerts immediately.
 REVIEW_RENOTIFY_COOLDOWN_S = 6 * 3600.0
@@ -344,14 +344,16 @@ class Orchestrator:
         self.fail_backoff = fail_backoff                # escalation factor
         self.poison_threshold = poison_threshold        # re-fails before quarantine
         self.daily_run_budget = daily_run_budget        # max task-runs/day (0=∞)
-        # repo당 동시 in-flight 상한(기본 2=동시성 on; leaf 5가 1→2로 flip). touches가
-        # 겹치지 않는 같은 리포 태스크만 동시 디스패치되고 나머지는 직렬로 남는다. 전역
-        # usage_guard 슬롯(#191)의 하위 제약 — 전역 상한을 올리거나 이중 계산하지 않는다.
+        # Per-repo concurrent in-flight cap (default 2 = concurrency on; leaf 5 flipped
+        # it 1→2). Only same-repo tasks whose touches do not overlap get dispatched
+        # concurrently; the rest stay serial. A sub-constraint of the global
+        # usage_guard slot (#191) — does not raise the global cap or double-count.
         self.max_parallel_per_repo = max_parallel_per_repo
-        # 크로스-체크아웃 동시 gradle-가능 run 전역 상한(메모리 가드, 8GB;
-        # [[runner-cgroup-memhigh-freeze-orphan-gradle]]). 0/음수 = 무제한(dormant);
-        # > 0 일 때만 디스패치에서 강제한다. usage_guard 쿼터 슬롯·repo당 cap과 별개이고
-        # 이중 계산하지 않는다(gradle run 수만 센다). 기본 0 이라 오늘 동작은 그대로.
+        # Cross-checkout concurrent gradle-capable-run global cap (memory guard, 8GB;
+        # [[runner-cgroup-memhigh-freeze-orphan-gradle]]). 0/negative = unlimited
+        # (dormant); only enforced at dispatch when > 0. Separate from the usage_guard
+        # quota slot and the per-repo cap, and does not double-count (counts only
+        # gradle runs). Default is 0, so today's behavior is unchanged.
         self.max_parallel_gradle_builds = max_parallel_gradle_builds
         self.capacity_cooldown_s = capacity_cooldown_s  # re-check delay after a
                                                         # usage/rate limit (no refail)
@@ -799,7 +801,7 @@ class Orchestrator:
         # serialises via _can_run_concurrently, only disjoint-touches pairs run
         # together — so a profile can still pin cap=1 to force every repo serial.
         live = self._checkout_inflight()
-        cap = max(1, int(self.max_parallel_per_repo))   # 0/음수 방어: 직렬 밑으로 못 내려감
+        cap = max(1, int(self.max_parallel_per_repo))   # guard against 0/negative: never below serial
         dispatched: list[Assignment] = []
         for t in runnable:
             key = self._checkout_key(t.payload)
@@ -876,7 +878,7 @@ class Orchestrator:
     def _wait_text(self, wait: str, lg: LedgerGate, existing: Assignment | None,
                    cg: CheckoutGate, key: str, usage_hold: str | None,
                    now: float) -> str:
-        """One Korean line explaining `wait` (queue view only)."""
+        """One Korean-language line explaining `wait` (queue view only)."""
         if wait == WAIT_PAUSED:
             return "PAUSED — 수동 정지 중"
         if wait == WAIT_USAGE_HOLD:
@@ -1125,7 +1127,7 @@ class Orchestrator:
     def _notify_review(self, a: Assignment, msg: m.Envelope) -> None:
         """Ping the human about a run that stopped short of merging.
 
-        The message used to assert "파이프라인 완료 · PR 열림(미머지)" unconditionally.
+        The message used to assert "pipeline complete · PR open (unmerged)" unconditionally.
         That is only sometimes true: gutenberg-reader-3 was reported that way on
         2026-08-07 while its report said `overall_status: fail` and `pr_url: null`
         — the human was asked to review and merge something that did not exist.
@@ -1143,7 +1145,7 @@ class Orchestrator:
         # caller's ledger.save). reconcile_merged reads it to self-detect false
         # alarms.
         blocker = getattr(a, "blocked_on", "")
-        # The PR URL rides in the "열기" button (link arg), never in the text body,
+        # The PR URL rides in the "Open" button (link arg), never in the text body,
         # so it can never be bisected. repo/branch/run path are NOT carried — they
         # are in the run record and the PR already; the phone alert only needs
         # WHAT happened + the ONE thing to do (in the headline) + which task.
@@ -1456,7 +1458,7 @@ class Orchestrator:
     def _nudge(self, agent: Agent, a: Assignment) -> None:
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=a.task_id,
                          payload=a.payload)
-        # Immediate on purpose — unlike the first-delivery [할당] FYI
+        # Immediate on purpose — unlike the first-delivery [assign] FYI
         # (human.deliver_pending, digest tier), a re-nudge only fires after a
         # human has sat on the ask for days (1d/3d/7d backoff): it IS the
         # escalation. No event key — last_nudge_ts/backoff already pace it, and
@@ -1614,7 +1616,7 @@ class Orchestrator:
         REJECTED is swept for the same reason, and because leaving it out was an
         inconsistency rather than a decision: `dispatch()` already treats
         (FAILED, REJECTED) as one retry class and `dashboard` renders them as one
-        "실패" section, so a REJECTED assignment shows up as a failure but was the
+        "Failure" section, so a REJECTED assignment shows up as a failure but was the
         only kind the sweep could never clear. The state is only ever reached via
         an agent REJECT reply, so nothing further arrives to move it — and the
         one path that does close a cancelled todo (`_retry`) runs from collect(),
@@ -1750,11 +1752,11 @@ class Orchestrator:
 
     def _record_false_alarm(self, a: Assignment, note: str) -> None:
         """Self-record a false alarm: a task parked under a FAILURE framing
-        (실패 원인 확인 필요 / 격리) that the sweep is now closing benignly
+        (suspected-failure / quarantine) that the sweep is now closing benignly
         ("PR merged out-of-band" / "todo already closed").
 
         Why: 2026-09-04 dripcoffee-integcheck-advote — a clean 0-commit RESULT
-        was announced at 10:32 as "실패 원인 확인 필요" and the same assignment
+        was announced at 10:32 as "suspected failure, needs investigation" and the same assignment
         was reconciled benignly at 10:52. The refutation was machine-visible the
         whole time, but the planner's inputs carry no execution history, so this
         defect class lived outside the self-improvement loop until a human
@@ -2127,14 +2129,14 @@ class Orchestrator:
         nothing closed the parent once every child finished:
         `parents_needing_review` only sees `is_parent=1` bundles (cause ①), so the
         parent's ledger row sat AWAITING_HUMAN forever, re-nudged by renudge_due and
-        stuck in the dashboard's "사람 대기" list. That is exactly what happened to
+        stuck in the dashboard's "awaiting human" list. That is exactly what happened to
         dancemirror-unified-projects (2026-10-10~11).
 
         This is the ledger-DRIVEN, gh-INDEPENDENT twin of reconcile_merged's "todo
         already closed" path. Per row (AWAITING_HUMAN/FAILED, non-human):
 
           - AC3 — md already done/cancelled (a human closed it directly): tidy the
-            ledger row to DONE so renudge_due stops and it drops out of "사람 대기".
+            ledger row to DONE so renudge_due stops and it drops out of "awaiting human".
             This generalizes reconcile_merged's close but without the `gh` call, so a
             `gh` hiccup can no longer abort it mid-tick.
           - AC1/AC2 — md still open: close the parent md AND tidy the ledger, but
@@ -2143,7 +2145,7 @@ class Orchestrator:
             rescope.is_oversize_rescope_park) AND every child is done. The
             "children >=1, all done" co-condition (tasks.child_status_rollup) excludes
             external-blocker parks (which have no children) on its own; anything short
-            of it stays parked — 미탐 over 오탐, the requirement's bias.
+            of it stays parked — false negative over false positive, the requirement's bias.
             A `result-no-pr` row (a 0-commit run whose only output was splitting
             the task into children) counts as the same re-scope signal: the
             children existing is the evidence, and they must all be done.
@@ -2521,9 +2523,9 @@ class Orchestrator:
         unblocked = self.reconcile_unblocked()  # blocker resolved -> stop waiting
         parents = self.reconcile_parents()     # children all done -> tell a human
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
-        self._advote_bridge_tick()             # advote 건의 → 태스크 다리 (fail-open, min-poll+main guarded)
-        self._beta_sweep_tick()                # 미발행 main → 베타 catch-up (fail-open, detached)
-        project_stalls = self._project_stall_tick()  # 정체 프로젝트 → 사람 결정 태스크 (fail-open, 1h throttle)
+        self._advote_bridge_tick()             # advote feedback → task bridge (fail-open, min-poll+main guarded)
+        self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
+        project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
         nudged = self.renudge_due(now)
         return {"reaped": reaped, "dispatched": dispatched, "updated": updated,
                 "reconciled": reconciled, "closed": closed, "unblocked": unblocked,
