@@ -1,25 +1,31 @@
-"""헤드리스 `claude` 호출용 인증 환경.
+"""Auth environment for headless `claude` invocations.
 
-왜 필요한가: Keychain의 OAuth 리프레시 토큰은 **절대 만료**를 갖는다(갱신으로
-연장되지 않는다). 만료되면 토큰이 빈 문자열로 비워지고 헤드리스 `claude -p`가
-전멸하는데, 증상이 없어서 며칠 뒤에야 발견된다 — 2026-08-15에 실제로 겪었고,
-2026-09-07 재로그인은 만료를 90일이 아니라 19일만 밀었다(9/15 → 10/4).
+Why this exists: a Keychain OAuth refresh token has an **absolute expiry**
+(it is not extended by renewal). Once it expires, the token is cleared to an
+empty string and headless `claude -p` dies wholesale — with no symptom, so it
+is only discovered days later. This actually happened on 2026-08-15, and the
+2026-09-07 re-login only pushed the expiry out 19 days, not 90 (9/15 → 10/4).
 
-해법: `claude setup-token`으로 발급한 장수 bearer 토큰을
-``<config dir>/automation-token`` (600)에 두고 `CLAUDE_CODE_OAUTH_TOKEN`으로 주입한다.
-구독 기반이라 API 과금이 붙지 않는다. 설계 근거: scripts/REMOTE_CONTROL_SETUP.md
-(이 규약은 claude_remote_control.sh가 이미 쓰던 것으로, 여기서 재사용한다).
+Fix: keep a long-lived bearer token issued by `claude setup-token` at
+``<config dir>/automation-token`` (600) and inject it via
+`CLAUDE_CODE_OAUTH_TOKEN`. It's subscription-based, so no API billing kicks
+in. Design rationale: scripts/REMOTE_CONTROL_SETUP.md (this convention is
+already used by claude_remote_control.sh; reused here).
 
-config dir은 **활성 Claude 계정**의 것이다(`macp.config.current_account`: 프로젝트
-`.macp` pin → 프로필 `active_account` → priority). 계정이 없으면 종전 단일 dir
-(`macp.accounts.LEGACY_CONFIG_DIR`; 모듈 상수 ``TOKEN_FILE``이 그 파일이고 호환용으로
-남는다, 실제 해석은 :func:`token_file`)이다. 계정이 해석되면 :func:`claude_env` 는
-`accounts.claude_env_for` 로 config dir 층과 토큰 층을 함께 적용하고, 그 계정 dir에
-토큰 파일이 없으면 상속받은 `CLAUDE_CODE_OAUTH_TOKEN`을 **제거**한다(다른 계정의 토큰이
-새지 않게).
+The config dir belongs to the **active Claude account**
+(`macp.config.current_account`: project `.macp` pin → profile
+`active_account` → priority). If there is no account, it falls back to the
+previous single dir (`macp.accounts.LEGACY_CONFIG_DIR`; the module constant
+``TOKEN_FILE`` is that file, kept for compatibility — the actual resolution
+goes through :func:`token_file`). Once an account resolves, :func:`claude_env`
+applies both the config-dir layer and the token layer via
+`accounts.claude_env_for`, and **removes** any inherited
+`CLAUDE_CODE_OAUTH_TOKEN` if that account's dir has no token file (so another
+account's token can't leak through).
 
-**계정이 없을 때 파일이 없으면 아무것도 하지 않는다** — 즉 미발급 상태에서도 동작이
-변하지 않고, 발급하면 자동으로 적용되며, 문제가 생기면 파일만 지우면 즉시 롤백된다.
+**When there is no account and no file, nothing happens** — behavior is
+unchanged before the token is issued, applies automatically once it is, and
+rolls back instantly if the file is ever deleted.
 """
 
 from __future__ import annotations
@@ -36,23 +42,24 @@ TOKEN_FILE = _accounts.legacy_config_dir() / "automation-token"
 
 
 class MalformedToken(ValueError):
-    """토큰 파일 내용이 bearer 토큰 모양이 아니다."""
+    """The token file's content doesn't look like a bearer token."""
 
 
 def _looks_like_token(s: str) -> bool:
-    """bearer 토큰의 최소 형태 검사.
+    """Minimal shape check for a bearer token.
 
-    2026-09-07에 `pbpaste > <토큰 파일>` 을 실행했더니 클립보드에
-    setup-token 출력이 아니라 **그 명령줄 자체**가 들어갔다. 파일이 비어있지
-    않다는 이유로 그대로 주입했다면 모든 헤드리스 스테이지가 인증 실패로 죽었을
-    것이다 — 잘못된 토큰은 '토큰 없음'보다 나쁘다(없으면 Keychain으로 폴백된다).
-    그래서 모양이 아니면 주입하지 않고 시끄럽게 실패한다.
+    On 2026-09-07, running `pbpaste > <token file>` put **the command line
+    itself** into the clipboard instead of the setup-token output. If it had
+    been injected just because the file wasn't empty, every headless stage
+    would have died from auth failure — a wrong token is worse than no token
+    (no token falls back to Keychain). So if it doesn't look right, don't
+    inject it, and fail loudly.
     """
     if not s or len(s) < 40:
         return False
-    if any(c.isspace() for c in s):   # 토큰에 공백/개행은 없다
+    if any(c.isspace() for c in s):   # a token has no whitespace/newlines
         return False
-    # 셸 명령·경로·URL이 섞여 들어온 경우
+    # a shell command, path, or URL got mixed in
     if any(bad in s for bad in ("&&", "|", " ", "/", "~", "$", "<", ">")):
         return False
     return True
@@ -77,11 +84,11 @@ def token_file() -> Path:
 
 
 def read_automation_token(path: Path | None = None, *, strict: bool = True) -> str | None:
-    """토큰 문자열, 없거나 비었으면 None. 토큰 내용은 절대 로깅하지 않는다.
+    """The token string, or None if missing or empty. Token content is never logged.
 
-    ``path`` 를 주지 않으면 :func:`token_file` (활성 계정 dir, 계정이 없으면
-    ``TOKEN_FILE``). ``strict`` 이면 모양이 틀린 내용에 대해 :class:`MalformedToken`
-    을 올린다.
+    If ``path`` isn't given, uses :func:`token_file` (the active account dir,
+    or ``TOKEN_FILE`` if there's no account). If ``strict``, raises
+    :class:`MalformedToken` for content with the wrong shape.
     """
     p = path or token_file()
     try:
@@ -102,18 +109,21 @@ def read_automation_token(path: Path | None = None, *, strict: bool = True) -> s
 
 
 def claude_env(base: dict | None = None, path: Path | None = None) -> dict:
-    """`claude` 서브프로세스에 넘길 환경.
+    """The environment to pass to the `claude` subprocess.
 
-    ``path`` 를 주지 않으면 **활성 계정**을 따른다(:func:`_current_account`): 계정이
-    있으면 ``macp.accounts.claude_env_for`` 가 config dir 층(계정 dir이 LEGACY가 아닐
-    때만 ``CLAUDE_CONFIG_DIR``)과 토큰 층(계정 dir의 토큰 주입, 없으면 상속받은
-    ``CLAUDE_CODE_OAUTH_TOKEN`` 제거)을 적용한다. 계정이 없거나 ``path`` 를 명시하면
-    종전 그대로 — 토큰이 있으면 주입, 없으면 env 를 **그대로** 둔다(제거 없음: 전역
-    env 토큰에 기대는 무계정 호스트가 깨지지 않게).
+    If ``path`` isn't given, this follows the **active account**
+    (:func:`_current_account`): when there is one, ``macp.accounts.claude_env_for``
+    applies both the config-dir layer (``CLAUDE_CONFIG_DIR``, only when the
+    account dir isn't LEGACY) and the token layer (inject the account dir's
+    token, or remove any inherited ``CLAUDE_CODE_OAUTH_TOKEN`` if it has
+    none). When there is no account, or ``path`` is given explicitly, this
+    behaves as before — inject the token if present, otherwise leave env
+    **as is** (no removal: so account-less hosts relying on a global env
+    token don't break).
 
-    ``ANTHROPIC_API_KEY``가 이미 설정돼 있으면 토큰 층은 건드리지 않는다 — 그 경우
-    사용자가 의도적으로 API 과금 경로를 쓰는 것이고, 여기서 덮으면 조용히
-    청구 주체가 바뀐다.
+    If ``ANTHROPIC_API_KEY`` is already set, the token layer is left alone —
+    in that case the user is deliberately using the API billing path, and
+    overwriting it here would silently switch who gets billed.
     """
     env = dict(os.environ if base is None else base)
     if path is None:
@@ -122,9 +132,10 @@ def claude_env(base: dict | None = None, path: Path | None = None) -> dict:
             return _accounts.claude_env_for(acct, env)
     if env.get("ANTHROPIC_API_KEY"):
         return env
-    # 모양이 틀린 토큰은 주입하지 않는다 — 주입하면 전 스테이지가 인증 실패로
-    # 죽고, 안 하면 Keychain 으로 조용히 폴백된다. 후자가 안전하다.
-    # (틀렸다는 사실은 claude_auth_watch 가 별도로 시끄럽게 알린다.)
+    # Don't inject a malformed-shape token — injecting it kills every stage
+    # with an auth failure, while not injecting it quietly falls back to
+    # Keychain. The latter is safe.
+    # (claude_auth_watch separately raises a loud alert about the malformed token.)
     token = read_automation_token(path, strict=False)
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
@@ -132,7 +143,7 @@ def claude_env(base: dict | None = None, path: Path | None = None) -> dict:
 
 
 def auth_source(env: dict | None = None) -> str:
-    """지금 어떤 자격증명으로 도는지 — 로그·헬스리포트용 한 단어."""
+    """Which credential is active right now — a one-word label for logs/health reports."""
     e = os.environ if env is None else env
     if e.get("ANTHROPIC_API_KEY"):
         return "api-key"

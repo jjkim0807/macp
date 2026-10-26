@@ -1,8 +1,8 @@
 """One-shot session-end checklist for second-brain (CLAUDE.md §10).
 
-``session-end`` runs the manual "세션 마무리" / "macp 동기화" checklist in a single
-command, so the steps in CLAUDE.md §10.1–§10.3 don't have to be re-discovered each
-time:
+``session-end`` runs the manual "세션 마무리" ("wrap up the session") / "macp 동기화"
+("sync macp") checklist in a single command, so the steps in CLAUDE.md §10.1–§10.3
+don't have to be re-discovered each time:
 
   1. **Classify** ``git status`` into ``ignorable`` / ``must_commit`` / ``ignored``
      — but decide ``Memory/index.md`` by its *actual diff*, not by path: a churn
@@ -44,7 +44,7 @@ ROOT = paths.vault_root(start=paths.vault_search_start())
 
 _INDEX_PATH = "Memory/index.md"
 # git status paths under these prefixes are runner/orchestrator runtime churn
-# (§10.1: "?? Worker/** → 무시"). Kept as a tuple for str.startswith().
+# (§10.1: "?? Worker/** → ignore"). Kept as a tuple for str.startswith().
 _IGNORABLE_PREFIXES = ("Worker/",)
 _DAEMON_MATCH = "secondbrain"
 # daemonctl.UNITS labels all start with the org prefix (e.g. "com.macp.secondbrain.
@@ -126,12 +126,12 @@ def classify_status(root: Path) -> dict[str, list[str]]:
     """Bucket ``git status --porcelain --ignored`` per CLAUDE.md §10.1.
 
     - ``!!`` (git-ignored, e.g. ``Todo/items/**``, ``Todo/todo.db``) → ``ignored``
-      (커밋 불필요).
+      (no commit needed).
     - under ``Worker/`` → ``ignorable`` (runner/orchestrator runtime churn).
     - ``Memory/index.md`` → ``ignorable`` if only its ``last_synced:`` line changed,
       else ``must_commit``.
     - everything else (``Notes/``, ``Decisions/``, ``Memory/entities/``,
-      ``Memory/sessions/``, ``CLAUDE.md``, …) → ``must_commit`` (반드시 커밋).
+      ``Memory/sessions/``, ``CLAUDE.md``, …) → ``must_commit`` (must be committed).
 
     Returns ``{"ignorable": [...], "must_commit": [...], "ignored": [...]}`` of paths.
     """
@@ -247,12 +247,13 @@ def _format_summary(
     daemons: dict[str, int | None] | None,
     dry_run: bool,
 ) -> list[str]:
-    """Render the "무시 N / 커밋 N / 처리할 것 N" summary as a list of lines.
+    """Render the "무시 N / 커밋 N / 처리할 것 N" (ignored N / committed N / to-handle N)
+    summary as a list of lines.
 
-    - 무시 = ignorable + ignored (noise the human need not touch).
-    - 커밋 = files this command committed for you (the journal).
-    - 처리할 것 = must_commit files that remain — the human's responsibility, and
-      what drives the exit code.
+    - 무시 (ignored) = ignorable + ignored (noise the human need not touch).
+    - 커밋 (committed) = files this command committed for you (the journal).
+    - 처리할 것 (to-handle) = must_commit files that remain — the human's
+      responsibility, and what drives the exit code.
     """
     must = buckets["must_commit"]
     n_ignore = len(buckets["ignorable"]) + len(buckets["ignored"])
@@ -282,10 +283,11 @@ def _format_summary(
     elif not daemons:
         lines.append("데몬: secondbrain 항목 없음 — 로드되지 않음(주의).")
     else:
-        # Report-only. A ``-`` PID (미실행) is normal for the *periodic* jobs
-        # (brief/health/…), which are loaded but idle between scheduled runs, so
-        # we surface the raw PID column rather than crying "dead" on every idle
-        # job — the human judges the persistent daemons (todo-sync·runner) per §10.3.
+        # Report-only. A ``-`` PID (미실행, "not running") is normal for the
+        # *periodic* jobs (brief/health/…), which are loaded but idle between
+        # scheduled runs, so we surface the raw PID column rather than crying
+        # "dead" on every idle job — the human judges the persistent daemons
+        # (todo-sync·runner) per §10.3.
         rendered = [
             f"{label}={'PID ' + str(pid) if pid is not None else '미실행'}"
             for label, pid in sorted(daemons.items())
