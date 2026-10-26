@@ -49,8 +49,19 @@ def _open_leaf_rows(db_path: str | Path) -> tuple[list, bool, bool]:
             cols += ", auto_merge"
         if has_nb:
             cols += ", not_before"
+        # Dispatch order = priority, highest first (NULL last), then insertion
+        # order. Until 2026-10-26 there was no ORDER BY at all, so the runner's
+        # few parallel slots went to whichever rows SQLite happened to return
+        # first (≈ rowid = import order): a task marked priority 95 still queued
+        # behind a dozen priority-40 tasks imported before it, and the
+        # frontmatter `priority` field did nothing for dispatch. Every consumer
+        # of this list (tick() and the queue views) walks it in order, so this
+        # one ORDER BY is the whole fix. A DB that predates the column keeps
+        # the old rowid order.
+        order = ("ORDER BY (priority IS NULL), priority DESC, rowid"
+                 if "priority" in present else "ORDER BY rowid")
         rows = con.execute(
-            f"SELECT {cols} FROM tasks WHERE status='open' AND is_parent=0"
+            f"SELECT {cols} FROM tasks WHERE status='open' AND is_parent=0 {order}"
         ).fetchall()
     finally:
         con.close()

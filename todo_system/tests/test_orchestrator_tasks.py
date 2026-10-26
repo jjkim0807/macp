@@ -285,3 +285,37 @@ class LoadDispatchableNotBeforeTest(unittest.TestCase):
         with patch.object(nb_gate, "_now", return_value=dt.datetime(2026, 10, 12, 17, 0)):
             got = [t.slug for t in tasks.load_dispatchable(self.db)]
         self.assertIn("timed-space", got)
+
+
+class DispatchPriorityOrderTest(unittest.TestCase):
+    """load_dispatchable walks open leaves by priority (high first, NULL last),
+    then insertion order — the order tick() fills its parallel slots in."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _db(self, rows):
+        p = self.tmp / "todo.db"
+        con = sqlite3.connect(p)
+        con.execute(f"CREATE TABLE tasks ({_COLS}, priority)")
+        con.executemany(
+            f"INSERT INTO tasks ({_COLS}, priority) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        con.commit()
+        con.close()
+        return p
+
+    def test_higher_priority_dispatches_first_regardless_of_import_order(self):
+        db = self._db([
+            _row("old-low") + (40.0,),
+            _row("old-none") + (None,),
+            _row("mid") + (60.0,),
+            _row("new-urgent") + (95.0,),
+            _row("tie-a") + (60.0,),
+        ])
+        got = [t.slug for t in tasks.load_dispatchable(db)]
+        self.assertEqual(got, ["new-urgent", "mid", "tie-a", "old-low", "old-none"])
+
+    def test_db_without_priority_column_keeps_insertion_order(self):
+        db = _make_db(self.tmp, [_row("a"), _row("b"), _row("c")])
+        self.assertEqual([t.slug for t in tasks.load_dispatchable(db)], ["a", "b", "c"])
