@@ -244,7 +244,8 @@ BROWSER_OWNER_ENV = "MACP_BROWSER_OWNER"
 # that attaches to the same Chrome once and takes the lease itself on first call.
 # Opt-in via paths.browser_mcp_server (env/config key, no default): only when it
 # names an existing file do BROWSER_MCP_STAGES get `--mcp-config` (owner =
-# run_id in the server's env) and BROWSER_MCP_TOOL_RULE; otherwise argv is
+# run_id in the server's env, plus BROWSER_MCP_PASSTHROUGH_ENVS when set) and
+# BROWSER_MCP_TOOL_RULE; otherwise argv is
 # byte-identical to before. The Bash wrapper rule above stays for compatibility.
 # `--strict-mcp-config` rides along so a user-scope registration of the same
 # server (interactive sessions, docs/configuration.md) can't load a second,
@@ -255,6 +256,14 @@ BROWSER_MCP_STAGES = BROWSER_TOOL_STAGES
 # The node binary, same knob the macp-browser wrapper honours (node isn't
 # always on the runner's PATH).
 BROWSER_MCP_NODE_ENV = "MACP_BROWSER_NODE"
+# Instance knobs the wrapper honours (scripts/macp-browser). The claude CLI
+# spawns a stdio MCP server with ONLY the config's `env` block, so the stage's
+# own environment never reaches it: each one set non-empty here is copied
+# through verbatim (the server resolves CDP from the instance's ports.env
+# itself; an explicit CDP wins there). The owner is never copied — it is
+# always the run_id.
+BROWSER_MCP_PASSTHROUGH_ENVS = ("MACP_BROWSER_INSTANCE", "MACP_BROWSER_DIR",
+                                "MACP_BROWSER_CDP")
 
 # The remote-gate executor (todo_system.orchestrator.remote_gate, CLAUDE delegate
 # note below) for a verification command too heavy/memory-bound for one stage:
@@ -378,11 +387,15 @@ def browser_mcp_server(stage: str) -> Path | None:
 
 def browser_mcp_config(server: Path, run_id: str) -> str:
     """The inline `--mcp-config` JSON for one stage: the macp-browser server
-    with the run_id as its lease owner. Holds a path and the run_id only."""
+    with the run_id as its lease owner, plus any BROWSER_MCP_PASSTHROUGH_ENVS
+    set non-empty in this process (none set → env is the owner alone, so the
+    default Chrome is unchanged). Holds a path, the run_id and those values."""
+    env = {k: v for k in BROWSER_MCP_PASSTHROUGH_ENVS if (v := os.environ.get(k))}
+    env[BROWSER_OWNER_ENV] = run_id
     cfg = {"mcpServers": {BROWSER_MCP_SERVER_NAME: {
         "command": os.environ.get(BROWSER_MCP_NODE_ENV) or "node",
         "args": [str(server)],
-        "env": {BROWSER_OWNER_ENV: run_id},
+        "env": env,
     }}}
     return json.dumps(cfg, sort_keys=True, separators=(",", ":"))
 

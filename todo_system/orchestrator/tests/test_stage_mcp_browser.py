@@ -18,7 +18,11 @@ from unittest import mock
 from todo_system import paths
 from todo_system.orchestrator import stages
 
-_KNOB_ENVS = ("MACP_BROWSER_MCP_SERVER", "MACP_BROWSER_NODE")
+_KNOB_ENVS = ("MACP_BROWSER_MCP_SERVER", "MACP_BROWSER_NODE",
+              *stages.BROWSER_MCP_PASSTHROUGH_ENVS)
+_INSTANCE_ENV = {"MACP_BROWSER_INSTANCE": "s-test",
+                 "MACP_BROWSER_DIR": "/tmp/macp-browser-test",
+                 "MACP_BROWSER_CDP": "http://127.0.0.1:9399"}
 _RUN_ID = "20260101T000000-t-slug"
 _MCP_STAGES = ("implement", "verify", "quick", "delegate")
 _NON_MCP_STAGES = ("research", "plan", "report", "discover")
@@ -26,7 +30,9 @@ _MCP_META_RE = re.compile(r"- \*\*Browser: MCP tools first[^\n]*\n")
 
 
 def _clean_env():
-    """patch.dict that drops the MCP knobs for the duration of a test."""
+    """patch.dict that drops the MCP knobs (server, node and the instance
+    passthrough knobs — conftest always sets MACP_BROWSER_DIR) for the duration
+    of a test."""
     env = {k: v for k, v in os.environ.items() if k not in _KNOB_ENVS}
     return mock.patch.dict(os.environ, env, clear=True)
 
@@ -163,6 +169,50 @@ class StageMcpWiringTest(unittest.TestCase):
             cfg = json.loads(stages.browser_mcp_config(self.server, _RUN_ID))
         self.assertEqual(cfg["mcpServers"]["macp-browser"]["command"],
                          "/opt/node/bin/node")
+
+    def _server_env(self, env: dict[str, str]) -> dict:
+        with _clean_env(), mock.patch.dict(os.environ, env):
+            cfg = json.loads(stages.browser_mcp_config(self.server, _RUN_ID))
+        return cfg["mcpServers"]["macp-browser"]["env"]
+
+    # Instance knobs unset (or empty) → owner only, bytes as before (default 9277).
+    def test_instance_knobs_absent_env_is_owner_only(self):
+        before = json.dumps({"mcpServers": {"macp-browser": {
+            "command": "node", "args": [str(self.server)],
+            "env": {"MACP_BROWSER_OWNER": _RUN_ID}}}},
+            sort_keys=True, separators=(",", ":"))
+        for env in ({}, {k: "" for k in _INSTANCE_ENV}):
+            with self.subTest(env=env), _clean_env(), mock.patch.dict(os.environ, env):
+                self.assertEqual(stages.browser_mcp_config(self.server, _RUN_ID), before)
+            self.assertEqual(self._server_env(env), {"MACP_BROWSER_OWNER": _RUN_ID})
+
+    # Instance knobs set → copied verbatim into the server env next to the owner.
+    def test_instance_knobs_pass_through(self):
+        self.assertEqual(self._server_env(_INSTANCE_ENV),
+                         {"MACP_BROWSER_OWNER": _RUN_ID, **_INSTANCE_ENV})
+
+    def test_instance_only_passes_just_instance(self):
+        self.assertEqual(self._server_env({"MACP_BROWSER_INSTANCE": "s-test"}),
+                         {"MACP_BROWSER_OWNER": _RUN_ID,
+                          "MACP_BROWSER_INSTANCE": "s-test"})
+
+    def test_owner_env_never_overrides_run_id(self):
+        env = self._server_env({"MACP_BROWSER_OWNER": "someone-else",
+                                "MACP_BROWSER_INSTANCE": "s-test"})
+        self.assertEqual(env["MACP_BROWSER_OWNER"], _RUN_ID)
+
+    def test_instance_knobs_reach_stage_argv(self):
+        for stage in _MCP_STAGES:
+            with self.subTest(stage=stage), _clean_env(), \
+                    mock.patch.dict(os.environ, _INSTANCE_ENV), \
+                    mock.patch.object(stages.paths, "browser_mcp_server",
+                                      return_value=self.server):
+                argv = stages.build_stage_argv(
+                    stage, task_id="t-slug", run_id=_RUN_ID,
+                    run_dir=Path("/tmp/runs/x"), branch="worker/t-slug",
+                    worker_root=Path("/nonexistent"))
+                self.assertEqual(_mcp_cfg(argv)["mcpServers"]["macp-browser"]["env"],
+                                 {"MACP_BROWSER_OWNER": _RUN_ID, **_INSTANCE_ENV})
 
     # AC2: unset → byte-identical to the pre-change argv.
     def test_off_argv_has_no_mcp_and_equals_on_minus_additions(self):
