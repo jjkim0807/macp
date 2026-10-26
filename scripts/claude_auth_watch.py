@@ -2,7 +2,7 @@
 """Watch the Claude Code CLI credential in the login Keychain and shout when it dies.
 
 Repo home: MaestroACP/scripts — installed by install_remote_control_launchagent.sh.
-(2026-08-19에 예전 단일 설정 디렉터리(legacy config dir)의 스크립트에서 이 레포로 이관.)
+(Moved into this repo on 2026-08-19 from a script in the old single config directory (legacy config dir).)
 
 Multi-account (leaf ⑤): the credential / automation-token / chrome checks run
 once per claude account of the resolved profile (macp.config.resolve), each
@@ -83,9 +83,10 @@ RC_LABEL = f"{paths.label_prefix(start=VAULT)}claude-remote-control"
 # follows whatever accounts the profile holds. Linux (cloud HQ): the CLI keeps its
 # OAuth credential in a 0600 <config dir>/.credentials.json (same
 # {"claudeAiOauth": {...}} shape); the Mac uses the shared login Keychain.
-# 7일: 재로그인은 로그인 시점부터 ~27일 창을 새로 준다(맥 9/07 로그인 → 10/04,
-# VM도 10/10으로 같은 폭). 잔여기간과 무관하므로 일찍 알릴 이유가 없다 — 21일로 두면
-# 로그인 6일 뒤부터 매 창의 대부분 동안 경고가 울려 소음이 된다(2026-09-14).
+# 7 days: a re-login grants a fresh ~27-day window from the login time (Mac logged in
+# 9/07 → 10/04; the VM likewise to 10/10, the same width). It does not depend on the
+# remaining time, so there is no reason to warn early — at 21 days the warning would go
+# off for most of every window starting 6 days after login and become noise (2026-09-14).
 WARN_DAYS = 7
 TRANSCRIPT_WINDOW_HOURS = 26  # a bit over a day, so a daily run never has a blind spot
 LOG_PATH = (Path.home() / "Library" / "Logs" / "claude-auth-watch.log" if IS_DARWIN
@@ -125,18 +126,20 @@ def _compose_kakao_text(title: str, message: str) -> str:
 
 def notify(title: str, message: str, link: str | None = None,
            level: str | None = None) -> None:
-    """카카오 + 데스크톱 배너. 둘 다 best effort.
+    """Kakao + desktop banner. Both are best effort.
 
-    데스크톱 배너만 쓰던 것을 2026-09-07에 카카오 우선으로 바꿨다: 이 경고는
-    launchd 헤드리스 컨텍스트에서 뜨고(osascript 자체가 거부될 수 있다), 배너는
-    화면을 안 보고 있으면 그냥 사라진다. 인증 만료는 놓치면 자동화가 통째로
-    죽는 종류라 실제로 읽는 채널로 보내야 한다. 카카오는 kakao_send.sh가 이미
-    다른 알림에 쓰는 경로다(길이는 compose_alert가 보장 — 눈먼 커트 없음). `link`은
-    kakao_send.sh 2번째 인자(열기 버튼)로 넘어간다.
+    This used to be desktop-banner only; on 2026-09-07 it switched to Kakao first: this
+    warning fires in a launchd headless context (osascript itself may be refused), and
+    a banner simply vanishes if nobody is looking at the screen. An auth expiry is the
+    kind of thing that, if missed, kills the whole automation, so it has to go to a
+    channel that is actually read. Kakao is the path kakao_send.sh already uses for
+    other alerts (compose_alert guarantees the length — no blind cut). `link` is passed
+    as kakao_send.sh's 2nd argument (the open button).
 
-    `level`은 노이즈 등급 옵트인(scripts/KAKAO_ALERTS.md): stdlib 제약 때문에
-    라우터를 import하지 않고 kakao_send.sh의 KAKAO_LEVEL env 경로를 태운다.
-    None(기본)이면 env를 건드리지 않아 기존 즉시 발송 그대로다."""
+    `level` is the noise-tier opt-in (scripts/KAKAO_ALERTS.md): because of the stdlib
+    constraint it does not import the router and instead goes through kakao_send.sh's
+    KAKAO_LEVEL env path. None (the default) leaves the env untouched, so it is the
+    same immediate send as before."""
     if KAKAO_SCRIPT.exists():
         try:
             args = [str(KAKAO_SCRIPT), _compose_kakao_text(title, message)]
@@ -296,17 +299,19 @@ def check_credential(name, config_dir, problems: list[str], notes: list[str]) ->
 
 
 def _check_automation_token(name, config_dir, problems: list[str], notes: list[str]) -> None:
-    """장수 automation token 유무(계정의 config dir 기준). 추론 전용 헤드리스 잡의
-    Keychain 만료 대비책.
+    """Whether a long-lived automation token exists (under the account's config dir). The
+    fallback for inference-only headless jobs against Keychain expiry.
 
-    토큰 자체는 읽지 않고 존재·권한만 본다 (내용은 절대 로깅하지 않는다).
-    없다고 problem 은 아니다 — 아직 발급 안 한 상태가 정상 경로일 수 있다.
+    It does not read the token itself; it only checks existence and permissions (the
+    contents are never logged). A missing token is not a problem — not having issued
+    one yet can be a normal path.
 
-    적용 범위 주의: remote-control은 이 토큰으로 살릴 수 없다. CLI 2.1.236은 장수
-    토큰을 거부한다("Remote Control requires a full-scope login token"). 2026-09-07에
-    아래 '미발급' 노트를 보고 토큰을 발급했다가, 당시 그것을 주입하던 래퍼 때문에
-    remote-control이 30초 크래시 루프에 빠졌다. 래퍼는 이제 변수를 unset 하고,
-    노트 문구도 적용 범위를 명시한다.
+    Scope caveat: remote-control cannot be kept alive with this token. CLI 2.1.236
+    refuses long-lived tokens ("Remote Control requires a full-scope login token"). On
+    2026-09-07 a token was issued after seeing the '미발급' (not issued) note below, and
+    the wrapper that injected it at the time sent remote-control into a 30-second crash
+    loop. The wrapper now unsets the variable, and the note wording also states the
+    scope.
     """
     label = _acct_label(name)
     tok = Path(config_dir) / "automation-token"
@@ -321,9 +326,10 @@ def _check_automation_token(name, config_dir, problems: list[str], notes: list[s
     if mode != 0o600:
         problems.append(label + f"automation-token 권한이 {oct(mode)} — chmod 600 필요")
 
-    # 내용이 토큰 모양인지까지 본다. 2026-09-07에 `pbpaste`가 setup-token 출력이
-    # 아니라 명령줄 자체를 파일에 넣은 일이 있었다 — 파일 존재만 확인했다면
-    # "발급 완료"로 읽히고 정작 인증은 Keychain 만료와 함께 죽었을 것이다.
+    # Also check that the contents look like a token. On 2026-09-07 `pbpaste` put the
+    # command line itself into the file instead of the setup-token output — checking only
+    # that the file exists would have read as "issued", while the auth actually died
+    # along with the Keychain expiry.
     try:
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
         from todo_system.claude_auth import _looks_like_token
@@ -688,11 +694,12 @@ def is_permanent_rc_error(line: str | None) -> bool:
 
 
 def last_startup_error(max_bytes: int = 8192, max_len: int = 240) -> str | None:
-    """remote-control stderr 로그 끝에서 가장 최근 에러 한 줄.
+    """The most recent error line from the end of the remote-control stderr log.
 
-    KeepAlive 크래시 루프는 launchctl 상태만 봐서는 원인이 안 보인다. 로그 끝에
-    이유가 그대로 찍혀 있으므로(예: "Remote Control requires a full-scope login
-    token") 알림 문구에 실어 보낸다. 이 로그에 토큰 문자열이 남는 경로는 없다.
+    A KeepAlive crash loop does not show its cause from the launchctl status alone. The
+    reason is printed verbatim at the end of the log (e.g. "Remote Control requires a
+    full-scope login token"), so it is carried in the alert text. There is no path by
+    which a token string ends up in this log.
     """
     try:
         with RC_LOG_PATHS[0].open("rb") as fh:
@@ -728,9 +735,10 @@ def check_remote_control_binary(problems: list[str], notes: list[str]) -> None:
     """
     pid = running_remote_control_pid()
     if pid is None:
-        # 왜 죽었는지까지 한 줄에 실어 보낸다. 2026-09-07 automation-token 크래시
-        # 루프는 자격증명·만료·transcript 검사를 모두 통과하고 여기서만 걸렸는데,
-        # "is not running"만으로는 원인을 찾으러 로그를 다시 뒤져야 했다.
+        # Carry why it died on the same line too. The 2026-09-07 automation-token crash
+        # loop passed every credential, expiry and transcript check and was caught only
+        # here, but with just "is not running" the logs had to be dug through again to
+        # find the cause.
         why = last_startup_error()
         detail = f" — 마지막 stderr: {why}" if why else ""
         if is_permanent_rc_error(why):
@@ -784,7 +792,8 @@ def check_remote_control_binary(problems: list[str], notes: list[str]) -> None:
         return
 
     notes.append(f"remote-control was pinned to deleted {detail} — auto-restarted")
-    # 요약 등급: 이미 자가 회복이 끝난 FYI다. 인증 이상(main의 notify)은 즉시 유지.
+    # Digest tier: this is an FYI whose self-recovery is already done. Auth problems
+    # (main's notify) stay immediate.
     notify(
         "Claude Remote Control 자동 복구",
         f"업그레이드로 사라진 바이너리({detail})를 붙들고 있어 재시작했습니다.",

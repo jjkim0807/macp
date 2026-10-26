@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Weekly health report for the second-brain automation stack.
 
-"측정 없는 자동화는 조용히 죽는다" — this is the meta-watchdog layer: it checks
+"측정 없는 자동화는 조용히 죽는다" ("automation without measurement dies
+quietly") — this is the meta-watchdog layer: it checks
 whether the safety nets themselves are still alive. Six checks, each mapped
 1:1 to a real incident (see INCIDENT_NOTES):
 
@@ -31,7 +32,8 @@ Design rules:
 - judge_* functions are pure (no file/subprocess IO) and unit-tested; the
   collectors (gather_*/read_*/tail_*) do the IO and take injectable paths.
 - stdlib only — launchd runs this with bare /usr/bin/python3 (no uv/venv).
-- 정상이면 무음: the episode is always written, kakao fires only on ≥1 WARN.
+- 정상이면 무음 (silent when healthy): the episode is always written, kakao
+  fires only on ≥1 WARN.
 - Tests load this module by path via importlib → the top level must stay
   side-effect free (constants/defs only; entry point strictly under __main__).
 
@@ -148,7 +150,7 @@ def judge_ledger(rows: list[dict]) -> CheckResult:
     awaiting_human/failed assignments. A MERGED pr_state means the ledger is
     lying — except a merged park (_is_merged_park), which is named under
     LEDGER_PARK_LABEL and never warns by itself. A lookup error is reported
-    loudly too — the reconciler shares the gh dependency, so '점검 불능' may
+    loudly too — the reconciler shares the gh dependency, so '점검 불능' (unable to check) may
     itself mean the safety net is dead. The detail stays one line and names
     slugs only: it is a table cell in the episode, and a blocker is a paragraph."""
     parked = [r for r in rows if _is_merged_park(r)]
@@ -412,7 +414,7 @@ def render_episode(results: list[CheckResult], now: dt.datetime) -> str:
 
 
 def build_kakao_message(results: list[CheckResult]) -> str:
-    """Short alert naming the WARN checks only (정상 항목은 언급하지 않는다).
+    """Short alert naming the WARN checks only (healthy checks are not mentioned).
 
     Self-limiting via compose_alert (single length source = kakao_format): the
     headline (count + where to look) always fits, and the WARN check names ride as
@@ -454,10 +456,11 @@ EPISODES_DIR = VAULT / "Memory" / "episodes"
 VAULT_LOGS_DIR = VAULT / "logs"
 # Engine file: resolve from the install dir, not the vault (split install).
 KAKAO_SEND_SH = _INSTALL_DIR / "scripts" / "kakao_send.sh"
-# 라이브 페이퍼런의 로그. 워커 워크트리(~/Worker/ai-stock-trading)가 아니라
-# 라이브 전용 디렉터리를 봐야 한다 — 2026-08-07 에 라이브가 ~/Trading 으로 분리되면서
-# 워커 쪽 equity_curve.csv 는 그 시점에 동결됐다. 여기를 잘못 가리키면 이 체크는
-# 오탐을 내면서 정작 감시 대상인 '라이브 루프 침묵'은 못 본다.
+# Logs of the live paper run. This must look at the live-only directory, not the worker
+# worktree (~/Worker/ai-stock-trading) — when the live run was split out to ~/Trading on
+# 2026-08-07, the worker-side equity_curve.csv froze at that point. Pointing this at the
+# wrong place makes the check raise false alarms while missing the very thing it
+# watches, a 'silent live loop'.
 TRADING_LOGS_DIR = Path.home() / "Trading" / "ai-stock-trading" / "logs"
 EQUITY_CSV = TRADING_LOGS_DIR / "equity_curve.csv"
 WATCHDOG_LOG = TRADING_LOGS_DIR / "watchdog.log"

@@ -111,7 +111,7 @@ UNMERGED_VAULT_BRANCH_STALE_HOURS = 1               # ditto, vault-local branch 
 # thresholds above, which clock the branch from the assignment's `updated_ts`.
 # The `info` demotion those comments refer to (merged 9f5b3cb4a) shipped with no
 # age axis at all: a PR open for five minutes and one open for five days both
-# read as "리뷰 대기", so the stranding this check exists to catch went silent
+# read as "리뷰 대기" (awaiting review), so the stranding this check exists to catch went silent
 # *permanently* the moment a PR existed — the demotion had no way back up. 24h is
 # one working day: long enough that an ordinary review-then-merge never trips it,
 # short enough that a forgotten PR resurfaces. Past it, the finding keeps its
@@ -355,7 +355,7 @@ def check_unmerged_delegate_branch(findings: list, assigns: dict,
 
     That demotion needs an age axis or it is a permanent mute. As first shipped
     it read a PR open for five minutes and one open for five days identically,
-    so "리뷰 대기" became the last thing this check ever said about the task and
+    so "리뷰 대기" (awaiting review) became the last thing this check ever said about the task and
     the stranding it exists to catch went quiet for good. Past
     OPEN_PR_STALE_HOURS the same finding therefore rises to `warn` and says how
     long the PR has been open; below it the `info` wording is untouched, and the
@@ -445,7 +445,7 @@ def check_unmerged_delegate_branch(findings: list, assigns: dict,
                            "pr_open_hours": (round(age_h, 1)
                                              if age_h is not None else None)}
             if stale:
-                # Days once it is past two of them; hours below that, where "1일"
+                # Days once it is past two of them; hours below that, where "1일" (1 day)
                 # would round away the difference between 24h and 47h.
                 age_txt = f"{round(age_h / 24)}일" if age_h >= 48 else f"{round(age_h)}시간"
                 findings.append({
