@@ -2540,6 +2540,37 @@ class Orchestrator:
                 "usage_hold": usage_hold}
 
 
+def auto_unblock(db: Path, items_dir: Path, *, _apply=None, _import=None) -> list:
+    """Flip `blocked` tasks whose every `depends_on` is done (task_deps) and, when
+    anything flipped, sync todo.db so this tick's load_dispatchable sees them.
+    Fail-open: any error is one log line and an empty result, never a dead tick.
+    The same step planner_tick.sh runs; both are idempotent (an already-flipped
+    task is no longer `blocked`, so a second pass finds nothing)."""
+    try:
+        if _apply is None:
+            from .. import task_deps
+            _apply = task_deps.apply_unblocks
+        flips, _cyclic = _apply(items_dir=items_dir, db=db)
+    except Exception as e:
+        print(f"[orchestrator] dependency unblock skipped (fail-open): {e}")
+        return []
+    if not flips:
+        return []
+    for slug, mode in flips:
+        print(f"[orchestrator] auto-unblocked {slug} -> worker_mode {mode} (deps done)")
+    try:
+        if _import is None:
+            import subprocess
+            _import = lambda: subprocess.run(  # noqa: E731
+                [sys.executable, "-P", "-m", "todo_system.cli", "import-md"],
+                cwd=str(Path(items_dir).parent.parent), check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        _import()
+    except Exception as e:
+        print(f"[orchestrator] import-md after unblock failed (fail-open): {e}")
+    return flips
+
+
 def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None:
     """Best-effort catch-up of local main to origin before a tick, race-hardened.
 
@@ -2739,6 +2770,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     pa = sub.add_parser("auto", help="Load auto tasks from todo.db and run a full tick")
     pa.add_argument("--db", default="Todo/todo.db")
+    pa.add_argument("--items-dir", default="Todo/items")
 
     pdash = sub.add_parser("dashboard", help="Regenerate Todo/Orchestrator.md")
     pdash.add_argument("--out", default="Todo/Orchestrator.md")
@@ -2859,6 +2891,12 @@ def _main(argv: list[str] | None = None) -> int:
         from . import tasks
         import sqlite3
         db = base / args.db
+        # Dependency unblock on EVERY tick, before the candidates are read: a task
+        # whose upstream was closed by the previous tick goes out in this one.
+        # Until 2026-10-26 only planner_tick.sh (30-min timer) ran task_deps, so a
+        # serial chain idled up to 30 min between links (mulkko-133 done 18:54,
+        # mulkko-134 still blocked until the 18:59 planner tick).
+        auto_unblock(db, base / args.items_dir)
         try:
             cands = tasks.load_dispatchable(db)
         except sqlite3.OperationalError:

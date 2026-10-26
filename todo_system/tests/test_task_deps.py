@@ -244,3 +244,44 @@ if __name__ == "__main__":
         flips, _ = TD.apply_unblocks(self.tmp, self.db)
         self.assertEqual(flips, [("down", "manual")])
         self.assertEqual(self._mode("down"), "manual")
+
+
+class OrchestratorAutoUnblockTest(unittest.TestCase):
+    """orchestrator.auto_unblock: the every-tick dependency release."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "nodb.db"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_flips_ready_task_and_syncs_db_once(self):
+        from todo_system.orchestrator import orchestrator as O
+        (self.tmp / "up.md").write_text(_md("done", "auto"), encoding="utf-8")
+        (self.tmp / "down.md").write_text(
+            _md("open", "blocked", depends_on=["up"], on_unblock="auto"), encoding="utf-8")
+        calls = []
+        flips = O.auto_unblock(self.db, self.tmp, _import=lambda: calls.append(1))
+        self.assertEqual(flips, [("down", "auto")])
+        self.assertEqual(TD.scan_items(self.tmp)["down"]["worker_mode"], "auto")
+        self.assertEqual(calls, [1])
+        # idempotent: second tick finds nothing and does not re-import
+        self.assertEqual(O.auto_unblock(self.db, self.tmp, _import=lambda: calls.append(1)), [])
+        self.assertEqual(calls, [1])
+
+    def test_nothing_ready_skips_import(self):
+        from todo_system.orchestrator import orchestrator as O
+        (self.tmp / "up.md").write_text(_md("open", "auto"), encoding="utf-8")
+        (self.tmp / "down.md").write_text(
+            _md("open", "blocked", depends_on=["up"], on_unblock="auto"), encoding="utf-8")
+        calls = []
+        self.assertEqual(O.auto_unblock(self.db, self.tmp, _import=lambda: calls.append(1)), [])
+        self.assertEqual(calls, [])
+
+    def test_fail_open_on_apply_error(self):
+        from todo_system.orchestrator import orchestrator as O
+
+        def boom(**_):
+            raise RuntimeError("disk gone")
+        self.assertEqual(O.auto_unblock(self.db, self.tmp, _apply=boom), [])
