@@ -347,8 +347,9 @@ def maybe_create(*, force: bool = False, now: float | None = None,
 # ----------------------------------------------------------- reports ---
 
 def parse_candidates(text: str) -> list[str]:
-    """Top-level bullets under `## 후보 태스크` (or `## Candidate tasks`) — the
-    report's candidate list. `없음`/`none` bullets are skipped."""
+    """Top-level bullets under `## 후보 태스크` (Candidate tasks) (or
+    `## Candidate tasks`) — the report's candidate list. `없음`/`none` bullets
+    are skipped."""
     body = section_body_any(text, CANDIDATE_HEADINGS)
     if not body:
         return []

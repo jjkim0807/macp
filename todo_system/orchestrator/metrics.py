@@ -468,7 +468,8 @@ def verify_fail_retry_cost(runs: str | Path | None = None) -> dict:
 
 
 def _breakdown_lines(bd: dict) -> list[str]:
-    """Render pipeline_breakdown() as the appended '스테이지별 분해' section.
+    """Render pipeline_breakdown() as the appended '스테이지별 분해' (per-stage
+    breakdown) section.
 
     Purely additive to render(): the four sections above it (and write()/__main__)
     are unchanged and pinned by tests, because the todo-sync daemon regenerates
@@ -514,7 +515,7 @@ def _usd(v: float) -> str:
 
 
 def _usage_lines(bd: dict, order: list[str]) -> list[str]:
-    """The '스테이지별 토큰 usage' table. Tolerates a breakdown without
+    """The '스테이지별 토큰 usage' (per-stage token usage) table. Tolerates a breakdown without
     `stage_usage` (one that predates it) — a raise here would cost render() the
     whole breakdown section."""
     su = bd.get("stage_usage") or {}

@@ -1,8 +1,8 @@
 """Durable pickup for report-stage follow-ups.
 
-The report stage names follow-ups in free prose — `## 다음 단계` and
-`## 사람이 검토해야 할 부분` in report.md — and, until now, nothing carried them
-forward. The planner only ever saw them if they happened to ride along in a
+The report stage names follow-ups in free prose — `## 다음 단계` (Next steps) and
+`## 사람이 검토해야 할 부분` (Needs human review) in report.md — and, until now,
+nothing carried them forward. The planner only ever saw them if they happened to ride along in a
 `run_completed` trigger's context (PR #79/#80 were luck, not design), and its
 own execution steps (worker-planner.md 1–12) never read Worker/runs at all. So a
 follow-up that missed that one scan window evaporated: a 2026-08-26 audit found 3
@@ -30,7 +30,7 @@ rejection line carrying `"route": "human"` parks the follow-up as
 tier, never an immediate ping), and waits for a person at
 `python -m todo_system.orchestrator.followups human`.
 `approve <id>` hands it back to the planner as open + approved, in its own
-"사람 승인됨" block; `dismiss <id> --reason …` closes it. Rejections written
+"사람 승인됨" (human-approved) block; `dismiss <id> --reason …` closes it. Rejections written
 before this existed are never backfilled — `reroute <id>` revives one at a time.
 
 Because the rejections file is append-only and read last-wins, each row keeps a
@@ -112,7 +112,7 @@ FOLLOWUP_SECTIONS = (NEXT_STEPS_HEADINGS[0], HUMAN_REVIEW_HEADINGS[0])
 
 # A bullet whose text is (or opens with) one of these sentinels is the section's
 # "nothing here" marker, not a follow-up — the report template writes
-# `- bullet (없으면 "없음")`. `none` must stand as a whole word, so a real bullet
+# `- bullet (if absent, "없음")`. `none` must stand as a whole word, so a real bullet
 # like "nonexistent path …" is kept.
 EMPTY_MARKERS = ("없음", "none")
 _EMPTY_MARKER = EMPTY_MARKERS[0]
@@ -576,7 +576,8 @@ def _state_of(rec: dict) -> str:
 def approve(fid: str, path: Path | None = None,
             rejections_path: Path | None = None) -> tuple[int, str]:
     """awaiting_human → open + approved: a person made the call the planner could
-    not, and the next planner run gets the row under '사람 승인됨 — 태스크화 대상'.
+    not, and the next planner run gets the row under '사람 승인됨 — 태스크화 대상'
+    (human-approved — candidate for task creation).
 
     Every rejection line already on file for the id counts as seen, so the line
     that parked it can never re-park or close it; only a line written after the
