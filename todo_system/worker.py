@@ -778,14 +778,14 @@ def kakao_notify(message: str, link: str | None = None, *,
 
     Calls scripts/kakao_send.sh which itself is non-fatal on token issues. We
     intentionally do not block the worker on notification failures. `link`, when
-    given, is passed as the script's 2nd arg (the "열기" button target), so detail
+    given, is passed as the script's 2nd arg (the "Open" button target), so detail
     can live at a URL instead of being crammed into — and cut from — the text.
 
     `level` / `event_key` are the OPT-IN noise tiers (scripts/KAKAO_ALERTS.md):
     both None — every pre-existing call — keeps today's immediate send without
     touching any routing state. digest/silent are handled in-process (no spawn);
     an immediate send with an event_key may be suppressed into the window's next
-    delivery ("외 N건"). Routing fails open to a plain send.
+    delivery ("+N more"). Routing fails open to a plain send.
 
     Notifications themselves are an author-only opt-in: with no channel
     configured in the vault (neither a Slack secret nor a Kakao token) the send
@@ -825,7 +825,7 @@ def kakao_notify(message: str, link: str | None = None, *,
 
 # -- Self-limiting composers for the worker's own kakao alerts ----------------
 # Every worker alert leads with an emoji headline (what happened + what to do or
-# "조치 불필요"); free-form detail (a failure message, a stall file list, an
+# "no action needed"); free-form detail (a failure message, a stall file list, an
 # English planner reason) rides as a word-clipped tail so nothing is blind-cut.
 # All go through compose_alert → length is <= KAKAO_TEXT_LIMIT by construction.
 
@@ -1305,7 +1305,7 @@ def _removable_candidates(
     `on_exclude(path, reason)` fires for a worktree that cleared the `wt-`
     prefix + worker-root parent filter but is then dropped on cond 2 (`dirty`)
     or cond 1 (`unmerged`). The reclaimer passes it to name *why* a `wt-*` never
-    reached a `정리 보류/완료` line — the previously silent gap this run closed
+    reached a `held/done` cleanup line — the previously silent gap this run closed
     (a superseded, still-unmerged worktree left no log trace at all). It fires
     only after the prefix/parent filter so unrelated worktrees (the main
     checkout, non-`wt-` siblings, out-of-root paths) never flood the tick log.
@@ -1794,7 +1794,7 @@ def sweep_remote_completed_runs() -> int:
             # No Kakao ping for remote-run completions — it's a low-signal FYI the
             # user asked to stop (2026-07-23). Genuine review needs still surface:
             # completed runs get a review todo above, and the v2 orchestrator sends
-            # its own [검토요청]/[격리] pings for tasks that actually need a human.
+            # its own [review-request]/[quarantine] pings for tasks that actually need a human.
             acked.add(run_id)
             surfaced += 1
 
@@ -1812,7 +1812,7 @@ def cmd_maintenance() -> int:
     still has to run somewhere:
 
       - autoclose_stale_reviews_local: closes review-<slug> todos whose parent is
-        done, so they stop piling up in the dashboard's 사람 할일 list.
+        done, so they stop piling up in the dashboard's "to-do for human" list.
       - sweep_remote_completed_runs: surfaces finished remote-host (Windows/sc1)
         runs as review todos + kakao — the only path by which remote work is
         reported back at all.
@@ -3750,9 +3750,10 @@ def invoke_stage(
                 stdin=subprocess.DEVNULL,
                 stdout=out_f,
                 stderr=err_f,
-                # 장수 automation token이 있으면 주입 — Keychain 리프레시 토큰의
-                # 절대만료와 독립적으로 헤드리스 인증을 유지한다. 파일이 없으면
-                # os.environ 그대로라 동작 무변경. todo_system/claude_auth.py 참고.
+                # Injects the long-lived automation token if present — keeps headless
+                # auth working independent of the Keychain refresh token's absolute
+                # expiry. With no file present, os.environ passes through unchanged,
+                # so behavior is unchanged. See todo_system/claude_auth.py.
                 env=claude_env(),
             )
     except subprocess.CalledProcessError as exc:
@@ -4453,7 +4454,7 @@ def _run_next_impl(
 
     print(f"run-next: starting run_id={run_id} slug={slug} mode={entry_mode} dry_run={dry_run}")
     if not dry_run:
-        # Digest tier: "조치 불필요" is in the message itself (KAKAO_ALERTS.md).
+        # Digest tier: "no action needed" is in the message itself (KAKAO_ALERTS.md).
         kakao_notify(_compose_worker_start(slug, entry_mode, len(stage_list)),
                      level=LEVEL_DIGEST, event_key=f"worker-start:{slug}")
 
@@ -4505,7 +4506,7 @@ def _run_next_impl(
                     finished_at=stage_finished,
                 )
                 # Immediate — but the same slug re-failing inside the merge
-                # window (auto-retry churn) collapses into one "외 N건" ping.
+                # window (auto-retry churn) collapses into one "+N more" ping.
                 kakao_notify(_compose_worker_fail(slug, stage, message),
                              event_key=f"worker-fail:{slug}")
             print(f"  stage={stage} FAILED: {message}")
