@@ -18,7 +18,9 @@ of two modes:
               that is the original rule — queue at or below
               MAESTRO_PLANNER_AGGRESSIVE_MAX_QUEUE (0) and no run in flight.
   normal      everything else — including the usage guard's no-data fail-open,
-              a stale snapshot and a carried hold. Unknown means normal.
+              a stale snapshot and a carried hold. Unknown means normal. A
+              queue at or over the depth limit (reachable only through the
+              keep-alive bypass, keep_alive.py) is normal before any check.
 
 Only aggressive changes anything: a shorter backoff, a higher new-task cap
 (inside the queue depth limit), a shorter discovery interval, and a "탐색 모드"
@@ -264,6 +266,9 @@ def max_parallel(env: dict | None = None) -> int:
 
 def decide(queue_depth: int, depth_limit: int, *,
            assignments_dir: Path | None = None) -> tuple[str, str, dict]:
+    # Only the keep-alive bypass of the depth gate reaches here at the limit.
+    if queue_depth >= depth_limit:
+        return NORMAL, f"queue {queue_depth} >= depth limit {depth_limit}", normal_knobs()
     decision = usage_guard.check()
     capacity = usage_guard.parallel_slots(decision, max_parallel())
     mode, reason = planner_aggressiveness(decision, queue_depth,

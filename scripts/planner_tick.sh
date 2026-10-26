@@ -16,6 +16,9 @@
 #   2) backoff — skip re-invoke while the open-task state is unchanged AND the
 #      last invocation was < EXHAUST_HOURS ago (an exhausted backlog shouldn't
 #      burn a planner run every tick; legacy PLANNER_EXHAUSTED_THRESHOLD_HOURS).
+# Both yield to a starved keep-alive project (todo_system/orchestrator/
+# keep_alive.py: a vault-policy prefix with zero actionable open tasks); the
+# earlier gates (HQ host, PAUSED, usage guard, daily budget) never do.
 #
 # Aggressive mode (todo_system/orchestrator/planner_mode.py): when usage has
 # fresh slack in BOTH windows, the queue is empty and nothing is running, the
@@ -36,7 +39,7 @@
 # "$MACP_PYTHON" -P -m todo_system... and the `command -v uv` guards are
 # skipped. Taken only when BOTH hold — no pyproject AND MACP_PYTHON set — so a
 # checkout keeps its command lines byte for byte. The stdlib-only python3 calls
-# (queue depth, backoff state, session id) stay as they are.
+# (backoff state, session id) stay as they are.
 set -uo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -131,44 +134,37 @@ if [ "${BUDGET:-0}" -gt 0 ] && [ "${RUNS_TODAY:-0}" -ge "$BUDGET" ]; then
   exit 0
 fi
 
+# Keep-alive projects (todo_system/orchestrator/keep_alive.py): a prefix the
+# vault policy's keep_alive_projects names, with zero actionable open tasks, is
+# "starved" — a full queue of other work must not let its chain go dry. Runs
+# after every hard gate above, so those still exit first. Fail safe: empty
+# unless something is starved; empty => every gate below behaves exactly as before.
+KCTX=$($PY -m todo_system.orchestrator.keep_alive emit-context 2>/dev/null)
+[ -n "$KCTX" ] && echo "[planner-tick] keep-alive starved: $(printf '%s' "$KCTX" | grep -c '^- \[') project(s)"
+
 # Gate 1: ACTIONABLE queue depth. Count open auto/delegate tasks MINUS those
 # whose ledger assignment is FAILED — a stalled (failed+cooldown) task is not
 # actionable work, and must NOT block the planner from running: otherwise a task
 # that failed on a red CI would keep the planner from creating the CI-fix that
-# would unblock it (a compounding stall). Self-healing depends on this.
-N=$(python3 - <<'PY' 2>/dev/null || echo 0
-import sqlite3, json, glob
-con = sqlite3.connect("Todo/todo.db")
-open_auto = {r[0] for r in con.execute(
-    "SELECT slug FROM tasks WHERE status='open' AND is_parent=0 "
-    "AND worker_mode IN ('auto','delegate','discover') "
-    # A task deferred by not_before cannot run yet, so it is not queue depth:
-    # two tasks held to a future date blocked aggressive mode (queue 2 > 0)
-    # and kept the planner from refilling a dry queue (2026-09-27).
-    # Date-only = 00:00 that day, a time host-local (mirrors
-    # todo_system/not_before.py): `YYYY-MM-DD[ |T]HH:MM[:SS]` vs local now.
-    "AND NOT (COALESCE(not_before,'') GLOB '[0-9][0-9][0-9][0-9]-*' "
-    "AND replace(trim(not_before),'T',' ') > "
-    "strftime('%Y-%m-%d %H:%M:%S','now','localtime'))")}
-failed = set()
-for f in glob.glob("Worker/assignments/*.json"):
-    try:
-        d = json.load(open(f))
-        if d.get("state") == "failed":
-            failed.add(d.get("task_id"))
-    except Exception:
-        pass
-print(len(open_auto - failed))
-PY
-)
+# would unblock it (a compounding stall). Self-healing depends on this. The rule
+# (keep_alive.ACTIONABLE_SQL minus failed ledger rows) is the one the starved
+# check above uses; the CLI prints 0 on any error, as the old `|| echo 0` did.
+N=$($PY -m todo_system.orchestrator.keep_alive queue-depth 2>/dev/null)
+case "$N" in ''|*[!0-9]*) N=0 ;; esac
 if [ "${N:-0}" -ge "$DEPTH_LIMIT" ]; then
-  echo "[planner-tick] actionable auto-queue ${N} >= ${DEPTH_LIMIT}; skip"
-  exit 0
+  if [ -n "$KCTX" ]; then
+    echo "[planner-tick] actionable auto-queue ${N} at the depth limit, but keep-alive project(s) starved; planning anyway"
+  else
+    echo "[planner-tick] actionable auto-queue ${N} >= ${DEPTH_LIMIT}; skip"
+    exit 0
+  fi
 fi
 
 # Planner mode (todo_system/orchestrator/planner_mode.py). Decided only here,
 # after every gate above (HQ, PAUSED, usage guard block, daily budget, queue
-# depth) has passed, so aggressive mode can never bypass one of them. Fail
+# depth) has passed, so aggressive mode can never bypass one of them (a
+# keep-alive bypass of the depth gate reaches here at N >= DEPTH_LIMIT, and
+# decide answers normal for that before anything else). Fail
 # closed: MODE stays normal unless the CLI printed an aggressive verdict with
 # well-formed knobs — a CLI error, missing uv or a parse failure is a normal tick.
 MODE=normal
@@ -199,12 +195,20 @@ if [ -f "$STATE" ]; then
   LAST_HASH=$(python3 -c "import json,sys;print(json.load(open('$STATE')).get('hash',''))" 2>/dev/null || echo "")
   LAST_TS=$(python3 -c "import json,sys;print(int(json.load(open('$STATE')).get('ts',0)))" 2>/dev/null || echo 0)
   if [ "$HASH" = "$LAST_HASH" ] && [ $((NOW - ${LAST_TS:-0})) -lt $((EXHAUST_HOURS * 3600)) ]; then
-    echo "[planner-tick] open-task state unchanged and last run < ${EXHAUST_HOURS}h ago; skip (exhausted)"
-    exit 0
+    if [ -n "$KCTX" ]; then
+      echo "[planner-tick] open-task state unchanged, but keep-alive project(s) starved; ignoring the ${EXHAUST_HOURS}h backoff"
+    else
+      echo "[planner-tick] open-task state unchanged and last run < ${EXHAUST_HOURS}h ago; skip (exhausted)"
+      exit 0
+    fi
   fi
 fi
 
-echo "[planner-tick] auto-queue=${N} (< ${DEPTH_LIMIT}); invoking planner agent…"
+if [ -n "$KCTX" ]; then
+  echo "[planner-tick] auto-queue=${N}; keep-alive starved — invoking planner agent…"
+else
+  echo "[planner-tick] auto-queue=${N} (< ${DEPTH_LIMIT}); invoking planner agent…"
+fi
 
 # Walk model_select's heavy ladder (Fable 5.1 first); claude-opus-4-8 if it prints nothing.
 if [[ "$INSTALLED" -eq 1 ]] || command -v uv >/dev/null 2>&1; then
@@ -275,6 +279,13 @@ if [ "$MODE" = "aggressive" ]; then
     echo "[planner-tick] injecting 탐색 모드 context (max_new_tasks=${AGG_MAX_NEW})"
     PROMPT="$PROMPT"$'\n\n'"$ACTX"
   fi
+fi
+# Keep-alive starved projects (KCTX, computed before Gate 1): which prefixes
+# need a task this call, their decision docs, and the rules. Empty on the
+# common path, so PROMPT is unchanged unless something is actually starved.
+if [ -n "$KCTX" ]; then
+  echo "[planner-tick] injecting $(printf '%s' "$KCTX" | grep -c '^- \[') keep-alive starved project(s) into planner context"
+  PROMPT="$PROMPT"$'\n\n'"$KCTX"
 fi
 
 # --- checkout lease: serialize THIS claude call against the orchestrator's vault

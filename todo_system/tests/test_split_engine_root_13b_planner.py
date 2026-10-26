@@ -151,7 +151,7 @@ _ENGINE_MODULES = {
     "todo_system.orchestrator.planner_mode", "todo_system.orchestrator.model_select",
     "todo_system.orchestrator.followups", "todo_system.orchestrator.discovery",
     "todo_system.orchestrator.lease", "todo_system.orchestrator.usage_probe",
-    "todo_system.cli",
+    "todo_system.orchestrator.keep_alive", "todo_system.cli",
 }
 
 # The four the AC names, with their exact installed argv.
