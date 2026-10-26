@@ -2024,6 +2024,15 @@ def cmd_maintenance() -> int:
         except Exception as exc:
             print(f"engine-pull: error — {exc}")
             rc = 1
+        # The engine checkout just moved; let the vault's own `uv run` follow it
+        # instead of executing whatever commit its uv.lock pinned days ago.
+        try:
+            for reason in bump_vault_engine_pin():
+                print(reason)
+                rc = 1
+        except Exception as exc:
+            print(f"vault-pin: error — {exc}")
+            rc = 1
         # New engine code is on disk; refresh the ~/.local/bin PATH wrappers from
         # it in the same tick so a stage's `Bash(macp-*:*)` rule never hits a
         # missing/stale wrapper (the 2026-10-23 macp-remote-gate exit 127 block).

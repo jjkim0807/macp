@@ -211,6 +211,7 @@ def test_cmd_maintenance_rc_on_failure(monkeypatch):
     monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     monkeypatch.setattr(worker, "rotate_logs", lambda: [])
     monkeypatch.setattr(worker, "check_unapplied_migrations", lambda: [])
+    monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: [])
     monkeypatch.setattr(worker, "sync_wrappers", lambda: [])
     monkeypatch.setattr(worker, "restart_stale_daemons", lambda: [])
     monkeypatch.setattr(worker, "check_dispatch_silence", lambda: None)

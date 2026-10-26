@@ -345,3 +345,24 @@ def test_commit_failure_reports_and_restores(tmp_path):
 
     assert reasons
     _assert_restored(fake, vault)
+
+
+def test_cmd_maintenance_rc_on_bump_failure(monkeypatch, capsys):
+    """A non-empty reason list raises the tick rc to 1 without dying."""
+    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
+    monkeypatch.setattr(worker, "pull_engine_checkout", lambda: [])
+    monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: ["vault-pin: boom"])
+    # Neutralise every other upkeep step so rc == 1 can only come from vault-pin.
+    monkeypatch.setattr(worker, "autoclose_stale_reviews_local", lambda: 0)
+    monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
+    monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
+    monkeypatch.setattr(worker, "rotate_logs", lambda: [])
+    monkeypatch.setattr(worker, "check_unapplied_migrations", lambda: [])
+    monkeypatch.setattr(worker, "sync_wrappers", lambda: [])
+    monkeypatch.setattr(worker, "restart_stale_daemons", lambda: [])
+    monkeypatch.setattr(worker, "check_dispatch_silence", lambda: None)
+    monkeypatch.setattr(worker, "check_work_starvation", lambda: None)
+    monkeypatch.setattr(worker.browser_watch, "check_login_watch", lambda **kw: None)
+
+    assert worker.cmd_maintenance() == 1
+    assert "vault-pin: boom" in capsys.readouterr().out
