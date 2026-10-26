@@ -22,8 +22,9 @@ of two modes:
 
 Only aggressive changes anything: a shorter backoff, a higher new-task cap
 (inside the queue depth limit), a shorter discovery interval, and a "탐색 모드"
-block injected into the planner prompt. The policy's blocked patterns are still
-enforced by that block; nothing here widens what the planner may create.
+(exploration mode) block injected into the planner prompt. The policy's
+blocked patterns are still enforced by that block; nothing here widens what
+the planner may create.
 
 Knobs (env, read per call):
     MAESTRO_PLANNER_AGGRESSIVE=0                            disable entirely

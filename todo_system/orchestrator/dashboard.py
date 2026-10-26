@@ -220,17 +220,17 @@ def render(ledger: Ledger, registry: Registry, db_path=None,
         "", "## 💤 대기 (deferred — 실패 아님, 자동 재시도)",
         *([_deferred_line(a) for a in deferred] or ["- 없음"]),
         "", "## ❌ 실패 (원인·재실패횟수)", *([_fail_line(a) for a in failed] or ["- 없음"]),
-        # Before ✅ 완료 on purpose: the brief is told to stop reading at the
-        # completed list, so anything placed after it is effectively invisible.
+        # Before "✅ 완료" (Done) on purpose: the brief is told to stop reading at
+        # the completed list, so anything placed after it is effectively invisible.
         "", "## 🕰 방치된 사람 태스크 (마감 없음 · 사람 소유)", *_stale_section(db_path),
-        # Same reason as the sweep above: before ✅ 완료, or it is invisible.
+        # Same reason as the sweep above: before "✅ 완료" (Done), or it is invisible.
         "", "## 📌 결정문 행동 항목 (미기재 · 끊긴 링크)",
         *_decisions_section(decisions_dir, items_dir),
         "", "## ✅ 완료", *([_line(a) for a in done] or ["- 없음"]),
         "", "## 🤖 에이전트 (liveness)",
         # Runners only. Humans send no heartbeat, so a `⚪ 사람` line here read as
-        # "did a person die?"; the parked / 방치된 사람 태스크 sections above own
-        # everything people-shaped.
+        # "did a person die?"; the parked / "방치된 사람 태스크" (stale human tasks)
+        # sections above own everything people-shaped.
         *[f"- {live.get(ag.id, '⚫ unknown')} "
           f"**{ag.id}** ({ag.kind})"
           + (f" — {', '.join(ag.projects)}" if ag.projects else "")

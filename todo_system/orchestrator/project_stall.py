@@ -353,7 +353,7 @@ def _ledger_signals(ledger) -> tuple[set[str], dict[str, dt.datetime]]:
 
 def _planner_exhausted(planner_state_path: Path | None) -> bool | None:
     """True/False from Worker/planner_state.json's verdict; None when there is no
-    record to judge (the AC's '판단 불가')."""
+    record to judge (the AC's 'cannot judge')."""
     if planner_state_path is None:
         return None
     try:
@@ -589,7 +589,7 @@ def render_decision_task(view: ProjectView, verdict: StallVerdict,
 
     # The project title is NOT interpolated into any frontmatter field the
     # _check_actions_dependency matcher scans (outcome/next_action/if_then): a
-    # title like "CI 파이프라인" would trip its `(?<![A-Za-z])CI(?![A-Za-z])` rule
+    # title like "CI pipeline" would trip its `(?<![A-Za-z])CI(?![A-Za-z])` rule
     # even followed by Korean. The title lives in the body heading instead.
     outcome = ("이 프로젝트의 다음 방향을 사람이 결정한다 — "
                "아래 선택지 중 하나를 고르거나 새 지시를 남긴다")
