@@ -48,9 +48,9 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-# Worker queue 자가치유(doctor) — stuck in_progress + cancelled task의 failed
-# entry + auto-retry 가능 failed entry 정리. brief가 깨끗한 queue를 읽도록 보장.
-# 결과 메시지는 표준출력에 한 줄씩 (`doctor: ...`).
+# Worker queue self-heal (doctor) — cleans up stuck in_progress entries, failed entries
+# of cancelled tasks, and auto-retryable failed entries. Guarantees brief reads a clean
+# queue. Result messages go to stdout one per line (`doctor: ...`).
 if [[ "$INSTALLED" -eq 1 ]]; then
   "$MACP_PYTHON" -P -m todo_system.worker scan-queue 2>&1 \
     | tee -a "$LOG_DIR/brief.out.log" \
@@ -61,13 +61,14 @@ elif command -v uv >/dev/null 2>&1; then
     | grep '^doctor:' || true
 fi
 
-# (email_to_todo 파이프라인은 2026-08-05 폐기 — Decisions/2026-08-05-email-to-todo-retire.md)
+# (The email_to_todo pipeline was retired on 2026-08-05 — Decisions/2026-08-05-email-to-todo-retire.md)
 
-# Task snapshot export — 로컬 SQLite(Todo/todo.db)가 SoT이고, 거기서
-# Todo/Snapshots/latest.json을 새로 만든다. brief agent는 이 스냅샷을 읽으므로
-# 여기서 export가 돌아야 브리핑이 오늘 데이터를 본다.
-# (호스팅 Supabase에서 export하던 시절의 주석이 남아 있었으나 폐기된 경로다.)
-# 실패해도 brief 생성은 진행 (|| true).
+# Task snapshot export — the local SQLite (Todo/todo.db) is the SoT, and
+# Todo/Snapshots/latest.json is rebuilt from it. The brief agent reads this snapshot, so
+# the export has to run here for the briefing to see today's data.
+# (A comment from the days of exporting from hosted Supabase was left over, but that is
+# a retired path.)
+# Even if it fails, brief generation goes on (|| true).
 if [[ "$INSTALLED" -eq 1 ]]; then
   echo "[$NOW_TS] brief.sh: running export_db_snapshot.py"
   "$MACP_PYTHON" -P "$ENGINE_DIR/scripts/export_db_snapshot.py" 2>&1 \
@@ -80,9 +81,10 @@ elif command -v uv >/dev/null 2>&1; then
     | grep '^export_db_snapshot:' || true
 fi
 
-# mailroom 메일 요약 — 21:30 별도 카톡 다이제스트는 2026-09-11 폐지. 대신 여기서
-# 최근 24h 메일 섹션(Todo/Snapshots/mailroom.md)을 만들고 brief agent가 읽어
-# 아침 브리핑에 합친다. mailroom 체크아웃이 없거나 실패해도 brief는 진행 (|| true).
+# mailroom mail summary — the separate 21:30 KakaoTalk digest was retired on 2026-09-11.
+# Instead, the last-24h mail section (Todo/Snapshots/mailroom.md) is built here and the
+# brief agent reads it and merges it into the morning briefing. Even if the mailroom
+# checkout is missing or it fails, brief goes on (|| true).
 MAILROOM_DIR="${MAILROOM_DIR:-$HOME/Projects/mailroom}"
 MAILROOM_SNAPSHOT="$VAULT_DIR/Todo/Snapshots/mailroom.md"
 if [[ -d "$MAILROOM_DIR" ]] && command -v uv >/dev/null 2>&1; then
