@@ -1291,6 +1291,9 @@ def bump_vault_engine_pin(
     except FileNotFoundError:
         print("vault-pin: skip — uv 없음")
         return []
+    except subprocess.TimeoutExpired:
+        _restore()
+        return ["vault-pin: uv lock 타임아웃"]
     # `diff --quiet` rc 0 = the lock did not move (origin not there yet) — no
     # sync, no commit; the next tick asks again.
     if _git(vault, "diff", "--quiet", "--", "uv.lock").returncode == 0:
@@ -1303,6 +1306,9 @@ def bump_vault_engine_pin(
         _restore()
         print("vault-pin: skip — uv 없음")
         return []
+    except subprocess.TimeoutExpired:
+        _restore()
+        return ["vault-pin: uv sync 타임아웃"]
 
     new = _vault_engine_pin(vault) or head
     if _git(vault, "add", "uv.lock").returncode != 0:
