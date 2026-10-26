@@ -335,6 +335,33 @@ def test_uv_sync_failure_reports_and_restores(tmp_path):
     _assert_restored(fake, vault)
 
 
+def test_uv_lock_timeout_reports_and_restores(tmp_path):
+    engine, vault = _layout(tmp_path, _git_lock(OLD))
+    responses = _behind_responses(vault)
+    responses["uv lock"] = subprocess.TimeoutExpired(cmd=["uv", "lock"], timeout=1)
+    fake = FakeRun(responses)
+
+    reasons = worker.bump_vault_engine_pin(engine=engine, vault=vault, run=fake)
+
+    assert reasons
+    assert "uv sync" not in fake.keys
+    _assert_restored(fake, vault)
+
+
+def test_uv_sync_timeout_reports_and_restores(tmp_path):
+    engine, vault = _layout(tmp_path, _git_lock(OLD))
+    responses = _behind_responses(vault)
+    responses["uv sync"] = subprocess.TimeoutExpired(cmd=["uv", "sync"], timeout=1)
+    fake = FakeRun(responses)
+
+    reasons = worker.bump_vault_engine_pin(engine=engine, vault=vault, run=fake)
+
+    assert reasons
+    assert "add" not in fake.keys
+    assert "commit" not in fake.keys
+    _assert_restored(fake, vault)
+
+
 def test_commit_failure_reports_and_restores(tmp_path):
     engine, vault = _layout(tmp_path, _git_lock(OLD))
     responses = _behind_responses(vault)
