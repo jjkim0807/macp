@@ -166,7 +166,7 @@ review_cycle: "-"
 After scanning and creating tasks (if any), output EXACTLY this format on the LAST line:
 
 ```
-verdict: <exhausted|tasks_created> tasks=<N> reason="<brief explanation>"
+verdict: <exhausted|tasks_created|error> tasks=<N> reason="<brief explanation>"
 ```
 
 Examples:
@@ -197,6 +197,9 @@ If NONE of the above triggers AND `verdict` was `exhausted`, skip planning and o
 ```
 verdict: exhausted tasks=0 reason="no trigger events since last exhausted plan"
 ```
+
+Exception: when the input carries the keep-alive block (see "Keep-alive projects"
+below), do not take this skip — plan for the listed projects.
 
 After planning, update `Worker/planner_state.json` with:
 - `last_run`: current timestamp
@@ -273,8 +276,8 @@ else standard. Reserve `heavy` — Fable credits are the scarce resource.
 
 Rules: one concrete change per task, within the estimate cap, a clear acceptance
 (the project's own checks green locally, naming the command), and `worker_mode: quick` if it's a one-file / one-liner. Priority
-order each cycle: **main-fix (red default branch) → next defined leaf → discovery-report
-candidates (below) → these maintenance sources.**
+order each cycle: **main-fix (red default branch) → keep-alive starved projects (below) →
+next defined leaf → discovery-report candidates (below) → these maintenance sources.**
 Still respect `max_new_tasks`. Never fabricate busywork — if nothing concrete and
 safe exists, output the `exhausted` verdict; idle is better than low-value churn.
 
@@ -306,13 +309,40 @@ them (`todo_system.orchestrator.discovery maybe-create`) only after you answer
 `exhausted`, one project at a time, at most once per repo per 14 days. Never write
 a task with `worker_mode: discover` — that would loop the cadence on itself.
 
+## Keep-alive projects (injected by planner_tick)
+
+`keep_alive_projects` in `Worker/planner_policy.yaml` lists task-slug prefixes of
+projects that must never go dry (each optionally with a `decision:` doc). When one of
+them has zero actionable open tasks, `scripts/planner_tick.sh` opens this call even
+with a full queue or an unchanged state, and your input carries a block whose heading
+is the literal `## keep-alive starved 프로젝트 …`, one `- [<prefix>] decision: <path>`
+line per starved project. When that block is present:
+
+1. Create **at least one** task per listed prefix, its slug starting with that prefix.
+   Read the listed decision doc first (when there is one) and continue in its direction.
+2. Never answer `exhausted` or "converged" for a listed project, and do not apply the
+   `no trigger events since last exhausted plan` or `auto queue depth limit reached`
+   skips to it.
+3. Use `worker_mode: auto` or `delegate`, with no `not_before` or a past one. A `quick`
+   task or a future `not_before` does not count as actionable, so the project would
+   stay starved and the next tick would open the planner again.
+4. Every guardrail still applies: `max_new_tasks_per_invocation` is the total cap for
+   the call (starved projects fill it first; any that don't fit wait for the next tick),
+   and `blocked_patterns`, `required_fields` and dedup are enforced as usual.
+5. If a task genuinely cannot be created for a listed project, answer
+   `verdict: error tasks=0 reason="keep-alive <prefix>: <why>"` and send the
+   `notifications.kakao_on_error` notification (subject to the repeated-error
+   de-duplication below).
+
+Project names come only from the vault policy; never assume which projects are listed.
+
 ## Execution steps
 
 1. Read `Worker/planner_policy.yaml` for guardrail rules
 2. Read `Worker/planner_state.json` to check trigger conditions
-3. If no triggers (per above), output skip verdict and stop
+3. If no triggers (per above), output skip verdict and stop — unless the input carries the keep-alive block (then plan for those projects)
 4. Read `Worker/queue.json` to check current pending auto tasks count
-5. If pending auto/delegate count >= limit from policy, output `verdict: exhausted tasks=0 reason="auto queue depth limit reached"` and stop
+5. If pending auto/delegate count >= limit from policy, output `verdict: exhausted tasks=0 reason="auto queue depth limit reached"` and stop — unless the input carries the keep-alive block (then plan for those projects only)
 6. Read `Memory/index.md` for active project context
 6b. **Durable report follow-ups:** if the prompt contains a pending-follow-ups block (literal
     heading `## 미처리 report 후속 …`, emitted by the engine)
@@ -323,7 +353,7 @@ a task with `worker_mode: discover` — that would loop the cadence on itself.
     Same max_new_tasks / dedup / guardrail limits — a follow-up is a candidate, not an override.
 7. Pick candidates in the priority order from "Safe work sources": main-fix for a
    red default branch (per "Default-branch health" — local evidence only, never
-   `gh run list`) → the next defined leaf of an open parent in `Todo/items/*.md`
+   `gh run list`) → keep-alive starved projects (per "Keep-alive projects") → the next defined leaf of an open parent in `Todo/items/*.md`
    whose current leaf is done and reviewed → discovery-report candidates →
    maintenance sources. Each must pass the guardrails from the policy.
 8. Dedup each candidate against existing tasks and the queue
@@ -500,6 +530,9 @@ verdict: exhausted tasks=0 reason="auto queue depth limit reached (N pending)"
 ```
 
 Update `planner_state.json` with `verdict: exhausted`. Idle exit — no error.
+
+Exception: when the input carries the keep-alive block, the queue being full does not
+end the call — create the keep-alive tasks (and only those) per "Keep-alive projects".
 
 ### All tasks blocked
 
