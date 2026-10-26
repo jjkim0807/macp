@@ -377,7 +377,7 @@ def _open_ifs_at_each_line(lines: list[str]):
 
 
 def test_tick_aggressive_overrides_are_scoped(tick_text):
-    # Start at the mode block: the Gate 1 python heredoc above has its own `if`s.
+    # Start at the mode block: the gates above have their own `if`s.
     body = tick_text[tick_text.index("\nMODE=normal\n"):]
     checked = 0
     for line, ifs in _open_ifs_at_each_line(body.splitlines()):
@@ -461,53 +461,76 @@ def test_tick_mode_block_fails_closed(tmp_path, tick_text, cli_out):
     assert res["log"].startswith("[planner-tick] mode=normal (")
 
 
-def test_tick_queue_depth_skips_not_before_deferred(tmp_path, tick_text):
-    # Run the real Gate-1 heredoc against a scratch todo.db.
-    start = tick_text.index("N=$(python3 - <<'PY'")
-    body = tick_text[tick_text.index("\n", start) + 1:tick_text.index("\nPY\n", start)]
+def _queue_depth(tmp_path: Path, rows) -> str:
+    # Gate 1 runs `keep_alive queue-depth`; run that CLI against a scratch todo.db.
     (tmp_path / "Todo").mkdir()
     (tmp_path / "Worker" / "assignments").mkdir(parents=True)
     import sqlite3
     con = sqlite3.connect(tmp_path / "Todo" / "todo.db")
     con.execute("CREATE TABLE tasks (slug TEXT, status TEXT, is_parent INT, "
                 "worker_mode TEXT, not_before TEXT)")
-    con.executemany("INSERT INTO tasks VALUES (?, 'open', 0, 'auto', ?)", [
-        ("ready-none", None), ("ready-empty", ""), ("ready-past", "2000-01-01"),
-        ("held-future", "2999-01-01")])
+    con.executemany("INSERT INTO tasks VALUES (?, 'open', 0, 'auto', ?)", rows)
     con.commit()
     con.close()
-    out = subprocess.run([sys.executable, "-c", body], cwd=tmp_path,
-                         capture_output=True, text=True, check=True).stdout
+    return subprocess.run(
+        [sys.executable, "-m", "todo_system.orchestrator.keep_alive", "queue-depth",
+         "--db", str(tmp_path / "Todo" / "todo.db"),
+         "--assignments-dir", str(tmp_path / "Worker" / "assignments")],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+        env={**os.environ, "PYTHONPATH": str(TICK.parents[1])}).stdout
+
+
+def test_tick_queue_depth_skips_not_before_deferred(tmp_path):
+    out = _queue_depth(tmp_path, [
+        ("ready-none", None), ("ready-empty", ""), ("ready-past", "2000-01-01"),
+        ("held-future", "2999-01-01")])
     assert out.strip() == "3"
 
 
-def test_tick_queue_depth_honors_not_before_time(tmp_path, tick_text):
+def test_tick_queue_depth_honors_not_before_time(tmp_path):
     # A time-of-day value is deferred only until that time, not the whole day.
-    start = tick_text.index("N=$(python3 - <<'PY'")
-    body = tick_text[tick_text.index("\n", start) + 1:tick_text.index("\nPY\n", start)]
-    (tmp_path / "Todo").mkdir()
-    (tmp_path / "Worker" / "assignments").mkdir(parents=True)
-    import sqlite3
-    con = sqlite3.connect(tmp_path / "Todo" / "todo.db")
-    con.execute("CREATE TABLE tasks (slug TEXT, status TEXT, is_parent INT, "
-                "worker_mode TEXT, not_before TEXT)")
-    con.executemany("INSERT INTO tasks VALUES (?, 'open', 0, 'auto', ?)", [
+    out = _queue_depth(tmp_path, [
         ("held-time", "2999-01-01 10:00"), ("held-timeT", "2999-01-01T10:00"),
         ("ready-time", "2000-01-01 10:00"), ("ready-timeT", "2000-01-01T23:59:59"),
         ("ready-none", None)])
-    con.commit()
-    con.close()
-    out = subprocess.run([sys.executable, "-c", body], cwd=tmp_path,
-                         capture_output=True, text=True, check=True).stdout
     assert out.strip() == "3"
 
 
-def test_tick_queue_depth_time_boundary_matches_helper(tick_text):
+def test_tick_gate1_uses_shared_rule(tick_text):
+    # One rule, in keep_alive: no duplicate SQL or heredoc left in the tick.
+    assert "N=$($PY -m todo_system.orchestrator.keep_alive queue-depth 2>/dev/null)" in tick_text
+    assert "worker_mode IN" not in tick_text
+    assert "<<'PY'" not in tick_text
+
+
+def test_tick_keep_alive_after_hard_gates(tick_text):
+    ka = tick_text.index("keep_alive emit-context")
+    for gate in ("hq_host --check", "Worker/_state/PAUSED", "usage_guard check",
+                 "MAESTRO_DAILY_RUN_BUDGET"):
+        assert tick_text.index(gate) < ka, gate
+    assert ka < tick_text.index(">= ${DEPTH_LIMIT}; skip")
+
+
+def test_decide_at_depth_limit_is_normal_without_usage_check(monkeypatch, tmp_path, capsys):
+    def boom(**_):
+        raise AssertionError("usage guard must not be consulted at the depth limit")
+    monkeypatch.setattr(pm.usage_guard, "check", boom)
+    mode, reason, k = pm.decide(5, 5, assignments_dir=tmp_path)
+    assert mode == pm.NORMAL and "depth limit" in reason
+    assert k == pm.normal_knobs()
+    assert pm.main(["decide", "--queue-depth", "7", "--depth-limit", "5",
+                    "--assignments-dir", str(tmp_path)]) == 0
+    kv = _kv(capsys.readouterr().out)
+    assert kv["MODE"] == "normal" and kv["REASON"] == "queue 7 >= depth limit 5"
+
+
+def test_tick_queue_depth_time_boundary_matches_helper():
     # The Gate-1 SQL comparison and not_before.is_deferred agree at the minute.
     import sqlite3
     from todo_system import not_before as nb
-    assert ("\"AND replace(trim(not_before),'T',' ') > \"\n"
-            "    \"strftime('%Y-%m-%d %H:%M:%S','now','localtime'))\")}") in tick_text
+    from todo_system.orchestrator import keep_alive
+    assert ("replace(trim(not_before),'T',' ') > "
+            "strftime('%Y-%m-%d %H:%M:%S','now','localtime')") in keep_alive.ACTIONABLE_SQL
     con = sqlite3.connect(":memory:")
     sql = "SELECT replace(trim(?),'T',' ') > ?"
     for value in ("2026-10-12 17:00", "2026-10-12T17:00", "2026-10-12"):
