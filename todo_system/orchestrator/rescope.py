@@ -1,27 +1,33 @@
-"""자동 재조정(auto-rescope) — 워커가 파킹하며 남긴 분할안을 사람 없이 집행한다.
+"""Auto-rescope — execute a split plan a worker left behind when it parked, without a human.
 
-어떤 태스크의 Implement(또는 Verify)가 "이건 한 Implement 스테이지를 넘어서
-재조정이 필요하다"로 멈추면, 지금까지는 Verify가 `blocked_on`을 세우고
-오케스트레이터 `collect()`가 `AWAITING_HUMAN`으로 파킹하며 ⛔ 카톡을 보냈다
-(2026-10-10 `dancemirror-unified-projects`가 정확히 이 경로). 그런데 워커가 run
-디렉터리에 **기계 판독 가능한 분할안**(`rescope.json`)을 남겼고 그게 안전 조건을
-만족하면, 사람 판단은 필요 없다 — 분할안대로 하위 태스크 2~5개를 만들어
-`depends_on`으로 직렬 연결하고 상위를 `worker_mode: off` 묶음으로 바꾸면 끝이다.
+When a task's Implement (or Verify) stage stops with "this needs re-scoping
+beyond a single Implement stage", until now Verify set `blocked_on` and the
+orchestrator's `collect()` parked it as `AWAITING_HUMAN`, sending a ⛔
+KakaoTalk alert (2026-10-10 `dancemirror-unified-projects` took exactly this
+path). But if the worker left a **machine-readable split plan**
+(`rescope.json`) in the run directory and it satisfies the safety conditions,
+no human judgment is needed — just create 2-5 sub-tasks from the plan, chain
+them serially with `depends_on`, and flip the parent into a
+`worker_mode: off` bundle.
 
-이 모듈이 그 집행을 한다. `resume.py`의 설계 제약을 그대로 따른다:
+This module performs that execution. It follows the same design constraints
+as `resume.py`:
 
-- **stdlib만.** 틱 경로에서 돌고, 틱은 베어 `python3`로도 떠야 하며 엔진 격리
-  (`scripts/check_engine_isolation.sh`)를 깨지 않아야 한다. 시블링 엔진 모듈
-  (`cli`·`repos`·`task_validate`)은 **함수 안에서 지연 import** 한다.
-- **판정은 순수 함수로.** `can_auto_rescope()`는 I/O를 하지 않는다 — plan dict와
-  부모 frontmatter dict를 인자로 받으므로 각 "사람에게 넘김" 분기가 파일 없이
-  단위 테스트된다.
-- **모든 불확실은 fail-open으로 "자동 불가"(⛔ 유지).** plan을 못 읽거나 판정이
-  애매하면 자동 재조정하지 않고 종전처럼 사람에게 넘긴다 — 조건 없이 하위를
-  찍어내는 것보다 안전하다.
-- **경로는 전부 인자로 주입.** `vault_root`·`items_dir`·`templates_dir`는
-  공개 함수의 인자다(틱은 `ledger.root`에서 조립, 기본값만 `cli.*`). 모듈이
-  루트를 스스로 계산하지 않으므로 테스트가 tmp 볼트를 벗어날 수 없다.
+- **stdlib only.** This runs on the tick path, the tick must also start under
+  a bare `python3`, and it must not break engine isolation
+  (`scripts/check_engine_isolation.sh`). Sibling engine modules (`cli`·
+  `repos`·`task_validate`) are **lazily imported inside functions**.
+- **Judgment is a pure function.** `can_auto_rescope()` does no I/O — it takes
+  the plan dict and the parent frontmatter dict as arguments, so each "hand
+  off to a human" branch is unit-tested without any files.
+- **Every uncertainty fails open to "cannot auto-rescope" (keep ⛔).** If the
+  plan can't be read or the judgment is ambiguous, this does not auto-rescope
+  and hands off to a human as before — safer than stamping out sub-tasks
+  unconditionally.
+- **All paths are injected as arguments.** `vault_root`·`items_dir`·
+  `templates_dir` are arguments of the public functions (the tick assembles
+  them from `ledger.root`; only the defaults come from `cli.*`). The module
+  never computes the root itself, so tests can never escape the tmp vault.
 """
 
 from __future__ import annotations
@@ -35,33 +41,38 @@ from pathlib import Path
 RESCOPE_SCHEMA_VERSION = 1
 RESCOPE_FILENAME = "rescope.json"
 
-# collect()가 파킹 행에 찍는 framing. `ALERT_BLOCKED`(⛔)와 분리해 이 행만
-# reconcile_rescope 스윕으로 라우팅한다. 선량한 park(ALERT_BLOCKED·
-# ALERT_TIMEOUT_PARK처럼)이므로 `FAILURE_ALERT_KINDS`에 넣지 않는다. 문자열은
-# orchestrator.ALERT_RESCOPE_PENDING과 같아야 한다(둘 다 wire format).
+# The framing collect() stamps on a parked row. Separate from `ALERT_BLOCKED`
+# (⛔) so only this row routes to the reconcile_rescope sweep. This is a benign
+# park (like ALERT_BLOCKED·ALERT_TIMEOUT_PARK), so it is not in
+# `FAILURE_ALERT_KINDS`. The string must match orchestrator.ALERT_RESCOPE_PENDING
+# (both are wire format).
 ALERT_RESCOPE_PENDING = "rescope-pending"
-# 자동 불가로 판명돼 사람에게 넘길 때 되돌리는 framing(= orchestrator.ALERT_BLOCKED).
+# The framing to revert to when auto-rescope turns out not viable and this
+# hands off to a human (= orchestrator.ALERT_BLOCKED).
 _ALERT_BLOCKED = "blocked"
 
-# notify 레벨(= kakao_format.LEVEL_DIGEST / LEVEL_IMMEDIATE). 엔진 격리를 위해
-# kakao_format을 import하지 않고 문자열로 미러한다 — 매핑은 호출자(_notify_routed)가 한다.
+# notify levels (= kakao_format.LEVEL_DIGEST / LEVEL_IMMEDIATE). Mirrored as
+# strings instead of importing kakao_format, for engine isolation — the caller
+# (_notify_routed) does the mapping.
 _LEVEL_DIGEST = "digest"
 _LEVEL_IMMEDIATE = "immediate"
 
 _MIN_SUBTASKS = 2
 _MAX_SUBTASKS = 5
-# 하위 하나가 반드시 가져야 하는 키. acceptance_criteria는 "비지 않은 list"여야 한다.
+# Keys every sub-task must have. acceptance_criteria must be a "non-empty list".
 _REQUIRED_SUBTASK_KEYS = ("slug", "title", "outcome", "acceptance_criteria")
 
-# "사람에게 넘김" 신호들 — 보수적으로(의심되면 HUMAN).
+# Signals to "hand off to a human" — be conservative (when in doubt, HUMAN).
 _FALSEY = frozenset({"false", "0", "no", "off", "none", ""})
-# 실계좌·실거래. repo/working_dir에 등장하면 HUMAN.
+# Real account / live trading. If it appears in repo/working_dir, HUMAN.
 _LIVE_MARKERS = ("ai-stock-trading",)
-# 실거래 태그(소문자).
+# Live-trading tags (lowercase).
 _LIVE_TAGS = frozenset({"live", "real-trade", "real-account"})
-# planner 자기 경계 가드레일(사람 소유). 부모 outcome/spec이나 하위 files에 등장하면 HUMAN.
+# Planner's own-boundary guardrail (human-owned). If it appears in the parent's
+# outcome/spec or a sub-task's files, HUMAN.
 _GUARDRAIL_PATHS = ("Worker/planner_policy.yaml", ".claude/commands/worker-planner.md")
-# if_then이 사람 확인을 요구하는 문구(케이스무시 substring). 보수적으로 HUMAN.
+# Phrases in if_then that ask for human confirmation (case-insensitive
+# substring). Conservatively HUMAN.
 _HUMAN_CONFIRM_PHRASES = (
     "사람 확인", "사람이 확인", "사람이 판단", "사람 판단", "사람에게",
     "수동", "manual", "human",
@@ -69,7 +80,7 @@ _HUMAN_CONFIRM_PHRASES = (
 
 
 def _now_iso() -> str:
-    """tz-aware 현재 시각 — ledger `updated_ts`/history가 fromisoformat으로 파싱되므로 offset이 붙는다."""
+    """tz-aware current time — carries an offset because ledger `updated_ts`/history are parsed with fromisoformat."""
     return dt.datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
@@ -78,27 +89,30 @@ def _default_log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# rescope.json 로드 · 발견
+# Load · discover rescope.json
 # ---------------------------------------------------------------------------
 
 
 def load_rescope(run_dir) -> dict | None:
-    """`run_dir/rescope.json`을 읽어 dict로. 없거나 깨졌으면 None(never raises)."""
+    """Read `run_dir/rescope.json` into a dict. Returns None if missing or broken (never raises)."""
     if run_dir is None:
         return None
     try:
         data = json.loads((Path(run_dir) / RESCOPE_FILENAME).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — 없음/깨짐 모두 "분할안 없음"으로 수렴
+    except Exception:  # noqa: BLE001 — both missing and broken converge to "no split plan"
         return None
     return data if isinstance(data, dict) else None
 
 
 def find_latest_rescope(runs_dir, slug: str) -> tuple[Path, dict] | None:
-    """`runs_dir` 아래 `YYYYMMDDTHHMMSS-<slug>` 디렉터리 중 **slug를 정확히** 매칭하는
-    것만 모아 이름 역순(=시간 역순)으로, `rescope.json`이 읽히는 첫 run의 (run_dir, plan).
+    """Among the `YYYYMMDDTHHMMSS-<slug>` directories under `runs_dir`, collect only
+    those that **exactly** match slug, sort by name descending (= time descending),
+    and return the (run_dir, plan) of the first run whose `rescope.json` reads
+    successfully.
 
-    slug 접미사 매칭을 금지한다 — 정확 매칭이라 `foo`가 `foo-bar`의 run을 집지 않는다
-    ([[macp-resumable-run-glob-matches-slug-suffix]] #54 교훈). None이면 발견 실패."""
+    Suffix matching on slug is forbidden — exact match means `foo` does not pick
+    up `foo-bar`'s run ([[macp-resumable-run-glob-matches-slug-suffix]] #54
+    lesson). None means discovery failed."""
     try:
         d = Path(runs_dir)
         if not d.is_dir():
@@ -108,7 +122,7 @@ def find_latest_rescope(runs_dir, slug: str) -> tuple[Path, dict] | None:
             (p for p in d.iterdir() if p.is_dir() and pat.match(p.name)),
             key=lambda p: p.name, reverse=True,
         )
-    except Exception:  # noqa: BLE001 — 발견 실패는 "분할안 없음"과 동급
+    except Exception:  # noqa: BLE001 — discovery failure ranks the same as "no split plan"
         return None
     for run_dir in cands:
         plan = load_rescope(run_dir)
@@ -118,7 +132,7 @@ def find_latest_rescope(runs_dir, slug: str) -> tuple[Path, dict] | None:
 
 
 # ---------------------------------------------------------------------------
-# 자동 재조정 가능? — 순수 판정 함수 (AC3)
+# Can auto-rescope? — pure judgment function (AC3)
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +174,7 @@ def _touches_guardrail(parent_fm: dict, subtasks: list) -> bool:
 
 
 def _subtasks_malformed(subtasks: list) -> str | None:
-    """형식 결손 사유 한 줄, 멀쩡하면 None. 필수 키 결손/빈값·중복 slug를 잡는다."""
+    """One-line reason for a structural defect, or None if fine. Catches missing/empty required keys and duplicate slugs."""
     seen: set[str] = set()
     for i, s in enumerate(subtasks):
         if not isinstance(s, dict):
@@ -181,12 +195,14 @@ def _subtasks_malformed(subtasks: list) -> str | None:
 
 def can_auto_rescope(rescope: dict | None, parent_fm: dict, *,
                      lineage_depth_reached: bool | None = None) -> RescopeDecision:
-    """"이 분할안을 사람 없이 집행해도 되는가"를 판정하는 **순수 함수**(I/O 없음).
+    """A **pure function** (no I/O) that judges "can this split plan be executed
+    without a human".
 
-    먼저 걸리는 "사람에게 넘김" 사유를 반환한다. `lineage_depth_reached`가 None이면
-    부모 frontmatter의 `auto_rescoped_from` 존재로 파생한다(= 이미 한 번 자동 분할로
-    태어난 태스크가 또 초과 → 깊이 1에서 멈춰 무한 분할을 막는다). 모든 검사를
-    통과하면 allow=True.
+    Returns the first "hand off to a human" reason it hits. If
+    `lineage_depth_reached` is None, it is derived from the presence of
+    `auto_rescoped_from` in the parent frontmatter (= a task that was already
+    born from one auto-split exceeds again → stop at depth 1 to prevent
+    infinite splitting). If every check passes, allow=True.
     """
     if not isinstance(rescope, dict):
         return RescopeDecision(False, "no/broken rescope plan")
@@ -215,15 +231,18 @@ def can_auto_rescope(rescope: dict | None, parent_fm: dict, *,
 
 
 # ---------------------------------------------------------------------------
-# 손 분할 부모 자동 닫기 신호 — 순수 판정 (reconcile_split_parents)
+# Signal to auto-close a hand-split parent — pure judgment (reconcile_split_parents)
 # ---------------------------------------------------------------------------
 
-# "한 Implement 스테이지 초과 → 재조정 필요" park를 식별하는 키워드(소문자 substring).
-# collect()가 그런 park에 세우는 `blocked_on`/`last_note`에 남는 문구다 — 계기 사례인
-# `dancemirror-unified-projects` 행은 "task exceeds a single Implement stage — needs
-# re-scoping into the 3 sub-tasks …"였다. 외부-블로커 park(상류 PR 대기 등)는 이 중
-# 아무 키워드도 담지 않고, 타임아웃 park(ALERT_TIMEOUT_PARK)는 blocked_on이 비어 있고
-# last_note가 "N회 연속 stage timeout"이라 역시 걸리지 않아, 둘 다 자연히 제외된다.
+# Keywords (lowercase substrings) that identify a "exceeds a single Implement
+# stage → needs re-scoping" park. These are the words left in the `blocked_on`/
+# `last_note` that collect() sets on that kind of park — the triggering case,
+# the `dancemirror-unified-projects` row, read "task exceeds a single Implement
+# stage — needs re-scoping into the 3 sub-tasks …". An external-blocker park
+# (e.g. waiting on an upstream PR) contains none of these keywords, and a
+# timeout park (ALERT_TIMEOUT_PARK) has an empty blocked_on with last_note
+# reading "N consecutive stage timeouts", so neither matches, and both are
+# naturally excluded.
 _RESCOPE_PARK_KEYWORDS = (
     "re-scop", "rescop", "exceeds a single implement stage",
     "sub-task", "sub task", "subtask",
@@ -231,24 +250,26 @@ _RESCOPE_PARK_KEYWORDS = (
 
 
 def is_oversize_rescope_park(blocked_on: str, last_note: str = "") -> bool:
-    """이 park가 "한 Implement 스테이지 초과 → 재조정 필요" park인가 — 순수 함수(I/O 없음).
+    """Is this park a "exceeds a single Implement stage → needs re-scoping" park
+    — a pure function (no I/O).
 
-    `blocked_on`과 `last_note`를 합쳐 소문자로 보고 `_RESCOPE_PARK_KEYWORDS` 중
-    하나라도 들어 있으면 True. reconcile_split_parents가 "손으로 쪼갠 부모"를
-    집어내는 1차 신호이고, 공동 필수조건(자식 ≥1이 전부 done)은
-    tasks.child_status_rollup이 따로 센다. `can_auto_rescope`처럼 인자만 보므로
-    파일 없이 단위 테스트된다."""
+    Concatenates `blocked_on` and `last_note`, lowercases them, and returns
+    True if any of `_RESCOPE_PARK_KEYWORDS` is present. This is the primary
+    signal reconcile_split_parents uses to pick out a "hand-split parent"; the
+    joint required condition (≥1 children, all done) is counted separately by
+    tasks.child_status_rollup. Like `can_auto_rescope`, it only looks at its
+    arguments, so it is unit-tested without any files."""
     hay = f"{blocked_on}\n{last_note}".lower()
     return any(k in hay for k in _RESCOPE_PARK_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
-# 멱등 상태파일 — 파킹당 중복 집행 방지 (AC4)
+# Idempotent state file — prevent duplicate execution per park (AC4)
 # ---------------------------------------------------------------------------
 
 
 def _rescoped_state_path(vault_root) -> Path:
-    """`parent_reconcile.json` 패턴. gitignored `Worker/_state/` 아래 호스트-로컬 상태."""
+    """The `parent_reconcile.json` pattern. Host-local state under the gitignored `Worker/_state/`."""
     return Path(vault_root) / "Worker" / "_state" / "rescope_reconcile.json"
 
 
@@ -265,22 +286,22 @@ def _already_rescoped(state_path, parent_slug: str) -> bool:
 
 
 def _record_rescoped(state_path, parent_slug: str, child_slugs: list[str]) -> None:
-    """read-merge-write, never raises (`_record_parent_surfaced` 패턴 그대로)."""
+    """read-merge-write, never raises (same pattern as `_record_parent_surfaced`)."""
     try:
         p = Path(state_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         data = _load_state(p)
         data[parent_slug] = {"ts": _now_iso(), "into": list(child_slugs)}
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:  # noqa: BLE001 — 멱등 기록은 best-effort
+    except Exception:  # noqa: BLE001 — the idempotent record is best-effort
         pass
 
 
 def plan_is_auto_viable(run_dir, parent_fm: dict, *, state_path, parent_slug: str) -> bool:
-    """collect()가 쓰는 얇은 게이트 — run-dir의 분할안이 자동 집행 가능한가.
+    """The thin gate collect() uses — is the split plan in the run-dir auto-executable.
 
-    load_rescope + `parent_slug` 일치 + 아직 집행 안 됨 + `can_auto_rescope.allow`.
-    예외는 fail-open으로 False(=⛔ 유지, silent-skip 방지)."""
+    load_rescope + `parent_slug` match + not yet executed + `can_auto_rescope.allow`.
+    Exceptions fail open to False (= keep ⛔, prevent a silent skip)."""
     try:
         plan = load_rescope(run_dir)
         if plan is None:
@@ -295,37 +316,41 @@ def plan_is_auto_viable(run_dir, parent_fm: dict, *, state_path, parent_slug: st
 
 
 # ---------------------------------------------------------------------------
-# 분할안 → 하위 태스크 생성기 (체인·상속·dedup) (AC2)
+# Split plan → sub-task generator (chaining · inheritance · dedup) (AC2)
 # ---------------------------------------------------------------------------
 
-# 상위에서 하위로 상속하는 frontmatter 필드. repo·auto_merge·allowed_tools·
-# model_tier는 AC2가 명시. max_turns·max_budget_usd·priority는 상위 계약을
-# 그대로 물려줘 하위가 같은 예산·우선순위로 돌게 한다(없으면 템플릿 기본값).
+# frontmatter fields inherited from parent to child. AC2 specifies repo·
+# auto_merge·allowed_tools·model_tier. max_turns·max_budget_usd·priority carry
+# the parent's contract over as-is so the children run with the same budget/
+# priority (template defaults if absent).
 _INHERIT_FIELDS = ("repo", "auto_merge", "allowed_tools", "model_tier",
                    "max_turns", "max_budget_usd", "priority")
-# 문자열로 들어오면 따옴표로 감싸는 필드(쉼표·괄호·URL·콜론 포함 가능).
+# Fields that get wrapped in quotes when given as a string (may contain
+# commas·parens·URLs·colons).
 _QUOTED_FIELDS = frozenset({"repo", "allowed_tools", "outcome", "next_action", "if_then"})
 
 
 def _yaml_dq(v) -> str:
-    """YAML double-quoted 스칼라. 백슬래시·따옴표만 이스케이프(파서는 평문으로 읽어도 무해)."""
+    """A YAML double-quoted scalar. Only backslashes and quotes are escaped (harmless even if the parser reads it as plain text)."""
     return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _render_scalar(key: str, v) -> str:
     if isinstance(v, bool):
-        return "true" if v else "false"      # yaml True → `true`(frontmatter 관용)
+        return "true" if v else "false"      # yaml True → `true` (frontmatter convention)
     if key in _QUOTED_FIELDS:
         return _yaml_dq(v)
     return str(v).strip()
 
 
 def _set_block_list(content: str, key: str, rendered_items: list[str]) -> str:
-    """frontmatter의 `key`를 YAML 블록 list로 설정(기존 값 제거 후 끝에 추가).
+    """Set frontmatter's `key` to a YAML block list (remove the existing value, then
+    append at the end).
 
-    `update_frontmatter_value`는 스칼라 한 줄만 쓰므로 블록 list에 못 쓴다. 여기서
-    `remove_frontmatter_key`로 기존 줄+블록을 지우고 블록 list를 재부착한다.
-    `rendered_items`는 이미 렌더된 문자열(`"..."` 또는 bare slug)이다."""
+    `update_frontmatter_value` only writes a single scalar line, so it can't
+    write a block list. Here, `remove_frontmatter_key` removes the existing
+    line+block and the block list is re-attached. `rendered_items` are
+    already-rendered strings (either `"..."` or a bare slug)."""
     from .. import cli
 
     content = cli.remove_frontmatter_key(content, key)
@@ -338,7 +363,7 @@ def _set_block_list(content: str, key: str, rendered_items: list[str]) -> str:
 
 
 def _subtask_tags(parent_fm: dict) -> list[str]:
-    """todo + 상위 태그(todo 제외) + worker — hand-made 하위의 태그 모양."""
+    """todo + parent tags (excluding todo) + worker — the tag shape of a hand-made sub-task."""
     raw = parent_fm.get("tags")
     items = raw if isinstance(raw, list) else ([raw] if raw else [])
     out = ["todo"]
@@ -397,27 +422,31 @@ def _render_body(spec: dict, design_notes: list, run_ref: str, title: str,
 def build_subtask_markdown(spec: dict, *, parent_slug: str, parent_fm: dict,
                            design_notes: list, run_ref: str, position: int,
                            prev_slug: str | None, templates_dir) -> str:
-    """하위 태스크 md 전문을 만든다 — `auto-worker` 템플릿의 frontmatter를 cmd_new식
-    스캐폴드 + 주입으로 채우고, 본문은 spec/설계노트로 재작성한다.
+    """Build the full sub-task md — fill the `auto-worker` template's frontmatter
+    via cmd_new-style scaffolding + injection, and rewrite the body from the
+    spec/design notes.
 
-    `position==0` → `worker_mode: auto`(의존 없음, 바로 큐). `position>0` →
-    `worker_mode: blocked` + `on_unblock: auto` + `depends_on: [prev_slug]`(직렬 체인).
-    `allowed_tools`는 반드시 **따옴표 친 콤마 문자열**(YAML list면 워커가 통째로 무시).
-    인라인 `# 주석`을 값에 붙이지 않는다(파서가 안 뗀다)."""
+    `position==0` → `worker_mode: auto` (no dependency, goes straight to the
+    queue). `position>0` → `worker_mode: blocked` + `on_unblock: auto` +
+    `depends_on: [prev_slug]` (serial chain). `allowed_tools` must always be a
+    **quoted comma string** (a YAML list gets ignored wholesale by the
+    worker). Do not attach an inline `# comment` to a value (the parser
+    doesn't strip it)."""
     from .. import cli
 
     slug = str(spec["slug"]).strip()
     title = str(spec.get("title") or slug).strip()
     today = dt.date.today().isoformat()
     content = (Path(templates_dir) / "auto-worker-task-template.md").read_text(encoding="utf-8")
-    # cmd_new식 스캐폴드(값 placeholder 치환).
+    # cmd_new-style scaffolding (replace value placeholders).
     content = content.replace("updated: 2026-05-19", f"updated: {today}")
     content = content.replace("due: YYYY-MM-DD", 'due: "-"')
     content = content.replace('worker_branch: "worker/<slug>"', f'worker_branch: "worker/{slug}"')
 
     specd = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
     goal = str(specd.get("goal") or spec.get("outcome") or "").strip()
-    # next_action/if_then는 비면 spec에서 파생해 템플릿 placeholder가 새지 않게 한다.
+    # If next_action/if_then are empty, derive them from the spec so a
+    # template placeholder doesn't leak through.
     next_action = str(spec.get("next_action") or goal).strip()
     if_then = str(spec.get("if_then")
                   or f"워커가 이 하위 태스크를 잡으면 {goal}").strip()
@@ -460,11 +489,14 @@ def build_subtask_markdown(spec: dict, *, parent_slug: str, parent_fm: dict,
 
 def generate_subtasks(rescope: dict, *, parent_slug: str, parent_fm: dict,
                       items_dir, templates_dir, run_ref: str = "") -> list[Path]:
-    """분할안의 하위 2~5개를 `items_dir`에 순서대로 쓰고 각 하위를 즉시 validate.
+    """Write the plan's 2-5 sub-tasks to `items_dir` in order and validate each
+    immediately.
 
-    **dedup**: 이미 있는 하위 파일은 건너뛴다(재실행 안전, `_propagate_downstream` 선례).
-    새로 쓴 하위에 validate ERROR가 있으면 `ValueError`를 올리고 **이번 호출이 만든 파일만
-    롤백**한다(executor가 사람 경로로 돌린다). WARN은 통과."""
+    **dedup**: an already-existing sub-task file is skipped (safe to re-run,
+    following the `_propagate_downstream` precedent). If a newly-written
+    sub-task has a validate ERROR, raise `ValueError` and **roll back only the
+    files this call created** (the executor falls back to the human path).
+    WARN passes."""
     from .. import task_validate as _task_validate
 
     subs = rescope.get("subtasks") or []
@@ -479,7 +511,7 @@ def generate_subtasks(rescope: dict, *, parent_slug: str, parent_fm: dict,
             slug = str(spec["slug"]).strip()
             dest = items_dir / f"{slug}.md"
             if dest.exists():
-                paths.append(dest)       # dedup — 이미 있으면 다시 만들지 않는다
+                paths.append(dest)       # dedup — don't recreate if it already exists
                 prev = slug
                 continue
             md = build_subtask_markdown(
@@ -495,7 +527,7 @@ def generate_subtasks(rescope: dict, *, parent_slug: str, parent_fm: dict,
             paths.append(dest)
             prev = slug
     except ValueError:
-        for p in created:                # 이번 호출이 쓴 것만 지운다 — 볼트를 원상복구
+        for p in created:                # Delete only what this call wrote — restore the vault
             try:
                 p.unlink()
             except OSError:
@@ -512,12 +544,14 @@ def _append_progress_log(content: str, note: str) -> str:
 
 
 def flip_parent_to_bundle(parent_path, child_slugs: list[str]) -> None:
-    """상위 md를 `worker_mode: off` 묶음으로 바꾸고 경위를 Progress Log에 남긴다.
+    """Flip the parent md into a `worker_mode: off` bundle and record the history
+    in the Progress Log.
 
-    `auto_rescoped: true`는 AC5 자동 닫기의 표식이고, `is_parent: true`는
-    `parents_needing_review`가 이 묶음을 보려면 필요하다 — import-md가 자식 `parent:`
-    링크에서 파생하지 **않고** 태스크 자신의 `is_parent` 필드만 읽기 때문이다
-    (cli.parse_task_file). `cli.cli`는 수정하지 않고 재사용만 한다."""
+    `auto_rescoped: true` is the marker AC5's auto-close looks for, and
+    `is_parent: true` is required for `parents_needing_review` to see this
+    bundle — because import-md does **not** derive it from a child's
+    `parent:` link, it only reads the task's own `is_parent` field
+    (cli.parse_task_file). `cli.cli` is only reused, never modified."""
     from .. import cli
 
     p = Path(parent_path)
@@ -532,12 +566,12 @@ def flip_parent_to_bundle(parent_path, child_slugs: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Executor — 파킹 감지 → 집행 → 정보 알림 → 멱등 → 파킹 정리 (AC2/AC4)
+# Executor — detect park → execute → informational alert → idempotency → clear the park (AC2/AC4)
 # ---------------------------------------------------------------------------
 
 
 def compose_rescope_alert(parent_slug: str, child_slugs: list[str]) -> str:
-    """자동 분할 정보 알림(🔀, digest). count+ask는 headline, slug들은 word-clip tail."""
+    """Informational auto-split alert (🔀, digest). count+ask is the headline, the slugs are a word-clipped tail."""
     from ..kakao_format import compose_alert
 
     headline = f"🔀 자동 분할: {parent_slug} → 하위 {len(child_slugs)}개 · 첫 태스크 시작"
@@ -552,7 +586,7 @@ def _fallback_alert(parent_slug: str, reason: str) -> str:
 
 
 def _notify(notify, msg: str, event_key: str, emit, *, level: str | None = None) -> None:
-    """알림은 곁가지 — 실패해도 이미 저장된 집행을 되돌리지 않는다(resume._notify 패턴)."""
+    """Notification is a side effect — a failure does not undo an execution already saved (same pattern as resume._notify)."""
     if notify is None:
         return
     try:
@@ -565,8 +599,9 @@ def _notify(notify, msg: str, event_key: str, emit, *, level: str | None = None)
 
 
 def _refresh_db(paths, db_path=None) -> None:
-    """상위+하위 md를 todo.db에 즉시 반영 — 데몬 lag 창(stale DB 재디스패치) 차단.
-    best-effort: 실패해도 todo-sync 데몬이 다음 틱에 흡수한다(`mark_done` 패턴)."""
+    """Immediately reflect the parent+children md into todo.db — blocks the daemon's
+    lag window (stale-DB redispatch). best-effort: if it fails, the todo-sync
+    daemon absorbs it on the next tick (same pattern as `mark_done`)."""
     try:
         from .. import cli
 
@@ -583,9 +618,10 @@ def _refresh_db(paths, db_path=None) -> None:
 
 
 def _fallback_to_human(a, ledger, notify, reason: str, emit) -> None:
-    """자동 불가 → ⛔ 1건(immediate) 보내고 파킹 유지. collect()가 ⛔를 억제했을 수
-    있으니 silent park를 막는다. framing을 ALERT_BLOCKED로 바꿔 다음 틱 재집행을 멈추고
-    reconcile_unparked(사람이 blocker 해제) 경로로 넘긴다."""
+    """Auto-rescope not viable → send one ⛔ (immediate) and keep the park.
+    collect() may have suppressed the ⛔, so this prevents a silent park.
+    Flips the framing to ALERT_BLOCKED to stop re-execution on the next tick
+    and hands off to the reconcile_unparked (human clears the blocker) path."""
     a.last_alert_kind = _ALERT_BLOCKED
     a.last_note = f"rescope not auto-viable: {reason}"[:200]
     a.history.append({"ts": _now_iso(), "type": "rescope-fallback",
@@ -598,14 +634,18 @@ def _fallback_to_human(a, ledger, notify, reason: str, emit) -> None:
 
 def execute_rescope(ledger, vault_root, notify, *, items_dir=None, templates_dir=None,
                     db_path=None, log=None) -> list[str]:
-    """파킹된(`AWAITING_HUMAN` + `blocked_on` + `ALERT_RESCOPE_PENDING`) 행을 찾아 자동
-    집행한다. 집행한 상위 slug 목록을 돌려주며 **절대 raise하지 않는다**(틱의 dispatch를
-    멈추면 안 됨 — 바깥 한 겹 + per-row 한 겹 try/except, `resume.consume` 구조).
+    """Find parked (`AWAITING_HUMAN` + `blocked_on` + `ALERT_RESCOPE_PENDING`) rows
+    and auto-execute them. Returns the list of executed parent slugs, and
+    **never raises** (must not stop the tick's dispatch — one outer + one
+    per-row try/except, the same structure as `resume.consume`).
 
-    각 행: run-dir의 분할안을 읽어 `can_auto_rescope`로 재확인(방어) → AUTO면
-    하위 생성(validate 포함)·상위 묶음 전환·파킹 assignment를 `ledger.save`로 정식 정리
-    (`Worker/assignments/*.json` 손편집 아님)·멱등 기록·DB refresh·🔀 1건(digest). HUMAN이면
-    fallback ⛔ 1건(immediate) 후 파킹 유지. validate 실패는 생성분 롤백 + fallback."""
+    For each row: read the split plan from the run-dir and re-confirm with
+    `can_auto_rescope` (defensive) → if AUTO: generate sub-tasks (including
+    validation) · flip the parent into a bundle · properly clear the parked
+    assignment via `ledger.save` (not a hand-edit of
+    `Worker/assignments/*.json`) · idempotent record · DB refresh · one 🔀
+    (digest). If HUMAN: fall back with one ⛔ (immediate) and keep the park.
+    A validate failure rolls back what it created and falls back."""
     done: list[str] = []
     emit = log or _default_log
     try:
@@ -665,8 +705,8 @@ def execute_rescope(ledger, vault_root, notify, *, items_dir=None, templates_dir
                 _notify(notify, compose_rescope_alert(parent_slug, child_slugs),
                         f"rescope:{parent_slug}", emit)
                 emit(f"{parent_slug}: 자동 분할 → {child_slugs} (상위 묶음, 파킹 정리)")
-            except Exception as e:  # noqa: BLE001 — per-row 격리
+            except Exception as e:  # noqa: BLE001 — per-row isolation
                 emit(f"{getattr(a, 'task_id', '?')}: skipped: {type(e).__name__}: {e}")
-    except Exception as e:  # noqa: BLE001 — 바깥 그물: tick()으로 raise 금지
+    except Exception as e:  # noqa: BLE001 — outer net: must not raise into tick()
         emit(f"sweep aborted: {type(e).__name__}: {e}")
     return done
