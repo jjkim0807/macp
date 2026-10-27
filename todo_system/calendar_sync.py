@@ -207,7 +207,14 @@ def _upsert_event(
         body["start"] = {"date": event_date.isoformat()}
         body["end"] = {"date": end_date.isoformat()}
 
-    # Find ALL existing events for this slug (could be duplicates from race conditions)
+    # Two-way sync (2026-10-27): the event remembers what macp last wrote
+    # (`macp_start`/`macp_end`, canonical form). A start/end that differs from
+    # that baseline was edited in the calendar app; the old code deleted and
+    # re-inserted every event on every md change, so such edits snapped back
+    # within minutes. Now: calendar edited, md not → pull into the md's
+    # `scheduled:`; md edited, calendar not → patch the event; both → the
+    # later edit wins (event `updated` vs md mtime); neither → no API write.
+    desired = (_canon(body["start"]), _canon(body["end"]))
     found = (
         service.events()
         .list(
@@ -219,16 +226,116 @@ def _upsert_event(
         .execute()
     )
     items = found.get("items", [])
-    # Delete all old events to prevent duplicates
-    for item in items:
+    # Duplicates (race conditions) — keep the first, drop the rest.
+    for item in items[1:]:
         try:
             service.events().delete(calendarId=calendar_id, eventId=item["id"]).execute()
         except Exception:
             # Event may already be deleted (HTTP 410) or otherwise unavailable
             pass
 
-    service.events().insert(calendarId=calendar_id, body=body).execute()
-    return "updated" if items else "created"
+    if not items:
+        body["extendedProperties"]["private"].update(
+            {"macp_start": desired[0], "macp_end": desired[1]})
+        service.events().insert(calendarId=calendar_id, body=body).execute()
+        return "created"
+
+    ev = items[0]
+    priv = (ev.get("extendedProperties") or {}).get("private") or {}
+    actual = (_canon(ev.get("start") or {}), _canon(ev.get("end") or {}))
+    base = (priv.get("macp_start"), priv.get("macp_end"))
+    has_base = all(base)
+    cal_changed = has_base and actual != base
+    md_changed = (not has_base) or desired != base   # legacy event: md wins once
+
+    if cal_changed and (not md_changed or _event_newer_than_md(ev, source_path)):
+        sched = _scheduled_value(ev.get("start") or {}, ev.get("end") or {})
+        if sched:
+            _write_scheduled(source_path, sched)
+        body["start"], body["end"] = ev["start"], ev["end"]
+        body["extendedProperties"]["private"].update(
+            {"macp_start": actual[0], "macp_end": actual[1]})
+        service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
+        return "pulled"
+
+    if (actual == desired and base == desired and ev.get("summary") == body["summary"]
+            and ev.get("description") == body["description"]):
+        return "unchanged"
+
+    body["extendedProperties"]["private"].update(
+        {"macp_start": desired[0], "macp_end": desired[1]})
+    service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
+    return "updated"
+
+
+def _canon(when: dict) -> str | None:
+    """A start/end dict as a comparable string: `D:YYYY-MM-DD` for all-day,
+    `T:<UTC ISO>` for timed (offsets and a bare `timeZone` resolve to the same
+    instant, so a round-trip through the API never reads as an edit)."""
+    if not when:
+        return None
+    if when.get("date"):
+        return f"D:{when['date']}"
+    raw = when.get("dateTime")
+    if not raw:
+        return None
+    t = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        tz = None
+        if when.get("timeZone"):
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(when["timeZone"])
+            except Exception:
+                tz = None
+        t = t.replace(tzinfo=tz or _event_tzinfo() or dt.timezone.utc)
+    return "T:" + t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+def _scheduled_value(start: dict, end: dict) -> str | None:
+    """The md `scheduled:` value for a calendar start/end (local clock)."""
+    if start.get("date"):
+        return start["date"]
+    if not start.get("dateTime") or not end.get("dateTime"):
+        return None
+    tz = _event_tzinfo()
+    s = dt.datetime.fromisoformat(str(start["dateTime"]).replace("Z", "+00:00"))
+    e = dt.datetime.fromisoformat(str(end["dateTime"]).replace("Z", "+00:00"))
+    if tz is not None:
+        s, e = (s.astimezone(tz) if s.tzinfo else s), (e.astimezone(tz) if e.tzinfo else e)
+    if e.date() != s.date():
+        return s.date().isoformat()          # spans midnight: keep the day, drop the times
+    return f"{s.date().isoformat()} {s:%H:%M}~{e:%H:%M}"
+
+
+def _md_path(source_path: str) -> Path:
+    p = Path(source_path)
+    return p if p.is_absolute() else ROOT / source_path
+
+
+def _event_newer_than_md(ev: dict, source_path: str) -> bool:
+    """Both sides changed since the last sync: the later edit wins."""
+    try:
+        upd = dt.datetime.fromisoformat(str(ev.get("updated", "")).replace("Z", "+00:00"))
+        mtime = dt.datetime.fromtimestamp(_md_path(source_path).stat().st_mtime, dt.timezone.utc)
+        return upd > mtime
+    except Exception:
+        return False
+
+
+def _write_scheduled(source_path: str, value: str) -> None:
+    """Set `scheduled:` in the task md (the source of truth) and log it. The
+    todo-sync daemon then re-imports; the next sync finds md == calendar ==
+    baseline and writes nothing, so there is no ping-pong."""
+    from .cli import update_frontmatter_value
+    path = _md_path(source_path)
+    text = path.read_text(encoding="utf-8")
+    today = dt.date.today().isoformat()
+    text = update_frontmatter_value(text, "scheduled", f'"{value}"')
+    text = update_frontmatter_value(text, "updated", today)
+    if "## Progress Log" in text:
+        text = text.rstrip("\n") + f"\n- {today}: 캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤 (calendar sync)\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def sync_due_tasks_to_calendar(
@@ -319,7 +426,7 @@ def sync_due_tasks_to_calendar(
             continue
 
         effective_due = due if has_due else sched_date
-        _upsert_event(
+        result = _upsert_event(
             service=service,
             calendar_id=calendar_id,
             slug=str(row["slug"]),
@@ -332,7 +439,8 @@ def sync_due_tasks_to_calendar(
             next_action=str(row["next_action"] or ""),
             source_path=source_path,
         )
-        created_or_updated += 1
+        if result != "unchanged":
+            created_or_updated += 1
 
     return created_or_updated, skipped
 

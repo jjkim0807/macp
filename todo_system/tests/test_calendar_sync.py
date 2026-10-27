@@ -767,3 +767,133 @@ def test_fetch_omits_the_timezone_argument_when_nothing_is_configured(monkeypatc
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- two-way sync (2026-10-27) ------------------------------------------------
+# Before: every md change deleted and re-inserted every event, so a time moved in
+# the calendar app snapped back within minutes. Now the event remembers what macp
+# last wrote; calendar-side edits flow into the md's `scheduled:`.
+
+class _TwoWayEvents(_FakeEvents):
+    def __init__(self, existing=None):
+        super().__init__(existing)
+        self.patched: list[tuple[str, dict]] = []
+
+    def patch(self, calendarId, eventId, body):
+        self.patched.append((eventId, body))
+        for e in self.existing:
+            if e["id"] == eventId:
+                e.update({k: v for k, v in body.items()})
+        return self._Req({})
+
+
+def _task_md(tmp_path, slug, scheduled):
+    p = tmp_path / f"{slug}.md"
+    p.write_text(
+        "---\nstatus: open\ndue: 2026-11-02\nupdated: 2026-10-20\n"
+        f'scheduled: "{scheduled}"\n---\n\n# t\n\n## Progress Log\n\n- 2026-10-20: made\n',
+        encoding="utf-8")
+    return p
+
+
+def _two_way(monkeypatch, tmp_path, scheduled, existing):
+    monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
+    p = _task_md(tmp_path, "t1", scheduled)
+    con = _db([("t1", "Task one", "2026-11-02", "na", str(p), "open", None)])
+    ev = _TwoWayEvents(existing)
+    _sync(con, ev)
+    return p, ev
+
+
+def _seoul(day, hm):
+    return {"dateTime": f"{day}T{hm}:00+09:00", "timeZone": "Asia/Seoul"}
+
+
+def _existing(start, end, base_start, base_end, updated="2026-10-21T00:00:00Z"):
+    priv = {"todo_slug": "t1"}
+    if base_start:
+        priv.update(macp_start=base_start, macp_end=base_end)
+    return {"id": "e1", "_slug": "t1", "start": start, "end": end, "summary": "Task one",
+            "description": "slug: t1\nnext_action: na\nsource: X", "updated": updated,
+            "extendedProperties": {"private": priv}}
+
+
+def test_new_task_is_inserted_with_a_baseline(monkeypatch, tmp_path):
+    _, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 10:00~11:00", [])
+    (body,) = ev.inserted
+    priv = body["extendedProperties"]["private"]
+    assert priv["macp_start"] == "T:2026-11-02T01:00" and priv["macp_end"] == "T:2026-11-02T02:00"
+
+
+def test_calendar_edit_is_pulled_into_md_and_not_reverted(monkeypatch, tmp_path):
+    # macp wrote 10:00~11:00; the user moved it to 14:00~15:30 in the calendar app.
+    moved = _existing(_seoul("2026-11-03", "14:00"), _seoul("2026-11-03", "15:30"),
+                      "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 10:00~11:00", [moved])
+    text = p.read_text(encoding="utf-8")
+    assert 'scheduled: "2026-11-03 14:00~15:30"' in text
+    assert "캘린더에서 일정을 옮겨" in text
+    assert not ev.inserted and not ev.deleted                 # no delete+re-insert any more
+    (_, body), = ev.patched
+    assert body["start"]["dateTime"].startswith("2026-11-03T14:00")
+    # second pass: md == calendar == baseline → no write (no ping-pong)
+    con = _db([("t1", "Task one", "2026-11-02", "na", str(p), "open", None)])
+    ev2 = _TwoWayEvents([ev.existing[0] | {"description": body["description"]}])
+    _sync(con, ev2)
+    assert not ev2.patched and not ev2.inserted and not ev2.deleted
+
+
+def test_md_edit_patches_the_event(monkeypatch, tmp_path):
+    same = _existing(_seoul("2026-11-02", "10:00"), _seoul("2026-11-02", "11:00"),
+                     "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 16:00~17:00", [same])
+    (_, body), = ev.patched
+    assert body["start"]["dateTime"].startswith("2026-11-02T16:00")
+    assert 'scheduled: "2026-11-02 16:00~17:00"' in p.read_text(encoding="utf-8")
+
+
+def test_unchanged_event_makes_no_api_write(monkeypatch, tmp_path):
+    same = _existing(_seoul("2026-11-02", "10:00"), _seoul("2026-11-02", "11:00"),
+                     "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    same["description"] = f"slug: t1\nnext_action: na\nsource: {tmp_path / 't1.md'}"
+    _, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 10:00~11:00", [same])
+    assert not ev.patched and not ev.inserted and not ev.deleted
+
+
+def test_both_changed_later_edit_wins(monkeypatch, tmp_path):
+    moved_old = _existing(_seoul("2026-11-03", "14:00"), _seoul("2026-11-03", "15:00"),
+                          "T:2026-11-02T01:00", "T:2026-11-02T02:00",
+                          updated="2000-01-01T00:00:00Z")         # older than the md
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 16:00~17:00", [moved_old])
+    assert 'scheduled: "2026-11-02 16:00~17:00"' in p.read_text(encoding="utf-8")
+    (_, body), = ev.patched
+    assert body["start"]["dateTime"].startswith("2026-11-02T16:00")   # md won
+
+    moved_new = _existing(_seoul("2026-11-03", "14:00"), _seoul("2026-11-03", "15:00"),
+                          "T:2026-11-02T01:00", "T:2026-11-02T02:00",
+                          updated="2999-01-01T00:00:00Z")         # newer than the md
+    p2, ev2 = _two_way(monkeypatch, tmp_path, "2026-11-02 16:00~17:00", [moved_new])
+    assert 'scheduled: "2026-11-03 14:00~15:00"' in p2.read_text(encoding="utf-8")
+
+
+def test_legacy_event_without_baseline_takes_md_once(monkeypatch, tmp_path):
+    legacy = _existing(_seoul("2026-11-03", "14:00"), _seoul("2026-11-03", "15:00"), None, None)
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 10:00~11:00", [legacy])
+    (_, body), = ev.patched
+    assert body["extendedProperties"]["private"]["macp_start"] == "T:2026-11-02T01:00"
+    assert 'scheduled: "2026-11-02 10:00~11:00"' in p.read_text(encoding="utf-8")
+
+
+def test_all_day_move_pulls_a_date(monkeypatch, tmp_path):
+    moved = _existing({"date": "2026-11-05"}, {"date": "2026-11-06"},
+                      "D:2026-11-02", "D:2026-11-03")
+    p, _ = _two_way(monkeypatch, tmp_path, "2026-11-02", [moved])
+    assert 'scheduled: "2026-11-05"' in p.read_text(encoding="utf-8")
+
+
+def test_canon_treats_offset_and_timezone_forms_alike(monkeypatch):
+    monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
+    a = CS._canon({"dateTime": "2026-11-02T10:00:00+09:00"})
+    b = CS._canon({"dateTime": "2026-11-02T10:00:00", "timeZone": "Asia/Seoul"})
+    c = CS._canon({"dateTime": "2026-11-02T01:00:00Z"})
+    assert a == b == c == "T:2026-11-02T01:00"
