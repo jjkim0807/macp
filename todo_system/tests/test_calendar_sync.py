@@ -165,6 +165,68 @@ class CalendarOwnershipTest(unittest.TestCase):
         self.assertEqual(events.deleted, [])
 
 
+class CalendarParentWithTimedChildrenTest(unittest.TestCase):
+    def _write(self, d: Path, name: str, fm: str) -> str:
+        path = d / f"{name}.md"
+        path.write_text(f"---\n{fm}\n---\n# {name}\n", encoding="utf-8")
+        return str(path)
+
+    def test_parent_with_timed_open_child_is_left_off_and_its_event_removed(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            parent = self._write(d, "prep", "due: 2026-10-29")
+            child = self._write(
+                d, "prep-1",
+                'parent: "[[prep|Prep]]"\nscheduled: "2026-10-28 10:00~12:00"',
+            )
+            con = _db([
+                ("prep", "prep parent", "2026-10-29", "", parent, "open", "manual"),
+                ("prep-1", "block one", "2026-10-29", "", child, "open", "manual"),
+            ])
+            events = _FakeEvents(existing=[
+                {"id": "allday", "_slug": "prep",
+                 "extendedProperties": {"private": {"todo_slug": "prep"}}},
+            ])
+            created, _ = _sync(con, events)
+
+        self.assertEqual(created, 1)
+        self.assertEqual([b["summary"] for b in events.inserted], ["block one"])
+        self.assertIn("dateTime", events.inserted[0]["start"])
+        self.assertEqual(events.deleted, ["allday"])
+
+    def test_parent_with_only_dated_children_keeps_its_event(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            parent = self._write(d, "proj", "due: 2026-11-01")
+            child = self._write(d, "proj-1", 'parent: "[[proj]]"\nscheduled: 2026-10-30')
+            con = _db([
+                ("proj", "project", "2026-11-01", "", parent, "open", None),
+                ("proj-1", "step", "2026-10-30", "", child, "open", None),
+            ])
+            events = _FakeEvents()
+            created, _ = _sync(con, events)
+
+        self.assertEqual(created, 2)
+        self.assertEqual(events.deleted, [])
+
+
+def test_parent_slug_forms(tmp_path):
+    for raw, want in [
+        ('"[[a-b]]"', "a-b"), ('"[[a-b|Title]]"', "a-b"),
+        ("Todo/items/a-b", "a-b"), ("-", None),
+    ]:
+        f = tmp_path / "t.md"
+        f.write_text(f"---\nparent: {raw}\n---\n", encoding="utf-8")
+        assert CS._parent_slug(str(f)) == want
+    g = tmp_path / "none.md"
+    g.write_text("---\ndue: -\n---\n", encoding="utf-8")
+    assert CS._parent_slug(str(g)) is None
+
+
 # Every value `test_mapping` below pins, plus the padded variants that used to
 # split the two implementations (`is_worker_owned` strips, the SQL predicate
 # did not). Keep in sync with `test_mapping` when either list grows.
