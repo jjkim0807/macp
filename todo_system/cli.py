@@ -1407,6 +1407,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         f"[{dt.datetime.now().isoformat(timespec='seconds')}] watching files (interval={args.interval}s)"
     )
 
+    # Two-way calendar sync: an edit made in the calendar app is pulled even when
+    # no md changed (a pull writes the md, which the next pass imports).
+    calendar_pull_every_s = 300
+    last_calendar_sync = time.monotonic()
     try:
         while True:
             time.sleep(args.interval)
@@ -1432,6 +1436,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                             client_secret_path=Path(args.gcal_client_secret),
                             token_path=Path(args.gcal_token),
                         )
+                        last_calendar_sync = time.monotonic()
                         print(
                             f"[{dt.datetime.now().isoformat(timespec='seconds')}] calendar sync: "
                             f"{created_or_updated} upserted, {skipped} skipped"
@@ -1498,6 +1503,26 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
                 prev_snapshot = current
                 _worker.todo_sync_heartbeat_clear()
+            elif (calendar_sync_enabled
+                    and time.monotonic() - last_calendar_sync >= calendar_pull_every_s):
+                # Nothing changed locally: still look for edits made in the
+                # calendar app. A pulled edit rewrites the md, so the next pass
+                # sees the change and runs the full import/regen as usual.
+                last_calendar_sync = time.monotonic()
+                try:
+                    created_or_updated, skipped = sync_due_tasks_to_calendar(
+                        con=con,
+                        calendar_id=args.calendar_id,
+                        client_secret_path=Path(args.gcal_client_secret),
+                        token_path=Path(args.gcal_token),
+                    )
+                    if created_or_updated:
+                        print(
+                            f"[{dt.datetime.now().isoformat(timespec='seconds')}] calendar poll: "
+                            f"{created_or_updated} changed, {skipped} skipped"
+                        )
+                except Exception as exc:
+                    print(f"[{dt.datetime.now().isoformat(timespec='seconds')}] calendar poll warning: {exc}")
     except KeyboardInterrupt:
         print("daemon stopped")
 
