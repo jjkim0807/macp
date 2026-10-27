@@ -2226,6 +2226,17 @@ class Runner:
         un-acked, so `receive()` hands it to whatever process comes up next."""
         with self._lock:
             msgs = self.mailbox.receive(self.agent.id)
+        # Serial handle() can block for an entire staged run. Service control
+        # messages first, in arrival order, before starting queued assignments.
+        # Within assignments, use the same stable priority order and legacy DB
+        # fallback as the parallel poller.
+        controls = [msg for msg in msgs if msg.type != m.TASK_ASSIGN]
+        assignments = [msg for msg in msgs if msg.type == m.TASK_ASSIGN]
+        if len(assignments) > 1:
+            need_fb = any(_envelope_priority(msg) is None for msg in assignments)
+            assignments = _by_priority(assignments,
+                                       _db_priorities() if need_fb else None)
+        msgs = controls + assignments
         handled = 0
         for i, msg in enumerate(msgs):
             if only_bypass and not (msg.payload or {}).get("bypass_guard"):

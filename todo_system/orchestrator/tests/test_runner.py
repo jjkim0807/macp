@@ -2533,6 +2533,63 @@ class RunnerInboxPriorityOrderTest(unittest.TestCase):
         self.assertEqual(runner_mod._envelope_priority(env("r", 7)), 7)
 
 
+class RunnerSerialPriorityOrderTest(unittest.TestCase):
+    """Serial polls give control messages prompt service and prioritize work."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mb = FileMailbox(self.tmp / "agents")
+        self.agent = _agent()
+        self.runner = Runner(self.mb, self.agent, ShadowExecutor(),
+                             log=lambda *_: None, code_time_fn=lambda: None)
+        self.handled = []
+        self.runner.handle = lambda msg: self.handled.append((msg.type, msg.task_id))
+        self._hb = mock.patch.multiple("todo_system.worker",
+                                       runner_heartbeat_start=mock.DEFAULT,
+                                       runner_heartbeat_clear=mock.DEFAULT)
+        self._hb.start()
+
+    def tearDown(self):
+        self._hb.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _assign(self, task_id, priority=None):
+        payload = {"task_path": f"Todo/items/{task_id}.md"}
+        if priority is not None:
+            payload["priority"] = priority
+        self.mb.send(m.Envelope(to=self.agent.id, type=m.TASK_ASSIGN,
+                                task_id=task_id, payload=payload))
+
+    def test_later_high_priority_assignment_runs_first(self):
+        self._assign("low", 20)
+        self._assign("urgent", 95)
+        self._assign("medium", 50)
+
+        self.assertEqual(self.runner.poll_once(), 3)
+        self.assertEqual([task for _, task in self.handled],
+                         ["urgent", "medium", "low"])
+
+    def test_legacy_envelopes_use_db_priority(self):
+        self._assign("old-low")
+        self._assign("old-urgent")
+        with mock.patch.object(runner_mod, "_db_priorities",
+                               return_value={"old-low": 10, "old-urgent": 90}):
+            self.assertEqual(self.runner.poll_once(), 2)
+        self.assertEqual([task for _, task in self.handled],
+                         ["old-urgent", "old-low"])
+
+    def test_control_messages_are_not_delayed_behind_queued_work(self):
+        self._assign("low", 20)
+        self.mb.send(m.Envelope(to=self.agent.id, type=m.PING))
+        self.mb.send(m.Envelope(to=self.agent.id, type=m.WAKE))
+        self._assign("urgent", 95)
+
+        self.assertEqual(self.runner.poll_once(), 4)
+        self.assertEqual(self.handled,
+                         [(m.PING, None), (m.WAKE, None),
+                          (m.TASK_ASSIGN, "urgent"), (m.TASK_ASSIGN, "low")])
+
+
 class EnvelopePriorityDbFallbackTest(unittest.TestCase):
     def _env(self, task_id, payload):
         return m.Envelope(to="x", type=m.TASK_ASSIGN, task_id=task_id, payload=payload)
