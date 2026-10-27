@@ -106,6 +106,16 @@ def _parse_scheduled(source_path: str) -> tuple[str | None, str | None, str | No
     return None, None, None
 
 
+def _parent_slug(source_path: str) -> str | None:
+    """Slug named by the `parent:` field (`[[slug]]`, `[[slug|title]]` or bare)."""
+    raw = _extract_field_from_markdown(source_path, "parent")
+    if not raw or raw == "-":
+        return None
+    m = re.match(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", raw.strip())
+    slug = (m.group(1) if m else raw).strip()
+    return slug.rsplit("/", 1)[-1] or None
+
+
 def _parse_due_time(source_path: str) -> str | None:
     """Parse due_time field (deadline time, not scheduled work time)."""
     val = _extract_field_from_markdown(source_path, "due_time")
@@ -244,6 +254,19 @@ def sync_due_tasks_to_calendar(
         """,
         human_params,
     ).fetchall()
+
+    # A task whose open children carry timed blocks (`scheduled: DATE HH:MM~HH:MM`)
+    # is a container: the children are the calendar entries, and the parent's
+    # own all-day event would only duplicate them. Dropping it here also lets
+    # the cleanup below remove an all-day event it already has.
+    covered_parents = set()
+    for r in rows:
+        _, child_start, child_end = _parse_scheduled(str(r["path"]))
+        if child_start and child_end:
+            parent = _parent_slug(str(r["path"]))
+            if parent:
+                covered_parents.add(parent)
+    rows = [r for r in rows if str(r["slug"]) not in covered_parents]
 
     # --- Cleanup: delete stale events (slug not in current open tasks) ---
     # Lookback is generous: an event only gets deleted if it carries a
