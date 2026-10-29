@@ -1830,7 +1830,7 @@ class HumanTriage(unittest.TestCase):
 
 
 class HumanBlockedBeatsOwned(HumanTriage):
-    """A human-owned task marked worker_mode: blocked shows as 블록, not 결정필요."""
+    """A human-owned task marked worker_mode: blocked shows as 블록, not 결정필요/직접 할 일."""
 
     def test_blocked_wins_over_owned(self):
         reg = types.SimpleNamespace(
@@ -1839,7 +1839,171 @@ class HumanBlockedBeatsOwned(HumanTriage):
         with mock.patch("todo_system.orchestrator.registry.load_registry", return_value=reg):
             rows = self._rows()
         self.assertEqual(rows["nodue"]["why"], "blocked")
-        self.assertEqual(rows["soon"]["why"], "owned")
+        # 10-27 contract: human-owned without a decision marker is a to-do, not 결정필요
+        self.assertEqual(rows["soon"]["why"], "todo")
+
+
+class HumanWhyDecisionVsTodo(unittest.TestCase):
+    """docs/dashboard-parity.md "human why": first match wins — parked → blocked →
+    owned (a `decision` tag or `needs_decision: true`, any owner) → todo (registry
+    human owner, not a decision) → manual → backlog. Explicit markers only."""
+
+    TODAY = dt.date(2049, 1, 10)
+    KEYS = {"slug", "title", "action", "why", "due", "not_before", "urgent", "later",
+            "category", "project"}
+    # slug, title, next_action, tags, due, worker_mode, expected why
+    ROWS = [
+        ("h_tag", "h_tag", "", "todo,decision", "-", None, "owned"),
+        ("h_tagmanual", "h_tagmanual", "", "todo, Decision ", "-", "manual", "owned"),
+        ("h_fm", "h_fm", "", "todo", "-", None, "owned"),
+        ("h_fmfalse", "h_fmfalse", "", "todo", "-", None, "todo"),
+        ("h_title", "진로 결정하기", "방향 결정", "todo", "-", None, "todo"),
+        ("h_soon", "h_soon", "", "todo", "2049-01-12", None, "todo"),
+        ("h_far", "h_far", "", "todo", "2049-02-01", None, "todo"),
+        ("x_dec", "x_dec", "", "todo,decision", "-", None, "owned"),
+        ("n_dec", "n_dec", "", "decision", "-", "manual", "owned"),
+        ("h_blockdec", "h_blockdec", "", "todo,decision", "2049-01-11", "blocked", "blocked"),
+        ("n_manual", "n_manual", "", "todo", "-", "manual", "manual"),
+        ("n_backlog", "n_backlog", "", "todo", "-", None, "backlog"),
+        ("h_badmd", "h_badmd", "", "todo", "-", None, "todo"),
+    ]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        items = self.tmp / "items"
+        items.mkdir()
+        (items / "h_fm.md").write_text("---\nstatus: open\nneeds_decision: true\n---\n# x\n",
+                                       encoding="utf-8")
+        (items / "h_fmfalse.md").write_text("---\nneeds_decision: false\n---\n# x\n",
+                                            encoding="utf-8")
+        (items / "h_badmd.md").write_bytes(b"\xff\xfe not frontmatter ---\n: :\n")
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, title TEXT, status TEXT, due TEXT, "
+                    "not_before TEXT, next_action TEXT, tags TEXT, parent_slug TEXT, "
+                    "is_parent INTEGER, worker_mode TEXT)")
+        con.executemany("INSERT INTO tasks VALUES (?,?,'open',?,NULL,?,?,NULL,0,?)",
+                        [(s, t, d, na, tags, wm) for s, t, na, tags, d, wm, _ in self.ROWS])
+        con.commit()
+        con.close()
+
+        def for_project(slug):
+            if slug.startswith("h_"):
+                return types.SimpleNamespace(id="me")
+            if slug.startswith("x_"):
+                return types.SimpleNamespace(id="bot")
+            return None
+
+        reg = types.SimpleNamespace(
+            agents=[types.SimpleNamespace(id="me", kind="human"),
+                    types.SimpleNamespace(id="bot", kind="ai")],
+            for_project=for_project)
+        M._DECISION_CACHE.clear()
+        self.addCleanup(M._DECISION_CACHE.clear)
+        for p in (mock.patch.object(M, "TODO_DB", db),
+                  mock.patch.object(M, "ITEMS", items),
+                  mock.patch.object(M, "_repo_in_chain", return_value=False),
+                  mock.patch("todo_system.orchestrator.registry.load_registry",
+                             return_value=reg)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _rows(self, assignments=()):
+        return {r["slug"]: r for r in M.collect_human(list(assignments), today=self.TODAY)}
+
+    def test_why_per_contract(self):
+        rows = self._rows()
+        for slug, *_, want in self.ROWS:
+            self.assertEqual(rows[slug]["why"], want, slug)
+
+    def test_title_prose_is_not_a_decision_marker(self):
+        rows = self._rows()
+        self.assertEqual(rows["h_title"]["why"], "todo")
+        self.assertFalse(M._is_decision("todo", "h_title"))
+
+    def test_blocked_decision_is_not_urgent(self):
+        row = self._rows()["h_blockdec"]
+        self.assertEqual(row["why"], "blocked")
+        self.assertFalse(row["urgent"])
+
+    def test_parked_unchanged(self):
+        a = [{"task": "h_tag", "state": "awaiting_human", "note": "", "project": "x"}]
+        out = M.collect_human(a, today=self.TODAY)
+        mine = [r for r in out if r["slug"] == "h_tag"]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["why"], "parked")
+        self.assertTrue(mine[0]["urgent"])
+
+    def test_why_order(self):
+        self.assertEqual(M.WHY_ORDER, {"parked": 0, "owned": 1, "todo": 2, "blocked": 3,
+                                       "manual": 4, "backlog": 5})
+        order = [r["why"] for r in M.collect_human([], today=self.TODAY) if not r["urgent"]]
+        ranks = [M.WHY_ORDER[w] for w in order]
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertLess(order.index("owned"), order.index("todo"))
+        self.assertLess(order.index("todo"), order.index("blocked"))
+
+    def test_todo_urgent_when_due_soon(self):
+        rows = self._rows()
+        self.assertEqual(rows["h_soon"]["why"], "todo")
+        self.assertTrue(rows["h_soon"]["urgent"])
+        self.assertEqual(rows["h_far"]["why"], "todo")
+        self.assertFalse(rows["h_far"]["urgent"])
+
+    def test_category_and_row_keys_unchanged(self):
+        rows = self._rows()
+        self.assertEqual(rows["h_title"]["category"], "life")    # still human_owned-driven
+        for r in rows.values():
+            self.assertEqual(set(r), self.KEYS, r["slug"])
+
+    def test_decision_tag_skips_file_read(self):
+        with mock.patch.object(M, "_needs_decision", wraps=M._needs_decision) as nd:
+            rows = self._rows()
+        self.assertEqual(rows["h_tag"]["why"], "owned")
+        called = {c.args[0] for c in nd.call_args_list}
+        self.assertNotIn("h_tag", called)
+        self.assertNotIn("h_tagmanual", called)
+        self.assertIn("h_fm", called)
+
+    def test_needs_decision_cached_by_mtime(self):
+        import todo_system.session_log as SL
+        with mock.patch.object(SL, "parse_frontmatter", wraps=SL.parse_frontmatter) as pf:
+            self.assertTrue(M._needs_decision("h_fm"))
+            self.assertTrue(M._needs_decision("h_fm"))
+        self.assertEqual(pf.call_count, 1)
+
+    def test_needs_decision_truthy_values(self):
+        items = M.ITEMS
+        for i, (val, want) in enumerate([("true", True), ("yes", True), ("1", True),
+                                         ("on", True), ("'True'", True), ("false", False),
+                                         ("no", False), ("", False), ("maybe", False)]):
+            slug = f"h_v{i}"
+            (items / f"{slug}.md").write_text(f"---\nneeds_decision: {val}\n---\n",
+                                              encoding="utf-8")
+            self.assertIs(M._needs_decision(slug), want, val)
+        self.assertFalse(M._needs_decision("h_missing"))
+
+
+class HumanWhyTodoBadge(unittest.TestCase):
+    """Web badge: todo = 직접 할 일 in the info tone (b-blu), owned keeps 결정필요 (b-pur)."""
+
+    def test_template_entries(self):
+        t = M._HTML_TEMPLATE
+        self.assertIn("todo:['@@dash.js.why_todo@@','b-blu']", t)
+        self.assertIn("owned:['@@dash.js.why_owned@@','b-pur']", t)
+        self.assertNotIn("todo:['@@dash.js.why_todo@@','b-pur']", t)
+
+    def test_rendered_pages(self):
+        self.assertIn("todo:['직접 할 일','b-blu']", M.HTML)
+        self.assertIn("owned:['결정필요','b-pur']", M.HTML)
+        self.assertIn("todo:['to do','b-blu']", M.render_html("en"))
+
+    def test_i18n_keys(self):
+        from todo_system import i18n
+        self.assertEqual(i18n.DASHBOARD["ko"]["dash.js.why_todo"], "직접 할 일")
+        self.assertEqual(i18n.DASHBOARD["en"]["dash.js.why_todo"], "to do")
+        self.assertEqual(i18n.DASHBOARD["ko"]["dash.js.why_owned"], "결정필요")
 
 
 class HumanTriageTimeOfDay(unittest.TestCase):
@@ -2230,8 +2394,10 @@ class StatusSingleFlightTests(unittest.TestCase):
 # exact same bytes. Each test sets MACP_LANGUAGE itself rather than leaning on
 # the conftest pin.
 
-_KO_HTML_SHA256 = "6a46e3157108c6c57f4620bd23f32b8518fd66cd94fec1c1705b48cf706a0091"
-_KO_HTML_LEN = 44138
+# 2026-10-30: +32 bytes = the `todo:['직접 할 일','b-blu'],` WHY entry (human why
+# decision-vs-todo); the rest of the page is byte-identical to the previous golden.
+_KO_HTML_SHA256 = "64edd8626f0a936a0633be5ef5401e9b690b165308ed76e0fd804e850e5cf777"
+_KO_HTML_LEN = 44170
 _HANGUL = re.compile("[가-힣]")
 
 

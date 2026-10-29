@@ -554,7 +554,7 @@ AUTO_MODES = ("auto", "delegate", "quick", "discover")
 # "사람 몫" rows due within this many days (or overdue) — plus pipeline-parked ones —
 # are `urgent` and shown up top; the rest fold away under the life/dev details.
 URGENT_DAYS = 3
-WHY_ORDER = {"parked": 0, "owned": 1, "blocked": 2, "manual": 3, "backlog": 4}
+WHY_ORDER = {"parked": 0, "owned": 1, "todo": 2, "blocked": 3, "manual": 4, "backlog": 5}
 # Fallback only (see _category): tags that mark a repo-less task as a dev/coding
 # project. The primary dev signal is now a `repo:` anywhere in the ancestor chain
 # (any declared coding project, no special tag needed); these catch repo-less dev
@@ -602,6 +602,48 @@ def _repo_in_chain(slug: str, parent_map: dict[str, str]) -> bool:
             return True
         cur = parent_map.get(cur, "")
     return False
+
+
+# A "결정 필요" row is a task someone has to *decide* — marked explicitly with the
+# `decision` tag or `needs_decision: true` frontmatter (docs/dashboard-parity.md
+# "human why"). (path, mtime) → flag cache, same shape as _REPO_CACHE.
+DECISION_TAG = "decision"
+_DECISION_CACHE: dict[str, tuple[float, bool]] = {}
+_TRUTHY = {"true", "yes", "1", "on"}
+
+
+def _needs_decision(slug: str) -> bool:
+    """The `needs_decision:` frontmatter of Todo/items/<slug>.md as a bool, cached
+    per (path, mtime). A missing file or any parse error is swallowed → False, so
+    the row degrades safely to a plain to-do instead of breaking the dashboard."""
+    p = ITEMS / f"{slug}.md"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return False
+    hit = _DECISION_CACHE.get(slug)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    flag = False
+    try:
+        from todo_system.session_log import parse_frontmatter
+        fm, _ = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        v = fm.get("needs_decision")
+        flag = v is True or str(v).strip().strip("'\"").lower() in _TRUTHY
+    except Exception:
+        flag = False
+    _DECISION_CACHE[slug] = (mtime, flag)
+    return flag
+
+
+def _is_decision(tags: str, slug: str) -> bool:
+    """True if the task is a decision: a `decision` tag (no file read) or
+    `needs_decision: true` frontmatter. Explicit markers only — title/next_action
+    prose is never read."""
+    t = {x.strip().lower() for x in (tags or "").split(",")}
+    if DECISION_TAG in t:
+        return True
+    return _needs_decision(slug)
 
 
 def _category(tags: str, repo_present: bool = False, human_owned: bool = False) -> str:
@@ -905,9 +947,10 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                   now: dt.datetime | None = None,
                   umbrellas: frozenset | set = frozenset()) -> list[dict]:
     """Everything that needs a person, not the worker: pipeline-parked tasks
-    (awaiting_human), human-owned decisions (registry human agent), and every open
-    leaf todo that ISN'T auto-worked — blocked (unblock), manual (hand-dev), or
-    with no worker_mode set (needs a decision / routing).
+    (awaiting_human), decision tasks (`decision` tag / `needs_decision` → `owned`),
+    human-owned to-dos (registry human agent, not a decision → `todo`), and every
+    open leaf todo that ISN'T auto-worked — blocked (unblock), manual (hand-dev),
+    or with no worker_mode set (needs routing).
 
     Each row carries `urgent` (see _is_urgent) and `later` — true when its
     `not_before` is still in the future (not actionable yet; collect_status moves
@@ -963,9 +1006,11 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                     owner = reg.for_project(slug) if reg else None
                     human_owned = bool(owner and owner.id in human_ids)
                     if wm == "blocked":
-                        why = "blocked"                # waiting — beats owned: nothing to decide yet
+                        why = "blocked"                # waiting — beats a decision: nothing to act on yet
+                    elif _is_decision(r["tags"], slug):
+                        why = "owned"                  # a real decision (tag / needs_decision) — any owner
                     elif human_owned:
-                        why = "owned"                  # personal decision (withdrawal/job/email)
+                        why = "todo"                   # a person does it (on its due/not_before)
                     elif wm == "manual":
                         why = "manual"                 # hand-developed
                     else:
@@ -1816,7 +1861,7 @@ const at=e=>e==null?'':new Date(e*1000).toLocaleString('@@dash.js.locale@@',{mon
 const LIM=10, PROJLIM=5, ACTLIM=6, showAll={runs:false,recent:false,projects:false,active:false};
 let last=null, mounted=false;
 
-const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owned@@','b-pur'],blocked:['@@dash.js.why_blocked@@','b-fail'],manual:['@@dash.js.why_manual@@','b-gray'],backlog:['@@dash.js.why_backlog@@','b-blu']};
+const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owned@@','b-pur'],todo:['@@dash.js.why_todo@@','b-blu'],blocked:['@@dash.js.why_blocked@@','b-fail'],manual:['@@dash.js.why_manual@@','b-gray'],backlog:['@@dash.js.why_backlog@@','b-blu']};
 const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m[1]}">${m[0]}</span>`};
 
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
