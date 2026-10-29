@@ -4383,6 +4383,12 @@ class UsageKillSwitchArgvTest(unittest.TestCase):
         patcher = mock.patch.object(ms, "resolve_model", return_value="model-x")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # host-independent: the pre-instrumentation argv formula asserted below
+        # assumes no browser MCP server is configured, regardless of whether
+        # this host actually has one installed.
+        mcp_patcher = mock.patch.object(stages, "browser_mcp_server", return_value=None)
+        mcp_patcher.start()
+        self.addCleanup(mcp_patcher.stop)
 
     def _argv(self, switch):
         with mock.patch.dict(os.environ):
