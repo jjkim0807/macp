@@ -400,7 +400,16 @@ def sync_due_tasks_to_calendar(
     calendar_id: str,
     client_secret_path: Path,
     token_path: Path,
+    calendar_routes: Sequence[CalendarRoute] | None = None,
 ) -> tuple[int, int]:
+    """Upsert open human-owned tasks as events and delete stale todo events.
+
+    ``calendar_routes`` (``--calendar-route TAG=CALENDAR_ID``) sends a task to
+    the calendar of its first routed tag (see :func:`route_calendar`); an
+    unrouted task goes to ``calendar_id``. Cleanup covers every managed
+    calendar (``calendar_id`` plus each route calendar). No routes → only
+    ``calendar_id``, exactly as before routing existed.
+    """
     creds = load_credentials(client_secret_path, token_path)
     service = build("calendar", "v3", credentials=creds)
 
@@ -408,9 +417,12 @@ def sync_due_tasks_to_calendar(
     # auto/delegate/... tasks are the pipeline's to do, and are tracked in
     # Worker/queue.json + the dashboard instead.
     human_owned, human_params = human_owned_sql_filter()
+    # `tags` is read only when routing needs it, so the no-route query is the
+    # same text as before.
+    cols = "slug, title, due, next_action, path" + (", tags" if calendar_routes else "")
     rows = con.execute(
         f"""
-        SELECT slug, title, due, next_action, path
+        SELECT {cols}
         FROM tasks
         WHERE status = 'open'
           AND {human_owned}
@@ -432,40 +444,53 @@ def sync_due_tasks_to_calendar(
                 covered_parents.add(parent)
     rows = [r for r in rows if str(r["slug"]) not in covered_parents]
 
-    # --- Cleanup: delete stale events (slug not in current open tasks) ---
+    # Each synced slug → the one calendar its event belongs in.
+    target_by_slug = {
+        str(r["slug"]): (
+            route_calendar(_split_tags(r["tags"]), calendar_routes, calendar_id)
+            if calendar_routes else calendar_id
+        )
+        for r in rows
+    }
+
+    # --- Cleanup: delete stale events in every managed calendar ---
+    # Stale = the event's todo_slug is not synced any more, or is synced to a
+    # different calendar (the task moved: it is inserted fresh in its new
+    # calendar from the md, so edits made to the old event in the calendar app
+    # are dropped). Events without a todo_slug are never touched.
     # Lookback is generous: an event only gets deleted if it carries a
-    # todo_slug we no longer sync, and events drift out of a narrow window
+    # todo_slug we no longer sync here, and events drift out of a narrow window
     # (done long ago, or newly worker-owned) faster than they get cleaned.
-    open_slugs = {str(r["slug"]) for r in rows}
     now = dt.datetime.now(_event_tzinfo())
     time_min = (now - dt.timedelta(days=400)).isoformat()
     time_max = (now + dt.timedelta(days=400)).isoformat()
     deleted_stale = 0
-    page_token: str | None = None
-    while True:
-        all_events = (
-            service.events()
-            .list(
-                calendarId=calendar_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                maxResults=500,
-                pageToken=page_token,
+    for cal in managed_calendars(calendar_id, calendar_routes):
+        page_token: str | None = None
+        while True:
+            all_events = (
+                service.events()
+                .list(
+                    calendarId=cal,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    maxResults=500,
+                    pageToken=page_token,
+                )
+                .execute()
             )
-            .execute()
-        )
-        for ev in all_events.get("items", []):
-            slug = ev.get("extendedProperties", {}).get("private", {}).get("todo_slug")
-            if slug and slug not in open_slugs:
-                try:
-                    service.events().delete(calendarId=calendar_id, eventId=ev["id"]).execute()
-                    deleted_stale += 1
-                except Exception:
-                    pass
-        page_token = all_events.get("nextPageToken")
-        if not page_token:
-            break
+            for ev in all_events.get("items", []):
+                slug = ev.get("extendedProperties", {}).get("private", {}).get("todo_slug")
+                if slug and target_by_slug.get(slug) != cal:
+                    try:
+                        service.events().delete(calendarId=cal, eventId=ev["id"]).execute()
+                        deleted_stale += 1
+                    except Exception:
+                        pass
+            page_token = all_events.get("nextPageToken")
+            if not page_token:
+                break
 
     created_or_updated = 0
     skipped = 0
@@ -485,7 +510,7 @@ def sync_due_tasks_to_calendar(
         effective_due = due if has_due else sched_date
         result = _upsert_event(
             service=service,
-            calendar_id=calendar_id,
+            calendar_id=target_by_slug[str(row["slug"])],
             slug=str(row["slug"]),
             title=str(row["title"]),
             due=str(effective_due),
