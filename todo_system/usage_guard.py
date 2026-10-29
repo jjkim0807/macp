@@ -157,7 +157,21 @@ def _cfg() -> dict:
         # use, so the step only needs to taper fan-out near that line.
         "session_parallel_step": f("USAGE_GUARD_SESSION_PARALLEL_STEP", 8.0),
         "weekly_parallel_step": f("USAGE_GUARD_WEEKLY_PARALLEL_STEP", 5.0),
+        # Opt-in minimum-progress mode (orchestrator `_min_progress_dispatch`):
+        # during a *pace* hold with nothing live, still dispatch the single top
+        # priority task. Hard-cap / paused / no-data holds stay full holds. Off
+        # by default so the plain hold behaviour is unchanged.
+        "min_progress": os.environ.get("USAGE_GUARD_MIN_PROGRESS", "0").strip().lower()
+                        in ("1", "true", "yes", "on"),
     }
+
+
+def min_progress_enabled() -> bool:
+    """Whether `USAGE_GUARD_MIN_PROGRESS` is on (read per call). Never raises."""
+    try:
+        return bool(_cfg()["min_progress"])
+    except Exception:
+        return False
 
 
 def _state_path() -> Path:
@@ -471,6 +485,26 @@ def _parse_iso(ts: str | None) -> float | None:
         return None
 
 
+def _iso_utc(ts: float | None) -> str | None:
+    """Epoch -> ISO 8601 UTC string (seconds precision), None-safe."""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def pace_release_at(util: float, resets_at: float, window_s: float,
+                    allowance: float) -> float:
+    """When a pace hold lifts: the moment elapsed% + allowance catches up to
+    `util` (linear in the window clock), or the window reset if that comes
+    first — a window that cannot catch up before it resets is released by the
+    reset. Pure."""
+    catch_up = resets_at - window_s * (1.0 - (util - allowance) / 100.0)
+    return min(catch_up, resets_at)
+
+
 def _eval_window(name: str, info: dict | None, window_s: float,
                  hard_cap: float, allowance: float, now: float) -> dict:
     """Decision for one rolling window (session/weekly).
@@ -515,9 +549,9 @@ def _eval_window(name: str, info: dict | None, window_s: float,
         return out
     if util > elapsed_pct + allowance:
         # catch-up time: when elapsed% + allowance == util
-        catch_up = resets_at - window_s * (1.0 - (util - allowance) / 100.0)
         out.update({
-            "blocked": True, "blocked_until": min(catch_up, resets_at),
+            "blocked": True,
+            "blocked_until": pace_release_at(util, resets_at, window_s, allowance),
             "reason": f"{name} {util:.0f}% ahead of pace "
                       f"({elapsed_pct:.0f}% elapsed + {allowance:.0f}pp allowance)",
         })
@@ -535,13 +569,62 @@ def evaluate(usage: dict, now: float | None = None) -> dict:
                      cfg["weekly_hard_cap"], cfg["weekly_allowance"], now),
     ]
     blocked = [w for w in windows if w["blocked"]]
+    until = max((w["blocked_until"] for w in blocked), default=None)
     return {
         "allowed": not blocked,
         "reason": "; ".join(w["reason"] for w in blocked) or None,
-        "blocked_until": max((w["blocked_until"] for w in blocked), default=None),
+        "blocked_until": until,
+        "release_eta": _iso_utc(until),
         "windows": windows,
         "checked_at": now,
     }
+
+
+def hold_kind(decision: dict | None) -> str | None:
+    """Classify a decision's hold. Pure; never raises.
+
+    - None: not a hold (allowed, or the guard is disabled).
+    - "paused": every account unavailable (`_paused_decision`).
+    - "no_data": a carried no-data hold, or a fail-closed one with no windows.
+    - "hard_cap": some blocked window is at/over its hard cap.
+    - "pace": blocked windows exist and none is at its hard cap.
+    - "unknown": anything else (e.g. a hand-built `{"allowed": False}`).
+
+    Derived from the existing window fields plus `_cfg()`, so the decision
+    shape stays as it was.
+    """
+    try:
+        if not decision or decision.get("disabled") or decision.get("allowed", True):
+            return None
+        if decision.get("paused"):
+            return "paused"
+        if decision.get("carried"):
+            return "no_data"
+        windows = decision.get("windows")
+        if isinstance(windows, list) and not windows:
+            return "no_data"
+        blocked = [w for w in windows or [] if isinstance(w, dict) and w.get("blocked")]
+        if not blocked:
+            return "unknown"
+        cfg = _cfg()
+        kinds = set()
+        for w in blocked:
+            name = w.get("name")
+            util = w.get("utilization")
+            if "hard cap" in str(w.get("reason") or ""):
+                kinds.add("hard_cap")
+            elif name not in ("session", "weekly") or util is None:
+                kinds.add("unknown")
+            elif float(util) >= cfg[f"{name}_hard_cap"]:
+                kinds.add("hard_cap")
+            else:
+                kinds.add("pace")
+        for k in ("hard_cap", "unknown"):
+            if k in kinds:
+                return k
+        return "pace"
+    except Exception:
+        return "unknown"
 
 
 def window_slack(w: dict, cfg: dict | None = None) -> float | None:
@@ -646,6 +729,7 @@ def _no_data_decision(state: dict, cfg: dict, now: float) -> dict:
             "reason": f"no usage data ({err}) — holding last known block: {held}",
             "held_reason": held,
             "blocked_until": until,
+            "release_eta": _iso_utc(until),
             "windows": prior.get("windows") or [],
             "checked_at": now, "stale": True, "carried": True,
             "age_s": age_s, "last_error": last_error, "next_retry_at": next_retry_at,
@@ -654,7 +738,7 @@ def _no_data_decision(state: dict, cfg: dict, now: float) -> dict:
         "allowed": not cfg["fail_closed"],
         "reason": f"no usage data ({err}) — "
                   + ("fail-closed" if cfg["fail_closed"] else "fail-open"),
-        "blocked_until": None, "windows": [], "checked_at": now,
+        "blocked_until": None, "release_eta": None, "windows": [], "checked_at": now,
         "stale": True,
         "age_s": age_s, "last_error": last_error, "next_retry_at": next_retry_at,
     }
@@ -824,12 +908,14 @@ def _paused_decision(cands, decision: dict, now: float) -> dict:
         until = _acc.until_epoch(entry)
         if until is not None:
             untils.append(until)
+    until = min(untils) if untils else None
     return {
         "allowed": False,
         "reason": "all accounts unavailable: "
                   + ", ".join(f"{n}({r})" for n, r in reasons.items()),
         "paused": True,
-        "blocked_until": min(untils) if untils else None,
+        "blocked_until": until,
+        "release_eta": _iso_utc(until),
         "windows": decision.get("windows") or [],
         "checked_at": now,
         "stale": bool(decision.get("stale")),
