@@ -1861,7 +1861,7 @@ const at=e=>e==null?'':new Date(e*1000).toLocaleString('@@dash.js.locale@@',{mon
 const LIM=10, PROJLIM=5, ACTLIM=6, showAll={runs:false,recent:false,projects:false,active:false};
 let last=null, mounted=false;
 
-const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owned@@','b-pur'],blocked:['@@dash.js.why_blocked@@','b-fail'],manual:['@@dash.js.why_manual@@','b-gray'],backlog:['@@dash.js.why_backlog@@','b-blu']};
+const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owned@@','b-pur'],todo:['@@dash.js.why_todo@@','b-blu'],blocked:['@@dash.js.why_blocked@@','b-fail'],manual:['@@dash.js.why_manual@@','b-gray'],backlog:['@@dash.js.why_backlog@@','b-blu']};
 const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m[1]}">${m[0]}</span>`};
 
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
