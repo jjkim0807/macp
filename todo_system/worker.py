@@ -1042,6 +1042,8 @@ _GIT_TIMEOUT_S = 10
 # `uv sync` resolves + links an environment; far slower than a git read, so it
 # gets its own ceiling rather than the 10s git timeout.
 _UV_SYNC_TIMEOUT_S = 300
+# `npm ci` wipes and reinstalls node_modules — the same order of cost as uv sync.
+_NPM_CI_TIMEOUT_S = 300
 # Injection seam for the budget tests. Patching `time.monotonic` itself would not
 # do: `subprocess.run(timeout=…)` reads the same function, so a fake clock turns
 # real git calls into bogus `TimeoutExpired` that the fail-open path swallows,
@@ -1373,6 +1375,163 @@ def sync_wrappers(*, engine: Path | None = None,
             print(f"wrapper-sync: {name} skipped — {exc}")
             continue
     return synced
+
+
+def _browser_npm_bin() -> str:
+    """The ``npm`` beside ``MACP_BROWSER_NODE`` when that is a path, else ``npm``.
+
+    A node installed outside the unit's PATH (nvm, a tarball) ships its npm in
+    the same ``bin/`` — the PATH lookup alone would miss it.
+    """
+    node = browser_watch.node_bin()
+    if "/" in node:
+        npm = Path(node).expanduser().parent / "npm"
+        if npm.is_file():
+            return str(npm)
+    return "npm"
+
+
+def _browser_modules_match_lock(d: Path) -> bool | None:
+    """Whether ``d/node_modules`` holds every direct dependency the lock pins.
+
+    Names come from ``package-lock.json`` → ``packages[""]`` dependencies and
+    devDependencies (optional ones may legitimately be absent). Each needs a
+    ``node_modules/<name>/package.json`` and, when the lock records a version
+    for it, the same ``version``. Version drift matters for the retry case: a
+    pull changed the lock, ``npm ci`` failed, and the next tick sees no new
+    commit while node_modules still holds the old versions.
+
+    None when the lock cannot be read or has an unexpected shape.
+    """
+    try:
+        lock = json.loads((d / "package-lock.json").read_text(encoding="utf-8"))
+        packages = lock["packages"]
+        root = packages[""]
+        names = [*root.get("dependencies", {}), *root.get("devDependencies", {})]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+            KeyError, TypeError, AttributeError):
+        return None
+    for name in names:
+        manifest = d / "node_modules" / name / "package.json"
+        if not manifest.is_file():
+            return False
+        entry = packages.get(f"node_modules/{name}")
+        want = entry.get("version") if isinstance(entry, dict) else None
+        if want is None:
+            continue
+        try:
+            have = json.loads(manifest.read_text(encoding="utf-8")).get("version")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return False
+        if have != want:
+            return False
+    return True
+
+
+def pull_browser_checkout(
+    *,
+    browser_dir: Path | None = None,
+    run: Callable = subprocess.run,
+) -> list[str]:
+    """Best-effort ff-only pull of the macp-browser checkout + ``npm ci`` on drift.
+
+    The logged-in browser's MCP server runs from its own checkout
+    (``MACP_BROWSER_DIR``, resolved by :func:`browser_watch.browser_dir`), which
+    nothing pulled: on 2026-10-28 it was still on a commit from eight days
+    earlier, so a merged server rewrite never deployed — and once pulled by
+    hand, a newly added npm dependency was not installed either. Each tick this
+    fetches and ``pull --ff-only``s ``main``, then runs ``npm ci`` when the pull
+    changed ``package-lock.json`` or ``node_modules`` no longer matches the
+    lock's direct dependencies (see :func:`_browser_modules_match_lock`).
+
+    Safety mirrors :func:`pull_engine_checkout`: skipped with one log line when
+    HEAD is not ``main`` or a tracked file has uncommitted changes (untracked
+    files do not count — the checkout's profile, leases and node_modules are
+    ignored anyway, and a stray file must not freeze updates forever), and
+    ``--ff-only`` so a local commit fails loudly instead of merging/rebasing.
+    No-op with zero subprocess calls when the directory is missing or is not a
+    git checkout, so a host without the browser sees no change at all.
+
+    Caveat: ``npm ci`` removes node_modules before reinstalling, so an MCP
+    server *starting* in that window can fail to load; servers already running
+    have their modules loaded and are unaffected.
+
+    Returns failure reasons (empty on success and every skip / no-op), the same
+    contract as :func:`pull_engine_checkout`; ``npm`` missing is a quiet skip.
+    ``browser_dir`` / ``run`` are test seams; runtime calls pass nothing.
+    """
+    d = Path(browser_dir) if browser_dir is not None else browser_watch.browser_dir()
+    if not (d / ".git").exists():
+        return []
+
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return run(
+            ["git", "-C", str(d), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_S,
+        )
+
+    try:
+        if _git("branch", "--show-current").stdout.strip() != "main":
+            print("browser-pull: skip — HEAD가 main이 아님")
+            return []
+        if _git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            print("browser-pull: skip — 체크아웃 dirty")
+            return []
+        before = _git("rev-parse", "--short", "HEAD").stdout.strip()
+        if _git("fetch", "origin", "main").returncode != 0:
+            return ["browser-pull: fetch 실패"]
+        if _git("pull", "--ff-only", "origin", "main").returncode != 0:
+            return ["browser-pull: ff-only pull 실패 (로컬 커밋?)"]
+        after = _git("rev-parse", "--short", "HEAD").stdout.strip()
+        # `diff --quiet` exits 1 when package-lock.json differs between the two.
+        lock_changed = before != after and _git(
+            "diff", "--quiet", before, after, "--", "package-lock.json"
+        ).returncode != 0
+    except subprocess.TimeoutExpired:
+        return ["browser-pull: git 타임아웃"]
+
+    pulled = f"pulled {before} -> {after}" if before != after else ""
+    if not (d / "package-lock.json").is_file():
+        need_ci = False
+    elif lock_changed:
+        need_ci = True
+    else:
+        match = _browser_modules_match_lock(d)
+        if match is None:
+            print("browser-pull: skip npm — package-lock.json 파싱 실패")
+            if pulled:
+                print(f"browser-pull: {pulled}")
+            return []
+        need_ci = not match
+    if not need_ci:
+        if pulled:
+            print(f"browser-pull: {pulled}")
+        return []
+
+    try:
+        proc = run(
+            [_browser_npm_bin(), "ci", "--no-audit", "--no-fund"],
+            cwd=str(d),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_NPM_CI_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        print(f"browser-pull: {pulled + ', ' if pulled else ''}skip — npm 없음")
+        return []
+    except subprocess.TimeoutExpired:
+        return ["browser-pull: npm ci 타임아웃"]
+    if proc.returncode != 0:
+        return ["browser-pull: npm ci 실패"]
+    if pulled:
+        print(f"browser-pull: {pulled} + npm ci")
+    else:
+        print("browser-pull: npm ci (node_modules가 잠금과 다름)")
+    return []
 
 
 def _resolve_base_ref(repo_root: Path) -> str | None:
@@ -2047,6 +2206,16 @@ def cmd_maintenance() -> int:
                 print(f"wrapper-sync: {name} (re)installed")
         except Exception as exc:
             print(f"wrapper-sync: error — {exc}")
+            rc = 1
+        # The logged-in browser's MCP server lives in its own checkout; a merged
+        # macp-browser PR (server code / npm deps) must reach it without a human
+        # pull (2026-10-28: stuck checkout, then @modelcontextprotocol/sdk missing).
+        try:
+            for reason in pull_browser_checkout():
+                print(reason)
+                rc = 1
+        except Exception as exc:
+            print(f"browser-pull: error — {exc}")
             rc = 1
         # macp edits its own source; the daemons executing those edits are
         # resident and would otherwise never load them.
