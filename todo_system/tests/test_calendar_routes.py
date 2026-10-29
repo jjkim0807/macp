@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from todo_system import calendar_sync as CS
+from todo_system import cli as CLI
 
 DEFAULT = "default@example.com"
 A = "a@example.com"
@@ -277,3 +278,52 @@ def test_empty_routes_behave_like_none_on_a_tagless_schema(monkeypatch):
     assert events.scans == [DEFAULT]
     assert [cal for cal, _ in events.inserted] == [DEFAULT]
     assert events.deleted == [(DEFAULT, "stale")]
+
+
+# --- CLI flag ------------------------------------------------------------------
+
+SUBCOMMANDS = ["import-md", "daemon", "calendar-sync"]
+
+
+@pytest.mark.parametrize("sub", SUBCOMMANDS)
+def test_parser_collects_repeated_routes(sub):
+    args = CLI.build_parser().parse_args([
+        sub, "--calendar-route", "red=a@example.com", "--calendar-route", "blue=b@example.com"])
+    assert args.calendar_route == [("red", A), ("blue", B)]
+
+
+@pytest.mark.parametrize("sub", SUBCOMMANDS)
+def test_parser_without_routes_is_none(sub):
+    assert CLI.build_parser().parse_args([sub]).calendar_route is None
+
+
+@pytest.mark.parametrize("sub", SUBCOMMANDS)
+def test_parser_rejects_a_malformed_route(sub):
+    with pytest.raises(SystemExit):
+        CLI.build_parser().parse_args([sub, "--calendar-route", "red"])
+
+
+def test_calendar_sync_command_passes_routes_through(monkeypatch):
+    import sqlite3
+
+    seen: dict = {}
+
+    def _fake_sync(**kw):
+        seen.update(kw)
+        return 0, 0
+
+    monkeypatch.setattr(CLI, "db_connect", lambda *a, **k: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(CLI, "init_db", lambda *a, **k: None)
+    monkeypatch.setattr(CLI, "import_markdown_to_db", lambda *a, **k: 0)
+    monkeypatch.setattr(CLI, "sync_due_tasks_to_calendar", _fake_sync)
+
+    args = CLI.build_parser().parse_args([
+        "calendar-sync", "--calendar-id", DEFAULT, "--calendar-route", "red=a@example.com"])
+    assert args.func(args) == 0
+    assert seen["calendar_id"] == DEFAULT
+    assert seen["calendar_routes"] == [("red", A)]
+
+    seen.clear()
+    args = CLI.build_parser().parse_args(["calendar-sync", "--calendar-id", DEFAULT])
+    assert args.func(args) == 0
+    assert seen["calendar_routes"] is None
