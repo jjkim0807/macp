@@ -572,3 +572,117 @@ def test_disable_switch_only_on_exact_one(monkeypatch):
     monkeypatch.setattr(ug, "get_snapshot", lambda **k: {"error": "x"})
     monkeypatch.setattr(ug, "_save_state", lambda s: None)
     assert ug.check().get("disabled") is None
+
+
+# ---------------------------------------------------------------------------
+# release ETA (pure pace_release_at), hold kind, min-progress switch
+# ---------------------------------------------------------------------------
+
+_R = NOW + 10 * 86400.0  # an arbitrary reset epoch for the pure-function table
+
+
+@pytest.mark.parametrize("util,allowance,window_s,expected", [
+    # (a) session catches up before the reset: elapsed% must reach 50-30=20%
+    (50.0, 30.0, ug.SESSION_WINDOW_S, _R - ug.SESSION_WINDOW_S * 0.8),
+    # (b) boundary: catch-up lands exactly on the reset
+    (100.0, 0.0, ug.SESSION_WINDOW_S, _R),
+    # (c) cannot catch up before the reset -> the reset releases it
+    (120.0, 10.0, ug.SESSION_WINDOW_S, _R),
+    # (d) weekly: elapsed% must reach 40-12=28%
+    (40.0, 12.0, ug.WEEKLY_WINDOW_S, _R - ug.WEEKLY_WINDOW_S * 0.72),
+])
+def test_pace_release_at_table(util, allowance, window_s, expected):
+    assert ug.pace_release_at(util, _R, window_s, allowance) == pytest.approx(expected)
+
+
+def test_pace_release_at_matches_eval_window():
+    # regression guard: the extraction kept _eval_window's blocked_until value
+    reset = NOW + 7 * 86400.0
+    w = ug._eval_window("weekly", {"utilization": 40.0,
+                                   "resets_at": _iso_in(7 * 86400.0)},
+                        ug.WEEKLY_WINDOW_S, 90.0, 12.0, NOW)
+    assert w["blocked"] and "ahead of pace" in w["reason"]
+    assert w["blocked_until"] == pytest.approx(
+        ug.pace_release_at(40.0, reset, ug.WEEKLY_WINDOW_S, 12.0))
+
+
+def test_pace_hold_has_release_eta_and_kind():
+    d = ug.evaluate(_usage(weekly_util=40.0, weekly_reset_in=7 * 86400.0), NOW)
+    assert not d["allowed"]
+    assert d["release_eta"] == ug._iso_utc(d["blocked_until"])
+    assert d["release_eta"].endswith("+00:00")
+    assert datetime.fromisoformat(d["release_eta"]).timestamp() == \
+        pytest.approx(d["blocked_until"], abs=1)
+    assert ug.hold_kind(d) == "pace"
+
+
+def test_weekly_hard_cap_hold_kind_and_eta_is_reset():
+    d = ug.evaluate(_usage(weekly_util=ug._cfg()["weekly_hard_cap"] + 1.0), NOW)
+    assert ug.hold_kind(d) == "hard_cap"
+    weekly = next(w for w in d["windows"] if w["name"] == "weekly")
+    assert d["release_eta"] == ug._iso_utc(weekly["resets_at"])
+
+
+def test_session_hard_cap_hold_kind():
+    d = ug.evaluate(_usage(session_util=ug._cfg()["session_hard_cap"] + 1.0), NOW)
+    assert ug.hold_kind(d) == "hard_cap"
+
+
+def test_mixed_pace_and_hard_cap_is_hard_cap_with_max_eta():
+    # session ahead of pace (just started, 50% used) + weekly at the hard cap
+    d = ug.evaluate(_usage(session_util=50.0, session_reset_in=ug.SESSION_WINDOW_S,
+                           weekly_util=ug._cfg()["weekly_hard_cap"] + 1.0), NOW)
+    assert all(w["blocked"] for w in d["windows"])
+    assert ug.hold_kind(d) == "hard_cap"
+    assert d["release_eta"] == ug._iso_utc(max(w["blocked_until"] for w in d["windows"]))
+
+
+def test_allowed_decision_has_no_kind_or_eta():
+    d = ug.evaluate(_usage(), NOW)
+    assert d["allowed"]
+    assert ug.hold_kind(d) is None
+    assert d["release_eta"] is None
+    assert ug.hold_kind({"allowed": True, "disabled": True}) is None
+
+
+def test_no_data_decisions_kind_and_eta(monkeypatch):
+    cfg = ug._cfg()
+    carried = ug._no_data_decision(_blocked_state(blocked_until=NOW + 3600), cfg, NOW)
+    assert carried["carried"] is True
+    assert ug.hold_kind(carried) == "no_data"
+    assert carried["release_eta"] == ug._iso_utc(NOW + 3600)
+
+    fresh = ug._no_data_decision({"error": "offline"}, cfg, NOW)
+    assert fresh["release_eta"] is None
+    monkeypatch.setenv("USAGE_GUARD_FAIL_CLOSED", "1")
+    closed = ug._no_data_decision({"error": "offline"}, ug._cfg(), NOW)
+    assert not closed["allowed"]
+    assert ug.hold_kind(closed) == "no_data"
+
+
+def test_hold_kind_paused_and_unknown():
+    assert ug.hold_kind({"allowed": False, "paused": True,
+                         "windows": [], "reason": "all accounts unavailable"}) == "paused"
+    assert ug.hold_kind({"allowed": False, "reason": "x"}) == "unknown"
+
+
+def test_min_progress_switch_default_off(monkeypatch):
+    assert ug.min_progress_enabled() is False
+    monkeypatch.setenv("USAGE_GUARD_MIN_PROGRESS", "0")
+    assert ug.min_progress_enabled() is False
+    monkeypatch.setenv("USAGE_GUARD_MIN_PROGRESS", "1")
+    assert ug.min_progress_enabled() is True
+
+
+def test_check_persists_release_eta(tmp_path, monkeypatch):
+    monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
+    (tmp_path / "latest.json").write_text(json.dumps({
+        "fetched_at": NOW - 10,
+        "usage": _usage(weekly_util=40.0, weekly_reset_in=7 * 86400.0),
+    }))
+    monkeypatch.setattr(ug, "_fetch_usage", lambda: None)
+    d = ug.check(now=NOW)
+    assert not d["allowed"]
+    state = json.loads((tmp_path / "latest.json").read_text())
+    assert state["decision"]["release_eta"] == d["release_eta"]
+    assert state["decision"]["release_eta"] == ug._iso_utc(d["blocked_until"])
