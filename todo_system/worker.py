@@ -2207,6 +2207,16 @@ def cmd_maintenance() -> int:
         except Exception as exc:
             print(f"wrapper-sync: error — {exc}")
             rc = 1
+        # The logged-in browser's MCP server lives in its own checkout; a merged
+        # macp-browser PR (server code / npm deps) must reach it without a human
+        # pull (2026-10-28: stuck checkout, then @modelcontextprotocol/sdk missing).
+        try:
+            for reason in pull_browser_checkout():
+                print(reason)
+                rc = 1
+        except Exception as exc:
+            print(f"browser-pull: error — {exc}")
+            rc = 1
         # macp edits its own source; the daemons executing those edits are
         # resident and would otherwise never load them.
         try:

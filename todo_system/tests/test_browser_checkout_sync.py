@@ -359,3 +359,58 @@ def test_npm_bin_next_to_node(tmp_path, monkeypatch):
 
     monkeypatch.delenv("MACP_BROWSER_NODE", raising=False)
     assert worker._browser_npm_bin() == "npm"
+
+
+def _neutralise_tick(monkeypatch) -> list[str]:
+    """Stub every other upkeep step; returns the list restart_stale_daemons appends to."""
+    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
+    monkeypatch.setattr(worker, "autoclose_stale_reviews_local", lambda: 0)
+    monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
+    monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
+    monkeypatch.setattr(worker, "rotate_logs", lambda: [])
+    monkeypatch.setattr(worker, "check_unapplied_migrations", lambda: [])
+    monkeypatch.setattr(worker, "pull_engine_checkout", lambda: [])
+    monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: [])
+    monkeypatch.setattr(worker, "sync_wrappers", lambda: [])
+    monkeypatch.setattr(worker, "check_dispatch_silence", lambda: None)
+    monkeypatch.setattr(worker, "check_work_starvation", lambda: None)
+    monkeypatch.setattr(worker.browser_watch, "check_login_watch", lambda **kw: None)
+    restarted: list[str] = []
+
+    def _restart():
+        restarted.append("called")
+        return []
+
+    monkeypatch.setattr(worker, "restart_stale_daemons", _restart)
+    return restarted
+
+
+def test_cmd_maintenance_npm_failure_does_not_block(monkeypatch, capsys):
+    restarted = _neutralise_tick(monkeypatch)
+    monkeypatch.setattr(worker, "pull_browser_checkout", lambda: ["browser-pull: npm ci 실패"])
+
+    assert worker.cmd_maintenance() == 1
+    assert restarted == ["called"]  # the step after browser-pull still ran
+    assert "browser-pull: npm ci 실패" in capsys.readouterr().out
+
+
+def test_cmd_maintenance_browser_pull_exception_does_not_block(monkeypatch, capsys):
+    restarted = _neutralise_tick(monkeypatch)
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(worker, "pull_browser_checkout", _boom)
+
+    assert worker.cmd_maintenance() == 1
+    assert restarted == ["called"]
+    assert "browser-pull: error — boom" in capsys.readouterr().out
+
+
+def test_cmd_maintenance_clean_browser_pull_keeps_rc_zero(monkeypatch):
+    # Control: with every step stubbed clean, rc 1 above can only come from browser-pull.
+    restarted = _neutralise_tick(monkeypatch)
+    monkeypatch.setattr(worker, "pull_browser_checkout", lambda: [])
+
+    assert worker.cmd_maintenance() == 0
+    assert restarted == ["called"]
