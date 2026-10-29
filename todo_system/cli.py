@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .calendar_sync import render_calendar_markdown, render_unified_markdown, sync_due_tasks_to_calendar
+from .calendar_sync import (
+    parse_calendar_route,
+    render_calendar_markdown,
+    render_unified_markdown,
+    sync_due_tasks_to_calendar,
+)
 from . import graph_memory as _graph_memory
 from . import not_before as _not_before
 from . import ownership as _ownership
@@ -1264,6 +1269,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 calendar_id=args.calendar_id,
                 client_secret_path=Path(args.gcal_client_secret),
                 token_path=Path(args.gcal_token),
+                calendar_routes=getattr(args, "calendar_route", None),
             )
             print(
                 f"calendar sync complete: {created_or_updated} upserted, {skipped} skipped "
@@ -1387,6 +1393,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 calendar_id=args.calendar_id,
                 client_secret_path=Path(args.gcal_client_secret),
                 token_path=Path(args.gcal_token),
+                calendar_routes=getattr(args, "calendar_route", None),
             )
             print(
                 f"[{dt.datetime.now().isoformat(timespec='seconds')}] calendar sync: "
@@ -1435,6 +1442,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                             calendar_id=args.calendar_id,
                             client_secret_path=Path(args.gcal_client_secret),
                             token_path=Path(args.gcal_token),
+                            calendar_routes=getattr(args, "calendar_route", None),
                         )
                         last_calendar_sync = time.monotonic()
                         print(
@@ -1515,6 +1523,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                         calendar_id=args.calendar_id,
                         client_secret_path=Path(args.gcal_client_secret),
                         token_path=Path(args.gcal_token),
+                        calendar_routes=getattr(args, "calendar_route", None),
                     )
                     if created_or_updated:
                         print(
@@ -1796,6 +1805,7 @@ def cmd_calendar_sync(args: argparse.Namespace) -> int:
             calendar_id=args.calendar_id,
             client_secret_path=Path(args.gcal_client_secret),
             token_path=Path(args.gcal_token),
+            calendar_routes=getattr(args, "calendar_route", None),
         )
         print(
             f"calendar sync complete: {created_or_updated} upserted, {skipped} skipped "
@@ -1938,6 +1948,19 @@ def cmd_tracker(args: argparse.Namespace) -> int:
     return 2
 
 
+def _add_calendar_route_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--calendar-route",
+        action="append",
+        type=parse_calendar_route,
+        default=None,
+        metavar="TAG=CALENDAR_ID",
+        help="Send open tasks carrying TAG to CALENDAR_ID (repeatable; the task's first "
+             "routed tag wins, otherwise --calendar-id). Every route calendar is also "
+             "cleaned of stale todo events.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="second-brain todo system (SQLite + Markdown sync)")
     parser.add_argument("--db", default=str(DB_PATH), help="Path to SQLite DB file")
@@ -1950,6 +1973,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = sub.add_parser("import-md", help="Import markdown todo item files into DB")
     p_import.add_argument("--calendar-sync", action="store_true")
     p_import.add_argument("--calendar-id", default=DEFAULT_CALENDAR_ID)
+    _add_calendar_route_arg(p_import)
     p_import.add_argument("--gcal-client-secret", default=str(DEFAULT_GCAL_CLIENT_SECRET_PATH))
     p_import.add_argument("--gcal-token", default=str(DEFAULT_GCAL_TOKEN_PATH))
     p_import.add_argument(
@@ -2038,6 +2062,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--interval", type=int, default=3, help="Polling interval in seconds")
     p_daemon.add_argument("--calendar-sync", action="store_true")
     p_daemon.add_argument("--calendar-id", default=DEFAULT_CALENDAR_ID)
+    _add_calendar_route_arg(p_daemon)
     p_daemon.add_argument("--primary-calendar-id", default=DEFAULT_PRIMARY_CALENDAR_ID, help="Primary calendar for unified view")
     p_daemon.add_argument("--gcal-client-secret", default=str(DEFAULT_GCAL_CLIENT_SECRET_PATH))
     p_daemon.add_argument("--gcal-token", default=str(DEFAULT_GCAL_TOKEN_PATH))
@@ -2058,6 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gcal = sub.add_parser("calendar-sync", help="Sync due work tasks to Google Calendar")
     p_gcal.add_argument("--calendar-id", default=DEFAULT_CALENDAR_ID)
+    _add_calendar_route_arg(p_gcal)
     p_gcal.add_argument("--gcal-client-secret", default=str(DEFAULT_GCAL_CLIENT_SECRET_PATH))
     p_gcal.add_argument("--gcal-token", default=str(DEFAULT_GCAL_TOKEN_PATH))
     p_gcal.set_defaults(func=cmd_calendar_sync)
