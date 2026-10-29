@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import re
 import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -336,6 +338,61 @@ def _write_scheduled(source_path: str, value: str) -> None:
     if "## Progress Log" in text:
         text = text.rstrip("\n") + f"\n- {today}: 캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤 (calendar sync)\n"
     path.write_text(text, encoding="utf-8")
+
+
+# (tag, calendarId) — one `--calendar-route TAG=CALENDAR_ID` flag.
+CalendarRoute = tuple[str, str]
+
+
+def parse_calendar_route(value: str) -> CalendarRoute:
+    """argparse ``type=`` for ``--calendar-route TAG=CALENDAR_ID``.
+
+    Splits on the first ``=`` (a calendar id may itself contain one); both
+    halves are stripped and must be non-empty.
+    """
+    tag, sep, cal = value.partition("=")
+    tag, cal = tag.strip(), cal.strip()
+    if not sep or not tag or not cal:
+        raise argparse.ArgumentTypeError(
+            f"expected TAG=CALENDAR_ID, got {value!r}")
+    return tag, cal
+
+
+def _split_tags(raw: str | None) -> list[str]:
+    """`tasks.tags` (comma-joined by the importer) as a list of stripped tags."""
+    if not raw:
+        return []
+    return [t.strip() for t in str(raw).split(",") if t.strip()]
+
+
+def route_calendar(
+    tags: Sequence[str] | None,
+    routes: Sequence[CalendarRoute] | None,
+    default: str,
+) -> str:
+    """The calendar a task with these tags is synced to.
+
+    Walks the TASK's tags in their own order and returns the route of the
+    first tag that has one — so a task's tag order decides between two routed
+    tags, not the order of the flags. When the same tag is routed twice, the
+    first flag wins. No routed tag → ``default`` (``--calendar-id``).
+    """
+    by_tag: dict[str, str] = {}
+    for tag, cal in routes or ():
+        by_tag.setdefault(tag, cal)
+    for tag in tags or ():
+        cal = by_tag.get(tag.strip())
+        if cal:
+            return cal
+    return default
+
+
+def managed_calendars(
+    calendar_id: str, routes: Sequence[CalendarRoute] | None
+) -> list[str]:
+    """Every calendar the sync owns todo events in: ``calendar_id`` first, then
+    each route calendar, each listed once."""
+    return list(dict.fromkeys([calendar_id, *(cal for _, cal in routes or ())]))
 
 
 def sync_due_tasks_to_calendar(
