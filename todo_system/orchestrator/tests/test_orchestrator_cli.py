@@ -321,6 +321,37 @@ class MainAutoSubcommandTest(unittest.TestCase):
         self.assertIn("PAUSED", out)
         self.assertIn("USAGE-HOLD (weekly cap)", out)
 
+    def test_auto_usage_hold_line_carries_release_eta(self):
+        eta = "2026-10-30T03:00:00+00:00"
+        tick_result = {
+            "reaped": [], "dispatched": [], "updated": [],
+            "reconciled": [], "closed": [], "unblocked": [], "unparked": [],
+            "resumed": [], "parents": [], "requeued": [], "renudged": [],
+            "budget_reached": False, "paused": False,
+            "usage_hold": "session 70% ahead of pace", "usage_hold_eta": eta,
+        }
+        with mock.patch("todo_system.orchestrator.hq_host.check",
+                        return_value=(True, "")), \
+             mock.patch.object(orchestrator, "_pull_main"), \
+             mock.patch.object(orchestrator, "_check_divergence"), \
+             mock.patch("todo_system.orchestrator.tasks.load_dispatchable",
+                        return_value=[]), \
+             mock.patch.object(orchestrator.Orchestrator, "tick",
+                                return_value=tick_result):
+            rc, out = self._main(["auto", "--db", "Todo/todo.db"])
+        self.assertEqual(rc, 0)
+        self.assertIn(f"USAGE-HOLD (session 70% ahead of pace; eta {eta})", out)
+
+    def test_usage_hold_suffix_helper(self):
+        eta = "2026-10-30T03:00:00+00:00"
+        self.assertEqual(orchestrator._usage_hold_suffix(
+            {"usage_hold": "pace", "usage_hold_eta": eta}), f" USAGE-HOLD (pace; eta {eta})")
+        self.assertEqual(orchestrator._usage_hold_suffix(
+            {"usage_hold": "reason", "usage_hold_eta": None}), " USAGE-HOLD (reason)")
+        self.assertEqual(orchestrator._usage_hold_suffix({"usage_hold": "reason"}),
+                         " USAGE-HOLD (reason)")
+        self.assertEqual(orchestrator._usage_hold_suffix({"usage_hold": None}), "")
+
     def test_auto_applies_profile_daily_run_budget(self):
         # Covers orchestrator.py:1932 (`budget = prof.daily_run_budget`) — the
         # macp-profile branch that only fires when load_profile() returns a

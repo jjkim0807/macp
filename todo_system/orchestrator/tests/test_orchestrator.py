@@ -7,6 +7,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -3553,3 +3554,131 @@ class CheckDivergenceTest(unittest.TestCase):
         st = _check_divergence(self.tmp, _run=self._fake("0\t0"), threshold=3)
         self.assertEqual(st["behind"], 0)
         self.assertFalse(st["alert"])
+
+
+class MinProgressModeTest(unittest.TestCase):
+    """Opt-in minimum-progress mode (USAGE_GUARD_MIN_PROGRESS): during a PACE
+    usage hold with nothing live, tick() sends exactly one task — the top of
+    load_dispatchable's priority order — with `bypass_guard` on the envelope
+    only. Hard-cap / paused / no-data holds, an explicit pause and the daily
+    budget still dispatch nothing; the switch is off by default."""
+
+    ETA = "2026-10-30T03:00:00+00:00"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mb = FileMailbox(self.tmp / "agents")
+        self.ledger = Ledger(self.tmp / "assignments")
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        self.orch = Orchestrator(self.mb, self.reg, self.ledger, notify=lambda *a, **k: None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pace(self) -> dict:
+        return {"allowed": False,
+                "reason": "session 70% ahead of pace (10% elapsed + 30pp allowance)",
+                "blocked_until": 1_900_000_000.0, "release_eta": self.ETA,
+                "windows": [{"name": "session", "blocked": True,
+                             "utilization": 70.0, "elapsed_pct": 10.0,
+                             "reason": "session 70% ahead of pace"}]}
+
+    def _hard_cap(self) -> dict:
+        cap = usage_guard._cfg()["weekly_hard_cap"]
+        return {"allowed": False,
+                "reason": f"weekly {cap + 1:.0f}% >= hard cap {cap:.0f}% (until reset)",
+                "blocked_until": 1_900_000_000.0, "release_eta": self.ETA,
+                "windows": [{"name": "weekly", "blocked": True,
+                             "utilization": cap + 1.0, "elapsed_pct": 50.0,
+                             "reason": "weekly >= hard cap (until reset)"}]}
+
+    def _tick(self, tasks_, decision, *, env="1", **kw):
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(usage_guard, "check", return_value=decision))
+            st.enter_context(mock.patch.object(usage_guard, "refresh_inactive_accounts",
+                                               return_value={}))
+            st.enter_context(mock.patch.dict(os.environ))
+            if env is None:
+                os.environ.pop("USAGE_GUARD_MIN_PROGRESS", None)
+            else:
+                os.environ["USAGE_GUARD_MIN_PROGRESS"] = env
+            return _hermetic_tick(self.orch, tasks_, usage_hold=_INHERIT, **kw)
+
+    def _two(self):
+        return [Task("task-high"), Task("task-low")]   # load_dispatchable order
+
+    def test_pace_hold_dispatches_only_top_priority_task(self):
+        r = self._tick(self._two(), self._pace())
+        self.assertEqual([a.task_id for a in r["dispatched"]], ["task-high"])
+        sent = self.mb.receive("w")
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].payload.get("bypass_guard"))
+        self.assertTrue(sent[0].payload.get("min_progress"))
+        row = self.ledger.load("task-high")
+        self.assertFalse((row.payload or {}).get("bypass_guard"))   # envelope only
+        self.assertTrue(any(h["type"] == "min-progress-dispatch" for h in row.history))
+
+    def test_pace_hold_with_live_run_dispatches_nothing(self):
+        self.ledger.save(Assignment(task_id="task-other", agent_id="w", corr_id="C0",
+                                    state=A.IN_PROGRESS, kind="ai-local"))
+        r = self._tick(self._two(), self._pace())
+        self.assertEqual(r["dispatched"], [])
+        self.assertEqual(self.mb.receive("w"), [])
+
+    def test_hard_cap_hold_dispatches_nothing(self):
+        r = self._tick(self._two(), self._hard_cap())
+        self.assertEqual(r["dispatched"], [])
+        self.assertEqual(self.mb.receive("w"), [])
+
+    def test_paused_decision_dispatches_nothing(self):
+        d = {"allowed": False, "paused": True, "reason": "all accounts unavailable: a(x)",
+             "blocked_until": None, "release_eta": None, "windows": []}
+        self.assertEqual(self._tick(self._two(), d)["dispatched"], [])
+
+    def test_carried_no_data_hold_dispatches_nothing(self):
+        d = dict(self._pace(), carried=True, stale=True,
+                 reason="no usage data (offline) — holding last known block: x")
+        self.assertEqual(self._tick(self._two(), d)["dispatched"], [])
+
+    def test_explicit_pause_and_budget_block_min_progress(self):
+        self.assertEqual(self._tick(self._two(), self._pace(), paused=True)["dispatched"], [])
+        self.assertEqual(
+            self._tick(self._two(), self._pace(), budget_exceeded=True)["dispatched"], [])
+        self.assertEqual(self.mb.receive("w"), [])
+
+    def test_default_off_keeps_hold(self):
+        self.assertEqual(self._tick(self._two(), self._pace(), env=None)["dispatched"], [])
+        self.assertEqual(self._tick(self._two(), self._pace(), env="0")["dispatched"], [])
+        self.assertEqual(self.mb.receive("w"), [])
+
+    def test_top_task_in_cooldown_falls_through_to_next(self):
+        self.ledger.save(Assignment(task_id="task-high", agent_id="w", corr_id="C0",
+                                    state=A.FAILED, kind="ai-local", attempts=1,
+                                    updated_ts=m.now_iso()))
+        r = self._tick(self._two(), self._pace())
+        self.assertEqual([a.task_id for a in r["dispatched"]], ["task-low"])
+
+    def test_retry_of_min_progress_assignment_does_not_carry_bypass(self):
+        self._tick(self._two(), self._pace())
+        first = self.mb.receive("w")
+        self.mb.ack("w", first)
+        row = self.ledger.load("task-high")
+        row.state = A.FAILED
+        with mock.patch.object(tasks, "task_status", return_value="open"):
+            self.orch._retry(row)
+        resent = self.mb.receive("w")
+        self.assertEqual(len(resent), 1)
+        self.assertFalse((resent[0].payload or {}).get("bypass_guard"))
+
+    def test_usage_hold_info_and_eta_in_tick_result(self):
+        r = self._tick(self._two(), self._pace())
+        self.assertEqual(r["usage_hold_eta"], self.ETA)
+        self.assertEqual(self.orch.usage_hold_info["kind"], "pace")
+        self.assertIsNone(self._tick([], {"allowed": True})["usage_hold_eta"])
+
+    def test_min_progress_fail_open(self):
+        with mock.patch.object(usage_guard, "min_progress_enabled",
+                               side_effect=RuntimeError("boom")):
+            r = self._tick(self._two(), self._pace())
+        self.assertEqual(r["dispatched"], [])
+        self.assertIsNotNone(r["usage_hold"])
