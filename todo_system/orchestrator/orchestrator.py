@@ -369,6 +369,10 @@ class Orchestrator:
         # instead of wherever the process was started.
         self._mb_base = mailbox_base
         self._agent_mb: dict[str, Mailbox] = {}
+        # Side channel set by usage_hold(): {"kind", "release_eta"} of the last
+        # blocked verdict (usage_guard.hold_kind / decision["release_eta"]), None
+        # when not blocked. usage_hold() itself keeps returning str | None.
+        self.usage_hold_info: dict | None = None
 
     def _runs_today(self) -> int:
         """Cost proxy: task pipeline runs started today (Worker/runs/<YYYYMMDD…>)."""
@@ -475,11 +479,16 @@ class Orchestrator:
         return self.reg.for_project(slug)
 
     # -- Dispatcher -------------------------------------------------------
-    def dispatch(self, task: Task, now: float | None = None) -> Assignment | None:
+    def dispatch(self, task: Task, now: float | None = None, *,
+                 envelope_extra: dict | None = None) -> Assignment | None:
         """Send a task to its owning agent. No-op if already active (dedup),
         unroutable, or recently failed (cooldown — so an open-but-unresolvable
         task is not re-processed every tick; that once looped expensive
-        opus+max-effort pipelines on already-done tasks)."""
+        opus+max-effort pipelines on already-done tasks).
+
+        `envelope_extra` is merged into the ENVELOPE payload only; the ledger
+        row keeps the task's own payload, so `_retry` and a cooldown re-dispatch
+        (both rebuilt from the ledger/task payload) never re-send it."""
         existing = self.ledger.load(task.slug)
         g = self._ledger_gate(existing, now)
         if g.kind in ("done", "busy"):
@@ -505,8 +514,10 @@ class Orchestrator:
         agent = self.route(task.slug)
         if agent is None:
             return None
+        env_payload = ({**(task.payload or {}), **envelope_extra}
+                       if envelope_extra else task.payload)
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=task.slug,
-                         payload=task.payload)
+                         payload=env_payload)
         self._mailbox_for(agent).send(env)   # via the agent's own transport
         a = Assignment(task_id=task.slug, agent_id=agent.id, corr_id=env.corr_id,
                        kind=agent.kind, payload=task.payload)
@@ -2327,7 +2338,10 @@ class Orchestrator:
         tick. After the verdict, the inactive accounts' snapshots are refreshed
         (leaf 4, `usage_guard.refresh_inactive_accounts`: TTL ×4, their own
         lock/backoff) for the dashboard and the runner's `exhausted_until` —
-        never part of the verdict, and its failure is swallowed on its own."""
+        never part of the verdict, and its failure is swallowed on its own.
+        A blocked verdict also sets `self.usage_hold_info` ({"kind",
+        "release_eta"}) for the min-progress branch and the tick log line."""
+        self.usage_hold_info = None
         try:
             from todo_system import usage_guard
             d = usage_guard.check()
@@ -2336,6 +2350,11 @@ class Orchestrator:
             except Exception:
                 pass
             if not d.get("allowed", True):
+                try:
+                    self.usage_hold_info = {"kind": usage_guard.hold_kind(d),
+                                            "release_eta": d.get("release_eta")}
+                except Exception:
+                    self.usage_hold_info = None
                 return d.get("reason") or "usage guard blocked"
         except Exception:
             pass
@@ -2510,6 +2529,9 @@ class Orchestrator:
         # picks it up next tick). Fail-open — never raises into the tick.
         rescoped = self.reconcile_rescope()    # parked rescope plan -> auto-split
         dispatched = self._dispatch_serial_per_checkout(runnable)
+        if usage_hold and not paused and not budget and not dispatched:
+            # Opt-in (USAGE_GUARD_MIN_PROGRESS): one task during a pace hold.
+            dispatched = self._min_progress_dispatch(tasks, usage_hold)
         updated = self.collect()          # still collect replies from in-flight work
         # AFTER collect (a child closed THIS tick is already in todo.db — mark_done
         # refreshes it synchronously) and BEFORE reconcile_merged, so this
@@ -2537,7 +2559,67 @@ class Orchestrator:
                 "project_stalls": project_stalls,
                 "requeued": requeued, "renudged": nudged,
                 "budget_reached": self.budget_exceeded(), "paused": self.paused(),
-                "usage_hold": usage_hold}
+                "usage_hold": usage_hold,
+                "usage_hold_eta": ((self.usage_hold_info or {}).get("release_eta")
+                                   if usage_hold else None)}
+
+    def _min_progress_dispatch(self, tasks: list[Task],
+                               usage_hold: str | None) -> list[Assignment]:
+        """Minimum-progress mode: dispatch at most ONE task during a usage hold.
+
+        Only when `USAGE_GUARD_MIN_PROGRESS` is on, the hold is a *pace* hold
+        (`usage_guard.hold_kind` — never a hard cap, PAUSED or no-data hold) and
+        no run is live anywhere (every in-flight ledger row counts, including a
+        DISPATCHED envelope the runner has not picked up yet). tick() calls it
+        only without an explicit pause or a daily-budget hold. Candidates are
+        walked in `load_dispatchable` order (priority first); one that cannot go
+        (cooldown, dedup, busy checkout) yields to the next, so a stuck top task
+        cannot freeze the whole hold.
+
+        The runner still holds while the guard blocks and only runs envelopes
+        whose payload carries `bypass_guard`, so the marker is put on the
+        ENVELOPE only (`dispatch(envelope_extra=...)`): the ledger row keeps the
+        task's own payload, and a retry / re-dispatch never inherits the bypass.
+        Fail-open to the plain hold: any error dispatches nothing.
+        """
+        try:
+            from todo_system import usage_guard
+            info = self.usage_hold_info or {}
+            if info.get("kind") != "pace" or not usage_guard.min_progress_enabled():
+                return []
+            live = self._checkout_inflight()
+            if any(live.values()):
+                return []
+            cap = max(1, int(self.max_parallel_per_repo))
+            eta = info.get("release_eta")
+            for t in tasks:
+                key = self._checkout_key(t.payload)
+                if self._checkout_gate(t, key, live, cap).wait:
+                    continue
+                a = self.dispatch(t, envelope_extra={"bypass_guard": True,
+                                                     "min_progress": True})
+                if a is None:
+                    continue
+                a.history.append({"ts": m.now_iso(), "type": "min-progress-dispatch",
+                                  "from": "orchestrator", "release_eta": eta})
+                self.ledger.save(a)
+                print(f"[orchestrator] {t.slug}: min-progress — 1 task during pace "
+                      f"hold ({usage_hold}; eta {eta or '?'})")
+                return [a]
+            return []
+        except Exception as e:
+            print(f"[orchestrator] min-progress skipped (fail-open → hold): {e}")
+            return []
+
+
+def _usage_hold_suffix(result: dict) -> str:
+    """The ` USAGE-HOLD (...)` part of the `auto` tick line, with the release
+    ETA (ISO) when the guard knows one."""
+    hold = result.get("usage_hold")
+    if not hold:
+        return ""
+    eta = result.get("usage_hold_eta")
+    return f" USAGE-HOLD ({hold}; eta {eta})" if eta else f" USAGE-HOLD ({hold})"
 
 
 def auto_unblock(db: Path, items_dir: Path, *, _apply=None, _import=None) -> list:
@@ -2911,7 +2993,7 @@ def _main(argv: list[str] | None = None) -> int:
         budget = f" BUDGET-REACHED (runs today={orch._runs_today()}/{orch.daily_run_budget})" \
             if result.get("budget_reached") else ""
         budget += " PAUSED" if result.get("paused") else ""
-        budget += f" USAGE-HOLD ({result['usage_hold']})" if result.get("usage_hold") else ""
+        budget += _usage_hold_suffix(result)
         print(f"candidates={len(cands)} dispatched={len(result['dispatched'])} "
               f"updated={len(result['updated'])} renudged={len(result['renudged'])} "
               f"reaped={len(result['reaped'])} "
