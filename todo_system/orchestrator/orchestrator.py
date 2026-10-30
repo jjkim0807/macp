@@ -489,6 +489,10 @@ class Orchestrator:
         `envelope_extra` is merged into the ENVELOPE payload only; the ledger
         row keeps the task's own payload, so `_retry` and a cooldown re-dispatch
         (both rebuilt from the ledger/task payload) never re-send it."""
+        closed = self._task_md_closed(task)
+        if closed:
+            print(f"[orchestrator] dispatch: {task.slug} md status={closed!r} — not dispatched")
+            return None
         existing = self.ledger.load(task.slug)
         g = self._ledger_gate(existing, now)
         if g.kind in ("done", "busy"):
@@ -548,6 +552,27 @@ class Orchestrator:
             self._nudge(agent, a)
         self.ledger.save(a)
         return a
+
+    def _task_md_closed(self, task: Task) -> str | None:
+        """The closed status (done/cancelled/canceled) the payload's own task md
+        states, else None. Every send passes dispatch(), including callers that
+        build a Task without load_dispatchable (CLI dispatch,
+        _min_progress_dispatch). Reads `task_path`, not tasks.task_status(slug),
+        so a payload without one is untouched. Fail-open: never raises."""
+        try:
+            from . import repos
+            raw = (task.payload or {}).get("task_path") or ""
+            if not raw:
+                return None
+            p = Path(raw)
+            if not p.is_absolute():
+                # ledger.root is Worker/assignments -> the vault root is two up.
+                p = Path(self.ledger.root).parent.parent / p
+            if not p.is_file():
+                return None
+            return repos.task_closed_from_fm(repos._frontmatter(p))
+        except Exception:  # noqa: BLE001 - fail-open: dispatch as before
+            return None
 
     def _ledger_gate(self, existing: Assignment | None,
                      now: float | None = None) -> LedgerGate:
