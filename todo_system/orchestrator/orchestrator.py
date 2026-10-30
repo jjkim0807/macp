@@ -1699,8 +1699,10 @@ class Orchestrator:
                         # answered None forever, parking a finished task permanently:
                         # 33 re-dispatches of a task that had nothing left to do. The
                         # todo being closed is the authority on "this work is over",
-                        # so trust it and stop holding a human slot for it.
-                        if tasks.task_status(a.task_id) not in ("done", "cancelled"):
+                        # so trust it and stop holding a human slot for it. Both
+                        # spellings: task_status returns the md value as written
+                        # (only lowercased) — cf. reconcile_unblocked.
+                        if tasks.task_status(a.task_id) not in ("done", "cancelled", "canceled"):
                             # Genuinely unfinished → leave it parked. One exception needs
                             # a human: a parked delegate whose PR a person CLOSED without
                             # merging will NEVER merge, so reconcile_merged would hold it
@@ -1732,7 +1734,7 @@ class Orchestrator:
                         # Merged, but a named step is still owed outside the PR (see
                         # the docstring). Checked only on this branch and only for rows
                         # with a blocker, so a plain merged row costs no extra md read.
-                        if tasks.task_status(a.task_id) not in ("done", "cancelled"):
+                        if tasks.task_status(a.task_id) not in ("done", "cancelled", "canceled"):
                             # Park once: re-park a FAILED/REJECTED row every time (else
                             # it re-dispatches onto a merged branch), but record an
                             # already-parked one only on first sight, not every tick.
