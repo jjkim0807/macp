@@ -66,6 +66,16 @@ class QueueLoadersTest(unittest.TestCase):
         self._add("blk", mode="blocked", not_before="2026-06-01")
         self.assertEqual(tasks.load_upcoming(self.db, now=self.NOW), [])
 
+    def test_upcoming_skips_md_closed_while_db_open(self):
+        self._add("closed", status="done", not_before="2026-06-01")   # md says done …
+        self._add("open-later", not_before="2026-06-01")
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE tasks SET status='open' WHERE slug='closed'")  # … db lags
+        con.commit()
+        con.close()
+        up = [r["slug"] for r in tasks.load_upcoming(self.db, now=self.NOW)]
+        self.assertEqual(up, ["open-later"])
+
     def test_blocked_waiting_on_lists_only_undone_predecessors(self):
         self._add("done-one", status="done")
         self._add("open-one")

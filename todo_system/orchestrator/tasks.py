@@ -105,6 +105,16 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
             print(f"[orchestrator] load_dispatchable: skipping {r['slug']} — "
                   f"frontmatter YAML error ({fm_err}); not dispatched")
             continue
+        # md<->DB status drift: todo.db's `open` lags a markdown already closed
+        # (daemon not yet re-synced, or mark_done's DB refresh failed) — the
+        # 2026-10-30 app-plugins-11 case, closed by a /focus session. A closed
+        # task is never dispatchable in any mode, so this is NOT gated on
+        # only_auto. Fail-open: an absent/blank status trusts the DB.
+        closed = repos.task_closed_from_fm(fm)
+        if closed:
+            print(f"[orchestrator] load_dispatchable: skipping {r['slug']} — "
+                  f"md status={closed!r} (todo.db said open; md<->db drift)")
+            continue
         # md<->DB drift guard: todo.db's worker_mode lags the markdown (the
         # todo-sync daemon rebuilds it), so a task hand-edited to a
         # non-dispatchable mode still shows a stale `auto` row until the daemon
@@ -203,7 +213,7 @@ def load_upcoming(db_path: str | Path = DEFAULT_DB, *,
                   now: dt.datetime | None = None) -> list[dict]:
     """Tasks load_dispatchable would return but for a FUTURE `not_before`.
 
-    Same mode / strict-YAML / md-drift guards as load_dispatchable (silently —
+    Same mode / strict-YAML / md-status / md-drift guards as load_dispatchable (silently —
     it already prints the skip lines), then `not_before` still deferred.
     `{"slug", "title", "path", "not_before"}`, earliest first."""
     rows, _, has_nb = _open_leaf_rows(db_path)
@@ -217,7 +227,7 @@ def load_upcoming(db_path: str | Path = DEFAULT_DB, *,
             continue
         fm, fm_err = (repos.frontmatter_with_error(r["path"]) if r["path"]
                       else ({}, None))
-        if fm_err is not None:
+        if fm_err is not None or repos.task_closed_from_fm(fm):
             continue
         md_mode = repos.task_worker_mode_from_fm(fm) if r["path"] else None
         if md_mode is not None and md_mode not in DISPATCHABLE_MODES:
