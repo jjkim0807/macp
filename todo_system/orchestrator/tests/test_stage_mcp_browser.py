@@ -157,7 +157,8 @@ class StageMcpWiringTest(unittest.TestCase):
         tools = argv[a + 1:argv.index("--add-dir")] if "--add-dir" in argv else argv[a + 1:]
         self.assertEqual(tools[:3], ["Read", "Edit", "Bash(git:*)"])
         for rule in (stages.SMS_TOOL_RULE, stages.BROWSER_TOOL_RULE,
-                     stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE):
+                     stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
+                     stages.MAIL_TOOL_RULE):
             self.assertIn(rule, tools)
         self.assertEqual(tools[-1], "mcp__macp-browser__*")
 
