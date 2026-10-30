@@ -276,6 +276,43 @@ class OrchestratorTest(unittest.TestCase):
         self.ledger.save(a)
         self.assertIsNone(self.orch.dispatch(Task("armchair-commander")))
 
+    def _md(self, status_line: str) -> str:
+        p = self.tmp / "armchair-commander.md"
+        p.write_text(f"---\n{status_line}worker_mode: auto\n---\n# t\n", encoding="utf-8")
+        return str(p)
+
+    def test_no_dispatch_of_md_closed_task(self):
+        # the md is the source of truth: a closed task is never sent, whatever
+        # its caller (CLI dispatch, _min_progress_dispatch) and with no ledger row
+        for status in ("done", "cancelled", "canceled", '"Done"'):
+            with self.subTest(status=status):
+                tp = self._md(f"status: {status}\n")
+                self.assertIsNone(self.orch.dispatch(
+                    Task("armchair-commander", {"task_path": tp})))
+                self.assertEqual(self.mb.receive("armchair-commander"), [])
+                self.assertIsNone(self.ledger.load("armchair-commander"))
+
+    def test_no_redispatch_of_md_closed_failed_row(self):
+        a = A.Assignment(task_id="armchair-commander", agent_id="armchair-commander",
+                         corr_id="c-old", kind="ai-local", state=A.FAILED)
+        self.ledger.save(a)
+        tp = self._md("status: done\n")
+        future = _parse_ts(a.updated_ts) + 10 * 86400       # well past any cooldown
+        self.assertIsNone(self.orch.dispatch(
+            Task("armchair-commander", {"task_path": tp}), now=future))
+        self.assertEqual(self.mb.receive("armchair-commander"), [])
+        row = self.ledger.load("armchair-commander")
+        self.assertEqual((row.state, row.corr_id), (A.FAILED, "c-old"))  # untouched
+
+    def test_md_open_or_statusless_task_dispatches(self):
+        for sent, line in enumerate(("status: open\n", ""), start=1):
+            with self.subTest(status_line=line):
+                tp = self._md(line)
+                a = self.orch.dispatch(Task("armchair-commander", {"task_path": tp}))
+                self.assertIsNotNone(a)
+                self.assertEqual(len(self.mb.receive("armchair-commander")), sent)
+                self.ledger.root.joinpath("armchair-commander.json").unlink()
+
     def test_poison_quarantine(self):
         a = A.Assignment(task_id="armchair-commander", agent_id="armchair-commander",
                          corr_id="c", kind="ai-local", state=A.FAILED, refail_count=3)

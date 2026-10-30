@@ -472,6 +472,25 @@ class RunnerSkipGuardTest(unittest.TestCase):
         self._md("t", "status: open\nworker_mode: auto\nis_parent: true")
         self._assert_skipped(self._assign("t", "Todo/items/t.md"))
 
+    def test_done_md_with_dispatched_row_is_skipped(self):
+        # 2026-10-30: a 10-27 envelope ran against a task a /focus session had
+        # closed on 10-28 — md done/manual, ledger row still DISPATCHED (not DONE)
+        self._row("t", DISPATCHED, corr_id="C-10-27")
+        self._md("t", "status: done\nworker_mode: manual")
+        self._assert_skipped(self._assign("t", "Todo/items/t.md"))
+        self.assertEqual(self.ledger.load("t").state, DISPATCHED)  # row untouched
+
+    def test_done_md_without_ledger_row_is_skipped(self):
+        self._md("t", "status: done\nworker_mode: auto")
+        self._assert_skipped(self._assign("t", "Todo/items/t.md"))
+
+    def test_cancelled_md_is_skipped(self):
+        for i, status in enumerate(("cancelled", "canceled", '"Done"')):
+            with self.subTest(status=status):
+                slug = f"t{i}"
+                self._md(slug, f"status: {status}\nworker_mode: auto")
+                self._assert_skipped(self._assign(slug, f"Todo/items/{slug}.md"))
+
     # -- still runs --------------------------------------------------------
     def test_failed_row_runs(self):
         self._row("t", FAILED)
@@ -493,6 +512,11 @@ class RunnerSkipGuardTest(unittest.TestCase):
                                 'parent: "[[bundle]]"')
         self._assign("bundle-step", "Todo/items/bundle-step.md")
         self._assert_ran("bundle-step")
+
+    def test_md_without_status_runs(self):
+        self._md("t", "worker_mode: auto")
+        self._assign("t", "Todo/items/t.md")
+        self._assert_ran("t")
 
     def test_corrupt_ledger_row_runs(self):
         self.ledger.root.mkdir(parents=True)

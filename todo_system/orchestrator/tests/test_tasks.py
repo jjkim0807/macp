@@ -178,6 +178,35 @@ class LoadDispatchableTest(unittest.TestCase):
         slugs = {t.slug for t in tasks.load_dispatchable(self.db)}
         self.assertIn("nomode", slugs)
 
+    def _insert_md(self, slug: str, fm: str) -> None:
+        md = self.tmp / f"{slug}.md"
+        md.write_text(f"---\n{fm}\n---\n# {slug}\n")
+        con = sqlite3.connect(self.db)
+        con.execute(f"INSERT INTO tasks ({_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (slug, slug, str(md), "", "", "", "auto", "open", 0))
+        con.commit()
+        con.close()
+
+    def test_md_done_overrides_db_open(self):
+        # DISCRIMINATOR: md<->DB status drift. The markdown says `status: done`
+        # (closed by a /focus session — 2026-10-30 app-plugins-11) but todo.db
+        # still carries the stale `open` row. WITHOUT the md status gate this
+        # row dispatches, since db status and worker_mode both pass.
+        for i, status in enumerate(("done", "cancelled", "canceled", '"Done"')):
+            self._insert_md(f"closed-{i}", f"status: {status}\nworker_mode: auto")
+        for only_auto in (True, False):     # closed is closed in every mode
+            with self.subTest(only_auto=only_auto):
+                slugs = {t.slug for t in
+                         tasks.load_dispatchable(self.db, only_auto=only_auto)}
+                self.assertFalse({s for s in slugs if s.startswith("closed-")}, slugs)
+                self.assertIn("t-auto", slugs)   # normal path unaffected
+
+    def test_md_without_status_fails_open(self):
+        # Fail-open: md names no status → trust the DB's `open`.
+        self._insert_md("nostatus", "worker_mode: auto")
+        slugs = {t.slug for t in tasks.load_dispatchable(self.db)}
+        self.assertIn("nostatus", slugs)
+
 
 class MarkDoneTest(unittest.TestCase):
     """Closing a task must land in BOTH the markdown and todo.db.

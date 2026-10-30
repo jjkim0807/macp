@@ -1742,6 +1742,12 @@ class Runner:
           never dispatchable). The `parent:` ancestor is deliberately NOT read:
           every child of a split bundle has an `off` parent by construction, so
           that rule would silently stop all split work.
+        - The dispatched task's OWN md is `status: done|cancelled|canceled`. On
+          2026-10-30 a 10-27 envelope that had sat un-acked for three days ran a
+          whole pipeline on a task a /focus session had closed on 10-28: the md
+          said done, but the ledger row was still DISPATCHED, so the DONE-row check
+          above missed it. The row left DISPATCHED is reaped to FAILED and then
+          closed by `reconcile_merged`'s todo-closed fallback, so no reply is needed.
 
         The caller sends no reply on skip. FAIL would trigger `_retry`,
         NEEDS_INPUT would overwrite DONE with AWAITING_HUMAN, and ACCEPT or even a
@@ -1770,6 +1776,9 @@ class Runner:
                 p = p if p.is_absolute() else vault_root / p
                 if p.is_file():
                     fm = repos._frontmatter(p)
+                    closed = repos.task_closed_from_fm(fm)
+                    if closed:
+                        return f"task md status: {closed}"
                     # task_worker_mode_from_fm also maps a bare `off` (YAML boolean False).
                     if repos.task_worker_mode_from_fm(fm) == "off":
                         return "task md worker_mode: off"
