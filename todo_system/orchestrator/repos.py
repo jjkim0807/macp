@@ -277,6 +277,27 @@ def read_task_worker_mode(md_path: str | Path) -> str | None:
     return task_worker_mode_from_fm(_frontmatter(md_path))
 
 
+CLOSED_STATUSES = ("done", "cancelled", "canceled")
+
+
+def task_status_from_fm(fm: dict) -> str | None:
+    """A task's `status:` lowercased, or None when absent/blank/placeholder/non-string."""
+    v = _clean(fm.get("status"))
+    return v.lower() if v else None
+
+
+def task_closed_from_fm(fm: dict) -> str | None:
+    """The closed status (done/cancelled/canceled) the md states, else None.
+
+    Dispatch gates read todo.db, which lags the markdown, and an un-acked
+    TASK_ASSIGN envelope bypasses dispatch entirely (2026-10-30: a 10-27 envelope
+    ran a task a /focus session had closed on 10-28). The md is the source of
+    truth, so the runner and the dispatcher re-check it. Fail-open: None unless
+    the md explicitly says closed."""
+    st = task_status_from_fm(fm)
+    return st if st in CLOSED_STATUSES else None
+
+
 def repo_name(url: str) -> str:
     """Local checkout name from a git URL, mirroring `git clone` defaults:
     https://github.com/example-org/agent-commander.git -> agent-commander"""
