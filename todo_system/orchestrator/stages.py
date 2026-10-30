@@ -225,6 +225,16 @@ SMS_CLI = "macp-sms"
 SMS_TOOL_RULE = f"Bash({SMS_CLI}:*)"
 SMS_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 
+# The mail-inbox CLI for tasks whose 2FA code arrives by e-mail instead of SMS:
+# same space-split problem as SMS, so one space-free PATH wrapper name. The
+# wrapper ships from its own repo, not this engine's scripts/, so it is
+# deliberately absent from worker._WRAPPER_NAMES (that list syncs engine
+# scripts/ only). delegate gets only this rule, never Bash(uv:*)/
+# Bash(python3:*); research and plan stay read-only.
+MAIL_CLI = "macp-mail"
+MAIL_TOOL_RULE = f"Bash({MAIL_CLI}:*)"
+MAIL_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
+
 # The HQ's logged-in Chrome (CLAUDE.md §12) for consoles that have no API. Same
 # space-split problem as SMS, so one PATH wrapper, scripts/macp-browser. The
 # wrapper — not this rule — is what narrows it to `browser.sh status|up` and the
@@ -297,21 +307,26 @@ EMULATOR_OWNER_ENV = "MACP_EMULATOR_OWNER"
 _STANDING_RULES = ((SMS_TOOL_RULE, SMS_TOOL_STAGES),
                    (BROWSER_TOOL_RULE, BROWSER_TOOL_STAGES),
                    (REMOTE_GATE_TOOL_RULE, REMOTE_GATE_TOOL_STAGES),
-                   (EMULATOR_TOOL_RULE, EMULATOR_TOOL_STAGES))
+                   (EMULATOR_TOOL_RULE, EMULATOR_TOOL_STAGES),
+                   (MAIL_TOOL_RULE, MAIL_TOOL_STAGES))
 
 STAGE_TOOLS = {
     "research": "Read Write",
     "plan": "Read Write",
     "implement": "Read Edit Write Bash(git:*) Bash(uv:*) Bash(npm:*) Bash(pnpm:*) "
                  f"Bash(node:*) Bash(npx:*) Bash(pytest:*) {SMS_TOOL_RULE} "
-                 f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}",
+                 f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
+                 f"{MAIL_TOOL_RULE}",
     "verify": (f"Read Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
-               f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}"),
+               f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
+               f"{MAIL_TOOL_RULE}"),
     "report": "Read Write Edit Bash(git:*) Bash(gh:*)",
     "delegate": ("Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*) "
-                 f"{SMS_TOOL_RULE} {BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE}"),
+                 f"{SMS_TOOL_RULE} {BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} "
+                 f"{MAIL_TOOL_RULE}"),
     "quick": (f"Read Edit Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
-              f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE}"),
+              f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
+              f"{MAIL_TOOL_RULE}"),
     # No Edit: discover reads a throwaway clone and WRITES exactly two files (the
     # episode report + its artifact). The shell set is what "run the project"
     # needs — the CI runner set plus file inspection and a way to bound a
@@ -412,9 +427,10 @@ def _safe_tools(stage: str, task_tools: str | None = None, *,
     Firebase task.
 
     The forbidden check applies to the task-supplied list too — that is the
-    property that makes honouring it safe at all. A task list still keeps
-    SMS_TOOL_RULE and BROWSER_TOOL_RULE, so a task needs no allowed_tools edit
-    to read a 2FA code or use the logged-in Chrome. `browser_mcp` (the MCP
+    property that makes honouring it safe at all. A task list still keeps the
+    _STANDING_RULES (SMS, BROWSER, REMOTE_GATE, EMULATOR, MAIL) on their
+    stages, so a task needs no allowed_tools edit to read a 2FA code (SMS or
+    mail) or use the logged-in Chrome. `browser_mcp` (the MCP
     server is configured) appends BROWSER_MCP_TOOL_RULE last on either path.
     """
     tools = STAGE_TOOLS[stage]
