@@ -77,8 +77,8 @@ LOGS_DIR = ROOT / "logs"
 #   - run queue    : Worker/remote/<name>/queue.json   (git-tracked)
 #   - run artifacts: Worker/remote/<name>/runs/        (git-tracked; *.log ignored)
 #   - idle planner : disabled (only the primary host may create tasks)
-# Todo/items/ is gitignored (single-machine data), so tasks travel to remote
-# hosts via the git-tracked inbox, and results travel back the same way
+# Todo/items/ is host-local (not synced by the orchestrator across hosts), so
+# tasks travel to remote hosts via the git-tracked inbox, and results travel back the same way
 # (queue.json + runs/ + Memory/episodes/). The primary host's scan-queue
 # sweeps remote queue files and surfaces finished runs as review todos.
 DEFAULT_HOST = "default"
@@ -665,8 +665,8 @@ def iter_worker_tasks_vault() -> Iterable[WorkerTask]:
     """Walk this host's task source and yield WorkerTask objects (flat layout).
 
     Primary host: Todo/items/*.md. Remote host: its git-tracked inbox
-    Worker/remote/<host>/inbox/*.md (Todo/items/ is gitignored and never
-    reaches other machines).
+    Worker/remote/<host>/inbox/*.md (Todo/items/ is host-local and not
+    synced to other machines by the orchestrator).
     """
     source_dir = REMOTE_INBOX_DIR if IS_REMOTE_HOST else ITEMS_DIR
     if not source_dir.exists():

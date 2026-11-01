@@ -125,8 +125,9 @@ def _porcelain_lines(root: Path) -> list[str]:
 def classify_status(root: Path) -> dict[str, list[str]]:
     """Bucket ``git status --porcelain --ignored`` per CLAUDE.md §10.1.
 
-    - ``!!`` (git-ignored, e.g. ``Todo/items/**``, ``Todo/todo.db``) → ``ignored``
-      (no commit needed).
+    - ``!!`` (git-ignored, e.g. ``Todo/todo.db``, ``Todo/Todo.md``) → ``ignored``
+      (no commit needed). ``Todo/items/**`` is git-tracked, so it falls under
+      "everything else" below.
     - under ``Worker/`` → ``ignorable`` (runner/orchestrator runtime churn).
     - ``Memory/index.md`` → ``ignorable`` if only its ``last_synced:`` line changed,
       else ``must_commit``.

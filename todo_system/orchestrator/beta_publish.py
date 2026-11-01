@@ -636,8 +636,9 @@ def _mirror_watermark_to_main(wm: Path, msg: str, *, vault_root: Path | str,
 
 
 def append_progress_log(task_path: Path | str, line: str, *, today: str | None = None) -> bool:
-    """Append ``- <date>: <line>`` under the task's ``## Progress Log`` (on-disk;
-    Todo/items is gitignored, so no commit needed). No-ops if the file is absent."""
+    """Append ``- <date>: <line>`` under the task's ``## Progress Log`` (on-disk
+    only; committing the task file, if needed, is the caller's job). No-ops if
+    the file is absent."""
     p = Path(task_path)
     if not p.exists():
         return False

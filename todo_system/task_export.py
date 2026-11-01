@@ -34,13 +34,13 @@ writes, and only when given an explicit ``--out``. The default ``vault_root`` is
 the live vault, so a bare ``export_all()`` reads real task files — and still
 writes nothing.
 
-**Do not commit the output.** ``Todo/items/`` is deliberately untracked
-(``.gitignore:78``, a Phase B decision), so a snapshot containing task bodies
-would leak into git exactly what git was told to exclude. The default output
-convention is therefore ``Todo/Snapshots/``, which ``.gitignore:74`` already
-ignores. (Note that ``Worker/**`` is *not* wholesale ignored — only specific
-subpaths are — so ``Worker/exports/*.json`` would be committable. That is the
-reason to avoid it, not a reason to use it.)
+**Do not commit the output.** ``Todo/items/`` is git-tracked, so its task
+bodies are already in git; a snapshot is a derived, point-in-time duplicate of
+that same content and committing it would just add stale copies to track. The
+default output convention is therefore ``Todo/Snapshots/``, which
+``.gitignore:74`` ignores. (Note that ``Worker/**`` is *not* wholesale ignored
+— only specific subpaths are — so ``Worker/exports/*.json`` would be
+committable. That is the reason to avoid it, not a reason to use it.)
 """
 
 from __future__ import annotations
@@ -301,8 +301,9 @@ def export_task(
 def export_all(vault_root: str | Path = DEFAULT_VAULT_ROOT) -> list[dict[str, Any]]:
     """Every task under ``<vault_root>/Todo/items``, sorted by filename.
 
-    Returns ``[]`` when the directory is absent — which is the normal state of a
-    worker checkout, since ``Todo/items/`` is gitignored. Writes nothing.
+    Returns ``[]`` when the directory is absent — the normal state for a
+    worker checkout of an external project repo, which has no ``Todo/`` at
+    all. Writes nothing.
     """
     vault_root = Path(vault_root)
     items_dir = vault_root / ITEMS_SUBDIR
