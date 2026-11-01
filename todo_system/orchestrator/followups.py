@@ -63,7 +63,7 @@ from pathlib import Path
 
 from .. import i18n, kakao_format, paths
 
-# Live runtime state, all under gitignored trees (Worker/_state/, Todo/items/).
+# Live runtime state, under Worker/_state/ (gitignored) and Todo/items/ (git-tracked but host-local).
 # Reassigned wholesale by tests; every function that defaults to one reads the
 # CURRENT module global at call time (path=None → resolve inside), never a value
 # captured in a default argument.

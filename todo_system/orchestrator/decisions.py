@@ -136,9 +136,11 @@ def _task_status(items_dir: str | Path, slug: str) -> str | None:
     `cancelled`, and the frontmatter files hold whatever was typed — normalising
     here would invent a state the source never claimed.
 
-    Note `Todo/items/` is gitignored, so this returns None for everything in a
-    fresh clone. That is why both directories are injected by the caller and the
-    tests run entirely on temp fixtures.
+    Note `Todo/items/` is git-tracked but not every checkout has it (e.g. a
+    worker checkout of an external project repo has no `Todo/` at all), so
+    this returns None whenever the directory or slug is absent. That is why
+    both directories are injected by the caller and the tests run entirely on
+    temp fixtures.
     """
     path = Path(items_dir) / f"{slug}.md"
     if not path.exists():
