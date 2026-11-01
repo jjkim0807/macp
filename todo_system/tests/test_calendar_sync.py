@@ -951,6 +951,32 @@ def test_title_change_after_pull_keeps_the_calendar_shape(monkeypatch, tmp_path)
     assert not ev3.patched and p.read_text(encoding="utf-8") == before
 
 
+def test_overnight_pull_without_due_projects_from_the_new_scheduled_date(monkeypatch, tmp_path):
+    """No `due:` → the scheduled date stands in for it, and `due_time` hangs the
+    1h block on that date. The pull moves `scheduled:`, so the md-side baseline
+    must be projected from the NEW date or the next tick reverts once."""
+    monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
+    p = tmp_path / "t1.md"
+    p.write_text(
+        "---\nstatus: open\ndue: -\nupdated: 2026-10-20\ndue_time: 09:00\n"
+        'scheduled: "2026-11-02"\n---\n\n# t\n\n## Progress Log\n\n- 2026-10-20: made\n',
+        encoding="utf-8")
+    moved = _existing(_seoul("2026-11-03", "23:00"), _seoul("2026-11-04", "01:00"),
+                      "T:2026-11-02T00:00", "T:2026-11-02T01:00")
+    con = _db([("t1", "Task one", "-", "na", str(p), "open", None)])
+    ev = _TwoWayEvents([moved])
+    _sync(con, ev)
+    assert 'scheduled: "2026-11-03"' in p.read_text(encoding="utf-8")
+    assert len(ev.patched) == 1
+    before = p.read_text(encoding="utf-8")
+
+    con = _db([("t1", "Task one", "-", "na", str(p), "open", None)])
+    ev2 = _TwoWayEvents([ev.existing[0]])
+    _sync(con, ev2)
+    assert not ev2.patched and not ev2.inserted and not ev2.deleted
+    assert p.read_text(encoding="utf-8") == before
+
+
 def test_pulled_progress_log_line_lands_in_its_section(monkeypatch, tmp_path):
     monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
     p = tmp_path / "t1.md"

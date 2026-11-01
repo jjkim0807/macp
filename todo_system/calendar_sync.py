@@ -86,7 +86,11 @@ def _parse_scheduled(source_path: str) -> tuple[str | None, str | None, str | No
 
     Returns (scheduled_date, start_time, end_time).
     """
-    val = _extract_field_from_markdown(source_path, "scheduled")
+    return _parse_scheduled_value(_extract_field_from_markdown(source_path, "scheduled"))
+
+
+def _parse_scheduled_value(val: str | None) -> tuple[str | None, str | None, str | None]:
+    """:func:`_parse_scheduled` on a raw `scheduled:` value instead of a file."""
     if not val or val == "-":
         return None, None, None
 
@@ -165,10 +169,15 @@ def _upsert_event(
     due_time: str | None,
     next_action: str,
     source_path: str,
+    due_from_scheduled: bool = False,
 ) -> str:
-    due_date = dt.date.fromisoformat(due)
-    event_date = dt.date.fromisoformat(scheduled_date) if scheduled_date else due_date
+    """Create, patch or pull one task's event; returns created / updated /
+    pulled / unchanged.
 
+    ``due_from_scheduled`` says ``due`` is not the md's own due date but its
+    `scheduled:` date standing in for one (the task has no due) — so a pull
+    that rewrites `scheduled:` also moves next tick's ``due``.
+    """
     body: dict[str, object] = {
         "summary": title,
         "description": f"slug: {slug}\nnext_action: {next_action or '-'}\nsource: {source_path}",
@@ -180,34 +189,8 @@ def _upsert_event(
         },
         "reminders": {"useDefault": False, "overrides": []},
     }
-
-    # One lookup per event, applied to both ends. An absent `tz` leaves the key
-    # OUT of the body rather than writing a guess; with a `tz` the body is
-    # byte-identical to the previous hard-coded form, key order included.
-    tz = _event_timezone()
-
-    def _timed(when: dt.datetime) -> dict[str, str]:
-        d = {"dateTime": when.isoformat()}
-        if tz:
-            d["timeZone"] = tz
-        return d
-
-    if scheduled_start and scheduled_end:
-        # Use scheduled work time for calendar event
-        start_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_start}:00")
-        end_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_end}:00")
-        body["start"] = _timed(start_dt)
-        body["end"] = _timed(end_dt)
-    elif due_time:
-        # Fallback to due_time (deadline) — show as 1h event
-        start_dt = dt.datetime.fromisoformat(f"{due_date.isoformat()}T{due_time}:00")
-        end_dt = start_dt + dt.timedelta(hours=1)
-        body["start"] = _timed(start_dt)
-        body["end"] = _timed(end_dt)
-    else:
-        end_date = event_date + dt.timedelta(days=1)
-        body["start"] = {"date": event_date.isoformat()}
-        body["end"] = {"date": end_date.isoformat()}
+    body["start"], body["end"] = _event_window(
+        due, scheduled_date, scheduled_start, scheduled_end, due_time)
 
     # Two-way sync (2026-10-27): the event remembers what macp last wrote
     # (`macp_start`/`macp_end`, canonical form). A start/end that differs from
@@ -216,6 +199,15 @@ def _upsert_event(
     # within minutes. Now: calendar edited, md not → pull into the md's
     # `scheduled:`; md edited, calendar not → patch the event; both → the
     # later edit wins (event `updated` vs md mtime); neither → no API write.
+    #
+    # Two baselines, because `scheduled:` cannot hold every calendar shape: a
+    # multi-day all-day event or a midnight-spanning timed one is pulled into
+    # the md lossily (its first day). `macp_start`/`macp_end` stay the CALENDAR
+    # side (the event's real start/end), `macp_md_start`/`macp_md_end` the MD
+    # side (what the md as last written produces). Comparing the md against the
+    # calendar-side value read the lossy pull as an md edit and patched the
+    # event back to one day on the next tick. A later hand edit of `scheduled:`
+    # still wins and collapses the event to what the md can express.
     desired = (_canon(body["start"]), _canon(body["end"]))
     found = (
         service.events()
@@ -236,9 +228,15 @@ def _upsert_event(
             # Event may already be deleted (HTTP 410) or otherwise unavailable
             pass
 
-    if not items:
+    def _baselines(cal: tuple, md: tuple) -> None:
+        # Every key on every write: Google's patch merges map keys, the test
+        # fake replaces the map — either way no stale baseline survives.
         body["extendedProperties"]["private"].update(
-            {"macp_start": desired[0], "macp_end": desired[1]})
+            {"macp_start": cal[0], "macp_end": cal[1],
+             "macp_md_start": md[0], "macp_md_end": md[1]})
+
+    if not items:
+        _baselines(desired, desired)
         service.events().insert(calendarId=calendar_id, body=body).execute()
         return "created"
 
@@ -247,27 +245,78 @@ def _upsert_event(
     actual = (_canon(ev.get("start") or {}), _canon(ev.get("end") or {}))
     base = (priv.get("macp_start"), priv.get("macp_end"))
     has_base = all(base)
+    md_base = (priv.get("macp_md_start"), priv.get("macp_md_end"))
+    if not all(md_base):
+        md_base = base                      # pre-split event: single-baseline rule
     cal_changed = has_base and actual != base
-    md_changed = (not has_base) or desired != base   # legacy event: md wins once
+    md_changed = (not has_base) or desired != md_base   # legacy event: md wins once
 
     if cal_changed and (not md_changed or _event_newer_than_md(ev, source_path)):
         sched = _scheduled_value(ev.get("start") or {}, ev.get("end") or {})
+        md_proj = desired
         if sched:
             _write_scheduled(source_path, sched)
+            # What next tick's `desired` will be, from the md just written.
+            s_date, s_start, s_end = _parse_scheduled_value(sched)
+            proj_due = s_date if (due_from_scheduled and s_date) else due
+            md_proj = tuple(_canon(w) for w in _event_window(
+                proj_due, s_date, s_start, s_end, due_time))
         body["start"], body["end"] = ev["start"], ev["end"]
-        body["extendedProperties"]["private"].update(
-            {"macp_start": actual[0], "macp_end": actual[1]})
+        _baselines(actual, md_proj)
         service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
         return "pulled"
 
-    if (actual == desired and base == desired and ev.get("summary") == body["summary"]
-            and ev.get("description") == body["description"]):
-        return "unchanged"
+    if not cal_changed and not md_changed:
+        if (ev.get("summary") == body["summary"]
+                and ev.get("description") == body["description"]):
+            return "unchanged"
+        # Text-only change (title, next_action, source): keep the event's own
+        # start/end — re-sending `desired` would revert a pulled multi-day or
+        # overnight shape the md cannot express.
+        body["start"], body["end"] = ev["start"], ev["end"]
+        _baselines(base, md_base)
+        service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
+        return "updated"
 
-    body["extendedProperties"]["private"].update(
-        {"macp_start": desired[0], "macp_end": desired[1]})
+    _baselines(desired, desired)
     service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
     return "updated"
+
+
+def _event_window(
+    due: str,
+    scheduled_date: str | None,
+    scheduled_start: str | None,
+    scheduled_end: str | None,
+    due_time: str | None,
+) -> tuple[dict, dict]:
+    """The event (start, end) the md's due/scheduled/due_time fields produce."""
+    due_date = dt.date.fromisoformat(due)
+    event_date = dt.date.fromisoformat(scheduled_date) if scheduled_date else due_date
+
+    # One lookup per event, applied to both ends. An absent `tz` leaves the key
+    # OUT of the body rather than writing a guess; with a `tz` the body is
+    # byte-identical to the previous hard-coded form, key order included.
+    tz = _event_timezone()
+
+    def _timed(when: dt.datetime) -> dict[str, str]:
+        d = {"dateTime": when.isoformat()}
+        if tz:
+            d["timeZone"] = tz
+        return d
+
+    if scheduled_start and scheduled_end:
+        # Use scheduled work time for calendar event
+        start_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_start}:00")
+        end_dt = dt.datetime.fromisoformat(f"{event_date.isoformat()}T{scheduled_end}:00")
+        return _timed(start_dt), _timed(end_dt)
+    if due_time:
+        # Fallback to due_time (deadline) — show as 1h event
+        start_dt = dt.datetime.fromisoformat(f"{due_date.isoformat()}T{due_time}:00")
+        end_dt = start_dt + dt.timedelta(hours=1)
+        return _timed(start_dt), _timed(end_dt)
+    end_date = event_date + dt.timedelta(days=1)
+    return {"date": event_date.isoformat()}, {"date": end_date.isoformat()}
 
 
 def _canon(when: dict) -> str | None:
@@ -520,6 +569,7 @@ def sync_due_tasks_to_calendar(
             due_time=due_time,
             next_action=str(row["next_action"] or ""),
             source_path=source_path,
+            due_from_scheduled=not has_due,
         )
         if result != "unchanged":
             created_or_updated += 1
