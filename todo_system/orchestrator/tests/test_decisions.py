@@ -532,5 +532,10 @@ class OrchestratorCliWiringTest(unittest.TestCase):
         self.assertIn("--items-dir", help_text)
 
 
+class DecisionsCliHelpTest(unittest.TestCase):
+    def test_help_exits_zero(self):
+        self.assertEqual(decisions._main(["--help"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,7 @@ idiom followups.py uses, and necessary because the real paths are live state.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -568,35 +569,48 @@ def reconcile(*, injected: list[str] | None = None, items_dir: Path | None = Non
 
 # ---------------------------------------------------------------- cli ---
 
-def main(argv: list[str] | None = None) -> int:
-    """planner_tick.sh entry points.
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m todo_system.orchestrator.discovery",
+        description="planner_tick.sh entry points.")
+    sub = parser.add_subparsers(dest="cmd")
+    p_create = sub.add_parser(
+        "maybe-create",
+        help="one discovery task when the planner is exhausted "
+             "(prints `created <slug>` or `skip: <reason>`)")
+    p_create.add_argument("--force", action="store_true")
+    sub.add_parser("emit-context", help="unconsumed reports as a planner-context block")
+    sub.add_parser("emit-consumed", help="per-report tasks already created (open+done), last 14 days")
+    sub.add_parser("reconcile", help="close handled reports / count injections")
+    sub.add_parser("status", help="what would happen, for a human")
+    return parser
 
-    maybe-create [--force]  one discovery task when the planner is exhausted
-                            (prints `created <slug>` or `skip: <reason>`)
-    emit-context            unconsumed reports as a planner-context block
-    emit-consumed           per-report tasks already created (open+done), last 14 days
-    reconcile              close handled reports / count injections
-    status                  what would happen, for a human
-    """
+
+def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    cmd = args[0] if args else ""
-    if cmd == "maybe-create":
-        path, reason = maybe_create(force="--force" in args)
+    parser = _build_parser()
+    try:
+        ns = parser.parse_args(args)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+
+    if ns.cmd == "maybe-create":
+        path, reason = maybe_create(force=ns.force)
         print(f"created {path.stem}" if path else f"skip: {reason}")
         return 0
-    if cmd == "emit-context":
+    if ns.cmd == "emit-context":
         sys.stdout.write(render_context(open_reports(_load_state())))
         return 0
-    if cmd == "emit-consumed":
+    if ns.cmd == "emit-consumed":
         sys.stdout.write(render_consumed(reports()))
         return 0
-    if cmd == "reconcile":
+    if ns.cmd == "reconcile":
         done = reconcile()
         if done:
             sys.stderr.write("discovery reconciled: " + "; ".join(
                 f"{k} -> {v}" for k, v in done.items()) + "\n")
         return 0
-    if cmd == "status":
+    if ns.cmd == "status":
         now = dt.datetime.now().timestamp()
         state = _load_state()
         repo_map = active_repos()
@@ -608,8 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"planner verdict: {planner_verdict() or '?'} · next: {nxt or '-'} · "
               f"open reports: {len(open_reports(state))} · enabled={enabled()}")
         return 0
-    sys.stderr.write("usage: python -m todo_system.orchestrator.discovery "
-                     "{maybe-create [--force]|emit-context|emit-consumed|reconcile|status}\n")
+    parser.print_usage(sys.stderr)
     return 2
 
 

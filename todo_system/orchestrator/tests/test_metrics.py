@@ -561,5 +561,23 @@ class VerifyFailRetryCostTest(unittest.TestCase):
         self.assertEqual(s["tokens"]["io"]["pooled_ratio"], None)
 
 
+class MetricsCliHelpTest(unittest.TestCase):
+    """`--help` must be a pure usage print — it must never fall through to
+    write(), which would rewrite Todo/Metrics.md as a surprise side effect."""
+
+    def test_help_exits_zero_without_writing_metrics_md(self):
+        with mock.patch.object(metrics, "write") as mocked_write:
+            with self.assertRaises(SystemExit) as ctx:
+                metrics.main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        mocked_write.assert_not_called()
+
+    def test_bare_invocation_still_writes(self):
+        with mock.patch.object(metrics, "write", return_value="ok") as mocked_write:
+            rc = metrics.main([])
+        self.assertEqual(rc, 0)
+        mocked_write.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

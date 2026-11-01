@@ -31,6 +31,7 @@ truncated count is always printed so a capped list cannot read as a complete one
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 MAX_SURFACED = 5
@@ -316,14 +317,23 @@ def render_section(rows: list[dict], limit: int = MAX_SURFACED) -> list[str]:
     return lines
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m todo_system.orchestrator.decisions",
+        description=__doc__.strip().splitlines()[0])
+    parser.add_argument("decisions_dir")
+    parser.add_argument("items_dir")
+    return parser
+
+
 def _main(argv: list[str]) -> int:
     """`python -m todo_system.orchestrator.decisions <decisions_dir> <items_dir>`."""
-    if len(argv) != 2:
-        print(__doc__.strip().splitlines()[0])
-        print("usage: python -m todo_system.orchestrator.decisions "
-              "<decisions_dir> <items_dir>")
-        return 2
-    decisions_dir, items_dir = argv
+    parser = _build_parser()
+    try:
+        ns = parser.parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+    decisions_dir, items_dir = ns.decisions_dir, ns.items_dir
     issues = find_action_item_issues(decisions_dir, items_dir)
     print(f"# 행동 항목 이슈 {len(issues)}건")
     for r in issues:
