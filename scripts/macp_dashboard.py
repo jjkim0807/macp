@@ -22,7 +22,10 @@ anything but loopback REQUIRES a shared secret in `MACP_DASHBOARD_TOKEN`. Open
 (including the page's own `/api/status` polling) rides on it. `Authorization:
 Bearer <secret>` works too. On loopback the token is optional. The intended
 production shape on the HQ host is loopback + `tailscale serve` (HTTPS on the
-tailnet); the token gate is the safety net for any other exposure path.
+tailnet); the token gate is the safety net for any other exposure path. Auth
+failures are rate-limited per client (behind a loopback proxy: the rightmost
+`X-Forwarded-For` hop, else `Tailscale-User-Login`, else the peer IP); while a
+client is throttled even a correct token gets 429 until the window passes.
 """
 from __future__ import annotations
 
@@ -2364,22 +2367,65 @@ class Handler(BaseHTTPRequestHandler):
             return False, False
         return True, from_query
 
-    def _note_auth_failure(self) -> bool:
-        """Record an auth failure for this client IP and return True once it is over
-        the sliding-window threshold (caller answers 429 instead of 401). Logs the
-        failure with the IP and the request PATH ONLY — never the presented secret
-        (a token can arrive in `?token=`, so self.path is deliberately not logged)."""
-        ip = self.client_address[0]
+    # Rate-limit bucket key. Behind `tailscale serve` every request arrives from
+    # loopback, so the peer IP alone would put every client in ONE bucket and one
+    # client's typos would lock out the others. Headers are trusted ONLY from a
+    # loopback peer (the local reverse proxy); a remote peer keeps its IP key.
+    # Order: the RIGHTMOST X-Forwarded-For hop first (the proxy appends it; the left
+    # part is client-controlled, so rotating it must not escape the bucket) — it is
+    # per device, whereas several devices may share one tailnet login; then
+    # Tailscale-User-Login (prefixed so it never collides with an IP); then the peer.
+    _CLIENT_KEY_MAX = 128
+
+    def _client_key(self) -> str:
+        peer = self.client_address[0]
+        if _is_loopback(peer) or peer.startswith("127."):
+            xff = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+            if xff:
+                return xff[:self._CLIENT_KEY_MAX]
+            login = (self.headers.get("Tailscale-User-Login") or "").strip()
+            if login:
+                return "user:" + login[:self._CLIENT_KEY_MAX]
+        return peer
+
+    def _is_throttled(self, key: str) -> bool:
+        """Read-only: True while `key` has >= RL_MAX_FAILS failures inside the
+        window. Checked BEFORE the token compare so a throttled client is refused
+        even with the right secret — otherwise the limit never blocks a guess."""
+        now = time.monotonic()
+        with self._auth_lock:
+            n = sum(1 for t in self._auth_failures.get(key, ()) if now - t < self.RL_WINDOW_S)
+        return n >= self.RL_MAX_FAILS
+
+    def _note_auth_failure(self, key: str | None = None) -> bool:
+        """Record an auth failure for this client key (see `_client_key`) and return
+        True once it is over the sliding-window threshold (caller answers 429
+        instead of 401). Logs the failure with the client key and the request PATH
+        ONLY — never the presented secret (a token can arrive in `?token=`, so
+        self.path is deliberately not logged)."""
+        key = key or self._client_key()
         path = urlparse(self.path).path
         now = time.monotonic()
         with self._auth_lock:
-            recent = [t for t in self._auth_failures.get(ip, ()) if now - t < self.RL_WINDOW_S]
+            recent = [t for t in self._auth_failures.get(key, ()) if now - t < self.RL_WINDOW_S]
             recent.append(now)
-            self._auth_failures[ip] = recent
+            self._auth_failures[key] = recent
             over = len(recent) >= self.RL_MAX_FAILS
-        logger.warning("dashboard auth failure ip=%s path=%s fails=%d%s",
-                       ip, path, len(recent), " -> rate-limited (429)" if over else "")
+        logger.warning("dashboard auth failure client=%s path=%s fails=%d%s",
+                       key, path, len(recent), " -> rate-limited (429)" if over else "")
         return over
+
+    def _note_refused_while_throttled(self, key: str) -> None:
+        """A CORRECT secret refused because `key` is throttled. Not recorded as a
+        failure: the page polls /api/status every few seconds, and counting those
+        would keep a throttled client locked out for as long as it polls."""
+        logger.warning("dashboard auth refused while throttled client=%s path=%s",
+                       key, urlparse(self.path).path)
+
+    def _reply_throttled(self):
+        self._reply(429, b"429 too many failed attempts; slow down\n",
+                    "text/plain; charset=utf-8",
+                    {"Retry-After": str(max(1, int(self.RL_WINDOW_S)))})
 
     def _reply(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(code)
@@ -2391,12 +2437,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        key = self._client_key()
+        # An open (token=None) loopback dashboard is never throttled: SMS-ingest
+        # failures share the bucket and must not lock out an intentionally open page.
+        throttled = self.token is not None and self._is_throttled(key)
         ok, set_cookie = self._authorized()
+        if throttled:
+            if ok:
+                self._note_refused_while_throttled(key)
+            else:
+                self._note_auth_failure(key)
+            self._reply_throttled()
+            return
         if not ok:
-            if self._note_auth_failure():
-                self._reply(429, b"429 too many failed attempts; slow down\n",
-                            "text/plain; charset=utf-8",
-                            {"Retry-After": str(self.RL_WINDOW_S)})
+            if self._note_auth_failure(key):
+                self._reply_throttled()
             else:
                 self._reply(401, b"401 unauthorized: open /?token=<MACP_DASHBOARD_TOKEN>\n",
                             "text/plain; charset=utf-8")
@@ -2470,15 +2525,24 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(503, b'{"error": "sms ingest disabled (MACP_SMS_TOKEN unset)"}',
                         "application/json")
             return
+        key = self._client_key()
+        throttled = self._is_throttled(key)
         auth = self.headers.get("Authorization", "")
         got = auth[7:].strip() if auth.startswith("Bearer ") else ""
-        if not got or not hmac.compare_digest(got, sms_token):
-            over = self._note_auth_failure()
+        good = bool(got) and hmac.compare_digest(got, sms_token)
+        if throttled:
+            if good:
+                self._note_refused_while_throttled(key)
+            else:
+                self._note_auth_failure(key)
+            _dispatch_ingest_alert("auth", 429)
+            self._reply_throttled()
+            return
+        if not good:
+            over = self._note_auth_failure(key)
             _dispatch_ingest_alert("auth", 429 if over else 401)
             if over:
-                self._reply(429, b"429 too many failed attempts; slow down\n",
-                            "text/plain; charset=utf-8",
-                            {"Retry-After": str(self.RL_WINDOW_S)})
+                self._reply_throttled()
             else:
                 self._reply(401, b'{"error": "unauthorized"}', "application/json")
             return
