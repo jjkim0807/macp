@@ -385,7 +385,15 @@ def _write_scheduled(source_path: str, value: str) -> None:
     text = update_frontmatter_value(text, "scheduled", f'"{value}"')
     text = update_frontmatter_value(text, "updated", today)
     if "## Progress Log" in text:
-        text = text.rstrip("\n") + f"\n- {today}: 캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤 (calendar sync)\n"
+        line = f"- {today}: 캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤 (calendar sync)"
+        # Inside the section: after its last entry, before the next `## `
+        # heading (`### ` sub-headings stay inside); EOF when it is the last.
+        head = re.search(r"^## Progress Log[ \t]*$", text, re.M)
+        nxt = re.compile(r"^## ", re.M).search(text, head.end()) if head else None
+        if nxt:
+            text = text[:nxt.start()].rstrip("\n") + f"\n{line}\n\n" + text[nxt.start():]
+        else:
+            text = text.rstrip("\n") + f"\n{line}\n"
     path.write_text(text, encoding="utf-8")
 
 
