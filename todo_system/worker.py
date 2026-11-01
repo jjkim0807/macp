@@ -1092,6 +1092,16 @@ def _git_read(repo_root: Path, *args: str,
     )
 
 
+# "uv sync pending" marker for the engine checkout. It lives in the vault's
+# gitignored Worker/_state — never in the engine work tree, where an untracked
+# file would make `status --porcelain` dirty and skip every later pull.
+_ENGINE_SYNC_MARKER_NAME = "engine-uv-sync-pending"
+
+
+def _engine_sync_marker(vault: Path) -> Path:
+    return vault / "Worker" / "_state" / _ENGINE_SYNC_MARKER_NAME
+
+
 def pull_engine_checkout(
     *,
     engine: Path | None = None,
@@ -1112,6 +1122,18 @@ def pull_engine_checkout(
     is dirty (excluding ``Worker/`` scratch), and ``--ff-only`` so a local commit
     fails loudly and retries next tick rather than merging/rebasing. A dependency
     change (``pyproject.toml`` / ``uv.lock``) triggers ``uv sync``.
+
+    A ``uv sync`` that exits non-zero, times out or finds no ``uv`` leaves a
+    "sync pending" marker (``vault/Worker/_state/engine-uv-sync-pending``).
+    Without it the next tick would see ``before == after`` and never resync, so
+    the daemons would run new code against the old environment. While the
+    marker exists, every tick whose fetch + pull succeed runs ``uv sync`` again —
+    even when the pull moved nothing, and without the dependency diff — until a
+    sync succeeds and clears it. The HEAD/dirty skips and fetch/pull failures
+    keep the marker as is. A tick with no marker and no new commit stays a
+    no-op with no diff and no ``uv`` call. :func:`restart_stale_daemons` is not
+    gated on the marker; the guarantee is the next-tick resync. Marker I/O
+    errors print one line and never kill the tick.
 
     No-op (empty list) for the combined layout (``engine == vault``), a wheel
     install, or any non-checkout — anything without an ``engine/.git``.
@@ -1151,24 +1173,53 @@ def pull_engine_checkout(
     if _git("pull", "--ff-only", "origin", "main").returncode != 0:
         return ["engine-pull: ff-only pull 실패 (로컬 커밋?)"]
     after = _git("rev-parse", "--short", "HEAD").stdout.strip()
-    if before == after:
+    marker = _engine_sync_marker(vault)
+    pending = marker.exists()
+    if before == after and not pending:
         return []
 
     # `diff --quiet` exits 0 when pyproject/uv.lock are unchanged, 1 when they
-    # differ — only then does the environment need resyncing.
-    if _git("diff", "--quiet", before, after, "--", "pyproject.toml", "uv.lock").returncode == 0:
+    # differ — only then does the environment need resyncing (unless an earlier
+    # sync is still pending, which needs one regardless of this pull's diff).
+    if not pending and _git(
+        "diff", "--quiet", before, after, "--", "pyproject.toml", "uv.lock"
+    ).returncode == 0:
         print(f"engine-pull: pulled {before} -> {after}")
         return []
-    if run(
-        ["uv", "sync", "-q"],
-        cwd=str(engine),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_UV_SYNC_TIMEOUT_S,
-    ).returncode != 0:
-        return ["engine-pull: uv sync 실패"]
-    print(f"engine-pull: pulled {before} -> {after} + uv sync")
+    try:
+        rc = run(
+            ["uv", "sync", "-q"],
+            cwd=str(engine),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_UV_SYNC_TIMEOUT_S,
+        ).returncode
+    except subprocess.TimeoutExpired:
+        reason = "engine-pull: uv sync 타임아웃"
+    except FileNotFoundError:
+        reason = "engine-pull: uv sync 실패 — uv 없음"
+    else:
+        reason = None if rc == 0 else "engine-pull: uv sync 실패"
+
+    if reason:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} {reason}\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"engine-pull: 보류 마커 기록 실패 — {exc}")
+        return [reason]
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"engine-pull: 보류 마커 삭제 실패 — {exc}")
+    if before != after:
+        print(f"engine-pull: pulled {before} -> {after} + uv sync")
+    else:
+        print("engine-pull: 보류된 uv sync 재시도 성공")
     return []
 
 
