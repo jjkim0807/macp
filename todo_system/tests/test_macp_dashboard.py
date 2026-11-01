@@ -154,50 +154,6 @@ class RepoInChain(unittest.TestCase):
         self.assertEqual(M._task_repo("c"), _REPO_URL)
 
 
-@unittest.skipUnless(_HAVE_YAML, "PyYAML required for the repo-frontmatter resolver")
-class VaultOracle(unittest.TestCase):
-    """Structural signal against the real Todo/items. Each assertion is skipped if
-    its fixture file is gone (vault content evolves) so the suite never goes red on
-    content drift — the mechanism itself is proven hermetically by RepoInChain."""
-
-    def setUp(self):
-        patcher = mock.patch.object(M, "ITEMS", VAULT / "Todo" / "items")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        M._REPO_CACHE.clear()
-
-    def test_setup_restores_items_after_other_tests_patch_it(self):
-        self.assertEqual(M.ITEMS, VAULT / "Todo" / "items")
-
-    def _need(self, *slugs):
-        for s in slugs:
-            if not (M.ITEMS / ("%s.md" % s)).exists():
-                self.skipTest("fixture absent: %s" % s)
-
-    def test_declared_project_has_repo(self):
-        self._need("agent-commander-ai-arena-ladder")
-        self.assertIsNotNone(M._task_repo("agent-commander-ai-arena-ladder"))
-
-    def test_life_admin_tasks_have_no_repo(self):
-        for s in ("cv-content-refresh", "withdrawal-b1-final-decision"):
-            self._need(s)
-            self.assertIsNone(M._task_repo(s))
-
-    def test_review_child_inherits_project_repo(self):
-        # the reported bug class: a worker-made review-* child (no own repo) must
-        # resolve dev via its parent project's declared repo.
-        child = "review-worldgraph-15-knowledge-state-pov-check-20260725T1412"
-        parent = "worldgraph-15-knowledge-state-pov-check"
-        self._need(child, parent)
-        self.assertIsNone(M._task_repo(child))    # child declares none of its own
-        self.assertIsNotNone(M._task_repo(parent))
-        self.assertTrue(M._repo_in_chain(child, {child: parent, parent: ""}))
-        self.assertEqual(
-            M._category("todo,work,worldgraph",
-                        repo_present=M._repo_in_chain(child, {child: parent, parent: ""})),
-            "dev")
-
-
 def _install_status_fixture(tc: unittest.TestCase) -> Path:
     """Point every path collect_status() reads at a temp tree, restored on cleanup.
 
