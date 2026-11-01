@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import email.message
 import hashlib
 import http.client
 import importlib.util
@@ -776,7 +777,122 @@ class RemoteAccessGateTests(unittest.TestCase):
                 s.get(f"/?token={secret_guess}")
         joined = "\n".join(cm.output)
         self.assertIn("auth failure", joined)
+        self.assertIn("client=", joined)
         self.assertNotIn(secret_guess, joined)             # presented secret never logged
+
+    # -- refuse while throttled + per-client buckets
+    #    (macp-dashboard-auth-limiter-refuse-while-throttled) --------------------
+
+    def _trip(self, s, headers=None):
+        """Send RL_MAX_FAILS wrong guesses; the last one must already be 429."""
+        codes = [s.get("/?token=nope", headers)[0] for _ in range(M.Handler.RL_MAX_FAILS)]
+        self.assertEqual(codes[-1], 429, codes)
+
+    def test_correct_token_refused_while_throttled(self):
+        # The bug: the limit only changed the status code of WRONG guesses; a right
+        # token still got 200, so a guesser was never actually blocked.
+        with _LiveServer(self.TOKEN) as s:
+            self._trip(s)
+            for path, hdrs in ((f"/?token={self.TOKEN}", None),
+                               ("/api/status", {"Cookie": f"{M.COOKIE}={self.TOKEN}"}),
+                               ("/api/status", {"Authorization": f"Bearer {self.TOKEN}"})):
+                status, h, body = s.get(path, hdrs)
+                self.assertEqual(status, 429, (path, hdrs))
+                self.assertIn("retry-after", {k.lower() for k in h})
+                self.assertNotIn("Set-Cookie", h)
+                self.assertNotIn(b"<html", body.lower())
+                self.assertNotIn(b'"ok"', body)
+
+    def test_correct_token_while_throttled_does_not_extend_window(self):
+        with _LiveServer(self.TOKEN) as s:
+            self._trip(s)
+            for _ in range(3):
+                self.assertEqual(s.get(f"/?token={self.TOKEN}")[0], 429)
+            fails = s.srv.RequestHandlerClass._auth_failures["127.0.0.1"]
+            self.assertEqual(len(fails), M.Handler.RL_MAX_FAILS)
+
+    def test_wrong_token_while_throttled_still_counts(self):
+        with _LiveServer(self.TOKEN) as s:
+            self._trip(s)
+            self.assertEqual(s.get("/?token=nope")[0], 429)
+            fails = s.srv.RequestHandlerClass._auth_failures["127.0.0.1"]
+            self.assertEqual(len(fails), M.Handler.RL_MAX_FAILS + 1)
+
+    def test_access_restored_after_window(self):
+        with _LiveServer(self.TOKEN) as s:
+            with mock.patch.object(s.srv.RequestHandlerClass, "RL_WINDOW_S", 0.5):
+                self._trip(s)
+                status, h, _ = s.get(f"/?token={self.TOKEN}")
+                self.assertEqual(status, 429)
+                retry = {k.lower(): v for k, v in h.items()}["retry-after"]
+                self.assertGreaterEqual(int(retry), 1)       # integer seconds, never "0.5"
+                time.sleep(0.6)
+                self.assertEqual(s.get(f"/?token={self.TOKEN}")[0], 200)
+
+    def test_failures_are_keyed_per_forwarded_client(self):
+        # Behind `tailscale serve` everything arrives from 127.0.0.1; one device's
+        # typos must not lock out another device (the phone).
+        attacker = {"X-Forwarded-For": "100.64.0.9"}
+        phone = {"X-Forwarded-For": "100.64.0.2"}
+        with _LiveServer(self.TOKEN) as s:
+            self._trip(s, attacker)
+            self.assertEqual(s.get(f"/?token={self.TOKEN}", phone)[0], 200)
+            self.assertEqual(s.get("/?token=nope", phone)[0], 401)
+            self.assertEqual(s.get(f"/?token={self.TOKEN}", attacker)[0], 429)
+
+    def test_forwarded_for_uses_rightmost_hop(self):
+        # The left part of X-Forwarded-For is client-controlled; rotating it must
+        # not escape the bucket keyed on the proxy-appended rightmost hop.
+        with _LiveServer(self.TOKEN) as s:
+            codes = [s.get("/?token=nope", {"X-Forwarded-For": f"203.0.113.{i}, 100.64.0.9"})[0]
+                     for i in range(M.Handler.RL_MAX_FAILS)]
+            self.assertEqual(codes[-1], 429, codes)
+            status = s.get(f"/?token={self.TOKEN}",
+                           {"X-Forwarded-For": "198.51.100.7, 100.64.0.9"})[0]
+            self.assertEqual(status, 429)
+
+    def test_tailscale_login_keys_when_no_forwarded_for(self):
+        alice = {"Tailscale-User-Login": "alice@example.com"}
+        bob = {"Tailscale-User-Login": "bob@example.com"}
+        with _LiveServer(self.TOKEN) as s:
+            self._trip(s, alice)
+            self.assertEqual(s.get(f"/?token={self.TOKEN}", alice)[0], 429)
+            self.assertEqual(s.get(f"/?token={self.TOKEN}", bob)[0], 200)
+            self.assertIn("user:alice@example.com", s.srv.RequestHandlerClass._auth_failures)
+
+    def test_client_key_ignores_headers_from_non_loopback_peer(self):
+        h = M.Handler.__new__(M.Handler)
+        hdrs = email.message.Message()
+        hdrs["X-Forwarded-For"] = "100.64.0.9"
+        hdrs["Tailscale-User-Login"] = "alice@example.com"
+        h.headers = hdrs
+        h.client_address = ("100.64.0.5", 40000)
+        self.assertEqual(h._client_key(), "100.64.0.5")      # remote peer: headers untrusted
+        h.client_address = ("127.0.0.1", 1)
+        self.assertEqual(h._client_key(), "100.64.0.9")      # loopback proxy: trusted
+        h.headers = email.message.Message()
+        self.assertEqual(h._client_key(), "127.0.0.1")       # no header: peer IP as before
+        long = email.message.Message()
+        long["X-Forwarded-For"] = "x" * 500
+        h.headers = long
+        self.assertEqual(len(h._client_key()), 128)          # bounded dict key / log field
+
+    def test_open_loopback_dashboard_never_throttled(self):
+        # Token None = intentionally open loopback page; SMS-ingest failures share
+        # the bucket and must not 429 it.
+        with _LiveServer(None) as s:
+            s.srv.RequestHandlerClass._auth_failures["127.0.0.1"] = (
+                [time.monotonic()] * (M.Handler.RL_MAX_FAILS + 1))
+            self.assertEqual(s.get("/api/status")[0], 200)
+
+    def test_throttled_refusal_logged_without_the_secret(self):
+        with self.assertLogs("macp.dashboard", "WARNING") as cm:
+            with _LiveServer(self.TOKEN) as s:
+                self._trip(s)
+                s.get(f"/?token={self.TOKEN}")
+        joined = "\n".join(cm.output)
+        self.assertIn("refused while throttled", joined)
+        self.assertNotIn(self.TOKEN, joined)
 
 
 class UnknownApiRoutingTests(unittest.TestCase):
