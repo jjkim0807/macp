@@ -891,6 +891,99 @@ def test_all_day_move_pulls_a_date(monkeypatch, tmp_path):
     assert 'scheduled: "2026-11-05"' in p.read_text(encoding="utf-8")
 
 
+# --- shapes the md cannot express (multi-day all-day, overnight timed) --------
+# `scheduled:` holds one day (+ an optional same-day time range). A pulled
+# multi-day or midnight-spanning event is written to the md lossily, and the
+# next tick used to read that lossy md as an md edit and patch the event back
+# to one day. Each round trip below checks BOTH halves of "no ping-pong": the
+# event is not patched again AND the md is not rewritten again.
+
+def _second_pass(p, ev, title="Task one"):
+    con = _db([("t1", title, "2026-11-02", "na", str(p), "open", None)])
+    ev2 = _TwoWayEvents([ev.existing[0]])
+    _sync(con, ev2)
+    return ev2
+
+
+def test_multi_day_all_day_edit_survives_the_round_trip(monkeypatch, tmp_path):
+    moved = _existing({"date": "2026-11-05"}, {"date": "2026-11-08"},
+                      "D:2026-11-02", "D:2026-11-03")
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02", [moved])
+    assert 'scheduled: "2026-11-05"' in p.read_text(encoding="utf-8")
+    (_, body), = ev.patched
+    assert body["start"] == {"date": "2026-11-05"} and body["end"] == {"date": "2026-11-08"}
+    before = p.read_text(encoding="utf-8")
+
+    ev2 = _second_pass(p, ev)
+    assert not ev2.patched and not ev2.inserted and not ev2.deleted
+    assert p.read_text(encoding="utf-8") == before
+    assert ev2.existing[0]["end"] == {"date": "2026-11-08"}
+
+
+def test_overnight_timed_edit_survives_the_round_trip(monkeypatch, tmp_path):
+    moved = _existing(_seoul("2026-11-03", "23:00"), _seoul("2026-11-04", "01:00"),
+                      "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 10:00~11:00", [moved])
+    assert 'scheduled: "2026-11-03"' in p.read_text(encoding="utf-8")
+    (_, body), = ev.patched
+    assert body["start"]["dateTime"].startswith("2026-11-03T23:00")
+    assert body["end"]["dateTime"].startswith("2026-11-04T01:00")
+    before = p.read_text(encoding="utf-8")
+
+    ev2 = _second_pass(p, ev)
+    assert not ev2.patched and not ev2.inserted and not ev2.deleted
+    assert p.read_text(encoding="utf-8") == before
+
+
+def test_title_change_after_pull_keeps_the_calendar_shape(monkeypatch, tmp_path):
+    moved = _existing({"date": "2026-11-05"}, {"date": "2026-11-08"},
+                      "D:2026-11-02", "D:2026-11-03")
+    p, ev = _two_way(monkeypatch, tmp_path, "2026-11-02", [moved])
+    before = p.read_text(encoding="utf-8")
+
+    ev2 = _second_pass(p, ev, title="Task one renamed")
+    (_, body), = ev2.patched
+    assert body["summary"] == "Task one renamed"
+    assert body["start"] == {"date": "2026-11-05"} and body["end"] == {"date": "2026-11-08"}
+    assert p.read_text(encoding="utf-8") == before
+    # ...and the text-only patch leaves a steady state behind.
+    ev3 = _second_pass(p, ev2, title="Task one renamed")
+    assert not ev3.patched and p.read_text(encoding="utf-8") == before
+
+
+def test_pulled_progress_log_line_lands_in_its_section(monkeypatch, tmp_path):
+    monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
+    p = tmp_path / "t1.md"
+    p.write_text(
+        "---\nstatus: open\ndue: 2026-11-02\nupdated: 2026-10-20\n"
+        'scheduled: "2026-11-02 10:00~11:00"\n---\n\n# t\n\n'
+        "## Progress Log\n\n- 2026-10-20: made\n\n## Notes\n\nkeep\n",
+        encoding="utf-8")
+    con = _db([("t1", "Task one", "2026-11-02", "na", str(p), "open", None)])
+    moved = _existing(_seoul("2026-11-03", "14:00"), _seoul("2026-11-03", "15:30"),
+                      "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    _sync(con, _TwoWayEvents([moved]))
+
+    text = p.read_text(encoding="utf-8")
+    assert text.count("캘린더에서 일정을 옮겨") == 1
+    made = text.index("- 2026-10-20: made")
+    logged = text.index("캘린더에서 일정을 옮겨")
+    notes = text.index("## Notes")
+    assert made < logged < notes
+    assert text.endswith("## Notes\n\nkeep\n")
+
+
+def test_write_scheduled_without_progress_log_adds_no_line(tmp_path):
+    p = tmp_path / "t1.md"
+    p.write_text('---\nstatus: open\nscheduled: "2026-11-02"\n---\n\n# t\n\nbody\n',
+                 encoding="utf-8")
+    CS._write_scheduled(str(p), "2026-11-05")
+    text = p.read_text(encoding="utf-8")
+    assert 'scheduled: "2026-11-05"' in text
+    assert "캘린더에서 일정을 옮겨" not in text
+    assert text.endswith("# t\n\nbody\n")
+
+
 def test_canon_treats_offset_and_timezone_forms_alike(monkeypatch):
     monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
     a = CS._canon({"dateTime": "2026-11-02T10:00:00+09:00"})
