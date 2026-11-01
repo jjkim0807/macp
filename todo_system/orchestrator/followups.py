@@ -53,6 +53,7 @@ never touch.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import json
@@ -689,36 +690,38 @@ def _section_label(section) -> str:
     return i18n.t(key) if key else str(section)
 
 
-def _parse_dismiss(rest: list[str]) -> tuple[str, str] | None:
-    """(id, reason) from `<id> --reason <text…>` or `<id> --reason=<text…>`."""
-    if len(rest) < 2 or rest[0].startswith("--"):
-        return None
-    fid, flag, tail = rest[0], rest[1], rest[2:]
-    if flag == "--reason":
-        reason = " ".join(tail)
-    elif flag.startswith("--reason="):
-        reason = " ".join([flag.removeprefix("--reason="), *tail])
-    else:
-        return None
-    reason = reason.strip()
-    return (fid, reason) if reason else None
-
-
 def _clean_id(raw: str) -> str:
     """Accept an id pasted with the brackets `human` prints around it."""
     return raw.strip().strip("[]")
 
 
-def _usage() -> int:
-    sys.stderr.write(
-        f"usage: {CLI} {{emit-context|reconcile|human|approve <id>|"
-        "dismiss <id> --reason <text>|reroute <id>}\n")
+def _usage(parser: argparse.ArgumentParser) -> int:
+    parser.print_usage(sys.stderr)
     return 2
 
 
 def _reply(rc: int, msg: str) -> int:
     (sys.stderr if rc else sys.stdout).write(msg + "\n")
     return rc
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The subcommand grammar: emit-context/reconcile/human take no arguments,
+    approve/reroute take one positional id, dismiss takes an id plus a
+    required `--reason` (one or more words, joined with spaces — matches the
+    old hand-rolled `<id> --reason <text…>` / `<id> --reason=<text…>` forms)."""
+    parser = argparse.ArgumentParser(prog=CLI)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("emit-context")
+    sub.add_parser("reconcile")
+    sub.add_parser("human")
+    for name in ("approve", "reroute"):
+        p = sub.add_parser(name)
+        p.add_argument("id")
+    p_dismiss = sub.add_parser("dismiss")
+    p_dismiss.add_argument("id")
+    p_dismiss.add_argument("--reason", nargs="+", required=True)
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -733,33 +736,40 @@ def main(argv: list[str] | None = None) -> int:
     never reconciles); `approve <id>` / `dismiss <id> --reason <text>` decide a
     parked follow-up; `reroute <id>` re-files one old `rejected` follow-up as
     awaiting a human. Exit codes: 0 done, 1 unknown id / refused transition /
-    write failure, 2 bad usage."""
+    write failure, 2 bad usage (including `--help`, which argparse answers
+    with exit 0 instead)."""
     args = list(sys.argv[1:] if argv is None else argv)
-    cmd = args[0] if args else ""
-    rest = args[1:]
-    if cmd == "emit-context":
+    parser = _build_parser()
+    try:
+        ns = parser.parse_args(args)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+
+    if ns.cmd == "emit-context":
         sys.stdout.write(render_context(open_followups()))
         return 0
-    if cmd == "reconcile":
+    if ns.cmd == "reconcile":
         done = reconcile()
         if done:
             sys.stderr.write(
                 f"reconciled {len(done)} follow-up(s): {' '.join(done)}\n")
         return 0
-    if cmd == "human":
+    if ns.cmd == "human":
         sys.stdout.write(render_human(load_followups()))
         return 0
-    if cmd in ("approve", "reroute"):
-        if len(rest) != 1 or not _clean_id(rest[0]):
-            return _usage()
-        fn = approve if cmd == "approve" else reroute
-        return _reply(*fn(_clean_id(rest[0])))
-    if cmd == "dismiss":
-        parsed = _parse_dismiss(rest)
-        if not parsed or not _clean_id(parsed[0]):
-            return _usage()
-        return _reply(*dismiss(_clean_id(parsed[0]), parsed[1]))
-    return _usage()
+    if ns.cmd in ("approve", "reroute"):
+        fid = _clean_id(ns.id)
+        if not fid:
+            return _usage(parser)
+        fn = approve if ns.cmd == "approve" else reroute
+        return _reply(*fn(fid))
+    if ns.cmd == "dismiss":
+        fid = _clean_id(ns.id)
+        reason = " ".join(ns.reason).strip()
+        if not fid or not reason:
+            return _usage(parser)
+        return _reply(*dismiss(fid, reason))
+    return _usage(parser)
 
 
 if __name__ == "__main__":
