@@ -480,6 +480,9 @@ class ConsumedTest(DiscoveryBase):
             self.assertEqual(discovery.main(["bogus"]), 2)
         self.assertIn("emit-consumed", err.getvalue())
 
+    def test_help_exits_zero(self):
+        self.assertEqual(discovery.main(["--help"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

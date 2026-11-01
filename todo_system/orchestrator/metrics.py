@@ -8,12 +8,14 @@ for itself. Stdlib-only; run with `python -m todo_system.orchestrator.metrics`.
 """
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import re
 import sqlite3
 import statistics
 import subprocess
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -619,5 +621,17 @@ def write(out_path: str | Path = DEFAULT_OUT) -> str:
     return text
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """No flags beyond `--help` (argparse answers that with exit 0 and no
+    side effect); bare invocation renders Todo/Metrics.md, same as before."""
+    parser = argparse.ArgumentParser(
+        prog="python -m todo_system.orchestrator.metrics",
+        description="Render Todo/Metrics.md from the assignment ledger, "
+                     "todo.db, and Worker/runs.")
+    parser.parse_args(sys.argv[1:] if argv is None else argv)
     print(write())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
