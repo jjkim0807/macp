@@ -190,9 +190,9 @@ class IngestEndpointTests(_StoreCase):
     def _settle(self, M=None):
         self.assertTrue((M or self.M).wait_ingest_alerts(5))
 
-    def _req(self, method, path, body=None, token=None, port=None):
+    def _req(self, method, path, body=None, token=None, port=None, headers=None):
         c = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=5)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **(headers or {})}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         c.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
@@ -264,6 +264,36 @@ class IngestEndpointTests(_StoreCase):
         self.assertEqual(codes[-1], 429)
         self._settle()
         self.assertEqual(len(self.alerts), 1)
+
+    # -- refuse while throttled + per-client buckets
+    #    (macp-dashboard-auth-limiter-refuse-while-throttled) --------------------
+
+    def _trip_sms(self, headers=None):
+        codes = [self._req("POST", "/api/sms", self.SECRET_BODY, token="wrong", headers=headers)[0]
+                 for _ in range(self.M.Handler.RL_MAX_FAILS)]
+        self.assertEqual(codes[-1], 429, codes)
+
+    def test_correct_sms_token_refused_while_throttled(self):
+        self._trip_sms()
+        st, _ = self._req("POST", "/api/sms", {"id": "late", "from": "1588", "body": "ok"},
+                          token=self.SMS)
+        self.assertEqual(st, 429)
+        self.assertEqual(sms.query(), [])                  # nothing stored while throttled
+        self._settle()
+        self.assertEqual(len(self.alerts), 1)              # auth kind: one alert per 6h
+
+    def test_sms_failures_keyed_per_forwarded_client(self):
+        attacker = {"X-Forwarded-For": "100.64.0.9"}
+        phone = {"X-Forwarded-For": "100.64.0.2"}
+        self._trip_sms(attacker)
+        st, _ = self._req("POST", "/api/sms", {"id": "phone-1", "from": "1588", "body": "ok"},
+                          token=self.SMS, headers=phone)
+        self.assertEqual(st, 200)
+        self.assertIn("phone-1", [r["id"] for r in sms.query()])
+        st, _ = self._req("POST", "/api/sms", {"id": "atk-1", "from": "1588", "body": "ok"},
+                          token=self.SMS, headers=attacker)
+        self.assertEqual(st, 429)
+        self.assertNotIn("atk-1", [r["id"] for r in sms.query()])
 
     def test_400_and_413_alert_per_kind_200_never(self):
         with mock.patch.object(self.M.Handler, "SMS_MAX_BYTES", 64):
