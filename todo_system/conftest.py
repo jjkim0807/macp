@@ -83,6 +83,16 @@ doctor and runner test) reads those same three seams plus its own
 ``REGISTRY_DIR``, which the fixture also points into the tmp dir, so it can
 never remove a real worktree or gradle-registry dir.
 
+The maintenance cache prune (``todo_system/maintenance_disk.py``) is a step of
+``worker.cmd_maintenance``, which several suites call. Below its 8 GiB trigger
+it runs ``uv cache prune`` and deletes old Gradle caches under the real
+``~/.gradle`` — and the HQ host had 6.4G free the day it was written, so every
+unisolated ``cmd_maintenance`` test would have fired it. ``_disk_prune_isolated``
+sets its kill switch (``MACP_DISK_PRUNE=0``) and points ``HOME_DIR``,
+``GRADLE_HOME_DIR``, ``STATE_DIR``, ``VAULT_ROOT`` and ``PROC_DIR`` into a tmp
+dir that is never created. The module's own tests lift the switch and build a
+fake home there.
+
 The ``auto`` tick's own side effects — ``orchestrator main auto`` reaches three
 things no test may do for real. ``usage_hold()`` calls ``usage_guard.check()``,
 whose ``get_snapshot`` sends a GET to the Anthropic OAuth usage endpoint (its
@@ -129,7 +139,7 @@ from typing import NamedTuple
 
 import pytest
 
-from todo_system import cli, usage_guard, worker
+from todo_system import cli, maintenance_disk, usage_guard, worker
 from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
 from todo_system.orchestrator import orchestrator as _orch_mod
 
@@ -446,6 +456,20 @@ def _disk_guard_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(disk_guard, "ASSIGNMENTS_DIR", base / "assignments")
     monkeypatch.setattr(disk_guard, "JOBS_DIR", base / "jobs")
     monkeypatch.setattr(worktree_sweep, "REGISTRY_DIR", base / "gradle-registry")
+
+
+@pytest.fixture(autouse=True)
+def _disk_prune_isolated(tmp_path_factory, monkeypatch):
+    # Switched off AND pointed at a tmp dir (see the module docstring). The dirs
+    # are never created, so a prune test that forgets a seam finds no caches.
+    base = tmp_path_factory.mktemp("disk-prune")
+    monkeypatch.setenv(maintenance_disk.KILL_ENV, "0")
+    monkeypatch.setenv(maintenance_disk.STATE_DIR_ENV, str(base / "state"))
+    monkeypatch.setattr(maintenance_disk, "HOME_DIR", base / "home")
+    monkeypatch.setattr(maintenance_disk, "GRADLE_HOME_DIR", base / "home" / ".gradle")
+    monkeypatch.setattr(maintenance_disk, "STATE_DIR", base / "state")
+    monkeypatch.setattr(maintenance_disk, "VAULT_ROOT", base / "vault")
+    monkeypatch.setattr(maintenance_disk, "PROC_DIR", str(base / "no-proc"))
 
 
 @pytest.fixture(autouse=True)
