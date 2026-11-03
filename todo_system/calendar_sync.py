@@ -279,8 +279,23 @@ def _upsert_event(
         return "updated"
 
     _baselines(desired, desired)
+    body["start"], body["end"] = _clear_other_shape(body["start"]), _clear_other_shape(body["end"])
     service.events().patch(calendarId=calendar_id, eventId=ev["id"], body=body).execute()
     return "updated"
+
+
+def _clear_other_shape(when: dict) -> dict:
+    """``when`` plus an explicit null for the key of the OTHER event shape.
+
+    Google's patch merges the start/end maps key by key, so moving an all-day
+    event (`date`) to a time block (`dateTime`), or back, left both keys on the
+    event and the API refused it with 400 "Invalid start time" on every tick
+    (2026-11-03: a task whose `scheduled:` went from a date to "… 14:00~16:00").
+    A null deletes the stale key; it is a no-op when the shape did not change.
+    """
+    if "dateTime" in when:
+        return {**when, "date": None}
+    return {**when, "dateTime": None, "timeZone": None}
 
 
 def _event_window(

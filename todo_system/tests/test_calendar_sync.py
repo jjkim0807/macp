@@ -1016,3 +1016,26 @@ def test_canon_treats_offset_and_timezone_forms_alike(monkeypatch):
     b = CS._canon({"dateTime": "2026-11-02T10:00:00", "timeZone": "Asia/Seoul"})
     c = CS._canon({"dateTime": "2026-11-02T01:00:00Z"})
     assert a == b == c == "T:2026-11-02T01:00"
+
+
+# --- shape change: all-day <-> timed (2026-11-03) ------------------------------
+# Google's patch merges the start/end maps, so a body with only `dateTime` left the
+# event's old `date` in place and the API answered 400 "Invalid start time" on every
+# tick. The patch must null the key of the other shape.
+
+def test_md_edit_from_all_day_to_timed_nulls_the_stale_date(monkeypatch, tmp_path):
+    all_day = _existing({"date": "2026-11-02"}, {"date": "2026-11-03"},
+                        "D:2026-11-02", "D:2026-11-03")
+    _, ev = _two_way(monkeypatch, tmp_path, "2026-11-02 14:00~16:00", [all_day])
+    (_, body), = ev.patched
+    assert body["start"]["dateTime"].startswith("2026-11-02T14:00")
+    assert body["start"]["date"] is None and body["end"]["date"] is None
+
+
+def test_md_edit_from_timed_to_all_day_nulls_the_stale_datetime(monkeypatch, tmp_path):
+    timed = _existing(_seoul("2026-11-02", "10:00"), _seoul("2026-11-02", "11:00"),
+                      "T:2026-11-02T01:00", "T:2026-11-02T02:00")
+    _, ev = _two_way(monkeypatch, tmp_path, "2026-11-04", [timed])
+    (_, body), = ev.patched
+    assert body["start"]["date"] == "2026-11-04"
+    assert body["start"]["dateTime"] is None and body["end"]["dateTime"] is None
