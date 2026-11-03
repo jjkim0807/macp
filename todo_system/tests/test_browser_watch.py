@@ -258,9 +258,11 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
         raise RuntimeError("watch exploded")
 
     monkeypatch.setattr(worker.browser_watch, "check_login_watch", boom)
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", rec("disk-prune", None))
     assert worker.cmd_maintenance() == 1
     assert called == ["autoclose", "sweep", "sync", "rotate", "migrations",
-                      "vault-pin", "wrappers", "restart", "silence", "starvation"]
+                      "vault-pin", "wrappers", "restart", "silence", "starvation",
+                      "disk-prune"]
 
 
 def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
@@ -272,6 +274,7 @@ def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
         monkeypatch.setattr(worker, name, lambda: [])
     for name in ("check_dispatch_silence", "check_work_starvation"):
         monkeypatch.setattr(worker, name, lambda: None)
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", lambda **k: None)
     monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
     sent = []
     monkeypatch.setattr(worker, "kakao_notify", lambda msg, *a, **k: sent.append(msg))

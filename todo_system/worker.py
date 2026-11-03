@@ -40,6 +40,7 @@ import hashlib
 from .claude_auth import claude_env
 from . import browser_watch
 from . import kakao_format
+from . import maintenance_disk
 from . import not_before as nb_gate
 from . import paths
 from .kakao_format import LEVEL_DIGEST, compose_alert
@@ -2185,6 +2186,9 @@ def cmd_maintenance() -> int:
         remote (and any host that takes over) is stale.
       - browser_watch.check_login_watch: hourly probe of the HQ's logged-in
         browser profile; pages on login-state transitions only.
+      - maintenance_disk.check_and_prune: below 8 GiB free on the root disk,
+        prunes re-downloadable caches (uv, old Gradle version caches and
+        build-cache entries); silent when healthy, pages once a day if still low.
 
     doctor_recover_queue is deliberately NOT here: it heals Worker/queue.json,
     which is exactly the store the cutover retires.
@@ -2302,6 +2306,15 @@ def cmd_maintenance() -> int:
                 print(f"browser-watch: paged — {msg.splitlines()[0]}")
         except Exception as exc:
             print(f"browser-watch: error — {exc}")
+            rc = 1
+        # The root disk fills with caches Gradle and uv re-download on demand
+        # (2026-11-03: 6.4G free of 96G); prune them before a build hits ENOSPC.
+        try:
+            line = maintenance_disk.check_and_prune(notify=kakao_notify)
+            if line:
+                print(line)
+        except Exception as exc:
+            print(f"disk-prune: error — {exc}")
             rc = 1
     return rc
 

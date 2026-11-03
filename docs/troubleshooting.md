@@ -72,6 +72,15 @@ usual cause. Name the exact local command in `acceptance_criteria`.
 - Never edit `Worker/assignments/*.json` by hand. The orchestrator owns the ledger, and
   a hand edit races the next tick.
 
+## Builds fail with "No space left on device"
+
+Look for `disk-prune:` and `disk guard:` lines in the maintenance and runner logs.
+`python -m todo_system.maintenance_disk --dry-run` shows free space, whether Gradle
+counts as busy, and which caches a pass would remove. A line ending in `— STILL below`
+means the prunable caches are already gone, and what fills the disk is something
+neither guard may touch (clones, distributions, data). `du -sh ~/.gradle ~/.cache
+~/Worker` usually finds it. See [Running 24/7](running.md#disk-space).
+
 ## The dashboard will not start
 
 It refuses non-loopback addresses without `MACP_DASHBOARD_TOKEN`. With
