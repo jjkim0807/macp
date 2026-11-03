@@ -729,5 +729,53 @@ class SuiteIsolationTest(unittest.TestCase):
         d.assert_not_called()
 
 
+def _quiet_other_steps(monkeypatch):
+    from todo_system import worker
+    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
+    for name in ("autoclose_stale_reviews_local", "sweep_remote_completed_runs",
+                 "sync_vault_state"):
+        monkeypatch.setattr(worker, name, lambda: 0)
+    for name in ("rotate_logs", "check_unapplied_migrations", "pull_engine_checkout",
+                 "bump_vault_engine_pin", "sync_wrappers", "pull_browser_checkout",
+                 "restart_stale_daemons"):
+        monkeypatch.setattr(worker, name, lambda: [])
+    for name in ("check_dispatch_silence", "check_work_starvation"):
+        monkeypatch.setattr(worker, name, lambda: None)
+    monkeypatch.setattr(worker.browser_watch, "check_login_watch", lambda **k: None)
+    return worker
+
+
+def test_cmd_maintenance_runs_the_step_with_kakao_notify(monkeypatch, capsys):
+    worker = _quiet_other_steps(monkeypatch)
+    seen = []
+
+    def step(**kw):
+        seen.append(kw)
+        return "disk-prune: free 6.0G → 9.0G of 96.0G — uv cache prune ok"
+
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", step)
+    assert worker.cmd_maintenance() == 0
+    assert seen == [{"notify": worker.kakao_notify}]
+    assert "disk-prune: free 6.0G → 9.0G" in capsys.readouterr().out
+
+
+def test_cmd_maintenance_silent_step_prints_nothing(monkeypatch, capsys):
+    worker = _quiet_other_steps(monkeypatch)
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", lambda **k: None)
+    assert worker.cmd_maintenance() == 0
+    assert "disk-prune" not in capsys.readouterr().out
+
+
+def test_cmd_maintenance_step_raising_sets_rc(monkeypatch, capsys):
+    worker = _quiet_other_steps(monkeypatch)
+
+    def boom(**kw):
+        raise RuntimeError("prune exploded")
+
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", boom)
+    assert worker.cmd_maintenance() == 1
+    assert "disk-prune: error — prune exploded" in capsys.readouterr().out
+
+
 if __name__ == "__main__":
     unittest.main()
