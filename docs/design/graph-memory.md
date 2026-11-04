@@ -181,7 +181,79 @@ typed edge `:261-282`). 임베딩·벡터 최근접이 없어 "의미가 비슷�
 
 ## §3 저장소·접근 경로 비교표 (공식 문서 URL 포함)
 
-*(Phase 3 에서 채움)*
+메모리 v2 는 (a) **벡터/임베딩**(R3), (b) **그래프 탐색**(R3), (c) **bi-temporal + provenance**
+(R1·R2) 를 한 저장소에서 지원해야 하고, (d) [[docs/design/state-store|state-store.md]] 의
+external SQLite·⑦ 원격 상태 API 와 **같은 서버로 질의**를 낼 수 있어야 한다(열림질문 해소,
+§3.4). 후보를 임베디드/서버형으로 나눠 비교한다.
+
+### 3.1 공식 문서 URL (WebFetch 2026-11-04 확인; 못 연 것은 '미확인')
+
+| 후보 / 참조 | 종류 | 공식 문서 URL | 확인 |
+|---|---|---|---|
+| SQLite 재귀 CTE (현행) | 임베디드 질의 | `https://www.sqlite.org/lang_with.html` | 확인 (stable; 재귀 CTE 로 트리/그래프 질의, 복합 재귀 3.34.0+) |
+| sqlite-vec | 임베디드 벡터 확장 | `https://github.com/asg017/sqlite-vec` | 확인 (**pre-v1 — breaking changes 주의**; `vec0` 가상테이블, float/int8/binary, sqlite-vss 후속, Apache-2.0/MIT) |
+| DuckDB VSS | 임베디드 벡터 확장 | `https://duckdb.org/docs/stable/core_extensions/vss` (정본 `…/docs/2.0/core_extensions/vss.html`) | 확인 (**experimental**; HNSW on ARRAY, 지속성은 experimental 플래그 뒤 — 미커밋 종료 시 손상 경고) |
+| Kùzu | 임베디드 그래프 DB | `https://docs.kuzudb.com` | **미확인** (DNS ENOTFOUND — 호스트 미해결; §3.2 기각 사유) |
+| pgvector | 서버(Postgres) 벡터 | `https://github.com/pgvector/pgvector` | 확인 (v0.8.x, Postgres 13+, HNSW·IVFFlat, 벡터는 일반 PG 테이블) |
+| Apache AGE | 서버(Postgres) 그래프 | `https://age.apache.org/` | 확인 (활성 ASF 프로젝트, PG16 호환, Cypher on Postgres) |
+| Neo4j | 서버 그래프 DB | `https://neo4j.com/docs` | 확인 (활성 상용, Cypher·GDS·네이티브 벡터) |
+| **Graphiti/Zep** (선행연구) | 시간축 KG 프레임워크 | `https://github.com/getzep/graphiti` · 논문 `https://arxiv.org/abs/2501.13956` | 확인 (Apache-2.0; validity window+provenance = R1·R2 와 동형; 백엔드 Neo4j/FalkorDB/Neptune·**Kuzu deprecated**; 논문 DMR 94.8% vs MemGPT 93.4%) |
+| **Letta** (구 MemGPT, 선행연구) | 에이전트 메모리 프레임워크 | `https://docs.letta.com/` · MemGPT 논문 `arXiv:2310.08560` | docs.letta.com 확인 (core/archival/recall 계층; pip 기본 SQLite+Chroma, Docker 기본 Postgres+pgvector) · 논문 arXiv id **미확인(미열람)** |
+
+### 3.2 비교표 (비용 · 운영 · 원격질의)
+
+**비용 열** = 본부 VM(macp-hq) **디스크·메모리** 증가와 **새 유료 인프라** 여부. 본부 VM 자체는
+어느 후보든 상주하므로 공통 비용에서 뺀다. 제약: 상시 외부 SaaS DB(Supabase·Neon) **금지**
+([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]), 유료는 GCP Cloud SQL 만·사람 게이트
+(월 ~$10~25, [[Decisions/2026-10-13-macp-task-store]]).
+
+| 후보 | 임베/서버 | 비용(디스크·메모리 / 새 유료 인프라) | 운영 부담 | 임베딩(벡터) | 그래프 탐색 | **external SQLite·⑦ API 와 같은 서버 질의?** |
+|---|---|---|---|---|---|---|
+| SQLite + 재귀 CTE (현행) | 임베디드 | 디스크 微·메모리 微 / **$0** | 최저(이미 운영) | **없음**(§1 한계②) | 재귀 CTE(느림) | **예** — `state.sqlite` 와 같은 파일/프로세스 |
+| **SQLite + sqlite-vec** ★ | 임베디드 | 디스크 小(벡터)·메모리 小 / **$0** | 낮음(확장 1개 load) | `vec0` KNN | 재귀 CTE | **예** — `state.sqlite` 와 동일 파일(ATTACH/동일 커넥션), ⑦ (a) HTTP API 가 그대로 노출 |
+| DuckDB + VSS | 임베디드 | 디스크 中·메모리 中(OLAP) / **$0** | 중(VSS 지속성 experimental — 손상 경고) | HNSW(ARRAY) | 재귀 CTE | 부분 — 별 엔진·별 파일, ⑦ API 로 노출하려면 별도 배선 |
+| ~~Kùzu~~ (기각) | 임베디드 | — / **$0** | — | 네이티브 | Cypher | — (아래 기각 사유) |
+| Postgres + pgvector (+AGE) | 서버 | 본부 self-host $0·메모리 中 / Cloud SQL **~$10~25** | 높음(DB 상주·IAM·백업·마이그레이션) | HNSW·IVFFlat | AGE Cypher | ⑦ (b) Cloud SQL 경로와 정합 — 단 **상시 DB**(배제 방침·사람 게이트) |
+| Neo4j | 서버 | 메모리 大(JVM) / self-host $0·관리형 유료 | 높음(별 서버 프로세스·힙 튜닝) | 네이티브 벡터 | Cypher(네이티브, 강력) | **아니오** — external SQLite 와 다른 서버 |
+
+★ = §4 권장 방향. **Kùzu 기각 사유**: 공식 docs 호스트가 DNS 로 해결되지 않고(미확인),
+Graphiti 요구사항 목록이 **"Kuzu 0.11.2 deprecated"** 로 명시한다. 임베디드 그래프 DB 로 기능은
+매력적이나 유지보수 신호가 끊긴 의존성을 메모리 SoT 로 삼을 수 없다.
+
+### 3.3 선행 연구 대조 (저장소가 아니라 참조 아키텍처)
+
+- **Graphiti/Zep** (확인): 시간축 지식그래프 기반 에이전트 메모리. edge 에 **validity window
+  (`valid_at`/`invalid_at`) + provenance** 를 다는 모델이 본 설계의 **R1(bi-temporal) + R2(출처)
+  와 정확히 같다** — 즉 v2 의 데이터 모델은 이미 검증된 방향이다. 논문(arXiv 2501.13956)은
+  Deep Memory Retrieval 벤치에서 MemGPT 대비 우위(94.8% vs 93.4%)를 보고하며, 이는 §5 가
+  적중률을 1급 지표로 삼는 근거다. **단 Graphiti 의 기본 백엔드는 Neo4j/FalkorDB(서버형)** 라
+  "본부 단일 SoT·$0·오프라인 내성" 우선순위와는 운영 트레이드오프가 있다 → 데이터 모델은 차용,
+  저장소는 external SQLite 로 간다(§4).
+- **Letta/MemGPT** (docs 확인): core/archival/recall **계층형 메모리** + 임베딩 retrieval.
+  기본 저장소가 pip=SQLite+Chroma, Docker=Postgres+pgvector 라는 점은 후보(SQLite+벡터 /
+  Postgres+pgvector)와 정합 — "임베디드 SQLite+벡터가 에이전트 메모리의 실무 기본값"이라는
+  방증이다.
+
+### 3.4 열림질문 해소 — 별도 저장소 신설하지 않고 external 축에 올라탄다
+
+요구(태스크 §5·Research 열림질문)대로 **메모리 v2 는 병렬 저장소를 신설하지 않는다**:
+
+1. **같은 백엔드**: 메모리 v2 는 [[docs/design/state-store|state-store.md]] §③ external 모드의
+   볼트 밖 호스트 SQLite(`~/.local/share/macp/state.sqlite`)와 **같은 파일/엔진**에 산다 —
+   sqlite-vec 확장을 load 하고 벡터·메모리 테이블을 그 DB 에 둔다(또는 `memory.sqlite` 를 같은
+   디렉토리에 두고 `ATTACH`). 관계 그래프는 **현 edges 테이블을 그대로 승격**(재귀 CTE 탐색),
+   벡터만 `vec0` 가상테이블로 추가한다. git 모드에서는 현 `Memory/relations.sqlite` 가 베이스라인.
+2. **같은 서버 원격 질의**: 원격 러너의 질의는 state-store.md §⑧ 의 권장 **⑦ (a) 본부 HTTP 상태
+   API + 토큰** 을 통해 낸다 — 상태 CRUD 엔드포인트에 **메모리 질의 엔드포인트**(hybrid search·
+   get_related)를 더하면 끝이고, **새 네트워크 서비스·새 유료 인프라가 필요 없다**. SQLite SoT 는
+   본부 한 곳(단일 SoT), 원격은 HTTP 로 읽는다. (상시 외부 DB 가 필요해지면 ⑦ (b) Cloud SQL —
+   사람 게이트.)
+3. **임베딩 생성 경로**(열림질문): **본부 VM 로컬 임베딩 모델**을 1차 권장한다 — 새 유료 API
+   호출 **$0**, 외부 전송 없음(R5 PII 경계와 정합: 민감 원문은 애초에 경계 밖이고, 요약/메타만
+   로컬에서 벡터화), 오프라인 내성. 관리형 임베딩 API(예: Vertex text-embedding)는 로컬 모델의
+   적중률이 §5 지표에서 부족할 때 가는 **사람 게이트 에스컬레이션**으로 둔다. 정확한 로컬 모델·
+   차원·양자화는 **구현 leaf 가 §5 벤치로 선택**(미확인 — 지금 단정하지 않는다). 디스크·메모리
+   증가는 "작은 문장 임베딩 모델 1개 + 벡터 인덱스" 수준으로, 본부 VM 상주 자원 안에서 흡수.
 
 ---
 
