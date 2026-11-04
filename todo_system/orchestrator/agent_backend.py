@@ -30,6 +30,7 @@ the engine tree is scanned by the public-identifier gate.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -204,6 +205,111 @@ def neutral_run_metadata(*, run_id: str, task_id: str, run_dir: Path, branch: st
     return "".join(lines)
 
 
+# ---- Gemini usage: `--output-format json` stats → stages.USAGE_KEYS ----------
+#
+# The runner hands ``report_usage`` only the argv and ``run_dir`` (never stdout),
+# so ``GeminiAgentBackend.run_stage`` saves the CLI's ``stats`` (+ ``session_id``)
+# to a per-stage sidecar under ``run_dir`` and ``report_usage`` reads it back —
+# the same read-back-from-disk shape as claude's transcript. The sidecar never
+# holds the ``response`` text.
+GEMINI_STATS_SUFFIX = ".gemini-stats.json"
+
+
+def gemini_stats_path(run_dir: Path, stage: str) -> Path:
+    """Where ``run_stage`` saves one stage's Gemini stats for ``report_usage``."""
+    return Path(run_dir) / f"{stage}{GEMINI_STATS_SUFFIX}"
+
+
+def _output_format(argv) -> str | None:
+    """The ``--output-format`` value in ``argv`` (``--output-format X``,
+    ``--output-format=X`` or ``-o X``; the last one wins), else None."""
+    fmt = None
+    toks = [str(t) for t in argv] if isinstance(argv, (list, tuple)) else []
+    for i, tok in enumerate(toks):
+        if tok in ("--output-format", "-o") and i + 1 < len(toks):
+            fmt = toks[i + 1]
+        elif tok.startswith("--output-format="):
+            fmt = tok.split("=", 1)[1]
+    return fmt
+
+
+def _n(v) -> int:
+    """A token count: int/float (not bool) → int, anything else → 0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    return int(v)
+
+
+def gemini_stats_usage(doc, *, duration_ms: int | None = None) -> dict | None:
+    """Map a Gemini CLI ``--output-format json`` document (or the sidecar subset —
+    same shape) onto a ``stages.USAGE_KEYS`` dict; None when it carries no usable
+    per-model stats.
+
+    Reference shape (Gemini CLI docs, design doc §3, checked 2026-10-22 — not yet
+    captured from a live run, so every field is optional and odd values count 0)::
+
+        {"session_id": "...",
+         "stats": {"models": {"<model>": {
+             "api": {"totalRequests", "totalErrors", "totalLatencyMs"},
+             "tokens": {"prompt", "candidates", "total", "cached",
+                        "thoughts", "tool"[, "input"]}}}}}
+
+    Mapping (claude's meaning for each key):
+    - ``input_tokens`` = Σ ``input`` when present, else ``max(prompt − cached, 0)``
+      (claude's input excludes cache reads);
+    - ``output_tokens`` = Σ ``candidates + thoughts`` (claude's output includes thinking);
+    - ``cache_creation_input_tokens`` = 0; ``cache_read_input_tokens`` = Σ ``cached``;
+    - ``num_turns`` = Σ ``api.totalRequests`` (None if no model reports it);
+    - ``model`` = the model with the most ``tokens.total`` (fallback
+      prompt+candidates+thoughts), ties → alphabetical;
+    - ``duration_ms`` = the runner's wall clock (kwarg); ``session_id`` = the
+      top-level ``session_id`` if a string; ``total_cost_usd`` = None (no cost field)."""
+    if not isinstance(doc, dict):
+        return None
+    stats = doc.get("stats")
+    if not isinstance(stats, dict):
+        return None
+    models = stats.get("models")
+    if not isinstance(models, dict) or not models:
+        return None
+    inp = out = cached_sum = 0
+    turns = None
+    totals: dict[str, int] = {}
+    for name, m in models.items():
+        if not isinstance(m, dict):
+            continue
+        tokens = m.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        api = m.get("api")
+        api = api if isinstance(api, dict) else {}
+        prompt, cached = _n(tokens.get("prompt")), _n(tokens.get("cached"))
+        cand, thoughts = _n(tokens.get("candidates")), _n(tokens.get("thoughts"))
+        explicit_in = tokens.get("input")
+        if isinstance(explicit_in, (int, float)) and not isinstance(explicit_in, bool):
+            inp += int(explicit_in)
+        else:
+            inp += max(prompt - cached, 0)
+        out += cand + thoughts
+        cached_sum += cached
+        req = api.get("totalRequests")
+        if isinstance(req, (int, float)) and not isinstance(req, bool):
+            turns = (turns or 0) + int(req)
+        total = tokens.get("total")
+        totals[str(name)] = (_n(total) if isinstance(total, (int, float))
+                             and not isinstance(total, bool)
+                             else prompt + cand + thoughts)
+    if not totals:
+        return None
+    model = sorted(totals, key=lambda k: (-totals[k], k))[0]
+    sid = doc.get("session_id")
+    got = {"input_tokens": inp, "output_tokens": out,
+           "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached_sum,
+           "num_turns": turns, "duration_ms": duration_ms, "model": model,
+           "session_id": sid if isinstance(sid, str) else None,
+           "total_cost_usd": None}
+    return {k: got.get(k) for k in stages.USAGE_KEYS}
+
+
 class GeminiAgentBackend:
     """First non-claude CLI backend: Gemini CLI (user decision 2026-11-04).
 
@@ -223,8 +329,9 @@ class GeminiAgentBackend:
 
     Capabilities (design §3 ✅): headless (``-p``), tool_allowlist (``tools.core``),
     turn_cap (``maxSessionTurns``), model_select, usage_report (``--output-format
-    json`` stats — the capability EXISTS; ``report_usage`` returns None until a
-    follow-up wires the parse, Solar precedent) and exit_quota (its own rate-limit
+    json`` stats, parsed by :func:`gemini_stats_usage` from the per-stage sidecar
+    :func:`gemini_stats_path` and recorded into stages.json; None under the
+    ``MACP_STAGE_USAGE=0`` kill switch) and exit_quota (its own rate-limit
     signal). NOT effort or add_dir."""
 
     name = "gemini"
@@ -279,9 +386,43 @@ class GeminiAgentBackend:
             return EXIT_EXHAUSTED
         return EXIT_SUCCESS if rc == 0 else EXIT_ERROR
 
-    def report_usage(self, stage: str, run_dir: Path, handle, **kwargs) -> dict | None:
-        """No usage channel wired yet → None (inert, like Solar's usage_rec=None).
-        Gemini CAN report tokens via ``--output-format json`` stats; a follow-up
-        parses them into a stages.USAGE_KEYS dict here. supports('usage_report')
-        stays True because the capability exists, not the wiring."""
-        return None
+    def report_usage(self, stage: str, run_dir: Path, handle, *,
+                     env: dict | None = None, returncode: int | None = None,
+                     duration_ms: int | None = None,
+                     timed_out: bool = False) -> dict | None:
+        """The stage's ``stages.USAGE_KEYS`` record from the ``--output-format json``
+        stats ``run_stage`` saved to :func:`gemini_stats_path`, also recorded into
+        stages.json ``usage.<stage>`` (as claude's ``record_stage_usage`` does).
+
+        ``handle`` is the argv the stage ran. None — record nothing — only when
+        usage is off (``MACP_STAGE_USAGE=0``) or ``handle`` did not ask for json
+        output (the mirror of claude's "no ``--session-id`` → None"). Otherwise
+        always a dict: the usage, or ``{"unavailable": "<why>"}``. No reason starts
+        with ``"no usage in transcript"``, so ``stages.usage_shows_no_api_work``
+        stays False and the runner's rc==0 capacity arm stays inert for gemini.
+        Never raises."""
+        try:
+            if not stages.usage_enabled() or _output_format(handle) != "json":
+                return None
+            suffix = f" (rc={returncode})" if returncode not in (0, None) else ""
+            if timed_out:
+                rec = {"unavailable": "timeout"}
+            else:
+                try:
+                    p = gemini_stats_path(run_dir, stage)
+                    if not p.is_file():
+                        rec = {"unavailable": "gemini stats not captured" + suffix}
+                    else:
+                        try:
+                            doc = json.loads(p.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            doc = None
+                        rec = gemini_stats_usage(doc, duration_ms=duration_ms)
+                        if rec is None:
+                            rec = {"unavailable": "gemini stats unparseable" + suffix}
+                except Exception as e:
+                    rec = {"unavailable": f"usage reader error: {type(e).__name__}"}
+            stages.record_usage(run_dir, stage, rec)
+            return rec
+        except Exception:
+            return None

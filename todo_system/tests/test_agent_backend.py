@@ -170,3 +170,124 @@ def test_report_usage_returns_none_for_stub_argv_without_session_id(tmp_path):
 
 def test_backend_satisfies_the_protocol():
     assert isinstance(ab.ClaudeAgentBackend(), ab.AgentBackend)
+
+
+# ---- GeminiAgentBackend: usage wiring + meta blocks ----
+
+_GEM_JSON_HANDLE = ["gemini", "--yolo", "-p", "PROMPT", "--output-format", "json"]
+
+
+def _gem_doc():
+    return {
+        "session_id": "s-1",
+        "stats": {"models": {
+            "gemini-2.5-pro": {
+                "api": {"totalRequests": 2, "totalErrors": 0, "totalLatencyMs": 10},
+                "tokens": {"prompt": 1000, "candidates": 50, "total": 1470,
+                           "cached": 400, "thoughts": 20, "tool": 0}},
+            "gemini-2.5-flash": {
+                "api": {"totalRequests": 1, "totalErrors": 0, "totalLatencyMs": 5},
+                "tokens": {"prompt": 100, "candidates": 10, "total": 110,
+                           "cached": 0, "thoughts": 0, "tool": 0}},
+        }},
+    }
+
+
+def _write_sidecar(run_dir, stage, doc):
+    import json
+    ab.gemini_stats_path(run_dir, stage).write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_gemini_stats_usage_maps_documented_shape():
+    rec = ab.gemini_stats_usage(_gem_doc(), duration_ms=99)
+    assert rec == {"input_tokens": 700, "output_tokens": 80,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 400,
+                   "num_turns": 3, "duration_ms": 99, "model": "gemini-2.5-pro",
+                   "session_id": "s-1", "total_cost_usd": None}
+    assert list(rec) == list(stages.USAGE_KEYS)
+
+
+def test_gemini_stats_usage_prefers_explicit_input_field():
+    doc = {"stats": {"models": {"m": {"tokens": {"input": 7, "prompt": 1000,
+                                                 "cached": 10, "candidates": 3}}}}}
+    rec = ab.gemini_stats_usage(doc)
+    assert rec["input_tokens"] == 7
+    assert rec["output_tokens"] == 3 and rec["cache_read_input_tokens"] == 10
+    assert rec["num_turns"] is None and rec["session_id"] is None
+    assert rec["model"] == "m"
+
+
+@pytest.mark.parametrize("doc", [
+    {}, {"stats": None}, {"stats": {"models": {}}}, {"stats": {"models": {"m": "x"}}},
+    "str", None,
+])
+def test_gemini_stats_usage_none_on_malformed(doc):
+    assert ab.gemini_stats_usage(doc) is None
+
+
+def test_gemini_report_usage_reads_sidecar_and_records(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _write_sidecar(tmp_path, "quick", _gem_doc())
+    rec = ab.GeminiAgentBackend().report_usage(
+        "quick", tmp_path, _GEM_JSON_HANDLE, returncode=0, duration_ms=1234)
+    assert "unavailable" not in rec
+    assert list(rec) == list(stages.USAGE_KEYS)
+    assert rec["duration_ms"] == 1234 and rec["input_tokens"] == 700
+    saved = json.loads((tmp_path / stages.STAGE_PROGRESS).read_text(encoding="utf-8"))
+    assert saved["usage"]["quick"] == rec
+
+
+def test_gemini_report_usage_timeout_records_unavailable(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _write_sidecar(tmp_path, "quick", _gem_doc())   # never credited on a timeout
+    rec = ab.GeminiAgentBackend().report_usage(
+        "quick", tmp_path, _GEM_JSON_HANDLE, timed_out=True)
+    assert rec == {"unavailable": "timeout"}
+    saved = json.loads((tmp_path / stages.STAGE_PROGRESS).read_text(encoding="utf-8"))
+    assert saved["usage"]["quick"] == {"unavailable": "timeout"}
+
+
+def test_gemini_report_usage_missing_or_bad_sidecar_is_not_a_quota_signature(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    g = ab.GeminiAgentBackend()
+    missing = g.report_usage("quick", tmp_path, _GEM_JSON_HANDLE, returncode=1)
+    assert missing == {"unavailable": "gemini stats not captured (rc=1)"}
+    ab.gemini_stats_path(tmp_path, "quick").write_text("not json{", encoding="utf-8")
+    bad = g.report_usage("quick", tmp_path, _GEM_JSON_HANDLE, returncode=0)
+    assert bad == {"unavailable": "gemini stats unparseable"}
+    assert stages.usage_shows_no_api_work(missing) is False
+    assert stages.usage_shows_no_api_work(bad) is False
+
+
+def test_gemini_report_usage_kill_switch_returns_none_and_writes_nothing(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "0")
+    _write_sidecar(tmp_path, "quick", _gem_doc())
+    assert ab.GeminiAgentBackend().report_usage(
+        "quick", tmp_path, _GEM_JSON_HANDLE, returncode=0) is None
+    assert not (tmp_path / stages.STAGE_PROGRESS).exists()
+
+
+def test_gemini_report_usage_explicit_text_format_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    handle = ["gemini", "--output-format", "text", "-p", "x"]
+    assert ab.GeminiAgentBackend().report_usage("quick", tmp_path, handle) is None
+    assert not (tmp_path / stages.STAGE_PROGRESS).exists()
+
+
+def test_gemini_report_usage_never_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _write_sidecar(tmp_path, "quick", _gem_doc())
+
+    def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(ab, "gemini_stats_usage", boom)
+    rec = ab.GeminiAgentBackend().report_usage("quick", tmp_path, _GEM_JSON_HANDLE)
+    assert rec == {"unavailable": "usage reader error: RuntimeError"}
+    # a nonexistent run_dir never raises either
+    rec2 = ab.GeminiAgentBackend().report_usage("quick", Path("/rd"), _GEM_JSON_HANDLE)
+    assert rec2 == {"unavailable": "gemini stats not captured"}

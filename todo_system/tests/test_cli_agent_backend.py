@@ -8,7 +8,8 @@ becomes the argv with the full prompt substituted and NO claude flags
 prompt is the stage prompt + a vendor-NEUTRAL run-metadata block (no claude
 tool-allowlist lines); ``GEMINI_MODEL`` carries the model (account.env, or the
 account's tier pin). Plus ``classify_exit`` 3-way, ``supports`` (6 of 8), and
-``report_usage`` None.
+``report_usage`` from ``--output-format json`` stats (sidecar; detailed tests in
+``test_agent_backend.py``).
 
 No personal identifier appears here (the engine tree is scanned by the
 public-identifier gate).
@@ -146,8 +147,18 @@ def test_gemini_supports_six_of_eight():
     assert not g.supports("add_dir")     # no confirmed --add-dir equivalent
 
 
-def test_gemini_report_usage_is_none_for_now():
+def test_gemini_report_usage_without_json_handle_records_nothing(monkeypatch):
+    # no --output-format json on the argv → no stats channel → None (inert),
+    # the mirror of claude's stub argv without --session-id.
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
     assert ab.GeminiAgentBackend().report_usage("quick", Path("/rd"), ["gemini"]) is None
+
+
+def test_gemini_report_usage_json_handle_is_never_none(monkeypatch):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    rec = ab.GeminiAgentBackend().report_usage(
+        "quick", Path("/rd"), ["gemini", "-p", "x", "--output-format", "json"])
+    assert rec == {"unavailable": "gemini stats not captured"}
 
 
 def test_gemini_satisfies_the_protocol():
