@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import threading
 
 import pytest
 
@@ -31,7 +32,10 @@ from todo_system.orchestrator.state_store import (
     TodoCacheReader,
     open_state_store,
 )
+from todo_system.orchestrator.state_store_remote import RemoteStateStore, make_server
 from todo_system.orchestrator.state_store_sqlite import ExternalStateStore
+
+TEST_REMOTE_TOKEN = "test-token"  # noqa: S105 — a test fixture's loopback bearer, not a secret
 
 
 @pytest.fixture
@@ -294,6 +298,24 @@ def test_open_state_store_env_external_returns_sqlite_store(monkeypatch, vault, 
     assert store.sqlite_path == tmp_path / "state.sqlite"
 
 
+def test_open_state_store_env_remote_returns_remote_store(monkeypatch, vault):
+    monkeypatch.setenv("MACP_STATE_BACKEND", "remote")
+    monkeypatch.setenv("MACP_STATE_REMOTE_URL", "http://hq-host:8787/")
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN", "tok")
+    store = open_state_store(vault)
+    assert isinstance(store, RemoteStateStore)
+    assert store.base_url == "http://hq-host:8787"   # trailing slash stripped
+    assert store.token == "tok"
+
+
+def test_open_state_store_remote_without_url_raises(monkeypatch, vault):
+    monkeypatch.setenv("MACP_STATE_BACKEND", "remote")
+    monkeypatch.delenv("MACP_STATE_REMOTE_URL", raising=False)
+    # No MACP_STATE_REMOTE_URL and no config key → a clear error naming the fix.
+    with pytest.raises(ValueError, match="MACP_STATE_REMOTE_URL"):
+        open_state_store(vault)
+
+
 # ---------------------------------------------------------------------------
 # Backend parity — the ledger + mailbox + planner_kv contract run as ONE suite
 # over both backends (acceptance #1). The git-specific pass-through assertions
@@ -301,18 +323,39 @@ def test_open_state_store_env_external_returns_sqlite_store(monkeypatch, vault, 
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(params=["git", "external"])
-def store(request, vault):
-    """One StateStore per backend, both on tmp paths.
+@pytest.fixture(params=["git", "external", "remote"])
+def store(request, vault, tmp_path):
+    """One StateStore per backend, all on tmp paths.
 
     git → a real repo (GitMailbox with no `origin`, so pull/push are no-ops) plus
     an explicit planner path so it never writes worker.PLANNER_STATE_PATH.
     external → ExternalStateStore on a tmp state.sqlite.
+    remote → a loopback ThreadingHTTPServer (make_server) wrapping an
+    ExternalStateStore on a tmp state.sqlite, with a RemoteStateStore client over
+    an ephemeral port and an injected test token; the server is torn down after
+    the test. This is the "local 2-process test" seam (acceptance #1/#4),
+    explicitly NOT a real tailnet round-trip (that is 7b).
     """
     if request.param == "git":
         _git_vault(vault)
-        return GitStateStore(vault, planner_state_path=vault / "planner_state.json")
-    return ExternalStateStore(sqlite_path=vault / "state.sqlite", vault_root=vault)
+        yield GitStateStore(vault, planner_state_path=vault / "planner_state.json")
+        return
+    if request.param == "external":
+        yield ExternalStateStore(sqlite_path=vault / "state.sqlite", vault_root=vault)
+        return
+    backend = ExternalStateStore(sqlite_path=vault / "state.sqlite", vault_root=vault)
+    server = make_server(backend, TEST_REMOTE_TOKEN)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield RemoteStateStore(
+            f"http://127.0.0.1:{port}", TEST_REMOTE_TOKEN,
+            outbox_path=tmp_path / "remote_outbox.jsonl")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_ledger_contract_parity(store):
