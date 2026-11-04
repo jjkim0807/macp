@@ -34,6 +34,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .statuses import is_closed
+
 MAX_SURFACED = 5
 
 # Frontmatter read outcomes. Three states, not two: `repos._frontmatter()`
@@ -58,11 +60,10 @@ _NONE_SENTINEL = ("none", "없음")
 # for an action someone already completed or cancelled is pure noise.
 _CLOSED_STATES = ("resolved", "dropped")
 
-# Task states that mean the linked task is closed. Wider than `cli.py`'s status
-# choices (`open|done|waiting|blocked`) because the acceptance criterion asks
-# about `cancelled` and the frontmatter files are free text — the raw string is
-# always reported alongside, so this set only decides what gets flagged.
-_CLOSED_TASK_STATES = ("done", "cancelled", "canceled")
+# Task states that mean the linked task is closed: the shared `statuses.is_closed`
+# (done/cancelled/canceled). Wider than `cli.py`'s status choices
+# (`open|done|waiting|blocked`) because the frontmatter files are free text — the
+# raw string is always reported alongside, so this only decides what gets flagged.
 
 
 def _read_frontmatter(path: str | Path) -> tuple[str, dict]:
@@ -175,7 +176,7 @@ def _classify_item(item, items_dir: str | Path) -> tuple[str, dict]:
     if status is None:
         return "orphan", {**fields, "note": f"`Todo/items/{slug}.md` 없음"}
     fields["task_status"] = status
-    if status.lower() in _CLOSED_TASK_STATES:
+    if is_closed(status):
         # The item still says open while its task is finished. Not a broken
         # link — a stale one, and the only place the task's status is
         # load-bearing rather than decorative.

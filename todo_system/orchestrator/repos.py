@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .. import paths
+from .statuses import CLOSED_STATUSES as CLOSED_STATUSES  # the shared set; leaf, no cycle
 
 
 def _worker_root(worker_root: str | Path | None) -> Path:
@@ -275,9 +276,6 @@ def read_task_worker_mode(md_path: str | Path) -> str | None:
     `off` (YAML 1.1 boolean False) reads as 'off'; True and other non-strings
     stay None (fail-open)."""
     return task_worker_mode_from_fm(_frontmatter(md_path))
-
-
-CLOSED_STATUSES = ("done", "cancelled", "canceled")
 
 
 def task_status_from_fm(fm: dict) -> str | None:

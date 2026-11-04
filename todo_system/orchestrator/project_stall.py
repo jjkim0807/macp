@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import not_before as nb_gate
+from .statuses import CLOSED_STATUSES as CLOSED_STATUSES
 
 # --- thresholds (the only knobs; see the AC) --------------------------------
 STALL_IDLE_HOURS = 48       # (d) min idle since the last activity to call it stalled
@@ -57,10 +58,11 @@ SWEEP_MIN_INTERVAL_S = 3600  # 1h min-poll throttle for the whole sweep (run_onc
 # equal so the copy can never drift.
 DISPATCHABLE_MODES = ("auto", "delegate", "quick", "discover")
 
-# A leaf whose status is one of these is closed, so it is NOT an open leaf.
-# `canceled` (one l) appears in the wild alongside `cancelled`; honour both, as
-# tasks.child_status_rollup does.
-CLOSED_STATUSES = frozenset({"done", "cancelled", "canceled"})
+# A leaf whose status is in CLOSED_STATUSES (imported above) is closed, so it is
+# NOT an open leaf. The one shared definition (both `cancelled` and `canceled`)
+# lives in the dependency-free leaf `statuses`, which is safe to import here —
+# unlike `tasks` (see the cycle above), which re-exports the same object as
+# `tasks.CLOSED_STATUSES`.
 
 # Ledger states that mean a run is actively in flight (orchestrator._IN_FLIGHT).
 IN_FLIGHT_STATES = frozenset({"dispatched", "accepted", "in_progress"})
