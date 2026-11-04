@@ -259,7 +259,74 @@ Graphiti 요구사항 목록이 **"Kuzu 0.11.2 deprecated"** 로 명시한다. �
 
 ## §4 권장안 + 단계별 구현 분할안
 
-*(Phase 4 에서 채움)*
+### 4.1 권장안 (1개)
+
+**external 모드 SQLite(`state.sqlite`)를 sqlite-vec 벡터 확장 + 현 edges 테이블의 재귀 CTE
+그래프 탐색으로 확장하고, 원격 질의는 ⑦ (a) 본부 HTTP 상태 API 를 재사용한다.** 새 저장소도,
+새 유료 인프라도 신설하지 않는다.
+
+근거(§3 비교표 기준):
+
+- **비용 $0**: sqlite-vec 는 본부 VM 상주 SQLite 에 확장 1개를 load 하는 것이고, 임베딩은 본부
+  로컬 모델(§3.4)이라 **새 유료 인프라가 없다**. Postgres+pgvector(Cloud SQL ~$10~25/월)·
+  Neo4j(별 서버)는 상시 비용·운영이 붙고 상시 외부 DB 배제 방침과도 충돌
+  ([[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]).
+- **단일 SoT**: 메모리가 상태 저장소(`state.sqlite`)와 **같은 파일**에 살아, state-store.md §④
+  의 "권위 사본은 SQLite, `Worker/assignments/` 는 읽기전용 스냅샷" 구조를 그대로 물려받는다.
+  별 저장소를 두면 SoT 가 둘로 갈려 정합성 부담이 생긴다.
+- **오프라인 내성 + 운영 최소**: 임베디드라 네트워크 의존이 없고(원격은 ⑦ API 한 겹), 본부가
+  죽어도 로컬 질의는 계속된다. Kùzu(기능은 매력적이나 **deprecated**·docs 미확인)·DuckDB VSS
+  (**experimental** 지속성 손상 경고)는 메모리 SoT 로 삼기엔 유지보수·안정성 신호가 약하다.
+- **데이터 모델은 Graphiti 를 차용**: bi-temporal(R1)+provenance(R2)+하이브리드 retrieval(R3)
+  은 Graphiti/Zep 이 벤치로 입증한 방향이다(§3.3). 저장소만 서버형(Neo4j/FalkorDB) 대신 external
+  SQLite 로 간다 — "본부 단일 SoT·$0·오프라인" 우선순위에 맞춘 선택.
+
+### 4.2 단계별 구현 분할안 (leaf 목록 · depends_on 체인 · 로컬 검증)
+
+> **분할 원칙**: expand → migrate → contract(parallel-change) 로 **각 leaf 가 단독으로
+> 컴파일·테스트 green**. 첫 leaf 는 external 모드를 기다리지 않는 **additive** 단계(가장 안전).
+> 완료 조건은 전부 **로컬 명령** — "CI green" 금지(Actions 미사용,
+> [[Decisions/2026-09-11-no-github-actions-local-release-lane]]). 각 leaf 는 부모와 동일하게
+> `repo: jjkim0807/macp`, `touches` 는 아래 열거.
+
+| leaf | 단계 | 범위(touches) | depends_on | 로컬 검증 명령 |
+|---|---|---|---|---|
+| **G1** bi-temporal+provenance 스키마 확장 | expand | `todo_system/graph_memory.py`(edges 에 `run_id`·`commit_sha` 열 add·`valid_until` tombstone 경로·`recorded_at` 보존) + `todo_system/tests/test_graph_memory_bitemporal.py`(신규) | **없음**(git 모드 `relations.sqlite` 에 additive — external 축 선행 불요) | `uv run pytest todo_system/tests/test_graph_memory_bitemporal.py` · `uvx ruff check .` · `bash scripts/check_engine_isolation.sh` |
+| **G2** 임베딩 + `vec0` 벡터 테이블 | expand | `todo_system/graph_memory.py`(로컬 임베딩 훅·R5 경계 필터·`vec0` 가상테이블 build) + 테스트(신규) | **G1** + sqlite-vec 설치 전제 + state-store leaf ④(ExternalStateStore SQLite) | `uv run pytest todo_system/tests/test_graph_memory_embeddings.py` · `uv run python -m todo_system.graph_memory embed --dry-run` |
+| **G3** 하이브리드 질의 API | migrate(병존) | `todo_system/graph_memory.py`(`query_related(task)` = 임베딩 KNN + `get_related` BFS; 기존 `get_related` **유지**) + 테스트(신규) | **G2** | `uv run pytest todo_system/tests/test_graph_memory_hybrid.py` |
+| **G4** 스테이지·brief 배선 + 평가 하니스 | migrate→contract | `Worker/proposals/<slug>/.claude/commands/{worker-research,worker-planner,brief}.md`(헤드리스가 `.claude/**` 못 씀 → proposals, 사람이 `cp`) + `todo_system/orchestrator/eval_memory.py`(§5 하니스, 신규) + 테스트 | **G3** | `uv run pytest todo_system/tests/test_graph_memory_eval.py` · `uvx ruff check .` · `AUDIT_ROOT=$(pwd) bash ~/Projects/MaestroACP/ops/check_public_identifiers.sh --export` |
+| **G5** 원격 질의 엔드포인트(⑦ API 올라타기) | human_gate | 본부 상태 API 에 메모리 질의 엔드포인트 추가(state-store leaf ⑦ 위) + 클라이언트 + 테스트 | **G3** + state-store leaf ⑦(원격 접근) | `uv run pytest todo_system/orchestrator/tests/test_state_api_memory.py` (네트워크 노출·프로비저닝은 **사람 결정**) |
+
+depends_on 체인(직렬): `G1 → G2 → G3 → {G4, G5}`. **부모 체인 선행 의존**: 메모리 v2 가
+external 축에 올라타므로 state-store.md §⑥ 지도의 leaf ②~⑥(상태 저장소 추상화)이 선행이고,
+G2(같은 DB 공동 배치)·G5(원격)는 각각 leaf ④·⑦에 의존한다. G1 은 git 모드에서 additive 라
+external 축을 기다리지 않고 **먼저 시작할 수 있는 안전한 첫 leaf**다.
+
+### 4.3 무손실 마이그레이션 (기존 relations.sqlite · md → v2)
+
+"같은 DB 확장" 경로로 무손실이 성립한다:
+
+1. **edges 보존**: 현 `edges` 테이블은 이미 `event_date/recorded_at/source_file/confidence` 를
+   가진다(`graph_memory.py:150-160`). G1 은 `run_id`·`commit_sha` 를 **nullable 열로 add** 하므로
+   기존 행은 provenance=NULL 로 **무손실 보존**(ALTER TABLE ADD COLUMN, 데이터 삭제 없음).
+2. **md 재생성 무손실·멱등**: md 소스(frontmatter 관계 필드 `:38-53` + 본문 wikilink `:64`)는
+   현 `edges_from_file`(`:228-282`)이 파싱하는 그대로다 — 재스캔하면 edges 가 똑같이 재생성된다
+   (현재도 매 틱 재빌드하므로 손실 위험 0). 단 G1 이후로는 `clear_edges`+전체 DELETE(`:171-173`)
+   대신 **tombstone(valid_until)** 로 역사를 남기는 증분 경로로 바꾸는 것이 R1 의 핵심(재빌드가
+   recorded_at·역사를 덮지 않게).
+3. **벡터는 파생**: 임베딩(G2)은 md 요약에서 **재생성 가능한 파생**이라 마이그레이션 대상이
+   아니다 — 처음 build 시 전체 임베딩 1회(배치), 이후 변경분만.
+4. **external 이관**: git 모드 `relations.sqlite` → external `state.sqlite` 이관은
+   state-store.md §④ 의 "git→external 1회 import(멱등 upsert)"가 이미 설계한 경로에 edges 테이블을
+   얹으면 된다. 즉 **새 마이그레이션 기계를 만들 필요 없이** 부모 체인의 import 에 편승한다.
+
+### 4.4 범위 가드 (이 설계 문서가 하지 않는 것)
+
+- §4 는 **문서 내부 서술만**이다. 실제 `Todo/items/<slug>.md` leaf 파일은 **생성하지 않는다** —
+  설계 머지 뒤 **사람이 권장안을 보고 게이트를 풀 때** 생성한다(태스크 Spec·CLAUDE.md §3 "leaf
+  태스크 파일 생성 금지"). 이 run 은 macp 체크아웃에서 돌아 볼트 `Todo/` 를 쓰지도 못한다.
+- `.claude/commands/**` 변경(G4)은 헤드리스 워커가 쓸 수 없으므로(하드 가드) 완성본을
+  `Worker/proposals/<slug>/` 에 두고 사람이 `cp` 한다 — G4 leaf 가 실제로 돌 때의 규약.
 
 ---
 
