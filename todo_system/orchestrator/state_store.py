@@ -30,6 +30,7 @@ from .. import paths
 from .assignment import Ledger
 from .atomic_io import atomic_write_text
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
+from .statuses import CANCELLED_STATUSES_SQL
 
 __all__ = [
     "GitPlannerKV",
@@ -165,7 +166,10 @@ class GitTodoCacheReader(TodoCacheReader):
             auto_done = con.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status='done' AND worker_mode IN ('auto','delegate')"
             ).fetchone()[0]
-            cancelled = con.execute("SELECT COUNT(*) FROM tasks WHERE status='cancelled'").fetchone()[0]
+            # Both spellings (cancelled / canceled), any case — statuses.CANCELLED_STATUSES.
+            cancelled = con.execute(
+                "SELECT COUNT(*) FROM tasks WHERE LOWER(status) IN " + CANCELLED_STATUSES_SQL
+            ).fetchone()[0]
             return {"done": done, "auto_done": auto_done, "cancelled": cancelled}
         except Exception:
             return dict(_ZERO_COUNTS)
