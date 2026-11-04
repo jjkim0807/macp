@@ -42,7 +42,6 @@ from . import message as m
 from . import repos
 from . import screen_check
 from . import agent_backend
-from . import solar_stage
 from . import stages
 from . import worktree_sweep
 from .assignment import DONE, Ledger
@@ -250,6 +249,21 @@ def _solar_task_prompt(payload: dict) -> str:
     if payload.get("next_action"):
         parts.append(f"Next action: {payload['next_action']}")
     return "\n\n".join(parts) or "Complete the task using the file tools."
+
+
+def _select_backend(agent: str | None, stage: str, vendors: dict, default):
+    """``(backend, account)`` for this stage — the one vendor-routing gate.
+
+    The vendor backend when the task's ``agent`` names a vendor in ``vendors``
+    (``{vendor: (backend, account)}``) whose lane covers ``stage``
+    (``stages.routes_to_vendor``) AND whose account actually resolved; else
+    ``(default, None)`` — claude, byte-identical. Every task without
+    ``agent: <vendor>`` plus a configured account takes the default."""
+    a = (agent or "").lower()
+    backend, acct = vendors.get(a, (None, None))
+    if backend is not None and acct is not None and stages.routes_to_vendor(a, stage):
+        return backend, acct
+    return default, None
 
 
 class StagedExecutor(ClaudeCodeExecutor):
@@ -1032,10 +1046,11 @@ class StagedExecutor(ClaudeCodeExecutor):
         # Vendor routing (leaf ⑥, generalised from macp-solar-run-single-stage-task):
         # resolve each non-claude vendor account ONCE, before the loop. None for
         # every task without `agent: <vendor>` AND a matching account configured —
-        # which is every task today — so the CLI branch below picks claude and the
+        # which is every task today — so _select_backend below picks claude and the
         # claude argv/env is byte-identical. When set, the vendor's lane stages
         # (stages.vendor_lane_for) route to that vendor instead of `claude -p`:
-        # upstage → solar_stage (HTTP tool loop), gemini → GeminiAgentBackend (CLI).
+        # upstage → SolarAgentBackend (solar_stage HTTP tool loop), gemini →
+        # GeminiAgentBackend (CLI).
         solar_acct = self._solar_account(payload, repo, msg.task_id)
         if solar_acct is not None:
             progress(f"solar account: {getattr(solar_acct, 'name', '?')} "
@@ -1044,15 +1059,21 @@ class StagedExecutor(ClaudeCodeExecutor):
         if gemini_acct is not None:
             progress(f"gemini account: {getattr(gemini_acct, 'name', '?')} "
                      f"(gemini — quick stage routes to the Gemini CLI backend)")
-        # The CLI backends, behind the AgentBackend seam. claude is the default;
-        # gemini is selected per stage when the task routes to it (below). Both
-        # are stateless and delegate to the same stages helpers / build_invocation,
-        # so the claude argv/env stays byte-identical (test_agent_backend_golden +
-        # test_agent_backend). The Solar (upstage HTTP) path stays on solar_stage.run
-        # unchanged — a SolarAgentBackend wrapper is a clean follow-up, not needed
-        # for the AC (Solar routes only to headless-only quick/delegate).
+        # Every backend sits behind the AgentBackend seam: claude is the default,
+        # gemini (CLI) and upstage (SolarAgentBackend → solar_stage.run HTTP tool
+        # loop) are picked per stage by the one vendor → (backend, account)
+        # selection (_select_backend over stages.routes_to_vendor). All three are
+        # stateless; claude/gemini delegate to the same stages helpers /
+        # build_invocation, so the claude argv/env stays byte-identical
+        # (test_agent_backend_golden + test_agent_backend). Solar keeps its own
+        # call site below only because its run_stage takes a different keyword
+        # set (task_prompt/artifact_path/deadline_s) — the same 8 kwargs the
+        # inline solar_stage.run call passed.
         claude_backend = agent_backend.ClaudeAgentBackend()
         gemini_backend = agent_backend.GeminiAgentBackend()
+        solar_backend = agent_backend.SolarAgentBackend()
+        vendor_backends = {"upstage": (solar_backend, solar_acct),
+                           "gemini": (gemini_backend, gemini_acct)}
         completed: list[str] = []
         # Set True only on the single terminal success below. The `finally` reads
         # it to decide the external worktree's fate: removed on success (its
@@ -1072,54 +1093,51 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # the longest legitimate gap between two touches is one
                 # run_stage_subprocess(timeout=self.stage_timeout) below, not the sum.
                 _worker.runner_heartbeat_start()
-                agent = (payload.get("agent") or "").lower()
-                use_solar = (solar_acct is not None and agent == "upstage"
-                             and stages.routes_to_vendor(agent, stage))
-                if use_solar:
+                # One vendor-routing gate for every backend: the task's `agent` +
+                # stages.routes_to_vendor (its lane covers this stage) + that
+                # vendor's account actually resolved → (vendor backend, account);
+                # else (claude, None), the byte-identical default.
+                backend, backend_acct = _select_backend(
+                    payload.get("agent"), stage, vendor_backends, claude_backend)
+                # Capability gate (leaf ④, AC #3): refuse to dispatch a stage whose
+                # required capabilities (stages.required_capabilities — read-only
+                # stages need tool_allowlist) the chosen backend cannot fulfil,
+                # rather than silently running it with a weaker guarantee. claude
+                # supports all eight so it never fires for the claude path (a test
+                # pins that positive path); Solar's quick/delegate lane needs only
+                # `headless`, so it passes there too; it guards gemini (and any
+                # later vendor).
+                missing_caps = agent_backend.missing_capabilities(backend, stage)
+                if missing_caps:
+                    return ExecOutcome(
+                        False,
+                        f"stage {stage}: backend '{backend.name}' lacks required "
+                        f"capability {', '.join(missing_caps)} — refusing to dispatch "
+                        "(would weaken the stage's guarantee)",
+                        {"branch": branch, "run_dir": str(run_dir), "stages": completed,
+                         "capability_gate": {"backend": backend.name,
+                                             "stage": stage, "missing": missing_caps}})
+                if backend is solar_backend:
                     # Solar (upstage) single-stage path — an in-engine read/write/
                     # finish tool loop, NOT `claude -p`. No argv, no subprocess, no
-                    # per-stage token transcript: usage_rec=None keeps the rc==0
-                    # capacity arm inert (usage_shows_no_api_work(None) is False),
-                    # and the key is read inside solar_stage.run and used only in
-                    # the request header. `r` is CompletedProcess-shaped so the
+                    # per-stage token transcript: report_usage is None, which keeps
+                    # the rc==0 capacity arm inert (usage_shows_no_api_work(None) is
+                    # False), and the key is read inside solar_stage.run and used only
+                    # in the request header. `r` is CompletedProcess-shaped so the
                     # shared tail below reads r.returncode/r.stdout unchanged, and
                     # solar_stage writes the stage artifact (delegate.md) itself.
                     # The deadline doubles as the loop's wall-clock bound; a Solar
                     # run cannot TimeoutExpired, so there is no timeout arm here.
-                    r = solar_stage.run(
+                    # The kwargs are exactly the inline solar_stage.run call's.
+                    r = backend.run_stage(
                         stage, task_prompt=_solar_task_prompt(payload),
-                        working_dir=working_dir, account=solar_acct, tier=tier,
+                        working_dir=working_dir, account=backend_acct, tier=tier,
                         artifact_path=run_dir / stages.STAGE_ARTIFACT[stage],
                         env=stage_env, deadline_s=stage_timeout, progress=progress)
-                    usage_rec = None
+                    usage_rec = backend.report_usage(stage, run_dir, r.args)
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
                 else:
-                    # Select the CLI backend for this stage: the gemini backend when
-                    # the task routes to gemini on its lane (stages.vendor_lane_for),
-                    # else claude (the default, byte-identical). Both are AgentBackends
-                    # dispatched identically below — only the cwd/env differ.
-                    if (gemini_acct is not None and agent == "gemini"
-                            and stages.routes_to_vendor(agent, stage)):
-                        backend, backend_acct = gemini_backend, gemini_acct
-                    else:
-                        backend, backend_acct = claude_backend, None
-                    # Capability gate (leaf ④, AC #3): refuse to dispatch a stage whose
-                    # required capabilities (stages.required_capabilities — read-only
-                    # stages need tool_allowlist) the chosen backend cannot fulfil,
-                    # rather than silently running it with a weaker guarantee. claude
-                    # supports all eight so it never fires for the claude path (a test
-                    # pins that positive path); it guards gemini (and any later vendor).
-                    missing_caps = agent_backend.missing_capabilities(backend, stage)
-                    if missing_caps:
-                        return ExecOutcome(
-                            False,
-                            f"stage {stage}: backend '{backend.name}' lacks required "
-                            f"capability {', '.join(missing_caps)} — refusing to dispatch "
-                            "(would weaken the stage's guarantee)",
-                            {"branch": branch, "run_dir": str(run_dir), "stages": completed,
-                             "capability_gate": {"backend": backend.name,
-                                                 "stage": stage, "missing": missing_caps}})
                     # Dispatch via the selected CLI backend. It builds its own argv and
                     # runs it with the SAME stages.run_stage_subprocess reaper this loop
                     # used inline — the claude argv/env is byte-identical

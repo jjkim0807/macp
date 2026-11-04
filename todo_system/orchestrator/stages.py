@@ -174,7 +174,7 @@ STAGES_DISCOVER = ("discover",)
 # git/build work; `delegate` ("do the work, edit files, write delegate.md") is
 # exactly what it can do. quick is listed so a quick task CAN be routed once a
 # key-authenticated vendor grows a verify path, but delegate is the lane opened
-# now (runner._solar_account + the `use_solar` branch).
+# now (runner._solar_account + runner._select_backend → SolarAgentBackend).
 SOLAR_STAGES = STAGES_QUICK + STAGES_DELEGATE
 # Gemini CLI (the first CLI non-claude backend, user decision 2026-11-04) starts
 # on the quick lane ONLY (design §4 Q4: the smallest safe start — one combined
@@ -203,16 +203,21 @@ def vendor_lane_for(agent: str | None) -> tuple[str, ...]:
 def routes_to_vendor(agent: str | None, stage: str) -> bool:
     """The general routing gate (replaces the single-vendor route_to_solar as the
     runner's mechanism): does this task's `agent` run THIS `stage` via a non-claude
-    backend? Pure — the runner ALSO gates on an actually-resolved vendor account,
-    so a True here with no account configured still never routes."""
+    backend? Pure — the runner's one selector (runner._select_backend) ALSO gates
+    on an actually-resolved vendor account, so a True here with no account
+    configured still never routes. Every vendor, upstage included, is selected
+    through this one gate."""
     return stage in vendor_lane_for(agent)
 
 
 def route_to_solar(agent: str | None, stage: str) -> bool:
     """Whether this stage runs via the Solar harness instead of `claude -p`: the
-    task's resolved `agent` is upstage AND the stage is a single-stage lane. Now a
-    thin special case of routes_to_vendor (upstage is one row of NON_CLAUDE_LANES),
-    kept as a named helper. Pure and total — the runner ALSO gates on an
+    task's resolved `agent` is upstage AND the stage is a single-stage lane. A
+    thin compatibility wrapper over routes_to_vendor (upstage is one row of
+    NON_CLAUDE_LANES): the runner no longer calls it — it selects upstage through
+    the general routes_to_vendor gate (runner._select_backend) — but the named
+    helper stays for callers/tests that ask the Solar question directly. Pure
+    and total — the runner ALSO gates on an
     actually-resolved upstage account, so this returning True for a task with no
     upstage account configured still never routes (and every claude task returns
     False here regardless)."""
