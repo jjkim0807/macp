@@ -78,7 +78,7 @@ source_file · event_date · recorded_at · valid_until · confidence`. 현 edge
 > episodes/sessions 추적분 push). plan·implement·verify·report 스테이지 프롬프트는 index.md 를
 > required-reading 으로 두지 **않는다**(Research 만 둔다) — 즉 "이 태스크와 관련된 과거 실패·결정"을
 > 실제로 질의하는 스테이지는 지금 **Research 하나뿐**이고, 그나마 index.md 라는 **집계 스냅샷**을
-> 읽는 수준이다(§2 요구 4번의 출발점).
+> 읽는 수준이다(§2 R4 의 출발점).
 
 ### 1.3 지금의 한계 (메모리 v2 가 넘어서려는 기준선)
 
@@ -175,7 +175,7 @@ typed edge `:261-282`). 임베딩·벡터 최근접이 없어 "의미가 비슷�
 - **임베딩 입력에도 동일 경계**: 임베딩 벡터는 원문을 부분 복원할 여지가 있으므로, 경계 밖
   데이터는 **임베딩 입력에서도 제외**한다(요약·메타만 벡터화).
 - 공개 리포(`jjkim0807/macp`) 설계라 스키마 예시·테스트 픽스처에 **실명·토큰·엔드포인트 host·
-  절대 홈경로**를 넣지 않는다(§6 식별자 자가감사의 대상).
+  절대 홈경로**를 넣지 않는다(공개 식별자 게이트 `check_public_identifiers.sh --export` 의 대상).
 
 ---
 
@@ -223,8 +223,8 @@ Graphiti 요구사항 목록이 **"Kuzu 0.11.2 deprecated"** 로 명시한다. �
 ### 3.3 선행 연구 대조 (저장소가 아니라 참조 아키텍처)
 
 - **Graphiti/Zep** (확인): 시간축 지식그래프 기반 에이전트 메모리. edge 에 **validity window
-  (`valid_at`/`invalid_at`) + provenance** 를 다는 모델이 본 설계의 **R1(bi-temporal) + R2(출처)
-  와 정확히 같다** — 즉 v2 의 데이터 모델은 이미 검증된 방향이다. 논문(arXiv 2501.13956)은
+  (유효 시작·무효화 시각) + provenance** 를 다는 모델이 본 설계의 **R1(bi-temporal) + R2(출처)
+  와 같은 방향이다**(정확한 필드명은 미확인 — 개념 대조) — 즉 v2 의 데이터 모델은 이미 검증된 길이다. 논문(arXiv 2501.13956)은
   Deep Memory Retrieval 벤치에서 MemGPT 대비 우위(94.8% vs 93.4%)를 보고하며, 이는 §5 가
   적중률을 1급 지표로 삼는 근거다. **단 Graphiti 의 기본 백엔드는 Neo4j/FalkorDB(서버형)** 라
   "본부 단일 SoT·$0·오프라인 내성" 우선순위와는 운영 트레이드오프가 있다 → 데이터 모델은 차용,
@@ -236,7 +236,8 @@ Graphiti 요구사항 목록이 **"Kuzu 0.11.2 deprecated"** 로 명시한다. �
 
 ### 3.4 열림질문 해소 — 별도 저장소 신설하지 않고 external 축에 올라탄다
 
-요구(태스크 §5·Research 열림질문)대로 **메모리 v2 는 병렬 저장소를 신설하지 않는다**:
+요구(부모 태스크 전제 "external 모드가 메모리 v2 의 기반"·Research 열림질문)대로 **메모리 v2 는
+병렬 저장소를 신설하지 않는다**:
 
 1. **같은 백엔드**: 메모리 v2 는 [[docs/design/state-store|state-store.md]] §③ external 모드의
    볼트 밖 호스트 SQLite(`~/.local/share/macp/state.sqlite`)와 **같은 파일/엔진**에 산다 —
@@ -379,7 +380,7 @@ R4 의 질의("이 태스크와 관련된 과거 실패·결정")가 실제로 �
   로 고정(지표가 임계 밑으로 떨어지면 FAIL). **"CI green" 아님** — 전부 로컬 명령
   ([[Decisions/2026-09-11-no-github-actions-local-release-lane]]).
 - 골든셋은 볼트 안(민감 아님: 태스크 slug·과거 기록 slug 쌍)에 두되, **공개 리포엔 실명·개인
-  데이터가 섞이지 않는 합성/익명 픽스처**만 둔다(R5·§6).
+  데이터가 섞이지 않는 합성/익명 픽스처**만 둔다(R5).
 
 ---
 
