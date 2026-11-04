@@ -7,6 +7,13 @@ stage execution was hard-wired to ``claude -p`` (``stages.build_stage_argv`` +
 seam the design note (docs/design/agent-backends.md §4) draws: a small protocol
 a dispatcher can talk to without knowing which vendor runs the stage.
 
+Three backends sit behind it today: ``ClaudeAgentBackend`` (the default),
+``GeminiAgentBackend`` (a CLI via ``config.build_invocation``) and
+``SolarAgentBackend`` (upstage — a pass-through to the ``solar_stage.run`` HTTP
+tool loop, so Solar is no longer a special path outside the seam). The runner
+picks one per stage through a single ``vendor → (backend, account)`` selection
+(``runner._select_backend`` over ``stages.routes_to_vendor``).
+
 Leaf ② (this file's first landing) is **additive** — ``ClaudeAgentBackend`` is a
 thin delegate to the existing ``stages`` helpers and *nobody calls it yet*
 (the runner is migrated onto it in leaf ③). The claude argv/env stays
@@ -22,9 +29,10 @@ a non-claude backend runs with no effort flag and no pacing. The eight named
 capabilities (``supports``) are the §2 list; the capability gate that consumes
 them is leaf ④.
 
-Stdlib + engine-local only (``stages`` is imported through the package so a test
-that patches ``stages.build_stage_argv`` / ``run_stage_subprocess`` /
-``record_stage_usage`` still intercepts). No personal identifier appears here —
+Stdlib + engine-local only (``stages`` and ``solar_stage`` are imported through
+the package so a test that patches ``stages.build_stage_argv`` /
+``run_stage_subprocess`` / ``record_stage_usage`` or ``solar_stage.run`` still
+intercepts). No personal identifier appears here —
 the engine tree is scanned by the public-identifier gate.
 """
 
@@ -36,7 +44,8 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..macp import config
-from . import stages
+from ..macp import upstage as UP
+from . import solar_stage, stages
 
 # The eight capabilities a stage needs from a backend (design §2). A dispatcher
 # asks ``backend.supports(cap)`` before it routes a stage, and refuses/warns on a
@@ -510,3 +519,59 @@ class GeminiAgentBackend:
             return rec
         except Exception:
             return None
+
+
+class SolarAgentBackend:
+    """Upstage Solar behind the seam: a thin pass-through to ``solar_stage.run``.
+
+    Unlike the two CLI backends there is no argv and no subprocess —
+    ``solar_stage.run`` is an in-engine HTTP read/write/finish tool loop. It
+    returns a ``CompletedProcess(["solar", stage, model], rc, stdout, "")`` the
+    runner's shared tail reads unchanged, and it writes the stage artifact
+    (``delegate.md`` / ``quick.md``) itself. It never raises ``TimeoutExpired``:
+    the runner's stage cap is passed as ``deadline_s`` and bounds the loop's wall
+    clock, so the timeout arm is never reached for this backend.
+
+    ``run_stage`` adds no defaults and drops no keyword — ``solar_stage.run``
+    receives exactly what the caller passed, so the call is byte-identical to the
+    pre-seam inline ``solar_stage.run(...)`` in the runner. ``solar_stage`` is
+    looked up as a module attribute at call time, so a test that patches
+    ``solar_stage.run`` still intercepts. The call shape differs from the CLI
+    backends (Solar needs ``task_prompt`` and ``artifact_path`` and none of the
+    claude prompt-building kwargs), so the runner keeps a small Solar call site
+    after the one shared ``vendor → (backend, account)`` selection.
+
+    Capabilities: ``headless`` and ``model_select`` (the account's tier model).
+    NOT ``tool_allowlist`` — the three file tools are fixed, so a task allowlist
+    cannot be enforced; that is why Solar's lane is the headless-only
+    quick/delegate stages (``stages.SOLAR_STAGES``). NOT ``usage_report`` /
+    ``exit_quota``: there is no stages.json usage channel — the token counts
+    already sit in the stdout/artifact metrics — and ``report_usage`` returning
+    None keeps the runner's rc==0 capacity arm inert, exactly as the inline
+    ``usage_rec = None`` did."""
+
+    name = "upstage"
+    _CAPS = frozenset({"headless", "model_select"})
+
+    def supports(self, capability: str) -> bool:
+        return capability in self._CAPS
+
+    def run_stage(self, stage: str, *, task_prompt: str, working_dir,
+                  artifact_path, **kwargs) -> subprocess.CompletedProcess:
+        return solar_stage.run(
+            stage, task_prompt=task_prompt, working_dir=working_dir,
+            artifact_path=artifact_path, **kwargs)
+
+    def classify_exit(self, rc: int, stdout: str) -> str:
+        """rc==0 only when the model called ``finish``. A 429 that outlived the
+        retry backoff ends the loop with the metrics line
+        ``error_kind: rate_limit`` → ``exhausted``; any other failure → ``error``."""
+        if rc == 0:
+            return EXIT_SUCCESS
+        if f"error_kind: {UP.KIND_RATE_LIMIT}" in (stdout or ""):
+            return EXIT_EXHAUSTED
+        return EXIT_ERROR
+
+    def report_usage(self, stage: str, run_dir: Path, handle, **kwargs) -> dict | None:
+        """No usage channel: always None, writes nothing (see the class docstring)."""
+        return None
