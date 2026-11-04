@@ -186,6 +186,31 @@ def route_to_solar(agent: str | None, stage: str) -> bool:
     still never routes (and every claude task returns False here regardless)."""
     return (agent or "").lower() == "upstage" and stage in SOLAR_STAGES
 
+
+# Stages whose read-only / test-only guarantee the pipeline TRUSTS when it reads
+# their artifact: research and plan write only their report, verify is test-only
+# by design, discover reads a throwaway clone. That guarantee is enforced today
+# by the stage's tool allowlist (STAGE_TOOLS has no Edit for them / TASK_TOOLS_STAGES
+# forbids widening them). A backend that cannot enforce an allowlist could let one
+# of these silently write, dissolving the guarantee — so it must declare the
+# `tool_allowlist` capability or the dispatcher refuses it (agent_backend
+# capability gate, AC #3). Write stages (implement/report/delegate/quick) already
+# touch the world, so they require only headless execution.
+_READONLY_GUARANTEE_STAGES = ("research", "plan", "verify", "discover")
+
+
+def required_capabilities(stage: str) -> frozenset[str]:
+    """The agent-backend capabilities (agent_backend.CAPABILITIES names) a backend
+    MUST support to run `stage` without weakening a guarantee the pipeline relies
+    on. Every stage needs `headless`; a read-only/test-only stage additionally
+    needs `tool_allowlist`. Pure and total — an unknown stage name gets the
+    headless floor, never raises. The dispatcher refuses/warns (never silently
+    routes) when a chosen backend misses any of these (design §2-2 / Q3)."""
+    caps = {"headless"}
+    if stage in _READONLY_GUARANTEE_STAGES:
+        caps.add("tool_allowlist")
+    return frozenset(caps)
+
 # The test runners are for the Step 5b local fallback (verify.md) — the prompt
 # tells verify to reproduce the repo's own CI commands when CI cannot run, and
 # without these the harness gated every one of them behind an approval prompt,

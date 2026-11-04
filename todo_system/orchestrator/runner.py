@@ -41,10 +41,10 @@ from . import lease as lease_mod
 from . import message as m
 from . import repos
 from . import screen_check
+from . import agent_backend
 from . import solar_stage
 from . import stages
 from . import worktree_sweep
-from .agent_backend import ClaudeAgentBackend
 from .assignment import DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, KIND_AI_LOCAL, load_registry
@@ -1031,7 +1031,7 @@ class StagedExecutor(ClaudeCodeExecutor):
         # this loop made inline, so the claude argv/env stays byte-identical
         # (test_agent_backend_golden + test_agent_backend). The use_solar branch is
         # untouched; N-backend selection is leaf ⑥.
-        claude_backend = ClaudeAgentBackend()
+        claude_backend = agent_backend.ClaudeAgentBackend()
         completed: list[str] = []
         # Set True only on the single terminal success below. The `finally` reads
         # it to decide the external worktree's fate: removed on success (its
@@ -1073,6 +1073,23 @@ class StagedExecutor(ClaudeCodeExecutor):
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
                 else:
+                    # Capability gate (leaf ④, AC #3): refuse to dispatch a stage whose
+                    # required capabilities (stages.required_capabilities — read-only
+                    # stages need tool_allowlist) the chosen backend cannot fulfil,
+                    # rather than silently running it with a weaker guarantee. claude
+                    # supports all eight so this never fires for the claude path (a test
+                    # pins that positive path, so the gate is not vacuous); it guards the
+                    # non-claude backends that leaf ⑤/⑥ route here.
+                    missing_caps = agent_backend.missing_capabilities(claude_backend, stage)
+                    if missing_caps:
+                        return ExecOutcome(
+                            False,
+                            f"stage {stage}: backend '{claude_backend.name}' lacks required "
+                            f"capability {', '.join(missing_caps)} — refusing to dispatch "
+                            "(would weaken the stage's guarantee)",
+                            {"branch": branch, "run_dir": str(run_dir), "stages": completed,
+                             "capability_gate": {"backend": claude_backend.name,
+                                                 "stage": stage, "missing": missing_caps}})
                     # Dispatch via the claude backend (leaf ③). It builds the SAME
                     # stages.build_stage_argv argv and runs it with the SAME
                     # stages.run_stage_subprocess call this loop used inline — the claude

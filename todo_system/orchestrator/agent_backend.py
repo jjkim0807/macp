@@ -56,6 +56,20 @@ EXIT_EXHAUSTED = "exhausted"
 EXIT_ERROR = "error"
 
 
+def missing_capabilities(backend, stage: str) -> list[str]:
+    """The capabilities ``stage`` requires (``stages.required_capabilities``) that
+    ``backend`` does NOT support, sorted. Empty = the backend may run the stage.
+
+    The capability gate (leaf ④, AC #3): a dispatcher calls this before routing a
+    stage and refuses/warns on a non-empty result rather than silently running the
+    stage with a weaker guarantee (e.g. a backend with no tool allowlist taking a
+    read-only ``research``/``verify``). ``ClaudeAgentBackend`` supports all eight,
+    so this is always ``[]`` for the claude path — the positive path is pinned by a
+    test so the gate can never pass vacuously."""
+    return [cap for cap in sorted(stages.required_capabilities(stage))
+            if not backend.supports(cap)]
+
+
 @runtime_checkable
 class AgentBackend(Protocol):
     """One coding agent, able to run a worker stage.
