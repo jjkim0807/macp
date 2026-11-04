@@ -31,39 +31,41 @@
 
 ## 발신처 전수 표 — macp 코드
 
-줄번호는 이 태스크 머지 시점 기준. 근거 열의 "자체 쿨다운"은 해당 발신처가 이미
-자기 재알림 억제(1회성/일일 재나그 등)를 갖고 있어 event_key 없이도 반복 발송이 없다는 뜻.
+앵커는 `module:function`(라인 번호 없음)이다 — 줄번호는 리팩터마다 떠내려가지만
+함수가 지워지거나 이름이 바뀌면 `todo_system/tests/test_kakao_alerts_doc_anchors.py`가
+즉시 깨진다. 근거 열의 "자체 쿨다운"은 해당 발신처가 이미 자기 재알림 억제(1회성/일일
+재나그 등)를 갖고 있어 event_key 없이도 반복 발송이 없다는 뜻.
 
-| 발신처 (파일:줄) | 종류 / 예시 문구 | 등급 | 근거 |
+| 발신처 (module:function) | 종류 / 예시 문구 | 등급 | 근거 |
 |---|---|---|---|
-| `todo_system/orchestrator/orchestrator.py:623` `_notify_review` | ⛔ 선행 조건 미충족 / ✅ PR 열림 리뷰 요청 / ✅ 0-commit 완료 / ❌ 실패 의심 (구 `[검토요청]`) | 즉시 | 사람 판단 필요. event_key `review:<framing>:<task>` + 쿨다운 6h — 같은 태스크가 같은 게이트에 반복 막히는 재알림(2026-08-18 하루 10건)을 합침 |
-| `todo_system/orchestrator/orchestrator.py:660` `_notify_orphaned_commits` | 🧨 미푸시 커밋 되감김 (구 `[커밋유실]`) | 즉시 | 데이터 유실 — 되살릴지 판단 필요. event_key `orphaned:<task>` |
-| `todo_system/orchestrator/orchestrator.py:669` `_notify_poison` | 🚧 N회 재실패로 격리 | 즉시 | 자동 재시도 중단 — 수동 처리 필요. event_key `poison:<task>` |
-| `todo_system/orchestrator/orchestrator.py:681` `_notify_timeout_park` | ⏱️ 연속 stage timeout 대기 전환 | 즉시 | long_job 전환 판단 필요. event_key `timeout-park:<task>` |
-| `todo_system/orchestrator/orchestrator.py:692` `_notify_blocker_cancelled` | 🔗 상류 취소로 진행 불가 | 즉시 | 태스크 존폐 판단 필요. event_key `blocker-cancelled:<task>` |
-| `todo_system/orchestrator/orchestrator.py:1314` `_notify_parent_complete` | 🧭 하위 완료된 상위 태스크 open (구 `[상위태스크 점검]`) | 즉시 | 닫을지 판단 필요. `_record_parent_surfaced`가 1회성 보장(자체 쿨다운) |
-| `todo_system/orchestrator/orchestrator.py:783` `_propagate_downstream` | 🔗 하류 통합검증 N개 생성 | **요약** | 자동 생성 FYI — 검증 결과는 별도 알림이 옴 |
-| `todo_system/orchestrator/orchestrator.py:840` `_nudge` | 🙋 파킹된 할당 재촉 (1d/3d/7d 백오프) | 즉시 | 사람 응답을 며칠째 기다리는 의도적 에스컬레이션. event_key 없음 — last_nudge_ts 백오프가 이미 페이싱(자체 쿨다운) |
-| `todo_system/orchestrator/human.py:121` `deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | **요약** | 2026-09-16 감사: 5건 전부 FYI — 직전 검토요청과 중복. QUERY/CANCEL/WAKE/PING은 즉시 유지(애매하면 즉시) |
-| `todo_system/orchestrator/followups.py:428` `_notify_awaiting` | 🙋 사람 결정 대기(followups human): [id] 태스크 — planner가 `"route":"human"`으로 넘긴 report 후속 | **요약** | 결정 대기일 뿐 수 시간 안에 할 일은 아님. id당 평생 1회(`human_notified` 표식 — digest 등급엔 자체 dedup이 없음). 적재 실패 시 다음 reconcile이 재시도하고 즉시 발송으로 폴백하지 않음. 목록·결정은 `python -m todo_system.orchestrator.followups human` / `approve` / `dismiss` |
-| `todo_system/worker.py:1455` migration drift | ⚠️ 마이그레이션 미적용 | 즉시 | DB 스키마 확인 필요 |
-| `todo_system/worker.py:1936` `check_dispatch_silence` | 🤖⚠️ macp 정체 | 즉시 | 파이프라인 침묵의 유일한 감지기. SILENCE_COOLDOWN 자체 쿨다운 |
-| `todo_system/worker.py:2030` `check_work_starvation` | 🤖💤 macp 유휴 | 즉시 | 새 태스크 투입 필요. 일 1회 자체 쿨다운 |
-| `todo_system/worker.py:2213` daemon 재기동 실패 | 🤖⚠️ 재기동 후에도 구코드 | 즉시 | 수동 확인 필요. escalated 1회성(자체 쿨다운) |
-| `todo_system/worker.py:2303` daemon 재기동 보류 | 🤖⚠️ 재기동 계속 연기 | 즉시 | 구코드로 도는 중 — 확인 필요. 일 1회 재나그(자체 쿨다운) |
-| `todo_system/worker.py:2648` dirty stall | ⚠️ Worker 정지: 미커밋 파일 | 즉시 | 커밋/정리해야 재개. 임계+12h 재나그(자체 쿨다운) |
-| `todo_system/worker.py:2668` stall 해제 | ✅ Worker 재개 | **요약** | 자가 회복 완료 FYI |
-| `todo_system/worker.py:3809` worker start | 🤖 Worker 시작 | **요약** | "조치 불필요, 진행 알림" — 문구 자체가 FYI |
-| `todo_system/worker.py:3861` worker fail | ❌ Worker 실패 | 즉시 | 런 로그 확인 필요. event_key `worker-fail:<slug>` |
-| `todo_system/worker.py:3882` worker done | ✅ Worker 완료 | **요약** | 후속 판단은 검토요청·리뷰 태스크가 따로 알림 |
-| `todo_system/orchestrator/runner.py:503` 베타 발행 실패 | ❌ 베타 발행 실패 | 즉시 | 릴리즈 파이프라인 고장 — 확인 필요 |
-| `todo_system/orchestrator/beta_publish.py:417` 베타 중단 | 🚫 [베타 중단] 테스터 0 | 즉시 | 콘솔에서 테스터 추가 필요 |
-| `scripts/health_report.py:706` 주간 헬스리포트 | ⚠️ 이상 N건 | 즉시 | WARN일 때만 발송(정상 무음) — 판단 필요. 주 1회 |
-| `scripts/claude_auth_watch.py:583` 인증 이상 | 🔐 Claude Code 인증 이상 | 즉시 | 방치하면 자동화 전체 정지 — /login 필요 |
-| `scripts/macp_dashboard.py:1631` `_run_ingest_alert` | 📵 SMS 릴레이 수신 거부 (HTTP 401/429/400/413) | 즉시 | 사람 조치 필요(토큰 재적용·앱 확인). 종류별(auth/bad_payload/too_large) 6h 자체 쿨다운(`sms.should_alert`, 파일 상태라 재시작에도 유지) |
-| `scripts/claude_auth_watch.py:563` remote-control 자동 복구 | 🔐 자동 복구됨 | **요약** | 이미 자가 회복 — `KAKAO_LEVEL=digest` env 옵트인 |
-| `.claude/commands/worker-planner.md:442` `[Planner] 태스크 N개 적재` | [Planner] 적재 | **요약** | FYI. 2026-10-11 적용(`KAKAO_LEVEL=digest`). 단 `planner_policy.yaml`의 `kakao_on_tasks_created: false`라 현재는 발송 안 됨 |
-| `scripts/notify_kakao.sh` 아침 브리프 | 데일리 브리프 | (등급 밖) | 자체가 일 1회 요약 채널 — 라우팅 대상 아님 |
+| `todo_system/orchestrator/orchestrator.py:_notify_review` | ⛔ 선행 조건 미충족 / ✅ PR 열림 리뷰 요청 / ✅ 0-commit 완료 / ❌ 실패 의심 (구 `[검토요청]`) | 즉시 | 사람 판단 필요. event_key `review:<framing>:<task>` + 쿨다운 6h — 같은 태스크가 같은 게이트에 반복 막히는 재알림(2026-08-18 하루 10건)을 합침 |
+| `todo_system/orchestrator/orchestrator.py:_notify_orphaned_commits` | 🧨 미푸시 커밋 되감김 (구 `[커밋유실]`) | 즉시 | 데이터 유실 — 되살릴지 판단 필요. event_key `orphaned:<task>` |
+| `todo_system/orchestrator/orchestrator.py:_notify_poison` | 🚧 N회 재실패로 격리 | 즉시 | 자동 재시도 중단 — 수동 처리 필요. event_key `poison:<task>` |
+| `todo_system/orchestrator/orchestrator.py:_notify_timeout_park` | ⏱️ 연속 stage timeout 대기 전환 | 즉시 | long_job 전환 판단 필요. event_key `timeout-park:<task>` |
+| `todo_system/orchestrator/orchestrator.py:_notify_blocker_cancelled` | 🔗 상류 취소로 진행 불가 | 즉시 | 태스크 존폐 판단 필요. event_key `blocker-cancelled:<task>` |
+| `todo_system/orchestrator/orchestrator.py:_notify_parent_complete` | 🧭 하위 완료된 상위 태스크 open (구 `[상위태스크 점검]`) | 즉시 | 닫을지 판단 필요. `_record_parent_surfaced`가 1회성 보장(자체 쿨다운) |
+| `todo_system/orchestrator/orchestrator.py:_propagate_downstream` | 🔗 하류 통합검증 N개 생성 | **요약** | 자동 생성 FYI — 검증 결과는 별도 알림이 옴 |
+| `todo_system/orchestrator/orchestrator.py:_nudge` | 🙋 파킹된 할당 재촉 (1d/3d/7d 백오프) | 즉시 | 사람 응답을 며칠째 기다리는 의도적 에스컬레이션. event_key 없음 — last_nudge_ts 백오프가 이미 페이싱(자체 쿨다운) |
+| `todo_system/orchestrator/human.py:deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | **요약** | 2026-09-16 감사: 5건 전부 FYI — 직전 검토요청과 중복. QUERY/CANCEL/WAKE/PING은 즉시 유지(애매하면 즉시) |
+| `todo_system/orchestrator/followups.py:_notify_awaiting` | 🙋 사람 결정 대기(followups human): [id] 태스크 — planner가 `"route":"human"`으로 넘긴 report 후속 | **요약** | 결정 대기일 뿐 수 시간 안에 할 일은 아님. id당 평생 1회(`human_notified` 표식 — digest 등급엔 자체 dedup이 없음). 적재 실패 시 다음 reconcile이 재시도하고 즉시 발송으로 폴백하지 않음. 목록·결정은 `python -m todo_system.orchestrator.followups human` / `approve` / `dismiss` |
+| `todo_system/worker.py:cmd_maintenance` | ⚠️ 마이그레이션 미적용 | 즉시 | DB 스키마 확인 필요. `check_unapplied_migrations`가 판정, `cmd_maintenance`가 발송 |
+| `todo_system/worker.py:check_dispatch_silence` | 🤖⚠️ macp 정체 | 즉시 | 파이프라인 침묵의 유일한 감지기. SILENCE_COOLDOWN 자체 쿨다운 |
+| `todo_system/worker.py:check_work_starvation` | 🤖💤 macp 유휴 | 즉시 | 새 태스크 투입 필요. 일 1회 자체 쿨다운 |
+| `todo_system/worker.py:restart_stale_daemons` | 🤖⚠️ 재기동 후에도 구코드 | 즉시 | 수동 확인 필요. escalated 1회성(자체 쿨다운) |
+| `todo_system/worker.py:_note_restart_deferral` | 🤖⚠️ 재기동 계속 연기 | 즉시 | 구코드로 도는 중 — 확인 필요. 일 1회 재나그(자체 쿨다운) |
+| `todo_system/worker.py:record_dirty_stall` | ⚠️ Worker 정지: 미커밋 파일 | 즉시 | 커밋/정리해야 재개. 임계+12h 재나그(자체 쿨다운) |
+| `todo_system/worker.py:clear_dirty_stall` | ✅ Worker 재개 | **요약** | 자가 회복 완료 FYI |
+| `todo_system/worker.py:_run_next_impl` (worker start) | 🤖 Worker 시작 | **요약** | "조치 불필요, 진행 알림" — 문구 자체가 FYI |
+| `todo_system/worker.py:_run_next_impl` (worker fail) | ❌ Worker 실패 | 즉시 | 런 로그 확인 필요. event_key `worker-fail:<slug>` |
+| `todo_system/worker.py:_run_next_impl` (worker done) | ✅ Worker 완료 | **요약** | 후속 판단은 검토요청·리뷰 태스크가 따로 알림 |
+| `todo_system/orchestrator/runner.py:_publish_beta` | ❌ 베타 발행 실패 | 즉시 | 릴리즈 파이프라인 고장 — 확인 필요 |
+| `todo_system/orchestrator/beta_publish.py:maybe_publish` | 🚫 [베타 중단] 테스터 0 | 즉시 | 콘솔에서 테스터 추가 필요 |
+| `scripts/health_report.py:main` | ⚠️ 이상 N건 | 즉시 | WARN일 때만 발송(정상 무음) — 판단 필요. 주 1회 |
+| `scripts/claude_auth_watch.py:check_accounts` | 🔐 Claude Code 인증 이상 | 즉시 | 방치하면 자동화 전체 정지 — /login 필요 |
+| `scripts/macp_dashboard.py:_run_ingest_alert` | 📵 SMS 릴레이 수신 거부 (HTTP 401/429/400/413) | 즉시 | 사람 조치 필요(토큰 재적용·앱 확인). 종류별(auth/bad_payload/too_large) 6h 자체 쿨다운(`sms.should_alert`, 파일 상태라 재시작에도 유지). 호출원은 `do_POST` |
+| `scripts/claude_auth_watch.py:check_remote_control_binary` | 🔐 자동 복구됨 | **요약** | 이미 자가 회복 — `KAKAO_LEVEL=digest` env 옵트인 |
+| `.claude/commands/worker-planner.md` `[Planner] 태스크 N개 적재` | [Planner] 적재 | **요약** | FYI. 2026-10-11 적용(`KAKAO_LEVEL=digest`). 단 `planner_policy.yaml`의 `kakao_on_tasks_created: false`라 현재는 발송 안 됨. 마크다운 프롬프트 안의 셸 커맨드라 함수 앵커 없음 — grep `KAKAO_LEVEL=digest.*Planner` |
+| `scripts/notify_kakao.sh` 아침 브리프 | 데일리 브리프 | (등급 밖) | 자체가 일 1회 요약 채널 — 라우팅 대상 아님. 셸 스크립트라 함수 앵커 없음 |
 
 ## 발신처 전수 표 — 외부 리포 (권고 등급, 코드는 후속 태스크로)
 
