@@ -122,6 +122,60 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR이 머지 없이 닫혔어요 — "
             "다시 열지·재작업할지·접을지 판단해주세요"),
+        # orchestrator trace view (orchestrator/trace.py render())
+        "trace.title": "# 🔎 trace — `{slug}`",
+        "trace.summary": "> 런 {n}개 · runs_dir `{runs_dir}` · 읽기 전용 (상태를 바꾸지 않음)",
+        "trace.latest.heading": "## 최신 런",
+        "trace.latest.no_runs": "- 런 없음 (`*-{slug}` 디렉터리가 하나도 없음)",
+        "trace.latest.position": "- 런 {n}개 중 마지막 ({n}/{n})",
+        "trace.latest.none": "(없음)",
+        "trace.latest.provenance_heading": (
+            "### 산출물 출처 (판정 근거는 stages.json이 아니라 파일 자체의 스탬프)"),
+        "trace.origin.own": "이번 런",
+        "trace.origin.missing": "없음",
+        "trace.origin.inherited": "- `{name}` ({stage}) — **상속본** ← `{detail}`",
+        "trace.origin.foreign_author": (
+            "- `{name}` ({stage}) — ⚠ **출처 불명**: 파일의 run_id는 `{detail}` "
+            "(스탬프 도입 이전의 상속본이거나 잘못 쓰인 run_id)"),
+        "trace.origin.presumed_own": (
+            "- `{name}` ({stage}) — 출처 표시 없음: **이번 런 생성으로 추정** "
+            "(상속이면 스탬프가 남으므로 — 단 스탬프 도입 이전 런이면 확증 불가)"),
+        "trace.verify.heading": (
+            "## verify 판정 (⚠ verify는 상속되지 않음 — 판정은 그 런의 디렉터리에만 남는다)"),
+        "trace.verify.no_verdict": "판정 없음",
+        "trace.verify.stale": " — ⚠ 이 판정은 이후 {after}번의 런 **이전** 상태",
+        "trace.verify.latest": " — 최신 런의 판정",
+        "trace.verify.line": "- 런 {i}/{n} `{run}`: **{verdict}**{stale}",
+        "trace.verify.none": (
+            "- verify.md 를 남긴 런이 하나도 없음 (런 {n}개 전부) "
+            "— 이 태스크는 아직 검증된 적이 없다"),
+        "trace.ledger.heading": "## 원장 (assignment ledger)",
+        "trace.ledger.not_injected": "- 원장 조회 안 함 (ledger 미주입)",
+        "trace.ledger.no_assignment": "- `{slug}` 에 대한 assignment 없음 (미할당이거나 이미 정리됨)",
+        "trace.ledger.stored": " (원장 저장값: {state} — 실패 아님, 자동 재시도)",
+        "trace.ledger.parked": (
+            "- ⛔ 원장이 **파킹** 상태 — todo.db/`load_dispatchable`가 이 태스크를 "
+            "후보로 올려도 `dispatch()`가 라우팅 전에 즉시 None을 반환한다"),
+        "trace.ledger.merged_exit": (
+            "  - 종결: PR은 이미 머지됨 — 남은 사람 단계를 마친 뒤 태스크 md를 "
+            "`status: done`으로 닫으면 다음 틱에 `reconcile_merged()`가 "
+            "\"todo already closed\" 경로로 자동 종결한다 — 재큐 불필요 "
+            "(원장 수기 편집도 불필요)"),
+        "trace.ledger.unpark": (
+            "  - 해제: 블로커 해소 후 태스크 md의 `worker_mode`를 비-디스패치 "
+            "값(`blocked` 등)으로 바꿨다가 `auto`로 되돌리면 "
+            "`reconcile_unparked()`가 그 전이를 해제 신호로 읽어 자동 재큐한다 "
+            "— 원장 수기 편집 불필요"),
+        "trace.ledger.long_job": "- long_job 실행 중",
+        "trace.ledger.checkout_busy": "- 체크아웃 대기 (다른 런이 같은 체크아웃 사용 중 — 끝나면 자동 재시도)",
+        "trace.ledger.run_dir": "- 원장이 가리키는 run_dir: `{run_dir}`",
+        "trace.branch.heading": "## 브랜치 · PR",
+        "trace.branch.origin_unknown": "- origin에 존재: unknown (git 조회 실패 — 실패가 아님)",
+        "trace.branch.origin_yes": "- origin에 존재: 예",
+        "trace.branch.origin_no": "- origin에 존재: 아니오 (미push, 또는 머지 후 삭제됨)",
+        "trace.branch.pr_merged": "- PR: 머지됨",
+        "trace.branch.pr_open": "- PR: 존재하지만 아직 머지 안 됨 (open/closed)",
+        "trace.branch.pr_unknown": "- PR: unknown (gh 없음/미인증/PR 없음 — 실패가 아님)",
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -223,6 +277,66 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR was closed without merging — "
             "decide whether to reopen, redo or drop it"),
+        # orchestrator trace view (orchestrator/trace.py render())
+        "trace.title": "# 🔎 trace — `{slug}`",
+        "trace.summary": "> {n} run(s) · runs_dir `{runs_dir}` · read-only (changes no state)",
+        "trace.latest.heading": "## Latest run",
+        "trace.latest.no_runs": "- no runs (no `*-{slug}` directory at all)",
+        "trace.latest.position": "- last of {n} run(s) ({n}/{n})",
+        "trace.latest.none": "(none)",
+        "trace.latest.provenance_heading": (
+            "### Artifact provenance (judged from each file's own stamp, not stages.json)"),
+        "trace.origin.own": "this run",
+        "trace.origin.missing": "missing",
+        "trace.origin.inherited": "- `{name}` ({stage}) — **inherited** ← `{detail}`",
+        "trace.origin.foreign_author": (
+            "- `{name}` ({stage}) — ⚠ **unknown origin**: the file's run_id is `{detail}` "
+            "(a copy from before stamping existed, or a wrongly written run_id)"),
+        "trace.origin.presumed_own": (
+            "- `{name}` ({stage}) — no origin mark: **presumed written by this run** "
+            "(an inheritance leaves a stamp — but for a run from before stamping "
+            "this cannot be confirmed)"),
+        "trace.verify.heading": (
+            "## verify verdicts (⚠ verify is not inherited — a verdict stays only in "
+            "its own run's directory)"),
+        "trace.verify.no_verdict": "no verdict",
+        "trace.verify.stale": " — ⚠ this verdict is from **before** the {after} later run(s)",
+        "trace.verify.latest": " — verdict of the latest run",
+        "trace.verify.line": "- run {i}/{n} `{run}`: **{verdict}**{stale}",
+        "trace.verify.none": (
+            "- no run left a verify.md (all {n} run(s)) "
+            "— this task has never been verified"),
+        "trace.ledger.heading": "## Assignment ledger",
+        "trace.ledger.not_injected": "- ledger not consulted (no ledger injected)",
+        "trace.ledger.no_assignment": (
+            "- no assignment for `{slug}` (never assigned, or already cleaned up)"),
+        "trace.ledger.stored": " (stored in the ledger as {state} — not a failure, retries automatically)",
+        "trace.ledger.parked": (
+            "- ⛔ the ledger row is **parked** — even when todo.db/`load_dispatchable` "
+            "lists this task as a candidate, `dispatch()` returns None right away, "
+            "before routing"),
+        "trace.ledger.merged_exit": (
+            "  - exit: the PR already merged — finish the remaining human step, then "
+            "close the task md with `status: done`; on the next tick "
+            "`reconcile_merged()` closes the row via the \"todo already closed\" path "
+            "— no requeue needed (no hand edit of the ledger either)"),
+        "trace.ledger.unpark": (
+            "  - release: once the blocker is resolved, switch the task md's "
+            "`worker_mode` to a non-dispatch value (`blocked` etc.) and back to "
+            "`auto`; `reconcile_unparked()` reads that transition as the release "
+            "signal and requeues automatically — no hand edit of the ledger needed"),
+        "trace.ledger.long_job": "- long_job running",
+        "trace.ledger.checkout_busy": (
+            "- waiting for the checkout (another run is using the same checkout "
+            "— retries automatically when it finishes)"),
+        "trace.ledger.run_dir": "- run_dir the ledger points at: `{run_dir}`",
+        "trace.branch.heading": "## Branch · PR",
+        "trace.branch.origin_unknown": "- exists on origin: unknown (git lookup failed — not a failure)",
+        "trace.branch.origin_yes": "- exists on origin: yes",
+        "trace.branch.origin_no": "- exists on origin: no (not pushed, or deleted after merge)",
+        "trace.branch.pr_merged": "- PR: merged",
+        "trace.branch.pr_open": "- PR: exists but not merged yet (open/closed)",
+        "trace.branch.pr_unknown": "- PR: unknown (no gh / not authenticated / no PR — not a failure)",
     },
 }
 
