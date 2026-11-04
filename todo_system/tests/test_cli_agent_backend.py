@@ -16,14 +16,22 @@ public-identifier gate).
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from todo_system.macp import config as C
 from todo_system.orchestrator import agent_backend as ab
+from todo_system.orchestrator import message as m
+from todo_system.orchestrator import runner as runner_mod
+from todo_system.orchestrator import solar_stage
 from todo_system.orchestrator import stages
+from todo_system.orchestrator.registry import Agent
+from todo_system.orchestrator.runner import StagedExecutor
 
 _KW = dict(task_id="slug", run_id="RID", run_dir=Path("/rd"), branch="worker/slug")
 
@@ -153,6 +161,80 @@ def test_gemini_runs_the_read_only_stage_capability_check_cleanly():
     g = ab.GeminiAgentBackend()
     assert ab.missing_capabilities(g, "quick") == []
     assert ab.missing_capabilities(g, "research") == []   # has tool_allowlist
+
+
+# ---- end-to-end routing: an `agent: gemini` quick task completes (AC #2) ----
+
+def test_gemini_quick_task_routes_to_gemini_backend_and_completes(tmp_path):
+    """Drive a full VAULT quick run through StagedExecutor with the dispatch
+    machinery stubbed (mirrors test_solar_stage's ExecuteRoutingTest): an
+    `agent: gemini` quick task runs via GeminiAgentBackend (a `gemini …` argv
+    reaches the mock runner, NOT a claude argv, and solar_stage.run is untouched),
+    the mock runner writes quick.md, and the run completes."""
+    runs = Path(tempfile.mkdtemp(dir=tmp_path))
+
+    def _run_dir() -> Path:
+        dirs = [p for p in runs.iterdir() if p.is_dir()]
+        assert len(dirs) == 1, dirs
+        return dirs[0]
+
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        (_run_dir() / stages.STAGE_ARTIFACT["quick"]).write_text(
+            "---\noverall_status: pass\n---\n# quick\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "gemini stage stdout", "")
+
+    solar_run = mock.Mock()
+    vp = subprocess.CompletedProcess([], 0, "", "")
+    vp.problem = None
+    vp.orphaned_commits = None
+    gemini_acct = C.Account(name="gem", agent="gemini", command="gemini --yolo -p {prompt}")
+    msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="t",
+                     payload={"worker_mode": "quick", "agent": "gemini", "auto_merge": True})
+    with contextlib.ExitStack() as stack:
+        for p in (
+            mock.patch.object(stages, "restore_main"),
+            mock.patch.object(stages, "install_push_guard"),
+            mock.patch.object(stages, "default_branch", return_value="main"),
+            mock.patch.object(stages, "prepare_vault_branch", return_value=vp),
+            mock.patch.object(stages, "remote_branch_exists", return_value=False),
+            mock.patch.object(stages, "RUNS_DIR", runs),
+            mock.patch.object(stages, "cleanup_build_daemons",
+                              return_value={"ran": False, "note": ""}),
+            # a safety net: if routing WRONGLY picked claude, the captured argv
+            # would start with "claude" and the assertion below fails fast (no
+            # real model probe). The gemini path does not call build_stage_argv.
+            mock.patch.object(stages, "build_stage_argv", return_value=["claude", "-p", "stub"]),
+            mock.patch.object(stages, "run_stage_subprocess", side_effect=fake_run),
+            mock.patch.object(solar_stage, "run", solar_run),
+            mock.patch.object(stages, "publish_branch",
+                              return_value={"pr_url": None, "note": ""}),
+            mock.patch.object(stages, "merge_pr",
+                              return_value={"merged": True, "note": ""}),
+            mock.patch.object(StagedExecutor, "_account_env", return_value=(None, "")),
+            mock.patch.object(StagedExecutor, "_solar_account", return_value=None),
+            mock.patch.object(StagedExecutor, "_gemini_account", return_value=gemini_acct),
+            mock.patch.object(StagedExecutor, "_live_sibling_hold", return_value=None),
+            mock.patch.object(StagedExecutor, "_acquire_checkout_lease", return_value=None),
+            mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("quick",)),
+            mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
+            mock.patch("todo_system.worker.runner_heartbeat_start"),
+        ):
+            stack.enter_context(p)
+        out = StagedExecutor().execute(msg, _AGENT, progress=lambda _s: None)
+    # the GEMINI backend ran the stage (a `gemini …` argv), not claude …
+    assert captured["argv"][0] == "gemini", captured["argv"]
+    assert "claude" not in captured["argv"]
+    # … and the Solar HTTP path was never touched.
+    solar_run.assert_not_called()
+    # the quick stage completed and was recorded
+    assert "quick" in out.payload.get("stages", []), out.summary
+    assert (_run_dir() / "quick.md").exists()
+
+
+_AGENT = Agent(id="w", kind="ai-local", capabilities=["git"], repo="~/Worker/x")
 
 
 def test_neutral_run_metadata_omits_external_note_for_vault_task():
