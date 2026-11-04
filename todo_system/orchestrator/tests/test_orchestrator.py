@@ -3404,9 +3404,11 @@ class MergedButBlockedTest(_TmpVaultCase):
         self._collect()
 
         def ledger_part():
-            md = trace.render("dash", self.ledger, runs_dir=self.tmp / "runs",
-                              repo_dir=self.tmp, pr_lookup=lambda *a, **k: None,
-                              branch_lookup=lambda *a, **k: False)
+            # the section split below uses the ko headings, so pin the language
+            with mock.patch.dict(os.environ, {"MACP_LANGUAGE": "ko"}):
+                md = trace.render("dash", self.ledger, runs_dir=self.tmp / "runs",
+                                  repo_dir=self.tmp, pr_lookup=lambda *a, **k: None,
+                                  branch_lookup=lambda *a, **k: False)
             return md.split("## 원장")[1].split("## 브랜치")[0]
 
         before = ledger_part()         # blocked, PR not merged yet: the re-queue recipe
