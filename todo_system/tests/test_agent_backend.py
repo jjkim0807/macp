@@ -291,3 +291,164 @@ def test_gemini_report_usage_never_raises(monkeypatch, tmp_path):
     # a nonexistent run_dir never raises either
     rec2 = ab.GeminiAgentBackend().report_usage("quick", Path("/rd"), _GEM_JSON_HANDLE)
     assert rec2 == {"unavailable": "gemini stats not captured"}
+
+
+def _gem_account(command="gemini --yolo -p {prompt}"):
+    return ab.config.Account(name="gem", agent="gemini", command=command)
+
+
+def _gem_capture(monkeypatch, stdout="ok", raises=None):
+    seen = {}
+
+    def cap(argv, **kw):
+        seen["argv"] = argv
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(stages, "run_stage_subprocess", cap)
+    return seen
+
+
+def test_gemini_argv_appends_output_format_json_when_usage_on(monkeypatch):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    seen = _gem_capture(monkeypatch)
+    ab.GeminiAgentBackend().run_stage("quick", account=_gem_account(), **_KW)
+    argv = seen["argv"]
+    assert argv == ["gemini", "--yolo", "-p", argv[3], "--output-format", "json"]
+
+
+def test_gemini_argv_unchanged_under_kill_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "0")
+    seen = _gem_capture(monkeypatch, stdout='{"stats": {"models": {"m": {}}}}')
+    kw = dict(_KW, run_dir=tmp_path)
+    ab.GeminiAgentBackend().run_stage("quick", account=_gem_account(), **kw)
+    assert len(seen["argv"]) == 4 and seen["argv"][:3] == ["gemini", "--yolo", "-p"]
+    assert not ab.gemini_stats_path(tmp_path, "quick").exists()
+
+
+@pytest.mark.parametrize("command", [
+    "gemini --yolo --output-format json -p {prompt}",
+    "gemini --yolo --output-format=json -p {prompt}",
+    "gemini --yolo -o json -p {prompt}",
+])
+def test_gemini_argv_does_not_duplicate_existing_format(monkeypatch, command):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    seen = _gem_capture(monkeypatch)
+    ab.GeminiAgentBackend().run_stage("quick", account=_gem_account(command), **_KW)
+    argv = seen["argv"]
+    assert argv[-2:] != ["--output-format", "json"]
+    assert sum(1 for t in argv if t.startswith("--output-format") or t == "-o") == 1
+    assert ab._output_format(argv) == "json"
+
+
+def test_gemini_argv_explicit_text_format_left_alone(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    seen = _gem_capture(monkeypatch, stdout='{"stats": {"models": {"m": {}}}}')
+    kw = dict(_KW, run_dir=tmp_path)
+    ab.GeminiAgentBackend().run_stage(
+        "quick", account=_gem_account("gemini --yolo --output-format text -p {prompt}"),
+        **kw)
+    assert "json" not in seen["argv"]
+    assert not ab.gemini_stats_path(tmp_path, "quick").exists()
+
+
+def _gem_stdout(**extra):
+    import json
+    doc = {"response": "SECRET-RESPONSE", "session_id": "s-9", "stats": _gem_doc()["stats"]}
+    doc.update(extra)
+    return json.dumps(doc)
+
+
+def test_gemini_run_stage_writes_stats_sidecar_and_report_usage_parses_it(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    out = _gem_stdout()
+    _gem_capture(monkeypatch, stdout=out)
+    kw = dict(_KW, run_dir=tmp_path)
+    g = ab.GeminiAgentBackend()
+    r = g.run_stage("quick", account=_gem_account(), **kw)
+    assert r.stdout == out   # stdout stays the raw CLI output
+    side = ab.gemini_stats_path(tmp_path, "quick").read_text(encoding="utf-8")
+    assert "response" not in side and "SECRET-RESPONSE" not in side
+    rec = g.report_usage("quick", tmp_path, r.args, returncode=0, duration_ms=5)
+    assert rec == {"input_tokens": 700, "output_tokens": 80,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 400,
+                   "num_turns": 3, "duration_ms": 5, "model": "gemini-2.5-pro",
+                   "session_id": "s-9", "total_cost_usd": None}
+
+
+def test_gemini_sidecar_tolerates_leading_noise(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _gem_capture(monkeypatch, stdout="Loaded cached credentials.\n" + _gem_stdout())
+    kw = dict(_KW, run_dir=tmp_path)
+    g = ab.GeminiAgentBackend()
+    r = g.run_stage("quick", account=_gem_account(), **kw)
+    rec = g.report_usage("quick", tmp_path, r.args, returncode=0)
+    assert "unavailable" not in rec and rec["session_id"] == "s-9"
+
+
+def test_gemini_non_json_stdout_clears_stale_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _write_sidecar(tmp_path, "quick", _gem_doc())   # an earlier invocation's stats
+    _gem_capture(monkeypatch, stdout="plain text")
+    kw = dict(_KW, run_dir=tmp_path)
+    g = ab.GeminiAgentBackend()
+    r = g.run_stage("quick", account=_gem_account(), **kw)
+    assert not ab.gemini_stats_path(tmp_path, "quick").exists()
+    assert g.report_usage("quick", tmp_path, r.args, returncode=0) == {
+        "unavailable": "gemini stats not captured"}
+
+
+def test_gemini_timeout_clears_stale_sidecar_and_propagates(monkeypatch, tmp_path):
+    monkeypatch.setenv(stages.USAGE_ENV, "1")
+    _write_sidecar(tmp_path, "quick", _gem_doc())
+    exc = subprocess.TimeoutExpired(cmd=["gemini", "--output-format", "json"], timeout=1)
+    _gem_capture(monkeypatch, raises=exc)
+    kw = dict(_KW, run_dir=tmp_path)
+    g = ab.GeminiAgentBackend()
+    with pytest.raises(subprocess.TimeoutExpired) as ei:
+        g.run_stage("quick", account=_gem_account(), **kw)
+    assert not ab.gemini_stats_path(tmp_path, "quick").exists()
+    assert g.report_usage("quick", tmp_path, ei.value.cmd, timed_out=True) == {
+        "unavailable": "timeout"}
+
+
+def test_gemini_prompt_carries_project_and_retry_blocks(monkeypatch):
+    seen = _gem_capture(monkeypatch)
+    ab.GeminiAgentBackend().run_stage(
+        "quick", account=_gem_account(), project_context="PROJ-CTX-1",
+        retry_context="RETRY-CTX-2", **_KW)
+    full = seen["argv"][3]
+    i_meta = full.index("# Run metadata")
+    i_proj = full.index("## Project memory")
+    i_retry = full.index("## ⚠ Previous attempt FAILED")
+    assert i_meta < i_proj < i_retry
+    assert "PROJ-CTX-1" in full and "RETRY-CTX-2" in full
+    seen2 = _gem_capture(monkeypatch)
+    ab.GeminiAgentBackend().run_stage("quick", account=_gem_account(), **_KW)
+    assert "## Project memory" not in seen2["argv"][3]
+    assert "Previous attempt FAILED" not in seen2["argv"][3]
+
+
+def test_gemini_meta_blocks_match_claude_wording(fixed, monkeypatch):
+    p, r = "PROJ line 1\nPROJ line 2", "RETRY: test_x failed"
+    claude = stages.build_stage_argv("quick", worker_root=fixed, project_context=p,
+                                     retry_context=r, **_KW)
+    claude_full = claude[2]
+    seen = _gem_capture(monkeypatch)
+    ab.GeminiAgentBackend().run_stage("quick", account=_gem_account(),
+                                      project_context=p, retry_context=r, **_KW)
+    gem_full = seen["argv"][3]
+    tag = "\n## Project memory"
+    assert claude_full[claude_full.index(tag):] == gem_full[gem_full.index(tag):]
+
+
+def test_neutral_run_metadata_default_is_byte_identical():
+    kw = dict(run_id="R", task_id="t", run_dir=Path("/rd"), branch="b",
+              stage="quick", auto_merge=True)
+    expected = ("\n\n---\n\n# Run metadata (injected by orchestrator)\n\n"
+                "- run_id: `R`\n- slug: `t`\n- run_dir: `/rd`\n- branch: `b`\n"
+                "- stage: `quick`\n- auto_merge: `true`\n")
+    assert ab.neutral_run_metadata(**kw) == expected
+    assert ab.neutral_run_metadata(project_context="", retry_context="", **kw) == expected

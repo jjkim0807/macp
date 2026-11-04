@@ -177,7 +177,8 @@ class ClaudeAgentBackend:
 
 def neutral_run_metadata(*, run_id: str, task_id: str, run_dir: Path, branch: str,
                          stage: str, auto_merge: bool, repo: str | None = None,
-                         working_dir: str | None = None) -> str:
+                         working_dir: str | None = None,
+                         project_context: str = "", retry_context: str = "") -> str:
     """The vendor-neutral run-metadata block appended to a CLI backend's prompt.
 
     A trimmed sibling of the block ``stages.build_stage_argv`` builds for claude:
@@ -186,7 +187,12 @@ def neutral_run_metadata(*, run_id: str, task_id: str, run_dir: Path, branch: st
     (a non-claude backend enforces its allowlist through its own config, not the
     prompt) and none of the macp-browser/emulator/remote-gate wrapper rules (those
     are claude-tool-allowlist entries). Kept here, not shared with build_stage_argv,
-    so the claude prompt stays byte-identical and this one can evolve on its own."""
+    so the claude prompt stays byte-identical and this one can evolve on its own.
+
+    ``project_context`` / ``retry_context`` append the SAME "Project memory" and
+    "Previous attempt FAILED" blocks, in the same words, that build_stage_argv
+    appends for claude (copied, not shared — a test pins that they match). Both
+    empty → the output is byte-identical to the block without them."""
     lines = [
         "\n\n---\n\n# Run metadata (injected by orchestrator)\n\n",
         f"- run_id: `{run_id}`\n",
@@ -202,6 +208,17 @@ def neutral_run_metadata(*, run_id: str, task_id: str, run_dir: Path, branch: st
             lines.append(f"- working_dir: `{working_dir}`\n")
         lines.append("- **External repo task**: operate on the checkout; vault "
                      "run_dir artifacts are read-only references.\n")
+    if project_context:
+        lines.append("\n## Project memory (.macp/memory — accumulated context)\n\n"
+                     + project_context + "\n")
+    if retry_context:
+        lines.append(
+            "\n## ⚠ Previous attempt FAILED — fix these specific issues\n\n"
+            "A prior run of THIS task already implemented on this branch but its "
+            "verification failed for the reasons below. You are continuing that "
+            "branch (its commits are present). Do NOT re-scaffold from scratch: "
+            "diagnose and FIX-FORWARD the exact failures below, then commit the "
+            "fix.\n\n" + retry_context + "\n")
     return "".join(lines)
 
 
@@ -310,6 +327,49 @@ def gemini_stats_usage(doc, *, duration_ms: int | None = None) -> dict | None:
     return {k: got.get(k) for k in stages.USAGE_KEYS}
 
 
+def _parse_cli_json(text) -> dict | None:
+    """The CLI's JSON document from stdout, or None. Tolerates leading/trailing
+    noise (e.g. a credentials notice) by retrying on the first-``{``..last-``}``
+    slice. Only a JSON object counts."""
+    if not isinstance(text, str):
+        return None
+    s = text.strip()
+    try:
+        doc = json.loads(s)
+    except ValueError:
+        lo, hi = s.find("{"), s.rfind("}")
+        if lo < 0 or hi <= lo:
+            return None
+        try:
+            doc = json.loads(s[lo:hi + 1])
+        except ValueError:
+            return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _clear_stats_sidecar(run_dir: Path, stage: str) -> None:
+    """Drop an earlier invocation's sidecar so a timeout / non-JSON run is never
+    credited with its stats. Best-effort, never raises."""
+    try:
+        gemini_stats_path(run_dir, stage).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _write_stats_sidecar(run_dir: Path, stage: str, stdout) -> None:
+    """Save ``stats`` (+ ``session_id``) — never ``response`` — from the CLI's
+    JSON stdout. Only into an existing ``run_dir`` (never creates one); no
+    ``stats`` → nothing written. Best-effort, never raises."""
+    try:
+        doc = _parse_cli_json(stdout)
+        if doc is None or "stats" not in doc or not Path(run_dir).is_dir():
+            return
+        keep = {k: doc[k] for k in ("session_id", "stats") if k in doc}
+        gemini_stats_path(run_dir, stage).write_text(json.dumps(keep), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class GeminiAgentBackend:
     """First non-claude CLI backend: Gemini CLI (user decision 2026-11-04).
 
@@ -318,7 +378,15 @@ class GeminiAgentBackend:
     metadata, lets ``build_invocation`` turn the account's ``command`` template
     into argv (``{prompt}`` substituted) with ``account.env``, injects
     ``GEMINI_MODEL`` for the task tier when the account pins one, and runs it with
-    the SAME ``stages.run_stage_subprocess`` reaper the claude path uses.
+    the SAME ``stages.run_stage_subprocess`` reaper the claude path uses. The
+    prompt carries the claude-equivalent "Project memory" / "Previous attempt
+    FAILED" blocks when ``project_context`` / ``retry_context`` are given.
+
+    With usage on, ``--output-format json`` is appended at the END of the argv
+    unless the command already sets a format; the CLI's ``stats`` (+
+    ``session_id``) are saved to :func:`gemini_stats_path` for ``report_usage``
+    and ``CompletedProcess.stdout`` stays the raw CLI output. Under the
+    ``MACP_STAGE_USAGE=0`` kill switch the argv is exactly the command's.
 
     No effort flag, no ``--session-id`` transcript, no usage-guard pacing — those
     are claude-subscription-only (design §4 Q2); a non-claude backend runs without
@@ -360,18 +428,34 @@ class GeminiAgentBackend:
         full = (stages.strip_frontmatter(stages.load_stage_prompt(stage))
                 + neutral_run_metadata(run_id=run_id, task_id=task_id, run_dir=run_dir,
                                        branch=branch, stage=stage, auto_merge=auto_merge,
-                                       repo=repo, working_dir=working_dir))
+                                       repo=repo, working_dir=working_dir,
+                                       project_context=project_context,
+                                       retry_context=retry_context))
         # build_invocation ignores claude extra_args for a non-claude agent, so the
         # invocation shape lives entirely in account.command (the admin configures
         # e.g. `gemini --yolo -p {prompt}`); we add no claude flags.
         argv, inv_env = config.build_invocation(account, full)
+        # Usage: ask for json stats unless the command already picks a format
+        # (an explicit non-json format is the admin's choice → no stats). Kill
+        # switch off → argv exactly as the command builds it, no sidecar touched.
+        fmt = _output_format(argv)
+        usage_on = stages.usage_enabled()
+        if usage_on and fmt is None:
+            argv = argv + ["--output-format", "json"]
+        want_stats = usage_on and fmt in (None, "json")
+        if want_stats:
+            _clear_stats_sidecar(run_dir, stage)
         merged_env = {**(env or {}), **inv_env}   # account.env (+ key) wins over the base
         model = self._model_for(account, tier)
         if model:
             merged_env["GEMINI_MODEL"] = model
-        return stages.run_stage_subprocess(
+        # TimeoutExpired propagates (the sidecar was already cleared).
+        r = stages.run_stage_subprocess(
             argv, cwd=(cwd or working_dir), env=merged_env,
             timeout=timeout, progress=progress)
+        if want_stats:
+            _write_stats_sidecar(run_dir, stage, r.stdout)
+        return r
 
     @staticmethod
     def _model_for(account, tier: str | None) -> str | None:
