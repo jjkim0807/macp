@@ -332,4 +332,77 @@ external 축을 기다리지 않고 **먼저 시작할 수 있는 안전한 첫 
 
 ## §5 평가 방법 (지표)
 
-*(Phase 5 에서 채움)*
+측정 없이 "고차원"만 쌓지 않는다 — v2 가 **실제로 나은지**를 숫자로 재는 방법을 못박는다
+([[worker-measurement-result-can-refute-task-hypothesis]]).
+
+### 5.1 핵심 지표 — 적중률 (retrieval hit-rate)
+
+R4 의 질의("이 태스크와 관련된 과거 실패·결정")가 실제로 관련 기록을 찾아내는 비율.
+
+- **라벨셋 `L`** = `{(task_i, relevant_i)}`. `relevant_i` = 사람이 "이 태스크와 관련"이라
+  인정한 과거 episode/decision slug 집합. 소규모 **골든셋**(예: 워커 태스크 30~50개)을 사람이
+  라벨링한다. (약한 라벨 — "그 태스크가 실제로 wikilink 로 건 과거 기록"을 관련으로 보는 방식 —
+  은 v1 이 바로 그 wikilink 를 질의에 쓰므로 **v1 에 유리한 편향**이 있다. 그래서 사람 골든셋이
+  1차이고, 약한 라벨은 보조 참고만.)
+- 각 `task_i` 로 메모리에 질의 → top-`k` 결과 `R_i`.
+- **precision@k** = 평균(`|R_i ∩ relevant_i| / k`) — 반환한 것 중 맞는 비율.
+- **recall@k** = 평균(`|R_i ∩ relevant_i| / |relevant_i|`) — 맞혀야 할 것 중 찾은 비율.
+- `k ∈ {5, 10}`.
+
+### 5.2 베이스라인 대비 (v2 vs v1, 한 표로)
+
+**같은 라벨셋 `L`** 에서 두 방식의 적중률을 한 표로 비교한다 — 개선이 숫자로 보이게. 아래는
+**측정 대상 표**(G4 평가 하니스가 채운다 — 지금 숫자를 지어내지 않는다):
+
+| 방식 | precision@5 | recall@10 | 질의 지연 p50 | 색인 비용 |
+|---|---|---|---|---|
+| **v1** (현행: `get_related` BFS + `index.md` 집계, wikilink/frontmatter 문자열 매칭) | _측정_ | _측정_ | _측정_ | 매 틱 전체 재빌드(`clear_edges`+전체 DELETE) |
+| **v2** (임베딩 KNN + 그래프 BFS 하이브리드, R3) | _측정_ | _측정_ | _측정_ | 증분(append+tombstone) |
+
+판정 규칙: v2 가 같은 `k`에서 precision·recall **양쪽** 또는 적어도 recall 을 유의하게 올리지
+못하면 하이브리드의 값어치가 없다는 뜻이므로, G3/G4 는 임베딩 모델·`k`·blend 가중치를 재조정하거나
+설계를 되돌린다(측정이 설계를 반증할 수 있다).
+
+### 5.3 보조 지표
+
+- **질의 지연(latency)**: 하이브리드 질의 p50/p95. 임베딩 KNN+BFS 가 워커 스테이지 예산 안에서
+  끝나야 한다(스테이지 질의는 수백 ms 급 목표).
+- **색인 비용**: 매 틱 전체 재빌드(v1) → 변경분 증분(v2)으로 줄었는지. 8055 edge(현재)·임베딩
+  배치 시간.
+- **커버리지(무손실 검증)**: §4.3 마이그레이션이 edges/사실을 **무손실**로 옮겼는지 —
+  `v1 edge 수 == v2 로 이관된 edge 수`(provenance NULL 허용), md 재스캔 결과 동치.
+
+### 5.4 측정 자동화 훅
+
+- `todo_system/orchestrator/eval_memory.py`(§4 G4, 신규)가 골든셋 JSON 을 읽어 v1·v2 질의를
+  돌리고 §5.2 표를 출력한다. 회귀는 로컬 `uv run pytest todo_system/tests/test_graph_memory_eval.py`
+  로 고정(지표가 임계 밑으로 떨어지면 FAIL). **"CI green" 아님** — 전부 로컬 명령
+  ([[Decisions/2026-09-11-no-github-actions-local-release-lane]]).
+- 골든셋은 볼트 안(민감 아님: 태스크 slug·과거 기록 slug 쌍)에 두되, **공개 리포엔 실명·개인
+  데이터가 섞이지 않는 합성/익명 픽스처**만 둔다(R5·§6).
+
+---
+
+## 부록: 이 노트가 확정한 설계 결정 요약
+
+1. **권장 저장소 = external 모드 SQLite + sqlite-vec**(현 edges 재귀 CTE 그래프 + `vec0` 벡터).
+   별 저장소·새 유료 인프라 없음(§3·§4.1).
+2. **bi-temporal** = `event_date`(valid) + `recorded_at`(transaction) + `valid_until`(tombstone);
+   재빌드 DELETE 대신 **append+tombstone** 으로 역사 보존(R1, §1 한계①③ 해소).
+3. **provenance** = `run_id` + commit sha(식별자 아닌 참조); `source_file` 확장(R2).
+4. **하이브리드 retrieval** = 임베딩 KNN + 그래프 BFS; 기존 `get_related` 는 병존 유지(R3).
+5. **원격 질의** = state-store.md ⑦ (a) **본부 HTTP 상태 API 재사용**(메모리 질의 엔드포인트
+   추가). SQLite SoT 는 본부 한 곳, 새 네트워크 서비스 불요. 상시 DB 필요 시 ⑦ (b) Cloud SQL —
+   사람 게이트(§3.4).
+6. **임베딩** = 본부 VM **로컬 모델 1차**($0·PII 경계·오프라인), 관리형 API 는 §5 지표 부족 시
+   사람 게이트 에스컬레이션. 정확 모델·차원은 구현 leaf 가 벤치로 선택(미확인)(§3.4).
+7. **PII 경계** = SMS·메일 본문·건강 원자료는 저장도 임베딩도 **안 함**; 요약/메타만(R5).
+8. **평가** = precision@k·recall@k **vs v1 베이스라인**(같은 골든셋), `eval_memory.py` 하니스 +
+   로컬 pytest. 측정이 설계를 반증할 수 있다(§5).
+9. **분할** = `G1→G2→G3→{G4,G5}`(expand→migrate→contract). **G1(bi-temporal 스키마 확장)이
+   additive 라 external 축을 기다리지 않는 안전한 첫 leaf**. 부모 체인(state-store §⑥ leaf
+   ②~⑥·④·⑦)이 선행 의존(§4.2).
+10. **데이터 모델은 Graphiti/Zep 차용**(validity window+provenance+하이브리드 = R1·R2·R3 동형,
+    arXiv 2501.13956 로 검증), **저장소만** 서버형 대신 external SQLite(§3.3).
+11. **범위**: 이 노트는 설계만 — 실제 leaf 태스크 생성·`.claude/commands` 적용은 **머지 뒤 사람
+    게이트**(§4.4).
