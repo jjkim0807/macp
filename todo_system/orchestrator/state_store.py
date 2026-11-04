@@ -231,16 +231,31 @@ class GitStateStore(StateStore):
 
 
 def open_state_store(vault_root: str | Path | None = None) -> StateStore:
-    """Build the StateStore for the configured backend (design §③/§⑥).
+    """Build the StateStore for the configured backend (design §③/§⑥/§⑧).
 
     ``git`` (the default) returns :class:`GitStateStore`; ``external`` returns
     leaf ④'s :class:`~todo_system.orchestrator.state_store_sqlite.ExternalStateStore`
-    (host-local SQLite outside the vault tree). The external module is imported
-    lazily, so the default path never loads it.
+    (host-local SQLite outside the vault tree); ``remote`` returns leaf ⑦'s
+    :class:`~todo_system.orchestrator.state_store_remote.RemoteStateStore`, the
+    HTTP client a non-primary host uses to reach the HQ's external state over the
+    network (design §⑧ option (a)) — it resolves :func:`paths.state_remote_url`
+    (required) and :func:`paths.state_remote_token`. Both non-git modules are
+    imported lazily, so the default path never loads them (``http.server`` only
+    loads in ``remote`` mode).
     """
     backend = paths.state_backend()
     if backend == "git":
         return GitStateStore(vault_root)
+    if backend == "remote":
+        from .state_store_remote import RemoteStateStore
+
+        url = paths.state_remote_url()
+        if not url:
+            raise ValueError(
+                "state_backend is 'remote' but no remote state URL is set; "
+                "set MACP_STATE_REMOTE_URL (or the state_remote_url config key)"
+            )
+        return RemoteStateStore(url, paths.state_remote_token())
     from .state_store_sqlite import ExternalStateStore
 
     return ExternalStateStore(vault_root=vault_root)

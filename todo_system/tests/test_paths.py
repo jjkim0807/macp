@@ -362,6 +362,119 @@ def test_state_sqlite_path_expanduser(monkeypatch, tmp_path):
     assert paths.state_sqlite_path(start=tmp_path) == Path("~/state.sqlite").expanduser()
 
 
+# --- state_backend(): "remote" is now a valid third value --------------------
+# §⑧ option (a): the external backend reached over the network. The git default
+# and the external value stay exactly as before; only the valid set grows.
+
+
+def test_state_backend_env_remote(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_STATE_BACKEND", "remote")
+    assert paths.state_backend(start=tmp_path) == "remote"
+
+
+@requires_tomllib
+def test_state_backend_config_key_remote(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_BACKEND", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("state_backend = 'remote'\n", encoding="utf-8")
+    assert paths.state_backend(start=tmp_path) == "remote"
+
+
+# --- state_remote_url(): env > config key > None; trailing slash stripped -----
+
+
+def test_state_remote_url_env_wins(monkeypatch, tmp_path):
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text(
+        "state_remote_url = 'http://config-host:9999'\n", encoding="utf-8")
+    monkeypatch.setenv("MACP_STATE_REMOTE_URL", "http://env-host:8000")
+    assert paths.state_remote_url(start=tmp_path) == "http://env-host:8000"
+
+
+def test_state_remote_url_env_strips_trailing_slash(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACP_STATE_REMOTE_URL", "http://env-host:8000/")
+    assert paths.state_remote_url(start=tmp_path) == "http://env-host:8000"
+
+
+@requires_tomllib
+def test_state_remote_url_config_key_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_URL", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text(
+        "state_remote_url = 'http://config-host:9999/'\n", encoding="utf-8")
+    # config value also has its trailing slash stripped.
+    assert paths.state_remote_url(start=tmp_path) == "http://config-host:9999"
+
+
+def test_state_remote_url_none_when_env_and_config_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_URL", raising=False)
+    start = tmp_path / "no" / "macp" / "here"
+    start.mkdir(parents=True)
+    assert paths.state_remote_url(start=start) is None
+
+
+def test_state_remote_url_marker_without_key_is_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_URL", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("profile = 'test-host'\n", encoding="utf-8")
+    assert paths.state_remote_url(start=tmp_path) is None
+
+
+# --- state_remote_token(): env > token-file > None; never a config key --------
+# A secret, so (unlike every other resolver) there is deliberately NO plaintext
+# config key — only an env var or a file path, following the .secrets/ precedent.
+
+
+def test_state_remote_token_env_wins(monkeypatch, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("file-token\n", encoding="utf-8")
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN", "env-token")
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN_FILE", str(token_file))
+    assert paths.state_remote_token(start=tmp_path) == "env-token"
+
+
+def test_state_remote_token_reads_token_file_stripped(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN", raising=False)
+    token_file = tmp_path / "token"
+    token_file.write_text("  secret-value\n", encoding="utf-8")
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN_FILE", str(token_file))
+    assert paths.state_remote_token(start=tmp_path) == "secret-value"
+
+
+def test_state_remote_token_file_path_is_expanduser(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "tok").write_text("home-token\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN_FILE", "~/tok")
+    assert paths.state_remote_token(start=tmp_path) == "home-token"
+
+
+def test_state_remote_token_unreadable_file_is_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN", raising=False)
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN_FILE", str(tmp_path / "nope"))
+    assert paths.state_remote_token(start=tmp_path) is None
+
+
+def test_state_remote_token_empty_file_is_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN", raising=False)
+    token_file = tmp_path / "token"
+    token_file.write_text("   \n", encoding="utf-8")
+    monkeypatch.setenv("MACP_STATE_REMOTE_TOKEN_FILE", str(token_file))
+    assert paths.state_remote_token(start=tmp_path) is None
+
+
+def test_state_remote_token_none_when_nothing_set(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN", raising=False)
+    monkeypatch.delenv("MACP_STATE_REMOTE_TOKEN_FILE", raising=False)
+    assert paths.state_remote_token(start=tmp_path) is None
+
+
 # --- tomllib-less interpreters (macOS launchd /usr/bin/python3 = 3.9) ---------
 # Without the fallback a 3.9 launchd daemon resolved every config key to None and
 # took the neutral default — a silent label change on the Mac. These cases hide

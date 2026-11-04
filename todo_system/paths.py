@@ -450,12 +450,19 @@ def browser_mcp_server(start: Path | None = None) -> Path | None:
 
 
 _DEFAULT_STATE_BACKEND = "git"
-_VALID_STATE_BACKENDS = frozenset({"git", "external"})
+_VALID_STATE_BACKENDS = frozenset({"git", "external", "remote"})
 
 
 def state_backend(start: Path | None = None) -> str:
     """Resolve which :class:`~todo_system.orchestrator.state_store.StateStore`
-    implementation the orchestrator should use: ``"git"`` or ``"external"``.
+    implementation the orchestrator should use: ``"git"``, ``"external"`` or
+    ``"remote"``.
+
+    ``"remote"`` is the external backend reached over the network: the host-local
+    SQLite SoT stays on the primary host (``external``), which also serves the
+    state API (:mod:`todo_system.orchestrator.state_store_remote`), and a remote
+    runner selects ``"remote"`` to call that API with
+    :func:`state_remote_url` / :func:`state_remote_token` (design §⑧ option (a)).
 
     Resolution order mirrors :func:`repo_slug`:
 
@@ -534,6 +541,68 @@ def state_sqlite_path(start: Path | None = None) -> Path:
     if xdg:
         return Path(xdg).expanduser() / "macp" / "state.sqlite"
     return Path(_DEFAULT_STATE_SQLITE_PATH).expanduser()
+
+
+def state_remote_url(start: Path | None = None) -> str | None:
+    """Resolve the base URL of the HQ state API the ``remote`` backend calls.
+
+    Resolution order mirrors :func:`worker_root`:
+
+    1. ``MACP_STATE_REMOTE_URL`` environment variable, if set and non-empty.
+    2. The ``state_remote_url`` key of the nearest ``.macp/config.toml``.
+    3. ``None`` — unset means no remote endpoint is configured. ``open_state_store``
+       raises a clear error naming ``MACP_STATE_REMOTE_URL`` when the backend is
+       ``remote`` but this is unset, rather than guessing a host.
+
+    A trailing ``/`` is stripped so the client can join paths as ``url + "/ledger/..."``.
+    Anchors its config search at :func:`vault_root_or_cwd`, like :func:`worker_root`,
+    because the runner resolves this while running from outside the vault. ``start``
+    overrides that anchor and is the test seam. Resolved per call, never frozen into
+    a module constant.
+    """
+    env = os.environ.get("MACP_STATE_REMOTE_URL")
+    if env:
+        return env.rstrip("/")
+
+    base = (start or vault_root_or_cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = _read_config_key(cfg, "state_remote_url")
+            return key.rstrip("/") if key else None
+
+    return None
+
+
+def state_remote_token(start: Path | None = None) -> str | None:
+    """Resolve the bearer token the ``remote`` backend sends to the HQ state API.
+
+    Resolution order (**env / token-file only — never a plaintext config key**, so
+    no secret is ever written to a repo- or vault-tracked ``.macp/config.toml``;
+    this follows the ``.secrets/`` precedent):
+
+    1. ``MACP_STATE_REMOTE_TOKEN`` environment variable, if set and non-empty.
+    2. The contents of the file named by ``MACP_STATE_REMOTE_TOKEN_FILE``
+       (``expanduser``-ed, ``.strip()``-ed). An unset, empty, unreadable or
+       empty-after-strip file reads as ``None``.
+    3. ``None`` — no token configured.
+
+    The value is never logged. ``start`` is accepted for signature symmetry with
+    the other resolvers but is unused: resolution reads only the environment.
+    """
+    env = os.environ.get("MACP_STATE_REMOTE_TOKEN")
+    if env:
+        return env
+
+    token_file = os.environ.get("MACP_STATE_REMOTE_TOKEN_FILE")
+    if token_file:
+        try:
+            value = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value or None
+
+    return None
 
 
 _LOCALTIME_PATH = Path("/etc/localtime")
