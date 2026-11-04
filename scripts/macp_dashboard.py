@@ -62,6 +62,7 @@ from todo_system import sms  # noqa: E402
 from todo_system import i18n  # noqa: E402
 from todo_system import not_before as _nb  # noqa: E402 — alias: is_deferred is taken below
 from todo_system.orchestrator.assignment import display_state, is_deferred  # noqa: E402
+from todo_system.orchestrator.statuses import is_cancelled, is_closed  # noqa: E402
 # Engine root through the resolver: dev checkout -> repo root (same value as the
 # bootstrap above); wheel install -> todo_system/_engine, where scripts/ and
 # .claude/commands ship in repo layout. The bootstrap only puts the engine on
@@ -803,7 +804,7 @@ def collect_projects(assignments: list[dict]) -> list[dict]:
             ct = tasks.get(c) or {}
             st = ct.get("status", "")
             a = state.get(c)
-            if a and st not in ("done", "cancelled"):
+            if a and not is_closed(st):
                 if a["state"] in ACTIVE:
                     active += 1
                 elif (a["state"] in ("awaiting_human", "failed")
@@ -812,7 +813,7 @@ def collect_projects(assignments: list[dict]) -> list[dict]:
             if kids.get(c):
                 stack.extend(kids[c])
                 continue                           # progress counts leaves only
-            if st == "cancelled":
+            if is_cancelled(st):                   # both spellings leave the total
                 continue
             total += 1
             done += st == "done"
@@ -854,7 +855,7 @@ def _top_ancestor(slug: str, tasks: dict[str, dict]) -> str:
 
 
 def _has_open_child(slug: str, kids: dict[str, list[str]], tasks: dict[str, dict]) -> bool:
-    return any((tasks.get(k) or {}).get("status") not in ("done", "cancelled", "canceled")
+    return any(not is_closed((tasks.get(k) or {}).get("status"))
                for k in kids.get(slug, []))
 
 
@@ -1015,7 +1016,7 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
     # 1) pipeline-parked for a human (PR review / decision / poison quarantine)
     for r in assignments:
         if (r["state"] == "awaiting_human"
-                and r.get("todo_status") not in ("cancelled", "done")
+                and not is_closed(r.get("todo_status"))
                 and r["task"] not in umbrellas):
             items.append({"slug": r["task"], "title": r["task"], "category": "dev",
                           "action": r["note"] or i18n.t("dash.human.parked"), "why": "parked",
@@ -1509,8 +1510,8 @@ def collect_status() -> dict:
     today = dt.datetime.now().strftime("%Y%m%d")
     runs_today = len([d for d in glob.glob(str(RUNS / f"{today}T*"))])
     # A failed/awaiting ledger entry whose todo is already cancelled/done is a stale
-    # bookkeeping leftover, not a live issue — don't surface it as "attention".
-    resolved = ("cancelled", "done")
+    # bookkeeping leftover, not a live issue — don't surface it as "attention"
+    # (is_closed: done / cancelled / canceled).
     # Three triage sections get a `group` key (additive) computed by the single
     # _group_of helper; the web client folds same-section rows that share a non-empty
     # group. recent/runs stay unstamped — recent (a[:40]) shares dict objects with
@@ -1528,7 +1529,7 @@ def collect_status() -> dict:
     # person — even when its own ledger row reads awaiting_human.
     umbrellas = _umbrellas_in_progress()
     attention = [r for r in a if r["state"] in ("awaiting_human", "failed")
-                 and r.get("todo_status") not in resolved
+                 and not is_closed(r.get("todo_status"))
                  and r["task"] not in umbrellas][:12]
     projects_rows = collect_projects(a)
     human_all = collect_human(a, projects={p["slug"] for p in projects_rows},

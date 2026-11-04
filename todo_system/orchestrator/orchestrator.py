@@ -1462,7 +1462,7 @@ class Orchestrator:
             status = tasks.task_status(a.task_id)
         except Exception:
             status = None
-        if status in ("done", "cancelled", "canceled"):
+        if tasks.is_closed(status):
             a.state = DONE
             a.updated_ts = m.now_iso()
             a.history.append({"ts": m.now_iso(), "type": "retry-skipped-closed",
@@ -1702,7 +1702,7 @@ class Orchestrator:
                         # so trust it and stop holding a human slot for it. Both
                         # spellings: task_status returns the md value as written
                         # (only lowercased) — cf. reconcile_unblocked.
-                        if tasks.task_status(a.task_id) not in ("done", "cancelled", "canceled"):
+                        if not tasks.is_closed(tasks.task_status(a.task_id)):
                             # Genuinely unfinished → leave it parked. One exception needs
                             # a human: a parked delegate whose PR a person CLOSED without
                             # merging will NEVER merge, so reconcile_merged would hold it
@@ -1734,7 +1734,7 @@ class Orchestrator:
                         # Merged, but a named step is still owed outside the PR (see
                         # the docstring). Checked only on this branch and only for rows
                         # with a blocker, so a plain merged row costs no extra md read.
-                        if tasks.task_status(a.task_id) not in ("done", "cancelled", "canceled"):
+                        if not tasks.is_closed(tasks.task_status(a.task_id)):
                             # Park once: re-park a FAILED/REJECTED row every time (else
                             # it re-dispatches onto a merged branch), but record an
                             # already-parked one only on first sight, not every tick.
@@ -1888,9 +1888,9 @@ class Orchestrator:
                     if slug == a.task_id:          # self-reference: never resolvable
                         continue
                     status = tasks.task_status(slug)
-                    if status not in ("done", "cancelled", "canceled"):
+                    if not tasks.is_closed(status):
                         continue
-                    if status in ("cancelled", "canceled"):
+                    if tasks.is_cancelled(status):
                         # already surfaced: this branch stays true on every tick (the
                         # task keeps both AWAITING_HUMAN and its blocker), so without
                         # the guard it would re-ping forever.
@@ -2205,7 +2205,7 @@ class Orchestrator:
                     if a.state not in (AWAITING_HUMAN, FAILED) or a.kind.startswith("human"):
                         continue
                     status = tasks.task_status(a.task_id)
-                    if status in ("done", "cancelled", "canceled"):
+                    if tasks.is_closed(status):
                         # AC3: the md is already closed; only the ledger lags behind.
                         self._close_split_parent_row(
                             a, "reconciled: todo already closed — ledger tidied",

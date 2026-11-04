@@ -45,6 +45,7 @@ from . import not_before as nb_gate
 from . import paths
 from .kakao_format import LEVEL_DIGEST, compose_alert
 from .orchestrator import stages as _stages
+from .orchestrator.statuses import is_closed
 from .orchestrator import worktree_sweep as _worktree_sweep
 from todo_system import daemonctl
 
@@ -960,7 +961,7 @@ def autoclose_stale_reviews_local() -> int:
 
     closable: list[WorkerTask] = []
     for slug, task in tasks_by_slug.items():
-        if not slug.startswith("review-") or task.status in ("done", "cancelled"):
+        if not slug.startswith("review-") or is_closed(task.status):
             continue
         parent_slug = _extract_parent_slug_from_review(slug)
         if parent_slug is None:
@@ -1997,7 +1998,9 @@ def doctor_recover_queue(queue: dict[str, Any]) -> list[str]:
         elif status == "failed":
             # If source task was cancelled or removed, mark entry skipped.
             source_status = slug_to_status.get(slug)
-            if source_status in ("cancelled", "done") or source_status is None:
+            # is_closed: done / cancelled / canceled — a one-l `canceled` task
+            # used to fall through to the auto-retry below.
+            if is_closed(source_status) or source_status is None:
                 entry["status"] = "skipped"
                 actions.append(f"skip cancelled/removed task: {slug}")
                 continue
@@ -2018,8 +2021,9 @@ def doctor_recover_queue(queue: dict[str, Any]) -> list[str]:
             # skips on `source_status is None`, this one must not. `Todo/items/`
             # is gitignored, so on a fresh clone or another host slug_to_status
             # comes back empty and "not found" would close every live row at once.
+            # Closed = both cancel spellings, via is_closed.
             source_status = slug_to_status.get(slug)
-            if source_status in ("done", "cancelled"):
+            if is_closed(source_status):
                 entry["status"] = "skipped"
                 actions.append(
                     f"skip stale pending: {slug} (source {source_status})"

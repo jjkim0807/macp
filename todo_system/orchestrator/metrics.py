@@ -23,6 +23,7 @@ from .. import paths
 from . import message as m
 from . import stages
 from .assignment import is_deferred
+from .statuses import CANCELLED_STATUSES_SQL
 
 # Vault-data root. start= is paths.vault_search_start(): the engine root in a
 # checkout (byte-identical to the former parents[2] anchor), None in an
@@ -51,7 +52,10 @@ def _db_counts() -> dict:
         auto_done = con.execute(
             "SELECT COUNT(*) FROM tasks WHERE status='done' AND worker_mode IN ('auto','delegate')"
         ).fetchone()[0]
-        cancelled = con.execute("SELECT COUNT(*) FROM tasks WHERE status='cancelled'").fetchone()[0]
+        # Both spellings (cancelled / canceled), any case — statuses.CANCELLED_STATUSES.
+        cancelled = con.execute(
+            "SELECT COUNT(*) FROM tasks WHERE LOWER(status) IN " + CANCELLED_STATUSES_SQL
+        ).fetchone()[0]
         return {"done": done, "auto_done": auto_done, "cancelled": cancelled}
     except Exception:
         return {"done": 0, "auto_done": 0, "cancelled": 0}

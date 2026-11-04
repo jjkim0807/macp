@@ -266,6 +266,19 @@ class ProjectsSectionTests(unittest.TestCase):
         self.assertEqual(by["fxq"]["status"], "waiting")
         self.assertEqual(d["projects"][0]["slug"], "fxp")  # running work sorts first
 
+    def test_canceled_one_l_leaf_not_counted_in_progress(self):
+        """`canceled` (one l) and a capitalised `Cancelled` leave the total too."""
+        con = sqlite3.connect(M.TODO_DB)
+        con.executemany(
+            "INSERT INTO tasks VALUES (?,?,?,'-',NULL,'',?,?,?,?)", [
+                ("fxp-e", "e", "canceled", "todo", "fxp", 0, None),
+                ("fxp-f", "f", "Cancelled", "todo", "fxp", 0, None),
+            ])
+        con.commit()
+        con.close()
+        by = {p["slug"]: p for p in M.collect_status()["projects"]}
+        self.assertEqual((by["fxp"]["leaves_done"], by["fxp"]["leaves_total"]), (1, 3))
+
     def test_order_running_then_priority_then_recent(self):
         tmp = Path(M.TODO_DB).parent
         (tmp / "assign" / "fxp-b.json").unlink()             # nothing running now

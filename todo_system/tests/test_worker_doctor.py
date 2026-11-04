@@ -99,6 +99,17 @@ class StalePendingRowTest(unittest.TestCase):
         self.assertEqual(queue["runs"][0]["status"], "skipped")
         self.assertEqual(len(actions), 1)
 
+    def test_canceled_one_l_source_closes_pending_row(self):
+        """`canceled` (one l) is closed too, as are case variants."""
+        for spelling in ("canceled", "Canceled"):
+            with self.subTest(spelling=spelling):
+                queue, actions = _doctor(
+                    [_pending_row("dropped-task", "r1")],
+                    [_task("dropped-task", spelling)],
+                )
+                self.assertEqual(queue["runs"][0]["status"], "skipped")
+                self.assertEqual(len(actions), 1)
+
     def test_open_source_pending_row_is_untouched(self):
         """AC2: killing a live waiting row silently empties the queue."""
         queue, actions = _doctor(
@@ -156,6 +167,52 @@ class StalePendingRowTest(unittest.TestCase):
             [_task("stuck-task", "done")],
         )
         self.assertEqual(queue["runs"][0]["status"], "pending")
+
+
+def _failed_row(slug: str, run_id: str, retries: int = 0) -> dict:
+    return {
+        "run_id": run_id,
+        "slug": slug,
+        "status": "failed",
+        "mode": "auto",
+        "created_at": "2026-08-21T15:06:12",
+        "auto_retry_count": retries,
+    }
+
+
+class FailedRowClosedSourceTest(unittest.TestCase):
+    """A failed entry whose source task is closed is skipped, never auto-retried.
+
+    Regression: the check used to know only `cancelled`/`done`, so a task closed
+    as `canceled` (one l) came back `pending` with auto_retry_count+1."""
+
+    def test_closed_source_failed_row_is_skipped_not_retried(self):
+        for spelling in ("canceled", "cancelled", "done", "Canceled"):
+            with self.subTest(spelling=spelling):
+                queue, actions = _doctor(
+                    [_failed_row("closed-task", "r1")],
+                    [_task("closed-task", spelling)],
+                )
+                row = queue["runs"][0]
+                self.assertEqual(row["status"], "skipped")
+                self.assertEqual(row["auto_retry_count"], 0)
+                self.assertEqual(len(actions), 1)
+                self.assertIn("closed-task", actions[0])
+
+    def test_open_source_failed_row_is_auto_retried(self):
+        queue, actions = _doctor(
+            [_failed_row("live-task", "r1")],
+            [_task("live-task", "open")],
+        )
+        row = queue["runs"][0]
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["auto_retry_count"], 1)
+        self.assertEqual(len(actions), 1)
+        self.assertIn("auto-retry", actions[0])
+
+    def test_unknown_source_failed_row_is_skipped(self):
+        queue, _ = _doctor([_failed_row("no-such-slug", "r1")], [])
+        self.assertEqual(queue["runs"][0]["status"], "skipped")
 
 
 class StaleWorktreeReportingHookTest(unittest.TestCase):

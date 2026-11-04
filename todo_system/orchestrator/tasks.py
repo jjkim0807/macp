@@ -16,6 +16,10 @@ from pathlib import Path
 from .. import not_before as nb_gate
 from . import repos
 from .orchestrator import Task
+from .statuses import CLOSED_STATUSES as CLOSED_STATUSES
+from .statuses import CLOSED_STATUSES_SQL
+from .statuses import is_cancelled as is_cancelled
+from .statuses import is_closed as is_closed
 
 DEFAULT_DB = "Todo/todo.db"
 DEFAULT_ITEMS = "Todo/items"
@@ -342,10 +346,10 @@ def parents_needing_review(db_path: str | Path = DEFAULT_DB) -> list[dict]:
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            """
+            f"""
             SELECT p.slug AS slug, p.title AS title, COUNT(c.slug) AS n,
                    SUM(CASE WHEN LOWER(COALESCE(c.status, '')) IN
-                       ('done', 'cancelled', 'canceled') THEN 1 ELSE 0 END) AS closed
+                       {CLOSED_STATUSES_SQL} THEN 1 ELSE 0 END) AS closed
             FROM tasks p JOIN tasks c ON c.parent_slug = p.slug
             WHERE COALESCE(p.is_parent, 0) = 1
               AND LOWER(COALESCE(p.status, '')) = 'open'
@@ -387,10 +391,10 @@ def child_status_rollup(parent_slug: str, db_path: str | Path = DEFAULT_DB) -> d
     con.row_factory = sqlite3.Row
     try:
         row = con.execute(
-            """
+            f"""
             SELECT COUNT(c.slug) AS n,
                    SUM(CASE WHEN LOWER(COALESCE(c.status, '')) IN
-                       ('done', 'cancelled', 'canceled') THEN 1 ELSE 0 END) AS closed
+                       {CLOSED_STATUSES_SQL} THEN 1 ELSE 0 END) AS closed
             FROM tasks c WHERE c.parent_slug = ?
             """,
             (parent_slug,),
@@ -420,10 +424,10 @@ def parents_with_open_children(db_path: str | Path = DEFAULT_DB) -> set[str]:
         return set()
     try:
         rows = con.execute(
-            """
+            f"""
             SELECT DISTINCT parent_slug FROM tasks
             WHERE COALESCE(parent_slug, '') != ''
-              AND LOWER(COALESCE(status, '')) NOT IN ('done', 'cancelled', 'canceled')
+              AND LOWER(COALESCE(status, '')) NOT IN {CLOSED_STATUSES_SQL}
             """
         ).fetchall()
     except sqlite3.Error:

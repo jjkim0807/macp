@@ -336,6 +336,13 @@ def test_dispatchable_modes_match_tasks_module():
     assert ps.DISPATCHABLE_MODES == tasks.DISPATCHABLE_MODES
 
 
+def test_closed_statuses_match_tasks_module():
+    from todo_system.orchestrator import repos, tasks
+    assert ps.CLOSED_STATUSES is tasks.CLOSED_STATUSES
+    assert repos.CLOSED_STATUSES is tasks.CLOSED_STATUSES
+    assert "canceled" in tasks.CLOSED_STATUSES and "cancelled" in tasks.CLOSED_STATUSES
+
+
 # =========================================================================== #
 # Phase 2 — collector against a real tmp vault + todo.db (import-md).
 # =========================================================================== #
