@@ -8,6 +8,7 @@ and the NEWEST, and the middle runs carrying inherited artifacts.
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import tempfile
 import unittest
@@ -25,6 +26,11 @@ RUN_IDS = [f"20260817T{t}-{SLUG}" for t in
 
 class TraceTest(unittest.TestCase):
     def setUp(self):
+        # These asserts pin the ko text byte for byte; the en default (and its
+        # no-Hangul guarantee) is covered in todo_system/tests/test_trace.py.
+        patcher = mock.patch.dict(os.environ, {"MACP_LANGUAGE": "ko"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.runs = self.tmp / "runs"
         self.runs.mkdir()
