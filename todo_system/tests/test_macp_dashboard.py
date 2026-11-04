@@ -2652,3 +2652,52 @@ class RenderHtmlByLanguage(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MACP_LANGUAGE": "ko"}), _LiveServer(None) as s:
             _, _, body = s.get("/")
         self.assertEqual(hashlib.sha256(body).hexdigest(), _KO_HTML_SHA256)
+
+
+class HumanPlannedBlockNotUrgent(unittest.TestCase):
+    """A to-do due soon whose `scheduled:` time block is still ahead is planned,
+    not urgent (2026-11-04: the header 결정 counter showed six study blocks already
+    booked in the calendar). Once the block ends with the task open → urgent again.
+    Date-only `scheduled:` keeps the due-date rule."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        items = self.tmp / "items"
+        items.mkdir()
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, title TEXT, status TEXT, due TEXT, "
+                    "not_before TEXT, next_action TEXT, tags TEXT, parent_slug TEXT, "
+                    "is_parent INTEGER, worker_mode TEXT)")
+        sched = {"block": '"2049-01-11 10:00~12:00"', "dateonly": "2049-01-11", "plain": None}
+        for slug, val in sched.items():
+            con.execute("INSERT INTO tasks VALUES (?,?,'open','2049-01-11',NULL,'','todo',"
+                        "NULL,0,'manual')", (slug, slug))
+            fm = "---\nstatus: open\ndue: 2049-01-11\n" + (f"scheduled: {val}\n" if val else "") + "---\n\n# t\n"
+            (items / f"{slug}.md").write_text(fm, encoding="utf-8")
+        con.commit()
+        con.close()
+        M._PLANNED_CACHE.clear()
+        for p in (mock.patch.object(M, "TODO_DB", db), mock.patch.object(M, "ITEMS", items),
+                  mock.patch.object(M, "REGISTRY", self.tmp / "missing.yaml"),
+                  mock.patch.object(M, "_repo_in_chain", return_value=False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _rows(self, now):
+        return {r["slug"]: r for r in M.collect_human([], now=now)}
+
+    def test_block_ahead_is_not_urgent(self):
+        rows = self._rows(dt.datetime(2049, 1, 10, 9, 0))
+        self.assertFalse(rows["block"]["urgent"])
+        self.assertTrue(rows["dateonly"]["urgent"])
+        self.assertTrue(rows["plain"]["urgent"])
+
+    def test_block_passed_is_urgent_again(self):
+        rows = self._rows(dt.datetime(2049, 1, 11, 12, 0))
+        self.assertTrue(rows["block"]["urgent"])
+
+    def test_row_keys_unchanged(self):
+        rows = self._rows(dt.datetime(2049, 1, 10, 9, 0))
+        self.assertNotIn("planned", rows["block"])

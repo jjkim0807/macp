@@ -639,6 +639,46 @@ def _needs_decision(slug: str) -> bool:
     return flag
 
 
+# A to-do with a calendar time block still ahead of it (`scheduled: "YYYY-MM-DD
+# HH:MM~HH:MM"`) is planned, not urgent: the calendar already holds it, and
+# counting it under 결정 · 🔥 급한 것 made the header number mean "study blocks
+# booked for tomorrow" (2026-11-04). Once the block's end passes with the task
+# still open, the row is urgent again. (path, mtime) → end cache, as above.
+_PLANNED_CACHE: dict[str, tuple[float, dt.datetime | None]] = {}
+
+
+def _planned_block_end(slug: str) -> dt.datetime | None:
+    """End of the `scheduled:` time block in Todo/items/<slug>.md (naive local time),
+    None for no block, a date-only value, or any read/parse error."""
+    p = ITEMS / f"{slug}.md"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    hit = _PLANNED_CACHE.get(slug)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    end = None
+    try:
+        from todo_system.session_log import parse_frontmatter
+        from todo_system.calendar_sync import _parse_scheduled_value
+        fm, _ = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        day, _start, stop = _parse_scheduled_value(str(fm.get("scheduled") or "").strip().strip("'\""))
+        if day and stop:
+            end = dt.datetime.combine(dt.date.fromisoformat(day),
+                                      dt.time.fromisoformat(stop.zfill(5)))
+    except Exception:
+        end = None
+    _PLANNED_CACHE[slug] = (mtime, end)
+    return end
+
+
+def _planned_ahead(slug: str, now: dt.datetime) -> bool:
+    """True while the task's calendar time block has not ended yet."""
+    end = _planned_block_end(slug)
+    return end is not None and now < end
+
+
 def _is_decision(tags: str, slug: str) -> bool:
     """True if the task is a decision: a `decision` tag (no file read) or
     `needs_decision: true` frontmatter. Explicit markers only — title/next_action
@@ -1025,7 +1065,8 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                                   "action": (r["next_action"] or "")[:110], "why": why,
                                   "due": r["due"] if _parse_date(r["due"]) else "",
                                   "not_before": _nb.display_not_before(r["nb"]),
-                                  "urgent": _is_urgent(why, r["due"], today),
+                                  "urgent": (_is_urgent(why, r["due"], today)
+                                             and not _planned_ahead(slug, now)),
                                   "later": _nb.is_deferred(r["nb"], now),
                                   "category": _category(r["tags"], repo_present, human_owned),
                                   "project": labels.get(slug, "")})
