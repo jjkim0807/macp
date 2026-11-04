@@ -44,6 +44,7 @@ from . import screen_check
 from . import solar_stage
 from . import stages
 from . import worktree_sweep
+from .agent_backend import ClaudeAgentBackend
 from .assignment import DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, KIND_AI_LOCAL, load_registry
@@ -1025,6 +1026,12 @@ class StagedExecutor(ClaudeCodeExecutor):
         if solar_acct is not None:
             progress(f"solar account: {getattr(solar_acct, 'name', '?')} "
                      f"(upstage — quick/delegate stages route to Solar)")
+        # The claude dispatch path, behind the AgentBackend seam (leaf ③). Stateless
+        # delegate to the same stages.build_stage_argv + run_stage_subprocess calls
+        # this loop made inline, so the claude argv/env stays byte-identical
+        # (test_agent_backend_golden + test_agent_backend). The use_solar branch is
+        # untouched; N-backend selection is leaf ⑥.
+        claude_backend = ClaudeAgentBackend()
         completed: list[str] = []
         # Set True only on the single terminal success below. The `finally` reads
         # it to decide the external worktree's fate: removed on success (its
@@ -1066,39 +1073,33 @@ class StagedExecutor(ClaudeCodeExecutor):
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
                 else:
-                    argv = stages.build_stage_argv(
-                        stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
-                        branch=branch, repo=repo_url, working_dir=working_dir,
-                        auto_merge=auto_merge, project_context=project_ctx,
-                        allowed_tools=payload.get("allowed_tools"), tier=tier,
-                        retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""))
-                    # Token usage → stages.json `usage.<stage>`. argv carries a fresh
-                    # --session-id unless MACP_STAGE_USAGE=0, and record_stage_usage
-                    # reads that session's transcript back once the process is gone —
-                    # ahead of every early return below, so a failed stage still gets
-                    # its row. It never raises and changes nothing this loop reads:
-                    # r.returncode, r.stdout and r.stderr reach run.log, the model-cache
-                    # hook, the capacity check and the artifact check exactly as they
-                    # did before (why not --output-format json: the comment above
-                    # stages.USAGE_ENV).
+                    # Dispatch via the claude backend (leaf ③). It builds the SAME
+                    # stages.build_stage_argv argv and runs it with the SAME
+                    # stages.run_stage_subprocess call this loop used inline — the claude
+                    # argv/env is byte-identical (test_agent_backend_golden +
+                    # test_agent_backend). run_stage_subprocess (inside the backend), not
+                    # subprocess.run: the stage leads its own session, so the timeout
+                    # reaps the WHOLE tree (`claude -p` → Bash → `./gradlew` → a 2~8G
+                    # Gradle/Kotlin JVM); subprocess.run kills only the direct child and
+                    # then blocks in a second, unbounded communicate() on the pipes those
+                    # grandchildren still hold — it left the JVM in the runner cgroup
+                    # above `memory.high` AND waited on it (2026-09-25). TimeoutExpired
+                    # propagates with the argv on .cmd for the arm below; the returned
+                    # CompletedProcess carries it on .args (the usage handle). The keyword
+                    # set is 1:1 with build_stage_argv (design §4 drop-in).
                     stage_started = time.monotonic()
                     try:
-                        # run_stage_subprocess, not subprocess.run: the stage leads its
-                        # own session, so the timeout below reaps the WHOLE tree
-                        # (`claude -p` → Bash → `./gradlew` → a 2~8G Gradle/Kotlin JVM).
-                        # subprocess.run kills only the direct child and then blocks in a
-                        # second, unbounded communicate() on the pipes those grandchildren
-                        # still hold — so it left the JVM in the runner cgroup above
-                        # `memory.high` AND waited on it (2026-09-25). Capture/text/encoding
-                        # are fixed inside the helper; cwd/env/timeout stay keywords so the
-                        # returned CompletedProcess and the raised TimeoutExpired are
-                        # shape-identical to what this call site read before.
-                        r = stages.run_stage_subprocess(
-                            argv, cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
-                            # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
-                            # is built before run_id exists, so the browser AND emulator
-                            # lease owners (= run_id, their own stages only) are layered
-                            # on here — each strips its key on every other stage.
+                        # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
+                        # is built before run_id exists, so the browser AND emulator
+                        # lease owners (= run_id, their own stages only) are layered
+                        # on here — each strips its key on every other stage.
+                        r = claude_backend.run_stage(
+                            stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
+                            branch=branch, repo=repo_url, working_dir=working_dir,
+                            auto_merge=auto_merge, project_context=project_ctx,
+                            allowed_tools=payload.get("allowed_tools"), tier=tier,
+                            retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
+                            cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
                             env=stages.with_emulator_owner(
                                 stage,
                                 stages.with_browser_owner(stage, stage_env, run_id),
@@ -1115,7 +1116,9 @@ class StagedExecutor(ClaudeCodeExecutor):
                         # and (3) return timed_out=True so the orchestrator's streak
                         # guard can park a task that keeps timing out and the retry
                         # resumes on origin/<branch> rather than restarting from scratch.
-                        stages.record_stage_usage(run_dir, stage, argv, timed_out=True)
+                        # argv is on the TimeoutExpired's .cmd (run_stage_subprocess set
+                        # it); report_usage flows it to the same stages.record_stage_usage.
+                        claude_backend.report_usage(stage, run_dir, e.cmd, timed_out=True)
                         partial = getattr(e, "stdout", None) or ""
                         if isinstance(partial, bytes):
                             partial = partial.decode("utf-8", "replace")
@@ -1150,8 +1153,17 @@ class StagedExecutor(ClaudeCodeExecutor):
                              "stages": completed, "timed_out": True,
                              "timeout_stage": stage, "checkpoint_sha": cp.get("tip"),
                              "repo": repo_url})
-                    usage_rec = stages.record_stage_usage(
-                        run_dir, stage, argv, env=stage_env, returncode=r.returncode,
+                    # Token usage → stages.json `usage.<stage>`, via the backend. The
+                    # argv (carrying a fresh --session-id unless MACP_STAGE_USAGE=0) is
+                    # on r.args; report_usage reads that session's transcript back once
+                    # the process is gone — ahead of every early return below, so a
+                    # failed stage still gets its row. It never raises and changes
+                    # nothing this loop reads: r.returncode/r.stdout/r.stderr reach
+                    # run.log, the model-cache hook, the capacity check and the artifact
+                    # check exactly as before (why not --output-format json: the comment
+                    # above stages.USAGE_ENV).
+                    usage_rec = claude_backend.report_usage(
+                        stage, run_dir, r.args, env=stage_env, returncode=r.returncode,
                         duration_ms=int((time.monotonic() - stage_started) * 1000))
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
