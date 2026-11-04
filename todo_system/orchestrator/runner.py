@@ -41,6 +41,7 @@ from . import lease as lease_mod
 from . import message as m
 from . import repos
 from . import screen_check
+from . import agent_backend
 from . import solar_stage
 from . import stages
 from . import worktree_sweep
@@ -344,29 +345,42 @@ class StagedExecutor(ClaudeCodeExecutor):
         return None, None
 
     @staticmethod
-    def _solar_account(payload: dict, repo: Path | None, task_id: str = ""):
-        """The upstage `Account` a quick/delegate stage should route to Solar, or
-        None. Returns an account ONLY when the task's payload carries
-        `agent: upstage` (repos.task_agent_from_fm wired it from frontmatter) AND
-        the resolved profile actually has an upstage account — `config.account_for`
-        with `agent="upstage"`, the vendor filter that keeps the claude
-        round-robin stable (accounts.py). Anchored at the repo like `_account_env`.
+    def _vendor_account(payload: dict, repo: Path | None, task_id: str, agent: str):
+        """The non-claude `Account` a task routed to `agent` should run as, or None.
 
-        Best-effort: anything other than a configured upstage task — no `agent`,
-        a claude task, no upstage account, or any resolution error — returns None,
-        so the `use_solar` branch simply never engages and the claude path is
-        byte-identical. Never raises, never reads the key (that is deferred to
-        `solar_stage.run`); the key never touches this resolution."""
-        if (payload.get("agent") or "").lower() != "upstage":
+        Returns an account ONLY when the task's payload carries `agent: <agent>`
+        (repos.task_agent_from_fm wired it from frontmatter) AND the resolved
+        profile actually has an account of that vendor — `config.account_for` with
+        the vendor filter that keeps the claude round-robin stable (accounts.py).
+        Anchored at the repo like `_account_env`.
+
+        Best-effort: anything else — no `agent`, a claude task, a different vendor,
+        no matching account, or any resolution error — returns None, so the vendor
+        branch simply never engages and the claude path is byte-identical. Never
+        raises, never reads a key (that is deferred to the backend's run_stage); no
+        key touches this resolution."""
+        if (payload.get("agent") or "").lower() != agent:
             return None
         try:
             from todo_system import macp
             start = str(repo) if repo else str(stages._VAULT_DATA_ROOT)
             ctx = macp.resolve(start)
             return macp.account_for(ctx.get("profile"), ctx.get("project"),
-                                    task_id, agent="upstage")
+                                    task_id, agent=agent)
         except Exception:
             return None
+
+    @staticmethod
+    def _solar_account(payload: dict, repo: Path | None, task_id: str = ""):
+        """The upstage `Account` a quick/delegate stage routes to Solar, or None
+        (the upstage case of `_vendor_account`). Kept as a named helper."""
+        return StagedExecutor._vendor_account(payload, repo, task_id, "upstage")
+
+    @staticmethod
+    def _gemini_account(payload: dict, repo: Path | None, task_id: str = ""):
+        """The gemini `Account` a quick stage routes to the Gemini CLI backend, or
+        None (the gemini case of `_vendor_account`)."""
+        return StagedExecutor._vendor_account(payload, repo, task_id, "gemini")
 
     @staticmethod
     def _maybe_rotate_account(acct: str | None, repo: Path | None, text: str,
@@ -1015,16 +1029,30 @@ class StagedExecutor(ClaudeCodeExecutor):
         stage_timeout = max(self.stage_timeout, stages.stage_timeout_for(payload))
         if stage_timeout != self.stage_timeout:
             progress(f"stage timeout: {stage_timeout}s (tier {tier})")
-        # Vendor routing (macp-solar-run-single-stage-task): resolve the upstage
-        # account ONCE, before the loop. None for every task without
-        # `agent: upstage` AND an upstage account configured — which is every
-        # task today — so `use_solar` below is False and the claude argv/env is
-        # byte-identical. When set, a quick/delegate stage runs via solar_stage
-        # instead of `claude -p` (stages.route_to_solar gates the stage).
+        # Vendor routing (leaf ⑥, generalised from macp-solar-run-single-stage-task):
+        # resolve each non-claude vendor account ONCE, before the loop. None for
+        # every task without `agent: <vendor>` AND a matching account configured —
+        # which is every task today — so the CLI branch below picks claude and the
+        # claude argv/env is byte-identical. When set, the vendor's lane stages
+        # (stages.vendor_lane_for) route to that vendor instead of `claude -p`:
+        # upstage → solar_stage (HTTP tool loop), gemini → GeminiAgentBackend (CLI).
         solar_acct = self._solar_account(payload, repo, msg.task_id)
         if solar_acct is not None:
             progress(f"solar account: {getattr(solar_acct, 'name', '?')} "
                      f"(upstage — quick/delegate stages route to Solar)")
+        gemini_acct = self._gemini_account(payload, repo, msg.task_id)
+        if gemini_acct is not None:
+            progress(f"gemini account: {getattr(gemini_acct, 'name', '?')} "
+                     f"(gemini — quick stage routes to the Gemini CLI backend)")
+        # The CLI backends, behind the AgentBackend seam. claude is the default;
+        # gemini is selected per stage when the task routes to it (below). Both
+        # are stateless and delegate to the same stages helpers / build_invocation,
+        # so the claude argv/env stays byte-identical (test_agent_backend_golden +
+        # test_agent_backend). The Solar (upstage HTTP) path stays on solar_stage.run
+        # unchanged — a SolarAgentBackend wrapper is a clean follow-up, not needed
+        # for the AC (Solar routes only to headless-only quick/delegate).
+        claude_backend = agent_backend.ClaudeAgentBackend()
+        gemini_backend = agent_backend.GeminiAgentBackend()
         completed: list[str] = []
         # Set True only on the single terminal success below. The `finally` reads
         # it to decide the external worktree's fate: removed on success (its
@@ -1044,8 +1072,9 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # the longest legitimate gap between two touches is one
                 # run_stage_subprocess(timeout=self.stage_timeout) below, not the sum.
                 _worker.runner_heartbeat_start()
-                use_solar = (solar_acct is not None
-                             and stages.route_to_solar(payload.get("agent"), stage))
+                agent = (payload.get("agent") or "").lower()
+                use_solar = (solar_acct is not None and agent == "upstage"
+                             and stages.routes_to_vendor(agent, stage))
                 if use_solar:
                     # Solar (upstage) single-stage path — an in-engine read/write/
                     # finish tool loop, NOT `claude -p`. No argv, no subprocess, no
@@ -1066,43 +1095,64 @@ class StagedExecutor(ClaudeCodeExecutor):
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")
                 else:
-                    argv = stages.build_stage_argv(
-                        stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
-                        branch=branch, repo=repo_url, working_dir=working_dir,
-                        auto_merge=auto_merge, project_context=project_ctx,
-                        allowed_tools=payload.get("allowed_tools"), tier=tier,
-                        retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""))
-                    # Token usage → stages.json `usage.<stage>`. argv carries a fresh
-                    # --session-id unless MACP_STAGE_USAGE=0, and record_stage_usage
-                    # reads that session's transcript back once the process is gone —
-                    # ahead of every early return below, so a failed stage still gets
-                    # its row. It never raises and changes nothing this loop reads:
-                    # r.returncode, r.stdout and r.stderr reach run.log, the model-cache
-                    # hook, the capacity check and the artifact check exactly as they
-                    # did before (why not --output-format json: the comment above
-                    # stages.USAGE_ENV).
+                    # Select the CLI backend for this stage: the gemini backend when
+                    # the task routes to gemini on its lane (stages.vendor_lane_for),
+                    # else claude (the default, byte-identical). Both are AgentBackends
+                    # dispatched identically below — only the cwd/env differ.
+                    if (gemini_acct is not None and agent == "gemini"
+                            and stages.routes_to_vendor(agent, stage)):
+                        backend, backend_acct = gemini_backend, gemini_acct
+                    else:
+                        backend, backend_acct = claude_backend, None
+                    # Capability gate (leaf ④, AC #3): refuse to dispatch a stage whose
+                    # required capabilities (stages.required_capabilities — read-only
+                    # stages need tool_allowlist) the chosen backend cannot fulfil,
+                    # rather than silently running it with a weaker guarantee. claude
+                    # supports all eight so it never fires for the claude path (a test
+                    # pins that positive path); it guards gemini (and any later vendor).
+                    missing_caps = agent_backend.missing_capabilities(backend, stage)
+                    if missing_caps:
+                        return ExecOutcome(
+                            False,
+                            f"stage {stage}: backend '{backend.name}' lacks required "
+                            f"capability {', '.join(missing_caps)} — refusing to dispatch "
+                            "(would weaken the stage's guarantee)",
+                            {"branch": branch, "run_dir": str(run_dir), "stages": completed,
+                             "capability_gate": {"backend": backend.name,
+                                                 "stage": stage, "missing": missing_caps}})
+                    # Dispatch via the selected CLI backend. It builds its own argv and
+                    # runs it with the SAME stages.run_stage_subprocess reaper this loop
+                    # used inline — the claude argv/env is byte-identical
+                    # (test_agent_backend_golden + test_agent_backend). run_stage_subprocess
+                    # (inside the backend), not subprocess.run: the stage leads its own
+                    # session, so the timeout reaps the WHOLE tree (`claude -p` → Bash →
+                    # `./gradlew` → a 2~8G Gradle/Kotlin JVM); subprocess.run kills only
+                    # the direct child and then blocks in a second, unbounded
+                    # communicate() on the pipes those grandchildren still hold — it left
+                    # the JVM in the runner cgroup above `memory.high` AND waited on it
+                    # (2026-09-25). TimeoutExpired propagates with the argv on .cmd for the
+                    # arm below; the returned CompletedProcess carries it on .args (the
+                    # usage handle).
+                    is_claude = backend is claude_backend
+                    # claude runs from the trusted vault root with the macp-browser /
+                    # emulator lease owners (= run_id) layered onto stage_env for its own
+                    # stages — byte-identical to the inline path. A non-claude CLI runs in
+                    # the checkout (working_dir) with plain stage_env: it does not use the
+                    # claude tool wrappers, so the owner env would be dead weight.
+                    stage_cwd = (str(stages._VAULT_DATA_ROOT) if is_claude
+                                 else (working_dir or str(stages._VAULT_DATA_ROOT)))
+                    stage_env_run = (stages.with_emulator_owner(
+                        stage, stages.with_browser_owner(stage, stage_env, run_id), run_id)
+                        if is_claude else stage_env)
                     stage_started = time.monotonic()
                     try:
-                        # run_stage_subprocess, not subprocess.run: the stage leads its
-                        # own session, so the timeout below reaps the WHOLE tree
-                        # (`claude -p` → Bash → `./gradlew` → a 2~8G Gradle/Kotlin JVM).
-                        # subprocess.run kills only the direct child and then blocks in a
-                        # second, unbounded communicate() on the pipes those grandchildren
-                        # still hold — so it left the JVM in the runner cgroup above
-                        # `memory.high` AND waited on it (2026-09-25). Capture/text/encoding
-                        # are fixed inside the helper; cwd/env/timeout stay keywords so the
-                        # returned CompletedProcess and the raised TimeoutExpired are
-                        # shape-identical to what this call site read before.
-                        r = stages.run_stage_subprocess(
-                            argv, cwd=str(stages._VAULT_DATA_ROOT),   # trusted cwd
-                            # per-account CLAUDE_CONFIG_DIR + worker Gradle limits; stage_env
-                            # is built before run_id exists, so the browser AND emulator
-                            # lease owners (= run_id, their own stages only) are layered
-                            # on here — each strips its key on every other stage.
-                            env=stages.with_emulator_owner(
-                                stage,
-                                stages.with_browser_owner(stage, stage_env, run_id),
-                                run_id),
+                        r = backend.run_stage(
+                            stage, task_id=msg.task_id, run_id=run_id, run_dir=run_dir,
+                            branch=branch, repo=repo_url, working_dir=working_dir,
+                            auto_merge=auto_merge, project_context=project_ctx,
+                            allowed_tools=payload.get("allowed_tools"), tier=tier,
+                            retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
+                            account=backend_acct, cwd=stage_cwd, env=stage_env_run,
                             timeout=stage_timeout, progress=progress)
                     except subprocess.TimeoutExpired as e:
                         # The stage cap fired. BEFORE this catch, TimeoutExpired escaped
@@ -1115,7 +1165,9 @@ class StagedExecutor(ClaudeCodeExecutor):
                         # and (3) return timed_out=True so the orchestrator's streak
                         # guard can park a task that keeps timing out and the retry
                         # resumes on origin/<branch> rather than restarting from scratch.
-                        stages.record_stage_usage(run_dir, stage, argv, timed_out=True)
+                        # argv is on the TimeoutExpired's .cmd (run_stage_subprocess set
+                        # it); report_usage flows it to the same stages.record_stage_usage.
+                        backend.report_usage(stage, run_dir, e.cmd, timed_out=True)
                         partial = getattr(e, "stdout", None) or ""
                         if isinstance(partial, bytes):
                             partial = partial.decode("utf-8", "replace")
@@ -1150,8 +1202,17 @@ class StagedExecutor(ClaudeCodeExecutor):
                              "stages": completed, "timed_out": True,
                              "timeout_stage": stage, "checkpoint_sha": cp.get("tip"),
                              "repo": repo_url})
-                    usage_rec = stages.record_stage_usage(
-                        run_dir, stage, argv, env=stage_env, returncode=r.returncode,
+                    # Token usage → stages.json `usage.<stage>`, via the backend. The
+                    # argv (carrying a fresh --session-id unless MACP_STAGE_USAGE=0) is
+                    # on r.args; report_usage reads that session's transcript back once
+                    # the process is gone — ahead of every early return below, so a
+                    # failed stage still gets its row. It never raises and changes
+                    # nothing this loop reads: r.returncode/r.stdout/r.stderr reach
+                    # run.log, the model-cache hook, the capacity check and the artifact
+                    # check exactly as before (why not --output-format json: the comment
+                    # above stages.USAGE_ENV).
+                    usage_rec = backend.report_usage(
+                        stage, run_dir, r.args, env=stage_env, returncode=r.returncode,
                         duration_ms=int((time.monotonic() - stage_started) * 1000))
                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                         f.write(f"\n=== {stage} (rc={r.returncode}) ===\n{r.stdout[-2000:]}\n")

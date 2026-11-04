@@ -28,8 +28,12 @@ You write tasks as small markdown files. macp then:
 
 macp aims to be **orthogonal to the coding agent**. The agent writes the code; macp
 decides what gets worked on, with which resources, and when. Agents sit behind an
-`Executor` interface. Today's executor drives [Claude Code](https://code.claude.com)
-(`claude -p`); support for other coding agents is planned.
+`Executor` interface, and stage execution behind a vendor-neutral `AgentBackend`.
+[Claude Code](https://code.claude.com) (`claude -p`) runs every stage; a task can route a
+stage to another agent by its `agent:` frontmatter or account — the Gemini CLI on the
+`quick` lane today — and a dispatch-time capability gate refuses a backend that can't meet
+a stage's needs (e.g. the tool allowlist a read-only stage relies on) instead of silently
+weakening it.
 
 **In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080
 tasks** on its own across **22 independent repositories**. In October 2026 that was
