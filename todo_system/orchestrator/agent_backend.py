@@ -34,6 +34,7 @@ import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from ..macp import config
 from . import stages
 
 # The eight capabilities a stage needs from a backend (design §2). A dispatcher
@@ -171,3 +172,116 @@ class ClaudeAgentBackend:
         return stages.record_stage_usage(
             run_dir, stage, handle, env=env, returncode=returncode,
             duration_ms=duration_ms, timed_out=timed_out)
+
+
+def neutral_run_metadata(*, run_id: str, task_id: str, run_dir: Path, branch: str,
+                         stage: str, auto_merge: bool, repo: str | None = None,
+                         working_dir: str | None = None) -> str:
+    """The vendor-neutral run-metadata block appended to a CLI backend's prompt.
+
+    A trimmed sibling of the block ``stages.build_stage_argv`` builds for claude:
+    the run context (run_id/slug/run_dir/branch/stage/auto_merge + the external-repo
+    note) WITHOUT claude-specific lines — no ``--allowed-tools`` authoritative line
+    (a non-claude backend enforces its allowlist through its own config, not the
+    prompt) and none of the macp-browser/emulator/remote-gate wrapper rules (those
+    are claude-tool-allowlist entries). Kept here, not shared with build_stage_argv,
+    so the claude prompt stays byte-identical and this one can evolve on its own."""
+    lines = [
+        "\n\n---\n\n# Run metadata (injected by orchestrator)\n\n",
+        f"- run_id: `{run_id}`\n",
+        f"- slug: `{task_id}`\n",
+        f"- run_dir: `{run_dir}`\n",
+        f"- branch: `{branch}`\n",
+        f"- stage: `{stage}`\n",
+        f"- auto_merge: `{str(auto_merge).lower()}`\n",
+    ]
+    if repo:
+        lines.append(f"- repo: `{repo}`\n")
+        if working_dir:
+            lines.append(f"- working_dir: `{working_dir}`\n")
+        lines.append("- **External repo task**: operate on the checkout; vault "
+                     "run_dir artifacts are read-only references.\n")
+    return "".join(lines)
+
+
+class GeminiAgentBackend:
+    """First non-claude CLI backend: Gemini CLI (user decision 2026-11-04).
+
+    A thin wrapper over ``config.build_invocation`` (the vendor-neutral
+    ``(argv, env)`` seam): ``run_stage`` assembles the stage prompt + neutral run
+    metadata, lets ``build_invocation`` turn the account's ``command`` template
+    into argv (``{prompt}`` substituted) with ``account.env``, injects
+    ``GEMINI_MODEL`` for the task tier when the account pins one, and runs it with
+    the SAME ``stages.run_stage_subprocess`` reaper the claude path uses.
+
+    No effort flag, no ``--session-id`` transcript, no usage-guard pacing — those
+    are claude-subscription-only (design §4 Q2); a non-claude backend runs without
+    them. The model flag (``-m``/``--model``) is unconfirmed on the Gemini CLI
+    (design §3 ⚠️), so model selection goes through ``GEMINI_MODEL`` in the env
+    (``account.env`` by default, or the account's ``models[tier]`` pin here) — the
+    path ``build_invocation`` already returns the account env on.
+
+    Capabilities (design §3 ✅): headless (``-p``), tool_allowlist (``tools.core``),
+    turn_cap (``maxSessionTurns``), model_select, usage_report (``--output-format
+    json`` stats — the capability EXISTS; ``report_usage`` returns None until a
+    follow-up wires the parse, Solar precedent) and exit_quota (its own rate-limit
+    signal). NOT effort or add_dir."""
+
+    name = "gemini"
+    _CAPS = frozenset({"headless", "tool_allowlist", "turn_cap",
+                       "model_select", "usage_report", "exit_quota"})
+    # Gemini/Google API rate-limit & quota signals → "exhausted" (its own signal,
+    # mapped onto the common 3-way). An exit-53 "Turn limit exceeded" is NOT here:
+    # that is the turn cap tripping, an "error" (the stage did not finish), not a
+    # transient capacity wall.
+    _EXHAUSTED_MARKERS = ("rate limit", "resource_exhausted", "resource exhausted",
+                          "quota exceeded", "quota exhausted", "too many requests",
+                          "status 429", "error 429")
+
+    def supports(self, capability: str) -> bool:
+        return capability in self._CAPS
+
+    def run_stage(self, stage: str, *, task_id: str, run_id: str, run_dir: Path,
+                  branch: str, repo: str | None = None,
+                  working_dir: str | None = None, auto_merge: bool = False,
+                  account=None, tier: str | None = None,
+                  project_context: str = "", retry_context: str = "",
+                  allowed_tools: str | None = None, worker_root: Path | None = None,
+                  cwd: str | None = None, env: dict | None = None,
+                  timeout: float | None = None,
+                  progress=None) -> subprocess.CompletedProcess:
+        full = (stages.strip_frontmatter(stages.load_stage_prompt(stage))
+                + neutral_run_metadata(run_id=run_id, task_id=task_id, run_dir=run_dir,
+                                       branch=branch, stage=stage, auto_merge=auto_merge,
+                                       repo=repo, working_dir=working_dir))
+        # build_invocation ignores claude extra_args for a non-claude agent, so the
+        # invocation shape lives entirely in account.command (the admin configures
+        # e.g. `gemini --yolo -p {prompt}`); we add no claude flags.
+        argv, inv_env = config.build_invocation(account, full)
+        merged_env = {**(env or {}), **inv_env}   # account.env (+ key) wins over the base
+        model = self._model_for(account, tier)
+        if model:
+            merged_env["GEMINI_MODEL"] = model
+        return stages.run_stage_subprocess(
+            argv, cwd=(cwd or working_dir), env=merged_env,
+            timeout=timeout, progress=progress)
+
+    @staticmethod
+    def _model_for(account, tier: str | None) -> str | None:
+        """The account's model pin for this tier (``Account.models[tier]``), or None
+        — None leaves whatever ``GEMINI_MODEL`` account.env already carries."""
+        models = getattr(account, "models", None) or {}
+        return models.get(tier) if tier else None
+
+    def classify_exit(self, rc: int, stdout: str) -> str:
+        t = (stdout or "").lower()
+        if any(mrk in t for mrk in self._EXHAUSTED_MARKERS):
+            return EXIT_EXHAUSTED
+        return EXIT_SUCCESS if rc == 0 else EXIT_ERROR
+
+    def report_usage(self, stage: str, run_dir: Path, handle, **kwargs) -> dict | None:
+        """No usage channel wired yet → None (inert, like Solar's usage_rec=None).
+        Gemini CAN report tokens via ``--output-format json`` stats; a follow-up
+        parses them into a stages.USAGE_KEYS dict here. supports('usage_report')
+        stays True because the capability exists, not the wiring."""
+        return None
