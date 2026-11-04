@@ -12,6 +12,14 @@
 #   AGENT_ID=sc1-homeland PROJECT_REPO="$HOME/sc1-homeland" \
 #     scripts/orchestrator_runner_remote.sh --mode shadow
 #   # flip --mode live-remote once the host is trusted and you want real runs.
+#
+#   # To share HQ's external state over the network (design §⑧ option (a)) instead
+#   # of the git:// mailbox, set STATE_BACKEND=remote with the HQ URL + a bearer
+#   # token (token read from a file so it is never on the command line / in ps):
+#   STATE_BACKEND=remote STATE_REMOTE_URL="http://HQ-HOST:PORT" \
+#     STATE_REMOTE_TOKEN_FILE="$HOME/.secrets/macp-state-token" \
+#     AGENT_ID=sc1-homeland scripts/orchestrator_runner_remote.sh --mode live-remote
+#   # Actually exposing the HQ port / installing the unit / tailscale serve is 7b.
 
 set -uo pipefail
 
@@ -50,6 +58,23 @@ for tool in python3 git; do
 done
 
 cd "$VAULT_DIR" || exit 1
+
+# Optional: route state through the network (external mode on a remote host —
+# design §⑧ option (a)). Unset STATE_BACKEND => byte-identical to the git path
+# (the git:// mailbox). With STATE_BACKEND=remote the default --uri stays
+# git://Worker/agents, so runner.py routes the mailbox through
+# open_state_store(base).mailbox() = the HTTP RemoteMailbox. The token is exported
+# only into the child env, never echoed.
+STATE_BACKEND="${STATE_BACKEND:-}"
+if [[ "$STATE_BACKEND" == "remote" ]]; then
+  export MACP_STATE_BACKEND=remote
+  if [[ -n "${STATE_REMOTE_URL:-}" ]]; then export MACP_STATE_REMOTE_URL="$STATE_REMOTE_URL"; fi
+  if [[ -n "${STATE_REMOTE_TOKEN:-}" ]]; then export MACP_STATE_REMOTE_TOKEN="$STATE_REMOTE_TOKEN"; fi
+  if [[ -n "${STATE_REMOTE_TOKEN_FILE:-}" ]]; then export MACP_STATE_REMOTE_TOKEN_FILE="$STATE_REMOTE_TOKEN_FILE"; fi
+  if [[ -n "${MACP_STATE_REMOTE_TOKEN:-}${MACP_STATE_REMOTE_TOKEN_FILE:-}" ]]; then tok_state="set"; else tok_state="unset"; fi
+  echo "[$(date +%FT%T)] state backend: remote (url=${MACP_STATE_REMOTE_URL:-unset}, token=$tok_state)"
+fi
+
 echo "[$(date +%FT%T)] remote runner: agent=$AGENT_ID mode=$MODE interval=${INTERVAL}s"
 exec python3 -m todo_system.orchestrator.runner \
   --agent-id "$AGENT_ID" --kind ai-remote ${PROJECT_REPO:+--repo "$PROJECT_REPO"} \

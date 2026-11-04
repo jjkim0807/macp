@@ -6,6 +6,7 @@ be replaced by a `.macp/config.toml` in the vault.
 - [Finding the vault](#finding-the-vault)
 - [Environment variables](#environment-variables)
 - [Switching to the external state backend](#switching-to-the-external-state-backend)
+- [Remote state backend](#remote-state-backend)
 - [Usage pacing](#usage-pacing)
 - [Profiles and accounts](#profiles-and-accounts)
 - [Anthropic usage and cost](#anthropic-usage-and-cost)
@@ -32,8 +33,11 @@ in the skeleton, and the matching environment variable wins:
 # timezone     = "Asia/Seoul"     # IANA zone for calendar events (MACP_TIMEZONE)
 # worker_root  = "~/Worker"       # where `repo:` tasks are cloned (MACP_WORKER_ROOT)
 # language     = "en"             # UI language for log/CLI text: en | ko (MACP_LANGUAGE)
-# state_backend      = "git"      # orchestrator state backend: git | external (MACP_STATE_BACKEND)
+# state_backend      = "git"      # orchestrator state backend: git | external | remote (MACP_STATE_BACKEND)
 # state_sqlite_path  = "~/.local/share/macp/state.sqlite"  # external backend's db path (MACP_STATE_SQLITE_PATH)
+# state_remote_url   = "http://HQ-HOST:PORT"  # remote backend: HQ state API base URL (MACP_STATE_REMOTE_URL)
+# (the remote bearer token has NO config key — it is a secret; use MACP_STATE_REMOTE_TOKEN
+#  or MACP_STATE_REMOTE_TOKEN_FILE, below)
 # browser_mcp_server = "/path/to/macp-browser/mcp/server.mjs"  # macp-browser MCP server for browser stages (MACP_BROWSER_MCP_SERVER)
 ```
 
@@ -49,8 +53,10 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `MACP_TIMEZONE` | IANA timezone for calendar events (key `timezone`; default: the host's zone) |
 | `MACP_WORKER_ROOT` | where external repositories are cloned (key `worker_root`; default `~/Worker`) |
 | `MACP_LANGUAGE` | UI language for engine log/CLI text, `en` or `ko` (key `language`; default `en`; other values read as `en`) |
-| `MACP_STATE_BACKEND` | orchestrator state backend: `git` (default) or `external` (key `state_backend`) |
+| `MACP_STATE_BACKEND` | orchestrator state backend: `git` (default), `external`, or `remote` (key `state_backend`) |
 | `MACP_STATE_SQLITE_PATH` | external backend's SQLite path (key `state_sqlite_path`; default `$XDG_DATA_HOME/macp/state.sqlite`, else `~/.local/share/macp/state.sqlite`) |
+| `MACP_STATE_REMOTE_URL` | remote backend: base URL of the HQ state API (key `state_remote_url`; required when the backend is `remote`) |
+| `MACP_STATE_REMOTE_TOKEN` / `MACP_STATE_REMOTE_TOKEN_FILE` | remote backend bearer token, or a file to read it from. Env-only — **no config key** (it is a secret). Never logged |
 | `MACP_BROWSER_MCP_SERVER` | macp-browser MCP server script for the browser stages (key `browser_mcp_server`; default unset = no MCP wiring; `MACP_BROWSER_NODE` picks the node binary, default `node`). See [Browser MCP server](#browser-mcp-server) |
 | `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
 | `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
@@ -105,6 +111,46 @@ snapshot written by `export` in the same format as before, so the dashboard keep
 working. A hand edit there is overwritten by the next export. In git mode `export` does
 nothing unless you pass `--sqlite-path`. To roll back, unset `MACP_STATE_BACKEND` (git is
 the default) and the vault files are authoritative again.
+
+## Remote state backend
+
+The `external` backend keeps the SQLite file on one host. A runner on a **different**
+machine cannot open that file, so the `remote` backend reaches the same state over an
+authenticated HTTP hop (design `docs/design/state-store.md` §⑧ option (a), $0 — no managed
+database). The authoritative SQLite stays in one place:
+
+- **HQ (the primary host)** runs `external` (the SQLite source of truth) **and** serves the
+  state API:
+
+  ```bash
+  MACP_STATE_REMOTE_TOKEN_FILE=~/.secrets/macp-state-token \
+    uv run python -m todo_system.orchestrator.state_store_remote serve --bind 127.0.0.1:8787
+  ```
+
+- **A remote host** sets `MACP_STATE_BACKEND=remote`, points `MACP_STATE_REMOTE_URL` at the
+  HQ API, and supplies the same bearer token with `MACP_STATE_REMOTE_TOKEN` (or
+  `MACP_STATE_REMOTE_TOKEN_FILE`). `scripts/orchestrator_runner_remote.sh` reads
+  `STATE_BACKEND` / `STATE_REMOTE_URL` / `STATE_REMOTE_TOKEN[_FILE]` and wires them for you.
+
+How it behaves:
+
+- **Auth.** Every request carries `Authorization: Bearer <token>`; a missing or wrong token
+  is rejected with `401`. Keep the token out of the repo and the vault — use the env var or a
+  file (there is deliberately **no** `state_remote_url`-style config key for it). It is never
+  logged. Behind a tailnet you can also restrict the listener to the mesh (a `tailscale`
+  ACL), so the token alone is not the only barrier.
+- **HQ down.** A call that cannot reach HQ retries with backoff, then a failed *write* is
+  appended to a host-local append-only outbox and the runner stops rather than losing the
+  task; when HQ returns, the outbox is flushed in order (idempotent upserts). Claiming new
+  work needs a live HQ, so a down HQ means "finish what you have, pick up nothing new".
+- **Single execution.** Two runners that receive the same message both call `claim`; the HQ
+  grants the lease to exactly one (a `BEGIN IMMEDIATE` conditional insert), so the task runs
+  once. A crashed owner's lease expires by TTL and can be re-acquired.
+
+**Not done here (task 7b, human):** actually exposing the HQ port on the network, installing
+a unit, or running `tailscale serve` is a separate human step. The code above runs the server
+on loopback only. Provisioning a managed database (Cloud SQL) is a separate human-gated
+escalation (§⑧ option (b)); `Supabase`/`Neon` are not used.
 
 ## Usage pacing
 

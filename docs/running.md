@@ -150,6 +150,19 @@ it runs the orchestrator tick, declared in a git-tracked line
 example a Windows machine for a Windows-only project. Each host needs its own engine
 checkout and `MACP_VAULT_ROOT`.
 
+Sharing state across hosts has two models. The **git model is the baseline**: messages
+and the ledger travel through the vault repo (the default `git://Worker/agents` mailbox),
+which is asynchronous and offline-tolerant — a host that cannot reach the remote simply
+catches up on the next tick. For a host that must share the **external** (SQLite) state
+instead, the `remote` backend reaches HQ's SQLite over an authenticated HTTP hop: HQ runs
+`external` and also serves `python -m todo_system.orchestrator.state_store_remote serve`,
+and the remote host sets `MACP_STATE_BACKEND=remote` with `MACP_STATE_REMOTE_URL` +
+`MACP_STATE_REMOTE_TOKEN` (`scripts/orchestrator_runner_remote.sh` wires these from
+`STATE_BACKEND` / `STATE_REMOTE_URL` / `STATE_REMOTE_TOKEN`). See
+[Remote state backend](configuration.md#remote-state-backend) for how it authenticates,
+degrades when HQ is down, and guarantees single execution. Actually exposing the HQ port on
+the tailnet or installing the server as a unit is a separate step (not done by the engine).
+
 ## A healthy system, at a glance
 
 ```bash
