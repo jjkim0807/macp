@@ -33,10 +33,13 @@ embedding or query code (those are out of G4 ``touches``). Stdlib only, no top-l
 
 from __future__ import annotations
 
+import argparse
+import json
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Iterable, Mapping
 
 from .. import graph_memory as gm
 
@@ -298,3 +301,263 @@ def render_table(m_v1: Metrics, m_v2: Metrics, *, weak: bool) -> str:
     lines.append("")
     lines.append(f"**배선 제안: {'권장' if recommended else '미권장'}** — {reason}")
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Reviewable weak-label scaffold (design §5.1/§5.4) + loader
+# ---------------------------------------------------------------------------
+
+_SCAFFOLD_NOTE = (
+    "약한 라벨(참고): 자동 후보 라벨셋이다. 각 task 의 candidate_relevant 는 v1·v2 가 top-k 로 "
+    "돌려준 과거 기록 후보(why = 어느 방식의 몇 위인지)이고, relevant 는 그 후보를 그대로 복사한 "
+    "초기값이다. 사람이 relevant 를 검토·가지치기해 확정한 뒤 status 를 golden 으로 바꾼다 "
+    "(설계 §5.1: 사람 골든셋이 1차, 약한 라벨은 v1 에 유리한 편향이 있어 보조 참고만)."
+)
+
+
+def emit_candidates(
+    con: Any,
+    tasks: Iterable[Mapping[str, Any]],
+    *,
+    k: int = 10,
+    v1_kwargs: dict[str, Any] | None = None,
+    v2_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a **reviewable** weak-label scaffold (design §5.1/§5.4): for each task,
+    the union of the v1 and v2 top-``k`` as candidate relevant records, each annotated
+    with a human-readable ``why`` (which surface ranked it where). ``relevant`` is
+    pre-seeded with the candidate slugs so the human prunes a concrete list rather than
+    starting from nothing; ``status="weak"`` until they confirm it. A plain dict,
+    JSON-serialisable, with no real identifiers — only the queried slugs."""
+    labels: list[dict[str, Any]] = []
+    for task in tasks:
+        v1 = v1_query(con, task, k, **(v1_kwargs or {}))
+        v2 = v2_query(con, task, k, **(v2_kwargs or {}))
+        v1_rank = {s: i for i, s in enumerate(v1)}
+        v2_rank = {s: i for i, s in enumerate(v2)}
+        candidates: list[dict[str, str]] = []
+        for slug in sorted(
+            set(v1) | set(v2),
+            key=lambda s: (min(v1_rank.get(s, 1_000_000), v2_rank.get(s, 1_000_000)), s),
+        ):
+            why_parts: list[str] = []
+            if slug in v2_rank:
+                why_parts.append(f"v2 rank {v2_rank[slug] + 1}")
+            if slug in v1_rank:
+                why_parts.append(f"v1 rank {v1_rank[slug] + 1}")
+            candidates.append({"slug": slug, "why": "; ".join(why_parts)})
+        labels.append(
+            {
+                "task": dict(task),
+                "candidate_relevant": candidates,
+                "relevant": [c["slug"] for c in candidates],
+                "label_source": "weak",
+            }
+        )
+    return {"version": 1, "status": "weak", "_note": _SCAFFOLD_NOTE, "labels": labels}
+
+
+def load_labelset(obj_or_path: Any) -> LabelSet:
+    """Load a label set from the emit scaffold (a dict) or a JSON file path. Reads
+    ``status`` + each entry's ``relevant`` list and ``task`` mapping, ignoring
+    ``candidate_relevant`` / ``_note`` (scaffold-only review aids). An entry's
+    ``label_source`` defaults to the set's ``status``."""
+    if isinstance(obj_or_path, (str, Path)):
+        obj = json.loads(Path(obj_or_path).read_text(encoding="utf-8"))
+    else:
+        obj = obj_or_path
+    status = str(obj.get("status", "golden"))
+    labels: list[LabelEntry] = []
+    for entry in obj.get("labels", []):
+        task = entry.get("task", {})
+        relevant = [str(s) for s in entry.get("relevant", [])]
+        label_source = str(entry.get("label_source", status))
+        labels.append(LabelEntry(task=task, relevant=relevant, label_source=label_source))
+    return LabelSet(status=status, labels=labels)
+
+
+# ---------------------------------------------------------------------------
+# CLI (mirrors graph_memory.build_parser: a shared --vault-root subcommand flag)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_db(args: argparse.Namespace) -> tuple[Path, Path]:
+    """``(vault_root, db_path)`` for one CLI run. Without ``--vault-root`` the module
+    globals are handed back verbatim (so ``monkeypatch.setattr(gm, "DB_PATH", …)``
+    keeps its meaning), mirroring ``graph_memory._cli_paths``."""
+    root = getattr(args, "vault_root", None)
+    if root is None:
+        return gm.ROOT, gm.DB_PATH
+    return root, root / "Memory" / "relations.sqlite"
+
+
+def _open_scanned(args: argparse.Namespace) -> tuple[Path, Any]:
+    """Open the edge DB, scanning the vault once if it is empty (same lazy index
+    build ``graph_memory.cmd_show_related`` does). Read-only on the vault otherwise."""
+    root, db_path = _resolve_db(args)
+    con = gm.init_relations_db(db_path)
+    if con.execute("SELECT COUNT(*) AS n FROM edges").fetchone()["n"] == 0:
+        gm.scan_vault_and_index(vault_root=root, con=con)
+    return root, con
+
+
+def _parse_ks(raw: str | None) -> tuple[int, ...]:
+    if not raw:
+        return (5, 10)
+    ks = tuple(int(x) for x in str(raw).split(",") if x.strip())
+    return ks or (5, 10)
+
+
+def _scan_vault_tasks(root: Path, *, limit: int) -> list[dict[str, Any]]:
+    """Up to ``limit`` task identities scanned from ``Todo/items/*.md`` frontmatter
+    (slug = file stem + any of title/outcome/next_action/touches present)."""
+    tasks: list[dict[str, Any]] = []
+    items_dir = root / "Todo" / "items"
+    if not items_dir.is_dir():
+        return tasks
+    for path in sorted(items_dir.glob("*.md")):
+        if len(tasks) >= limit:
+            break
+        try:
+            fm, _body = gm.parse_frontmatter(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        task: dict[str, Any] = {"slug": path.stem}
+        for key in ("title", "outcome", "next_action", "touches"):
+            if key in fm:
+                task[key] = fm[key]
+        tasks.append(task)
+    return tasks
+
+
+def _load_tasks_json(path: str) -> list[dict[str, Any]]:
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(obj, dict) and "tasks" in obj:
+        return list(obj["tasks"])
+    if isinstance(obj, list):
+        return list(obj)
+    raise ValueError('--tasks JSON must be a list of task mappings or {"tasks": [...]}')
+
+
+def _emit_preview(scaffold: dict[str, Any]) -> str:
+    lines = ["| task | 후보 관련 기록 (why) |", "|---|---|"]
+    for entry in scaffold["labels"][:20]:
+        slug = entry["task"].get("slug", "?")
+        cands = "; ".join(
+            f"{c['slug']} ({c['why']})" for c in entry["candidate_relevant"][:5]
+        )
+        lines.append(f"| {slug} | {cands or '—'} |")
+    return "\n".join(lines)
+
+
+def cmd_table(args: argparse.Namespace) -> int:
+    labelset = load_labelset(args.golden)
+    ks = _parse_ks(args.k)
+    _root, con = _open_scanned(args)
+    try:
+        m_v1, m_v2 = run_eval(con, labelset, ks=ks)
+    finally:
+        con.close()
+    print(render_table(m_v1, m_v2, weak=labelset.status != "golden"))
+    return 0
+
+
+def cmd_emit_candidates(args: argparse.Namespace) -> int:
+    root, con = _open_scanned(args)
+    try:
+        tasks = _load_tasks_json(args.tasks) if args.tasks else _scan_vault_tasks(root, limit=args.limit)
+        scaffold = emit_candidates(con, tasks, k=args.k)
+    finally:
+        con.close()
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(scaffold, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {len(scaffold['labels'])} weak-label candidate task(s) → {out}")
+    print()
+    print(_emit_preview(scaffold))
+    return 0
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    """Query related past records for a task — the surface the prompt-wiring proposals
+    cite. Graceful BFS-only when sqlite-vec is absent."""
+    task: dict[str, Any] = {"slug": args.slug}
+    if args.title:
+        task["title"] = args.title
+    if args.touches:
+        task["touches"] = list(args.touches)
+    _root, con = _open_scanned(args)
+    try:
+        items = gm.query_related(con, task, k=args.k)
+    finally:
+        con.close()
+    if not items:
+        print(f"관련 과거 기록 없음 (slug={args.slug})")
+        return 0
+    for it in items:
+        bits = [it.slug]
+        if it.source_file:
+            bits.append(f"source={it.source_file}")
+        if it.run_id:
+            bits.append(f"run_id={it.run_id}")
+        bits.append(f"combined={it.score.combined:.3f}")
+        print("- " + "  ".join(bits))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="graph memory v2 — 적중률 평가 하니스 (precision@k·recall@k, v1 vs v2)"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--vault-root",
+        type=Path,
+        default=None,
+        help="vault root to query (default: this engine's configured vault)",
+    )
+
+    p_table = sub.add_parser(
+        "table",
+        help="Run v1/v2 over a golden label set and print the §5.2 comparison table",
+        parents=[common],
+    )
+    p_table.add_argument("--golden", required=True, help="path to a golden/weak label-set JSON")
+    p_table.add_argument("--k", default="5,10", help="comma-separated k values (default: 5,10)")
+    p_table.set_defaults(func=cmd_table)
+
+    p_emit = sub.add_parser(
+        "emit-candidates",
+        help="Emit a reviewable weak-label candidate scaffold JSON for human labeling",
+        parents=[common],
+    )
+    p_emit.add_argument("--out", required=True, help="path to write the scaffold JSON")
+    p_emit.add_argument("--limit", type=int, default=50, help="max task .md to scan (default: 50)")
+    p_emit.add_argument("--tasks", default=None, help="optional tasks JSON instead of scanning the vault")
+    p_emit.add_argument("--k", type=int, default=10, help="candidates per task (default: 10)")
+    p_emit.set_defaults(func=cmd_emit_candidates)
+
+    p_query = sub.add_parser(
+        "query",
+        help="Query related past records for a task (the prompt-wiring proposals' surface)",
+        parents=[common],
+    )
+    p_query.add_argument("--slug", required=True)
+    p_query.add_argument("--title", default=None)
+    p_query.add_argument("--touches", nargs="*", default=None)
+    p_query.add_argument("--k", type=int, default=10)
+    p_query.set_defaults(func=cmd_query)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
