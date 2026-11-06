@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import math
 import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 from . import paths
 
@@ -439,6 +441,183 @@ def scan_vault_and_index(
         f"from {file_count} files"
     )
     return live_total
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (memory v2 · G2) — local embedder seam + R5 boundary filter + corpus
+# ---------------------------------------------------------------------------
+#
+# Additive on top of G1. Three pieces, all stdlib and extension-free here (the
+# sqlite-vec vec0 table + lazy load live further down):
+#
+#   1. a deterministic, zero-network *default* embedder (feature-hashing) behind
+#      an injectable seam — the real sentence model + quantization is deferred to
+#      the G4 §5 bench (design §3.4, decision #6); tests inject a tiny fake;
+#   2. the R5 privacy boundary filter — SMS / mail body / health-raw / OTP docs
+#      (by path segment or frontmatter tag) are never embedded (design §2 R5,
+#      CLAUDE.md §11/§11b: "볼트나 외부로 옮겨 적지 않는다");
+#   3. the corpus walk that turns each embeddable doc into a summary text.
+
+# vec0 vector dimension. A module constant, threaded as ``dim=`` through
+# ``init_vec0`` / ``embed_vault`` so it stays configurable without touching the
+# seam. 256 is a deliberate, cheap default for the stdlib feature-hashing
+# embedder; the real model's native dimension is a G4 bench decision.
+EMBED_DIM = 256
+
+# R5 boundary denylist (design §2 R5). Defensive: these categories do not exist
+# in the current vault corpus, but the filter is fixed by a RED test so a future
+# SMS/mail/health-raw doc can never leak into an embedding vector. Matched as a
+# whole **path segment** (never a substring) and against frontmatter ``tags``;
+# an implementer may widen these sets but must not narrow below SMS/mail-body/
+# health-raw. No absolute home paths / real identifiers here (public-id gate).
+EMBED_DENY_PATH_SEGMENTS: tuple[str, ...] = (
+    "sms",
+    "mail",
+    "inbox",
+    "health-raw",
+    "health_raw",
+    "otp",
+)
+EMBED_DENY_TAGS: tuple[str, ...] = (
+    "sms",
+    "mail",
+    "health-raw",
+    "health_raw",
+    "pii",
+    "otp",
+    "private-health",
+)
+
+# Frontmatter fields whose string value is a human-written summary worth
+# embedding (title/outcome/… beats raw body alone). Body is appended after.
+_EMBED_SUMMARY_FIELDS: tuple[str, ...] = (
+    "title",
+    "name",
+    "outcome",
+    "summary",
+    "next_action",
+    "if_then",
+    "description",
+)
+
+# Tokeniser for the feature-hashing embedder: unicode word runs (``\w`` already
+# covers Hangul in Python 3), lowercased. Deterministic and stdlib-only.
+_EMBED_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _embed_tokens(text: str) -> list[str]:
+    return _EMBED_TOKEN_RE.findall(text.lower())
+
+
+def _default_embedder(text: str, dim: int = EMBED_DIM) -> list[float]:
+    """Deterministic, offline, stdlib-only feature-hashing embedder.
+
+    Each token is hashed (``hashlib`` — **not** the salted builtin ``hash``, so
+    the vector is byte-identical across processes and runs) into one of ``dim``
+    buckets with a sign bit, counts are accumulated, and the vector is
+    L2-normalised. No ML dependency, no network. This is the "경량 결정적 로컬
+    기본값" the requirement asks for; the real model is a G4 decision. It is the
+    default behind the ``embed_vault`` seam, which tests override with a fake.
+    """
+    vec = [0.0] * dim
+    for tok in _embed_tokens(text):
+        digest = hashlib.sha1(tok.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], "big") % dim
+        sign = 1.0 if digest[4] & 1 else -1.0
+        vec[bucket] += sign
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0.0:
+        vec = [v / norm for v in vec]
+    return vec
+
+
+def _content_hash(text: str) -> str:
+    """sha256 of the embed-input text — the change-detection key for incremental
+    re-embedding (a byte-identical summary is never re-embedded)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _path_segments(rel_path: str | Path) -> set[str]:
+    """Lower-cased path segments of a vault-relative path, plus the filename
+    stem as its own segment (so ``Notes/sms.md`` is caught while
+    ``Notes/smsidebar.md`` is not — segment match, never substring)."""
+    p = Path(rel_path)
+    segments = {part.lower() for part in p.parts}
+    segments.add(p.stem.lower())
+    return segments
+
+
+def is_embeddable(rel_path: str | Path, fm: dict[str, Any]) -> bool:
+    """R5 boundary filter: False iff the doc is on the privacy denylist.
+
+    Denied when any path segment is in :data:`EMBED_DENY_PATH_SEGMENTS` **or** any
+    frontmatter ``tags`` entry is in :data:`EMBED_DENY_TAGS`. Everything else is
+    embeddable. Pinned by a RED test (``test_graph_memory_embeddings.py``).
+    """
+    if _path_segments(rel_path) & set(EMBED_DENY_PATH_SEGMENTS):
+        return False
+
+    raw_tags = fm.get("tags")
+    if isinstance(raw_tags, list):
+        tags = {str(t).strip().lower() for t in raw_tags}
+    elif isinstance(raw_tags, str):
+        tags = {raw_tags.strip().lower()}
+    else:
+        tags = set()
+    if tags & set(EMBED_DENY_TAGS):
+        return False
+
+    return True
+
+
+def _embed_input_text(path: Path, fm: dict[str, Any], body: str, *, max_chars: int = 4000) -> str:
+    """Derive the summary text to embed from a doc: filename stem + human-written
+    summary frontmatter fields + body, truncated. Never the raw sensitive fields
+    (those docs are filtered out upstream by :func:`is_embeddable`)."""
+    parts: list[str] = [path.stem]
+    for key in _EMBED_SUMMARY_FIELDS:
+        val = fm.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    body_text = body.strip()
+    if body_text:
+        parts.append(body_text)
+    return "\n".join(parts)[:max_chars]
+
+
+class CorpusDoc(NamedTuple):
+    """One embeddable document: its vault-relative path, the embed-input text,
+    and its mtime (a cheap incremental pre-filter; the content hash is authoritative)."""
+
+    source_file: str
+    text: str
+    mtime: float
+
+
+def iter_embed_corpus(vault_root: Path = ROOT) -> Iterable[CorpusDoc]:
+    """Walk SCAN_ROOTS and yield a :class:`CorpusDoc` per **embeddable** doc.
+
+    Reuses :func:`iter_markdown_files` (so ``Memory/sessions`` is already out of
+    scope), applies the R5 filter, and derives a non-empty summary text for each
+    survivor. Denied or unreadable or empty-summary docs are skipped.
+    """
+    for path in iter_markdown_files(vault_root):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, body = parse_frontmatter(content)
+        rel = str(path.relative_to(vault_root))
+        if not is_embeddable(rel, fm):
+            continue
+        text = _embed_input_text(path, fm, body)
+        if not text.strip():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        yield CorpusDoc(source_file=rel, text=text, mtime=mtime)
 
 
 # ---------------------------------------------------------------------------
