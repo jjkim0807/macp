@@ -20,6 +20,13 @@ dependencies = [
 dev = [
 	"pytest>=8.0",
 	"ruff>=0.8",
+	# Optional embeddings backend (memory v2 · G2). Kept in the dev group, NOT in
+	# [project].dependencies, so it is a genuine *optional* dependency: the shipped
+	# wheel never requires it (the installed-wheel smoke syncs --no-dev and so
+	# structurally lacks it, proving graph_memory's graceful-skip path), while the
+	# dev/test env installs it so the gate exercises a real vec0 build + KNN query.
+	# graph_memory imports it lazily, inside the embed path only — never at module top.
+	"sqlite-vec>=0.1",
 ]
 
 [project.urls]
