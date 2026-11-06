@@ -27,7 +27,10 @@ paths and placeholder values (public repo — no real name/token/host/abs-home p
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+
+import pytest
 
 from todo_system import graph_memory as gm
 
@@ -347,5 +350,186 @@ def test_embed_skips_gracefully_when_sqlite_vec_absent(isolated_vault, monkeypat
         related = {(r["from_slug"], r["to_slug"]) for r in gm.get_related(con, "a")}
         assert ("a", "x") in related
         assert "Memory Index" in gm.render_index_markdown(con, vault_root=isolated_vault.root)
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — real sqlite-vec vec0 build / KNN / incremental upsert / delete
+# ---------------------------------------------------------------------------
+#
+# These need the optional extension, so each guards with importorskip. In the
+# dev/test env sqlite-vec IS installed (dependency-groups.dev), so the gate runs
+# them for real; the installed-wheel smoke is --no-dev and skips them, which is
+# the optional contract. Run the suite with -rs once to confirm they RAN here.
+
+
+def _onehot_embedder(text: str) -> list[float]:
+    """A tiny fake embedder: a one-hot 3-vector keyed by a fruit keyword, so the
+    nearest-neighbour answer for a crafted query is predictable."""
+    t = text.lower()
+    if "apple" in t:
+        return [1.0, 0.0, 0.0]
+    if "banana" in t:
+        return [0.0, 1.0, 0.0]
+    return [0.0, 0.0, 1.0]
+
+
+def _hash_embedder(text: str, dim: int = 4) -> list[float]:
+    """A deterministic fake embedder whose vector changes whenever the text does
+    — so editing a doc produces an observably different vector."""
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return [digest[i] / 255.0 for i in range(dim)]
+
+
+def _vec_snapshot(con) -> dict[str, tuple[int, str, bytes]]:
+    """Per-source (rowid, content_hash, embedding-blob), by point lookup on rowid
+    (vec0 rows are addressable by rowid)."""
+    out: dict[str, tuple[int, str, bytes]] = {}
+    for row in con.execute("SELECT rowid, source_file, content_hash FROM vec_sources"):
+        blob = con.execute(
+            "SELECT embedding FROM vec_embeddings WHERE rowid = ?", (row["rowid"],)
+        ).fetchone()[0]
+        out[row["source_file"]] = (row["rowid"], row["content_hash"], blob)
+    return out
+
+
+def test_vec0_embed_builds_table_and_knn_finds_nearest(isolated_vault):
+    """A full embed builds ``vec_embeddings``, one row per included doc, and a
+    serialized KNN query returns the expected nearest source_file."""
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple orchard harvest\n")
+    isolated_vault.write("Notes/banana.md", "banana tree tropical\n")
+    isolated_vault.write("Notes/cherry.md", "cherry blossom spring\n")
+    con = isolated_vault.connect()
+    try:
+        result = gm.embed_vault(
+            con, vault_root=isolated_vault.root, embedder=_onehot_embedder, dim=3
+        )
+        assert result.embedded == 3
+        assert result.skipped_reason is None
+        assert gm._table_exists(con, "vec_embeddings")
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 3
+        assert con.execute("SELECT COUNT(*) FROM vec_sources").fetchone()[0] == 3
+
+        query = sqlite_vec.serialize_float32([0.9, 0.1, 0.0])  # near the apple axis
+        row = con.execute(
+            "SELECT rowid FROM vec_embeddings WHERE embedding MATCH ? "
+            "ORDER BY distance LIMIT 1",
+            (query,),
+        ).fetchone()
+        nearest = con.execute(
+            "SELECT source_file FROM vec_sources WHERE rowid = ?", (row["rowid"],)
+        ).fetchone()
+        assert nearest["source_file"] == "Notes/apple.md"
+    finally:
+        con.close()
+
+
+def test_reembed_updates_only_the_edited_rowid_in_place(isolated_vault):
+    """Re-embedding after editing one doc updates exactly that rowid's vector and
+    content_hash **in place** (same rowid); the other doc's row is untouched."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple version one\n")
+    isolated_vault.write("Notes/banana.md", "banana version one\n")
+    con = isolated_vault.connect()
+    try:
+        gm.embed_vault(con, vault_root=isolated_vault.root, embedder=_hash_embedder, dim=4)
+        before = _vec_snapshot(con)
+
+        isolated_vault.write("Notes/apple.md", "apple version two — edited\n")
+        result = gm.embed_vault(
+            con, vault_root=isolated_vault.root, embedder=_hash_embedder, dim=4
+        )
+        assert result.embedded == 1
+        assert result.unchanged == 1
+        assert result.removed == 0
+        after = _vec_snapshot(con)
+
+        # apple: same rowid (in-place update), new content hash, new vector blob
+        assert after["Notes/apple.md"][0] == before["Notes/apple.md"][0]
+        assert after["Notes/apple.md"][1] != before["Notes/apple.md"][1]
+        assert after["Notes/apple.md"][2] != before["Notes/apple.md"][2]
+        # banana: fully untouched
+        assert after["Notes/banana.md"] == before["Notes/banana.md"]
+    finally:
+        con.close()
+
+
+def test_removed_doc_deletes_both_vec0_and_vec_sources_rows(isolated_vault):
+    """Deleting a doc on disk removes both its vec0 row and its vec_sources row on
+    the next embed; the surviving doc is intact."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/keep.md", "keep me around\n")
+    isolated_vault.write("Notes/drop.md", "drop me later\n")
+    con = isolated_vault.connect()
+    try:
+        gm.embed_vault(con, vault_root=isolated_vault.root, embedder=_hash_embedder, dim=4)
+        drop_rowid = con.execute(
+            "SELECT rowid FROM vec_sources WHERE source_file = ?", ("Notes/drop.md",)
+        ).fetchone()["rowid"]
+
+        (isolated_vault.root / "Notes" / "drop.md").unlink()
+        result = gm.embed_vault(
+            con, vault_root=isolated_vault.root, embedder=_hash_embedder, dim=4
+        )
+        assert result.removed == 1
+
+        assert con.execute(
+            "SELECT COUNT(*) FROM vec_sources WHERE source_file = ?", ("Notes/drop.md",)
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM vec_embeddings WHERE rowid = ?", (drop_rowid,)
+        ).fetchone()[0] == 0
+        # keep.md survives in both tables
+        assert con.execute("SELECT COUNT(*) FROM vec_sources").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_default_embedder_full_roundtrip_is_incremental(isolated_vault):
+    """The real default (256-dim feature-hashing) embedder runs end to end through
+    vec0: first run embeds all, a byte-identical rescan embeds nothing."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/a.md", "a durable fact\n")
+    isolated_vault.write("Notes/b.md", "b durable fact\n")
+    con = isolated_vault.connect()
+    try:
+        first = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert first.embedded == 2
+        assert first.dim == gm.EMBED_DIM
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 2
+
+        second = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert second.embedded == 0
+        assert second.unchanged == 2
+    finally:
+        con.close()
+
+
+def test_cli_embed_real_run_builds_vectors(tmp_path):
+    """``main(["embed", --vault-root, tmp])`` (non-dry-run) builds the vec tables.
+
+    Plain tmp vault (not ``isolated_vault``) so the real-vault-untouched guard
+    stays meaningful. Re-opens the DB and loads the extension to inspect it."""
+    import sqlite3
+
+    pytest.importorskip("sqlite_vec")
+    vault = tmp_path / "vault"
+    (vault / "Notes").mkdir(parents=True)
+    (vault / "Notes" / "a.md").write_text("alpha fact\n", encoding="utf-8")
+
+    assert gm.main(["embed", "--vault-root", str(vault)]) == 0
+
+    import sqlite_vec
+
+    con = sqlite3.connect(vault / "Memory" / "relations.sqlite")
+    try:
+        con.enable_load_extension(True)
+        sqlite_vec.load(con)
+        con.enable_load_extension(False)
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM vec_sources").fetchone()[0] == 1
     finally:
         con.close()
