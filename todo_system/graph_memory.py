@@ -141,6 +141,11 @@ def normalize_target(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Nullable provenance columns (G1): appended to the end of the edge column list
+# so a freshly-created schema and an in-place-migrated one end up identical.
+_PROVENANCE_COLUMNS: tuple[str, ...] = ("run_id", "commit_sha")
+
+
 def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
@@ -156,7 +161,9 @@ def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             event_date TEXT,
             recorded_at TEXT NOT NULL,
             valid_until TEXT,
-            confidence REAL
+            confidence REAL,
+            run_id TEXT,
+            commit_sha TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_slug);
         CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_slug);
@@ -164,6 +171,18 @@ def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
         """
     )
+    con.commit()
+
+    # Idempotent, lossless migration of a pre-G1 ``edges`` table (created before
+    # the provenance columns existed): add each missing column via ALTER TABLE
+    # ADD COLUMN so existing rows survive with provenance = NULL. A no-op on a
+    # freshly-created schema (the CREATE above already has both columns) and on an
+    # already-migrated DB. Column names are hard-coded constants — DDL cannot be
+    # parameterised — so the f-string carries no injection surface.
+    existing = {row["name"] for row in con.execute("PRAGMA table_info(edges)")}
+    for name in _PROVENANCE_COLUMNS:
+        if name not in existing:
+            con.execute(f"ALTER TABLE edges ADD COLUMN {name} TEXT")
     con.commit()
     return con
 
@@ -184,6 +203,8 @@ def insert_edges(con: sqlite3.Connection, edges: Iterable[dict[str, Any]]) -> in
             e["recorded_at"],
             e.get("valid_until"),
             e.get("confidence"),
+            e.get("run_id"),
+            e.get("commit_sha"),
         )
         for e in edges
     ]
@@ -193,8 +214,9 @@ def insert_edges(con: sqlite3.Connection, edges: Iterable[dict[str, Any]]) -> in
         """
         INSERT INTO edges (
             from_slug, to_slug, edge_type, source_file,
-            event_date, recorded_at, valid_until, confidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            event_date, recorded_at, valid_until, confidence,
+            run_id, commit_sha
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
