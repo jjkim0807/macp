@@ -202,3 +202,235 @@ def test_scan_path_leaves_provenance_null(isolated_vault):
         assert live[0]["commit_sha"] is None
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — incremental tombstone sync + current-valid query invariance
+# ---------------------------------------------------------------------------
+
+
+def test_disappeared_relation_is_tombstoned_not_deleted(isolated_vault):
+    """A relation whose source link is gone has ``valid_until`` stamped in place.
+
+    The row is not ``DELETE``\\ d: it survives with its original id and
+    ``recorded_at``, so the bi-temporal history is intact while nothing is live.
+    """
+    isolated_vault.write("Notes/a.md", "[[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        live = _live(con)
+        assert len(live) == 1
+        original_id = live[0]["id"]
+        original_recorded = live[0]["recorded_at"]
+
+        (isolated_vault.root / "Notes" / "a.md").unlink()
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        assert _live(con) == []  # nothing current-valid
+        history = _all(con)
+        assert len(history) == 1  # survived — tombstoned, not deleted
+        assert history[0]["id"] == original_id
+        assert history[0]["valid_until"] is not None
+        assert history[0]["recorded_at"] == original_recorded
+    finally:
+        con.close()
+
+
+def test_reappeared_relation_inserts_new_live_row_keeping_tombstone(isolated_vault):
+    """A relation that comes back becomes a brand-new live row.
+
+    The earlier tombstone is left untouched; the revived edge is a fresh insert
+    (strictly higher id), never a flip of the dead row back to live.
+    """
+    isolated_vault.write("Notes/a.md", "[[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        (isolated_vault.root / "Notes" / "a.md").unlink()
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert _live(con) == []
+        tomb = _all(con)
+        assert len(tomb) == 1 and tomb[0]["valid_until"] is not None
+        tomb_id = tomb[0]["id"]
+
+        # The same relation reappears.
+        isolated_vault.write("Notes/a.md", "[[x]]\n")
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        rows = _all(con)
+        assert len(rows) == 2  # tombstone kept + a new live row
+        live = _live(con)
+        assert len(live) == 1
+        assert live[0]["valid_until"] is None
+        assert live[0]["id"] > tomb_id  # a genuinely new insert
+        kept = next(r for r in rows if r["id"] == tomb_id)
+        assert kept["valid_until"] is not None  # old tombstone untouched
+    finally:
+        con.close()
+
+
+def test_idempotent_rescan_preserves_recorded_at_and_row_identity(isolated_vault):
+    """Re-scanning an unchanged vault changes nothing — no churn of history.
+
+    Identity is matched without ``recorded_at``, so an identical row is left as
+    is: same id, same ``recorded_at``, still live, no tombstone created.
+    """
+    isolated_vault.write("Notes/a.md", "[[x]] [[y]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        before = _all(con)
+        assert len(before) == 2
+        for _ in range(3):
+            gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        after = _all(con)
+        assert len(after) == 2  # no reinsert, no tombstone
+        assert [r["id"] for r in after] == [r["id"] for r in before]
+        assert [r["recorded_at"] for r in after] == [r["recorded_at"] for r in before]
+        assert all(r["valid_until"] is None for r in after)
+    finally:
+        con.close()
+
+
+def test_duplicate_body_link_occurrences_are_tracked_by_multiplicity(isolated_vault):
+    """Two identical ``[[x]]`` links in one body are two live edges, stably.
+
+    Signature matching is by multiplicity (``Counter``), so a byte-identical
+    rescan keeps exactly two — never collapsing them, never accumulating a third.
+    """
+    isolated_vault.write("Notes/a.md", "[[x]] and again [[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert len(_live(con)) == 2
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert len(_live(con)) == 2  # stable, no accumulation
+        assert len(_all(con)) == 2  # and no tombstone churn
+
+        # Drop to a single occurrence: exactly one is tombstoned.
+        isolated_vault.write("Notes/a.md", "[[x]] once\n")
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert len(_live(con)) == 1
+        assert sum(1 for r in _all(con) if r["valid_until"] is not None) == 1
+    finally:
+        con.close()
+
+
+def test_event_date_change_tombstones_old_signature_and_inserts_new(isolated_vault):
+    """A changed ``event_date`` is a new signature: old row tombstoned, new live."""
+    isolated_vault.write("Notes/a.md", "---\nevent_date: 2026-08-01\n---\n\n[[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert [r["event_date"] for r in _live(con)] == ["2026-08-01"]
+
+        isolated_vault.write("Notes/a.md", "---\nevent_date: 2026-09-01\n---\n\n[[x]]\n")
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        live = _live(con)
+        assert len(live) == 1
+        assert live[0]["event_date"] == "2026-09-01"
+        allrows = _all(con)
+        assert len(allrows) == 2
+        old = [r for r in allrows if r["event_date"] == "2026-08-01"]
+        assert len(old) == 1 and old[0]["valid_until"] is not None
+    finally:
+        con.close()
+
+
+def test_confidence_change_tombstones_old_signature_and_inserts_new(isolated_vault):
+    """``confidence`` is part of the signature too — a change rolls the row over."""
+    isolated_vault.write("Notes/a.md", "---\nconfidence: 0.5\n---\n\n[[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        assert [r["confidence"] for r in _live(con)] == [0.5]
+
+        isolated_vault.write("Notes/a.md", "---\nconfidence: 0.9\n---\n\n[[x]]\n")
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        live = _live(con)
+        assert len(live) == 1 and live[0]["confidence"] == 0.9
+        allrows = _all(con)
+        assert len(allrows) == 2
+        old = [r for r in allrows if r["confidence"] == 0.5]
+        assert len(old) == 1 and old[0]["valid_until"] is not None
+    finally:
+        con.close()
+
+
+def test_current_valid_queries_exclude_tombstoned_edges(isolated_vault):
+    """``get_related`` / ``most_referenced`` / index aggregates skip tombstones."""
+    isolated_vault.write("Notes/a.md", "[[x]] [[y]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        isolated_vault.write("Notes/a.md", "[[x]]\n")  # y disappears
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        related = sorted((r["from_slug"], r["to_slug"]) for r in gm.get_related(con, "a"))
+        assert related == [("a", "x")]
+        assert gm.get_related(con, "y") == []  # tombstoned target unreachable
+        assert gm.most_referenced_slugs(con) == [("x", 1)]
+
+        md = gm.render_index_markdown(con, vault_root=isolated_vault.root)
+        assert "> total edges: 1\n" in md
+        assert "- `wikilink`: 1\n" in md
+    finally:
+        con.close()
+
+
+def test_get_related_current_valid_matches_a_fresh_rebuild(isolated_vault, tmp_path):
+    """AC#3 invariance: the incremental path's live result == a full rebuild's.
+
+    After an edge is tombstoned, ``get_related`` on the incremental DB returns
+    exactly what a from-scratch scan of the same final vault state produces —
+    byte-for-byte — while the tombstoned edge still lives in history.
+    """
+    isolated_vault.write("Notes/a.md", "[[x]] [[y]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        isolated_vault.write("Notes/a.md", "[[x]]\n")  # y disappears -> tombstone
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        incr = sorted((r["from_slug"], r["to_slug"]) for r in gm.get_related(con, "a"))
+
+        # Full rebuild of the SAME final vault state into a separate, clean DB.
+        fresh = gm.init_relations_db(tmp_path / "fresh" / "relations.sqlite")
+        try:
+            gm.scan_vault_and_index(vault_root=isolated_vault.root, con=fresh)
+            rebuilt = sorted(
+                (r["from_slug"], r["to_slug"]) for r in gm.get_related(fresh, "a")
+            )
+        finally:
+            fresh.close()
+
+        assert incr == rebuilt == [("a", "x")]
+        # The tombstoned y edge is still recoverable from history on the incr DB.
+        assert any(
+            r["to_slug"] == "y" and r["valid_until"] is not None for r in _all(con)
+        )
+    finally:
+        con.close()
+
+
+def test_history_query_over_all_rows_returns_full_timeline(isolated_vault):
+    """Querying all rows (incl. tombstoned) returns the full appear/vanish/return
+    timeline, while current-valid queries collapse to the single live edge."""
+    isolated_vault.write("Notes/a.md", "[[x]]\n")
+    con = isolated_vault.connect()
+    try:
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        (isolated_vault.root / "Notes" / "a.md").unlink()
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        isolated_vault.write("Notes/a.md", "[[x]]\n")
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+
+        ax = [r for r in _all(con) if (r["from_slug"], r["to_slug"]) == ("a", "x")]
+        assert len(ax) == 2  # the full timeline: one dead, one alive
+        assert sum(1 for r in ax if r["valid_until"] is None) == 1
+        assert sum(1 for r in ax if r["valid_until"] is not None) == 1
+        assert len(gm.get_related(con, "a")) == 1  # current-valid sees one
+    finally:
+        con.close()
