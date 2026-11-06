@@ -4,7 +4,13 @@ Walks the markdown vault, parses wikilinks + frontmatter relationship fields,
 and populates ``Memory/relations.sqlite`` so future briefs can traverse the
 accumulated knowledge graph.
 
-Schema follows plan Phase 2.6 (bi-temporal: ``event_date`` + ``recorded_at``).
+Schema is bi-temporal (plan Phase 2.6): ``event_date`` is valid-time (when the
+fact held), ``recorded_at`` is transaction-time (when it was written), and
+``valid_until`` tombstones a relation that no longer holds. Each edge also
+carries nullable ``run_id`` / ``commit_sha`` provenance (memory v2 · G1). Rescans
+sync **incrementally** — a vanished relation is tombstoned, not deleted — so
+``recorded_at`` and history survive; current-valid queries read
+``valid_until IS NULL`` rows only.
 
 Stdlib only. Intentionally duplicates a minimal frontmatter parser so this
 module stays decoupled from ``todo_system.cli``.
