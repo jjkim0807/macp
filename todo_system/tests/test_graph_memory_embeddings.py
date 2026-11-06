@@ -176,3 +176,176 @@ def test_corpus_skips_memory_sessions(isolated_vault):
     sources = {doc.source_file for doc in gm.iter_embed_corpus(isolated_vault.root)}
     assert "Notes/kept.md" in sources
     assert not any(s.startswith("Memory/sessions/") for s in sources)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — incremental plan + dry-run + CLI (plain table, no extension)
+# ---------------------------------------------------------------------------
+
+
+def _seed_vec_sources(con, corpus, *, dim=gm.EMBED_DIM):
+    """Simulate a prior embed by filling the plain ``vec_sources`` table with the
+    current corpus' content hashes — no sqlite-vec needed to test the diff."""
+    gm.init_vec_sources(con)
+    for doc in corpus:
+        con.execute(
+            "INSERT INTO vec_sources (source_file, content_hash, mtime, dim, embedded_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (doc.source_file, gm._content_hash(doc.text), doc.mtime, dim, "2026-11-06T00:00:00"),
+        )
+    con.commit()
+
+
+def test_plan_first_run_embeds_every_doc(isolated_vault):
+    """First run (empty ``vec_sources``) → every corpus doc is to-embed."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    isolated_vault.write("Notes/b.md", "beta fact\n")
+    con = isolated_vault.connect()
+    try:
+        corpus = list(gm.iter_embed_corpus(isolated_vault.root))
+        to_embed, unchanged, to_remove = gm.plan_embedding(con, corpus)
+        assert {i.source_file for i in to_embed} == {"Notes/a.md", "Notes/b.md"}
+        assert unchanged == []
+        assert to_remove == []
+        # plan is read-only: it must not have created vec_sources
+        assert not gm._table_exists(con, "vec_sources")
+    finally:
+        con.close()
+
+
+def test_plan_unchanged_rescan_embeds_nothing(isolated_vault):
+    """A byte-identical rescan re-embeds nothing — vectors are a derived cache."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    isolated_vault.write("Notes/b.md", "beta fact\n")
+    con = isolated_vault.connect()
+    try:
+        corpus = list(gm.iter_embed_corpus(isolated_vault.root))
+        _seed_vec_sources(con, corpus)
+        to_embed, unchanged, to_remove = gm.plan_embedding(con, corpus)
+        assert to_embed == []
+        assert set(unchanged) == {"Notes/a.md", "Notes/b.md"}
+        assert to_remove == []
+    finally:
+        con.close()
+
+
+def test_plan_reembeds_only_the_edited_doc(isolated_vault):
+    """Editing one doc re-plans exactly that one; the rest stay unchanged."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    isolated_vault.write("Notes/b.md", "beta fact\n")
+    con = isolated_vault.connect()
+    try:
+        _seed_vec_sources(con, list(gm.iter_embed_corpus(isolated_vault.root)))
+        isolated_vault.write("Notes/a.md", "alpha fact — now edited\n")
+        corpus2 = list(gm.iter_embed_corpus(isolated_vault.root))
+        to_embed, unchanged, to_remove = gm.plan_embedding(con, corpus2)
+        assert {i.source_file for i in to_embed} == {"Notes/a.md"}
+        assert unchanged == ["Notes/b.md"]
+        assert to_remove == []
+    finally:
+        con.close()
+
+
+def test_plan_removes_deleted_and_newly_denied_docs(isolated_vault):
+    """A doc gone from disk, or newly caught by the R5 filter, lands in to-remove."""
+    isolated_vault.write("Notes/gone.md", "will be deleted\n")
+    isolated_vault.write("Notes/becomes-private.md", "will gain a denied tag\n")
+    isolated_vault.write("Notes/stays.md", "stays put\n")
+    con = isolated_vault.connect()
+    try:
+        _seed_vec_sources(con, list(gm.iter_embed_corpus(isolated_vault.root)))
+        (isolated_vault.root / "Notes" / "gone.md").unlink()
+        isolated_vault.write(
+            "Notes/becomes-private.md", "---\ntags:\n  - sms\n---\n\nnow private\n"
+        )
+        corpus2 = list(gm.iter_embed_corpus(isolated_vault.root))
+        to_embed, unchanged, to_remove = gm.plan_embedding(con, corpus2)
+        assert to_remove == ["Notes/becomes-private.md", "Notes/gone.md"]
+        assert unchanged == ["Notes/stays.md"]
+        assert to_embed == []
+    finally:
+        con.close()
+
+
+def test_rebuild_flag_replans_every_doc_even_if_unchanged(isolated_vault):
+    """``rebuild=True`` ignores the content-hash cache and re-embeds everything."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    con = isolated_vault.connect()
+    try:
+        corpus = list(gm.iter_embed_corpus(isolated_vault.root))
+        _seed_vec_sources(con, corpus)
+        to_embed, unchanged, to_remove = gm.plan_embedding(con, corpus, rebuild=True)
+        assert {i.source_file for i in to_embed} == {"Notes/a.md"}
+        assert unchanged == []
+    finally:
+        con.close()
+
+
+def test_dry_run_is_side_effect_free(isolated_vault):
+    """``embed_vault(dry_run=True)`` reports the plan and writes nothing — no
+    vec0 table, no vec_sources rows, no sqlite-vec needed."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    con = isolated_vault.connect()
+    try:
+        result = gm.embed_vault(con, vault_root=isolated_vault.root, dry_run=True)
+        assert result.dry_run is True
+        assert result.to_embed == 1
+        assert result.embedded == 0
+        assert not gm._table_exists(con, "vec_embeddings")
+        assert not gm._table_exists(con, "vec_sources")
+    finally:
+        con.close()
+
+
+def test_cli_embed_dry_run_prints_plan_and_exits_zero(tmp_path, capsys):
+    """``main(["embed", --vault-root, tmp, --dry-run])`` prints the planned docs,
+    returns 0, and creates no vector tables. Uses a plain tmp vault (not
+    ``isolated_vault``) so the real-vault-untouched guard stays meaningful."""
+    import sqlite3
+
+    vault = tmp_path / "vault"
+    (vault / "Notes").mkdir(parents=True)
+    (vault / "Notes" / "a.md").write_text("alpha fact\n", encoding="utf-8")
+
+    rc = gm.main(["embed", "--vault-root", str(vault), "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "embed plan (dry-run)" in out
+    assert "Notes/a.md" in out
+
+    con = sqlite3.connect(vault / "Memory" / "relations.sqlite")
+    try:
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    assert "vec_embeddings" not in names
+    assert "vec_sources" not in names
+
+
+def test_embed_skips_gracefully_when_sqlite_vec_absent(isolated_vault, monkeypatch, capsys):
+    """Optional-dep contract: with sqlite-vec unavailable, a non-dry-run embed
+    prints a clear skip message and returns 0 effect — and the rest of
+    graph_memory (scan / get_related / render_index) keeps working untouched."""
+    isolated_vault.write("Notes/a.md", "[[x]] alpha fact\n")
+    con = isolated_vault.connect()
+    try:
+        def _raise(_con):
+            raise gm.EmbeddingsUnavailable("sqlite-vec is not installed (simulated)")
+
+        monkeypatch.setattr(gm, "_load_sqlite_vec", _raise)
+
+        result = gm.embed_vault(con, vault_root=isolated_vault.root, dry_run=False)
+        assert result.skipped_reason is not None
+        assert result.embedded == 0
+        assert "skipping embed" in capsys.readouterr().out
+        # the absent path returned before building anything
+        assert not gm._table_exists(con, "vec_embeddings")
+        assert not gm._table_exists(con, "vec_sources")
+
+        # rest of graph_memory still works on the same connection
+        gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+        related = {(r["from_slug"], r["to_slug"]) for r in gm.get_related(con, "a")}
+        assert ("a", "x") in related
+        assert "Memory Index" in gm.render_index_markdown(con, vault_root=isolated_vault.root)
+    finally:
+        con.close()

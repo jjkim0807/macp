@@ -25,8 +25,9 @@ import math
 import re
 import sqlite3
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 from . import paths
 
@@ -620,6 +621,276 @@ def iter_embed_corpus(vault_root: Path = ROOT) -> Iterable[CorpusDoc]:
         yield CorpusDoc(source_file=rel, text=text, mtime=mtime)
 
 
+# --- incremental plan (plain companion table — no extension needed) ---------
+#
+# Vectors are a *derived* cache (design §4.3 point 3): the first embed is a full
+# batch, later runs re-embed only changed/new docs and drop gone/newly-denied
+# ones. The change-detection state lives in a plain ``vec_sources`` table whose
+# ``rowid`` is the link to the matching ``vec_embeddings`` (vec0) row — a plain
+# table so the whole plan / dry-run path is testable with sqlite-vec absent.
+
+
+class PlanItem(NamedTuple):
+    """A doc the next embed must (re)embed: its path, text, content hash, mtime."""
+
+    source_file: str
+    text: str
+    content_hash: str
+    mtime: float
+
+
+@dataclass
+class EmbedResult:
+    """Outcome of an :func:`embed_vault` call (counts only — no vectors/text)."""
+
+    total_corpus: int
+    to_embed: int
+    to_remove: int
+    embedded: int
+    removed: int
+    unchanged: int
+    dim: int
+    dry_run: bool
+    skipped_reason: str | None
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def init_vec_sources(con: sqlite3.Connection) -> None:
+    """Create the plain ``vec_sources`` companion table (idempotent). Its
+    ``rowid`` doubles as the ``vec_embeddings`` (vec0) rowid for each source."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vec_sources (
+            rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file TEXT UNIQUE NOT NULL,
+            content_hash TEXT NOT NULL,
+            mtime REAL,
+            dim INTEGER NOT NULL,
+            embedded_at TEXT NOT NULL
+        )
+        """
+    )
+    con.commit()
+
+
+def plan_embedding(
+    con: sqlite3.Connection,
+    corpus: Iterable[CorpusDoc],
+    *,
+    rebuild: bool = False,
+) -> tuple[list[PlanItem], list[str], list[str]]:
+    """Diff the current corpus against ``vec_sources`` — **read-only, no writes**.
+
+    Returns ``(to_embed, unchanged, to_remove)``:
+
+    * **to_embed** — new docs, docs whose embed-input text changed (content hash
+      differs), and (when ``rebuild``) every doc;
+    * **unchanged** — source_files whose content hash matches the stored one;
+    * **to_remove** — source_files in ``vec_sources`` no longer in the corpus
+      (deleted on disk, or newly denied by the R5 filter).
+
+    A missing ``vec_sources`` table reads as "nothing embedded yet" → first run
+    is a full batch. Never writes, so the dry-run path is side-effect-free.
+    """
+    existing: dict[str, str] = {}
+    if _table_exists(con, "vec_sources"):
+        for row in con.execute("SELECT source_file, content_hash FROM vec_sources"):
+            existing[row["source_file"]] = row["content_hash"]
+
+    to_embed: list[PlanItem] = []
+    unchanged: list[str] = []
+    seen: set[str] = set()
+    for doc in corpus:
+        seen.add(doc.source_file)
+        content_hash = _content_hash(doc.text)
+        prior = existing.get(doc.source_file)
+        if rebuild or prior is None or prior != content_hash:
+            to_embed.append(
+                PlanItem(doc.source_file, doc.text, content_hash, doc.mtime)
+            )
+        else:
+            unchanged.append(doc.source_file)
+
+    to_remove = sorted(sf for sf in existing if sf not in seen)
+    return to_embed, unchanged, to_remove
+
+
+# --- sqlite-vec lazy load + vec0 build/upsert (the optional extension) -------
+
+
+class EmbeddingsUnavailable(RuntimeError):
+    """The sqlite-vec extension could not be loaded (not installed, or this
+    Python/SQLite was built without loadable-extension support). Callers turn
+    this into a clear "skipping embed" message and keep the rest of
+    graph_memory working — it is never fatal."""
+
+
+def _load_sqlite_vec(con: sqlite3.Connection):
+    """Lazily import sqlite-vec and load the extension into ``con``.
+
+    Import is **inside this function only** — never at module top — so
+    ``import todo_system.graph_memory`` (and the whole scan/index/query path,
+    and the installed-wheel smoke) stay importable with sqlite-vec absent.
+    Raises :class:`EmbeddingsUnavailable` for both "not installed" and "this
+    python has no loadable-extension support". Returns the ``sqlite_vec`` module
+    (for ``serialize_float32``).
+    """
+    try:
+        import sqlite_vec
+    except ImportError as exc:  # not installed (the shipped wheel's state)
+        raise EmbeddingsUnavailable("sqlite-vec is not installed") from exc
+    try:
+        con.enable_load_extension(True)
+        sqlite_vec.load(con)
+        con.enable_load_extension(False)
+    except (AttributeError, sqlite3.OperationalError, sqlite3.NotSupportedError) as exc:
+        raise EmbeddingsUnavailable(
+            f"sqlite-vec could not be loaded into this SQLite build: {exc}"
+        ) from exc
+    return sqlite_vec
+
+
+def init_vec0(con: sqlite3.Connection, dim: int) -> None:
+    """Create the ``vec_embeddings`` vec0 virtual table (idempotent). Requires
+    the extension already loaded (:func:`_load_sqlite_vec`). ``dim`` is int-coerced
+    into the DDL — it cannot be parameterised, so the coercion is the injection
+    guard. A pre-existing table with a different ``dim`` is left as-is by
+    ``IF NOT EXISTS`` (a dim change would need a rebuild — out of G2 scope)."""
+    con.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(embedding float[{int(dim)}])"
+    )
+    con.commit()
+
+
+def _print_embed_plan(
+    to_embed: list[PlanItem], unchanged: list[str], to_remove: list[str], *, dim: int
+) -> None:
+    print(f"embed plan (dry-run) — dim={dim}, corpus sees {len(to_embed) + len(unchanged)} docs")
+    print(f"  to embed ({len(to_embed)}):")
+    for item in to_embed:
+        print(f"    + {item.source_file}")
+    print(f"  unchanged: {len(unchanged)}")
+    print(f"  to remove ({len(to_remove)}):")
+    for source_file in to_remove:
+        print(f"    - {source_file}")
+
+
+def embed_vault(
+    con: sqlite3.Connection,
+    *,
+    vault_root: Path = ROOT,
+    embedder: Callable[[str], Sequence[float]] = _default_embedder,
+    dim: int = EMBED_DIM,
+    dry_run: bool = False,
+    rebuild: bool = False,
+) -> EmbedResult:
+    """Embed the vault corpus into the ``vec_embeddings`` vec0 table, incrementally.
+
+    Walks :func:`iter_embed_corpus` (R5-filtered), diffs it against ``vec_sources``
+    with :func:`plan_embedding`, and:
+
+    * ``dry_run=True`` — prints the plan and returns, touching **nothing** (no
+      vec0 / vec_sources write, no sqlite-vec needed);
+    * sqlite-vec absent — prints a clear skip message and returns with
+      ``skipped_reason`` set (the rest of graph_memory is unaffected);
+    * otherwise — builds the tables, applies the plan (insert new vectors,
+      update changed ones in place by rowid, delete gone/denied ones), and upserts
+      ``vec_sources``.
+
+    ``embedder`` is the injectable seam (default: the stdlib feature-hashing
+    :func:`_default_embedder`); tests pass a fake. ``dim`` must match what the
+    embedder produces — a mismatch raises, so a wrong fake fails loudly.
+    """
+    corpus = list(iter_embed_corpus(vault_root))
+    to_embed, unchanged, to_remove = plan_embedding(con, corpus, rebuild=rebuild)
+
+    def _result(embedded: int, removed: int, skipped_reason: str | None, dry: bool) -> EmbedResult:
+        return EmbedResult(
+            total_corpus=len(corpus),
+            to_embed=len(to_embed),
+            to_remove=len(to_remove),
+            embedded=embedded,
+            removed=removed,
+            unchanged=len(unchanged),
+            dim=dim,
+            dry_run=dry,
+            skipped_reason=skipped_reason,
+        )
+
+    if dry_run:
+        _print_embed_plan(to_embed, unchanged, to_remove, dim=dim)
+        return _result(0, 0, None, True)
+
+    try:
+        vec_ext = _load_sqlite_vec(con)
+    except EmbeddingsUnavailable as exc:
+        print(f"sqlite-vec not installed — skipping embed ({exc})")
+        return _result(0, 0, str(exc), False)
+
+    init_vec_sources(con)
+    init_vec0(con, dim)
+
+    existing_rowids = {
+        row["source_file"]: row["rowid"]
+        for row in con.execute("SELECT rowid, source_file FROM vec_sources")
+    }
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    serialize = vec_ext.serialize_float32
+
+    embedded = 0
+    for item in to_embed:
+        vector = list(embedder(item.text))
+        if len(vector) != dim:
+            raise ValueError(
+                f"embedder returned {len(vector)} dims, expected {dim} "
+                f"(for {item.source_file}) — embedder/dim mismatch"
+            )
+        blob = serialize([float(x) for x in vector])
+        rowid = existing_rowids.get(item.source_file)
+        if rowid is None:
+            cur = con.execute(
+                "INSERT INTO vec_sources (source_file, content_hash, mtime, dim, embedded_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (item.source_file, item.content_hash, item.mtime, dim, now),
+            )
+            con.execute(
+                "INSERT INTO vec_embeddings (rowid, embedding) VALUES (?, ?)",
+                (cur.lastrowid, blob),
+            )
+        else:
+            con.execute(
+                "UPDATE vec_sources SET content_hash = ?, mtime = ?, dim = ?, embedded_at = ? "
+                "WHERE source_file = ?",
+                (item.content_hash, item.mtime, dim, now, item.source_file),
+            )
+            con.execute(
+                "UPDATE vec_embeddings SET embedding = ? WHERE rowid = ?", (blob, rowid)
+            )
+        embedded += 1
+
+    removed = 0
+    for source_file in to_remove:
+        rowid = existing_rowids.get(source_file)
+        if rowid is not None:
+            con.execute("DELETE FROM vec_embeddings WHERE rowid = ?", (rowid,))
+        con.execute("DELETE FROM vec_sources WHERE source_file = ?", (source_file,))
+        removed += 1
+
+    con.commit()
+    print(
+        f"embedded {embedded} docs ({len(unchanged)} unchanged, {removed} removed) "
+        f"into vec0[{dim}] from {len(corpus)} corpus docs"
+    )
+    return _result(embedded, removed, None, False)
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -1051,6 +1322,19 @@ def cmd_show_related(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_embed(args: argparse.Namespace) -> int:
+    """Embed the vault corpus into the vec0 table (or just show the plan with
+    ``--dry-run``). Always returns 0 — a missing sqlite-vec is a graceful skip,
+    not an error."""
+    root, db_path, _index_path = _cli_paths(args)
+    con = init_relations_db(db_path)
+    try:
+        embed_vault(con, vault_root=root, dry_run=args.dry_run, rebuild=args.rebuild)
+    finally:
+        con.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="second-brain graph memory indexer (M3-a)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1092,6 +1376,23 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     p_xl.set_defaults(func=cmd_cross_links)
+
+    p_embed = sub.add_parser(
+        "embed",
+        help="Embed the vault corpus into the sqlite-vec vec0 table (incremental)",
+        parents=[common],
+    )
+    p_embed.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be embedded/removed without writing (needs no sqlite-vec)",
+    )
+    p_embed.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="re-embed every corpus doc, ignoring the incremental content-hash check",
+    )
+    p_embed.set_defaults(func=cmd_embed)
 
     return parser
 
