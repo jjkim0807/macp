@@ -1073,12 +1073,59 @@ def _knn_seeds(
     dim: int,
 ) -> dict[str, dict[str, Any]]:
     """Semantic layer: the ``k`` nearest embedded corpus docs to ``query_text`` as
-    ``{slug: {"vector": score, "source_file": path}}``.
+    ``{slug: {"vector": score, "source_file": path}}``, slug = the doc's path stem.
 
-    Phase 3 fills this in. In Phase 2 it is a stub that yields no hits, so
-    ``query_related`` is BFS-only until the KNN layer lands.
+    Graceful degradation, identical to :func:`embed_vault`: yields ``{}`` (never
+    raises) when ``k <= 0``, when the vault was never embedded (``vec_embeddings`` /
+    ``vec_sources`` absent), or when sqlite-vec cannot be loaded at query time
+    (:class:`EmbeddingsUnavailable`). sqlite-vec stays behind the lazy
+    :func:`_load_sqlite_vec` seam — no top-level ``import sqlite_vec`` (stdlib-only
+    contract). An embedder whose output length ``!= dim`` is a loud ``ValueError``,
+    matching ``embed_vault`` (a wrong fake fails fast, it is not a silent skip).
+
+    The vector score is ``1.0 / (1.0 + distance)`` over sqlite-vec's L2 ``distance``
+    (selectable alongside ``rowid`` in a KNN ``MATCH`` query). Rows come back
+    distance-ascending, so the first occurrence of a slug is its nearest doc; a
+    later rowid sharing the same path stem is ignored. The ``LIMIT ?`` (= ``k``) is
+    mandatory for a vec0 KNN query.
     """
-    return {}  # vector layer — Phase 3
+    if k <= 0:
+        return {}
+    if not _table_exists(con, "vec_embeddings") or not _table_exists(con, "vec_sources"):
+        return {}
+    try:
+        vec_ext = _load_sqlite_vec(con)
+    except EmbeddingsUnavailable:
+        return {}
+
+    vector = list(embedder(query_text))
+    if len(vector) != dim:
+        raise ValueError(
+            f"embedder returned {len(vector)} dims, expected {dim} — embedder/dim mismatch"
+        )
+    blob = vec_ext.serialize_float32([float(x) for x in vector])
+
+    seeds: dict[str, dict[str, Any]] = {}
+    rows = con.execute(
+        "SELECT rowid, distance FROM vec_embeddings WHERE embedding MATCH ? "
+        "ORDER BY distance LIMIT ?",
+        (blob, k),
+    ).fetchall()
+    for row in rows:
+        src = con.execute(
+            "SELECT source_file FROM vec_sources WHERE rowid = ?", (row["rowid"],)
+        ).fetchone()
+        if src is None:
+            continue
+        source_file = src["source_file"]
+        slug = Path(source_file).stem
+        if slug in seeds:
+            continue  # distance-ordered → the first row per slug is its nearest doc
+        seeds[slug] = {
+            "vector": 1.0 / (1.0 + row["distance"]),
+            "source_file": source_file,
+        }
+    return seeds
 
 
 def query_related(
