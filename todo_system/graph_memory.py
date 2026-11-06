@@ -4,7 +4,13 @@ Walks the markdown vault, parses wikilinks + frontmatter relationship fields,
 and populates ``Memory/relations.sqlite`` so future briefs can traverse the
 accumulated knowledge graph.
 
-Schema follows plan Phase 2.6 (bi-temporal: ``event_date`` + ``recorded_at``).
+Schema is bi-temporal (plan Phase 2.6): ``event_date`` is valid-time (when the
+fact held), ``recorded_at`` is transaction-time (when it was written), and
+``valid_until`` tombstones a relation that no longer holds. Each edge also
+carries nullable ``run_id`` / ``commit_sha`` provenance (memory v2 · G1). Rescans
+sync **incrementally** — a vanished relation is tombstoned, not deleted — so
+``recorded_at`` and history survive; current-valid queries read
+``valid_until IS NULL`` rows only.
 
 Stdlib only. Intentionally duplicates a minimal frontmatter parser so this
 module stays decoupled from ``todo_system.cli``.
@@ -141,6 +147,11 @@ def normalize_target(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Nullable provenance columns (G1): appended to the end of the edge column list
+# so a freshly-created schema and an in-place-migrated one end up identical.
+_PROVENANCE_COLUMNS: tuple[str, ...] = ("run_id", "commit_sha")
+
+
 def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
@@ -156,7 +167,9 @@ def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             event_date TEXT,
             recorded_at TEXT NOT NULL,
             valid_until TEXT,
-            confidence REAL
+            confidence REAL,
+            run_id TEXT,
+            commit_sha TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_slug);
         CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_slug);
@@ -164,6 +177,18 @@ def init_relations_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
         """
     )
+    con.commit()
+
+    # Idempotent, lossless migration of a pre-G1 ``edges`` table (created before
+    # the provenance columns existed): add each missing column via ALTER TABLE
+    # ADD COLUMN so existing rows survive with provenance = NULL. A no-op on a
+    # freshly-created schema (the CREATE above already has both columns) and on an
+    # already-migrated DB. Column names are hard-coded constants — DDL cannot be
+    # parameterised — so the f-string carries no injection surface.
+    existing = {row["name"] for row in con.execute("PRAGMA table_info(edges)")}
+    for name in _PROVENANCE_COLUMNS:
+        if name not in existing:
+            con.execute(f"ALTER TABLE edges ADD COLUMN {name} TEXT")
     con.commit()
     return con
 
@@ -184,6 +209,8 @@ def insert_edges(con: sqlite3.Connection, edges: Iterable[dict[str, Any]]) -> in
             e["recorded_at"],
             e.get("valid_until"),
             e.get("confidence"),
+            e.get("run_id"),
+            e.get("commit_sha"),
         )
         for e in edges
     ]
@@ -193,8 +220,9 @@ def insert_edges(con: sqlite3.Connection, edges: Iterable[dict[str, Any]]) -> in
         """
         INSERT INTO edges (
             from_slug, to_slug, edge_type, source_file,
-            event_date, recorded_at, valid_until, confidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            event_date, recorded_at, valid_until, confidence,
+            run_id, commit_sha
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -282,42 +310,135 @@ def edges_from_file(path: Path, vault_root: Path = ROOT, recorded_at: str | None
     return edges
 
 
+def _edge_signature(e: dict[str, Any]) -> tuple[Any, ...]:
+    """Identity of a relation for the incremental tombstone diff.
+
+    Two edges are "the same relation" iff this 6-tuple matches. ``event_date``
+    and ``confidence`` are part of it on purpose: a change in either tombstones
+    the old row and inserts a new one (rather than silently mutating history),
+    while a byte-identical row is left untouched so its ``recorded_at`` is
+    preserved. ``recorded_at`` / ``valid_until`` / provenance are deliberately
+    excluded — they are the bookkeeping the diff maintains, not identity.
+    """
+    return (
+        e["from_slug"],
+        e["to_slug"],
+        e["edge_type"],
+        e["source_file"],
+        e.get("event_date"),
+        e.get("confidence"),
+    )
+
+
 def scan_vault_and_index(
     vault_root: Path = ROOT,
     con: sqlite3.Connection | None = None,
     db_path: Path | None = None,
 ) -> int:
-    """Walk vault, parse all edges, replace contents of edges table.
+    """Walk vault, parse all edges, sync the edges table incrementally.
+
+    Instead of ``clear_edges`` + full reinsert, this reconciles the live
+    (``valid_until IS NULL``) rows against the edges the current vault would
+    produce, matched by :func:`_edge_signature` with multiplicity:
+
+    * a relation (or one of its duplicate occurrences) that is no longer present
+      has ``valid_until`` stamped — a **tombstone**, not a delete, so history and
+      the original ``recorded_at`` survive;
+    * a newly-appeared relation (or an extra occurrence) is inserted fresh with
+      ``recorded_at`` = now and ``valid_until`` NULL;
+    * a byte-identical relation is left exactly as it was (``recorded_at`` kept).
+
+    The net effect on the *live* multiset equals what a full rebuild would have
+    produced, so current-valid queries are invariant (design §R1), while the
+    tombstoned rows accumulate the bi-temporal history.
 
     When ``con`` is omitted the connection is opened against ``db_path``, which
     defaults to ``vault_root``'s own ``Memory/relations.sqlite`` — so scanning a
     copied vault can never overwrite this one's. An explicit ``con`` wins and
     ``db_path`` is then ignored.
 
-    Returns total number of edges inserted.
+    Returns the number of live edges after the sync (= what a full rebuild would
+    have inserted).
     """
     own_con = False
     if con is None:
         con = init_relations_db(db_path or (vault_root / "Memory" / "relations.sqlite"))
         own_con = True
 
-    clear_edges(con)
-
     recorded_at = dt.datetime.now().isoformat(timespec="seconds")
-    total = 0
+
+    # Desired state: every edge the current vault would produce (a full rebuild).
+    desired: list[dict[str, Any]] = []
     file_count = 0
     for path in iter_markdown_files(vault_root):
         file_count += 1
-        batch = edges_from_file(path, vault_root=vault_root, recorded_at=recorded_at)
-        if batch:
-            insert_edges(con, batch)
-            total += len(batch)
+        desired.extend(
+            edges_from_file(path, vault_root=vault_root, recorded_at=recorded_at)
+        )
+    desired_counts = Counter(_edge_signature(e) for e in desired)
+
+    # Live state: currently-valid rows grouped by signature, id-ordered so the
+    # highest ids are the ones tombstoned when multiplicity drops (deterministic).
+    live_ids: dict[tuple[Any, ...], list[int]] = {}
+    for row in con.execute(
+        """
+        SELECT id, from_slug, to_slug, edge_type, source_file, event_date, confidence
+        FROM edges
+        WHERE valid_until IS NULL
+        ORDER BY id
+        """
+    ):
+        sig = (
+            row["from_slug"],
+            row["to_slug"],
+            row["edge_type"],
+            row["source_file"],
+            row["event_date"],
+            row["confidence"],
+        )
+        live_ids.setdefault(sig, []).append(row["id"])
+
+    # Tombstone the surplus: live occurrences beyond the desired multiplicity
+    # (relation gone, or now seen fewer times than before).
+    tombstoned = 0
+    for sig, ids in live_ids.items():
+        want = desired_counts.get(sig, 0)
+        for edge_id in ids[want:]:
+            con.execute(
+                "UPDATE edges SET valid_until = ? WHERE id = ?", (recorded_at, edge_id)
+            )
+            tombstoned += 1
+
+    # Insert the deficit: desired occurrences the live set does not already cover.
+    # Walk ``desired`` in order, taking the shortfall per signature; every
+    # occurrence of a signature is identical for insertion, so which we take
+    # does not matter.
+    deficit: Counter[tuple[Any, ...]] = Counter()
+    for sig, want in desired_counts.items():
+        shortfall = want - len(live_ids.get(sig, ()))
+        if shortfall > 0:
+            deficit[sig] = shortfall
+    to_insert: list[dict[str, Any]] = []
+    for e in desired:
+        sig = _edge_signature(e)
+        if deficit.get(sig, 0) > 0:
+            to_insert.append(e)
+            deficit[sig] -= 1
+    insert_edges(con, to_insert)
+
+    # insert_edges commits only when it inserts; commit here so a tombstone-only
+    # scan (deficit empty) still flushes the UPDATEs above.
+    con.commit()
 
     if own_con:
         con.close()
 
-    print(f"indexed {total} edges from {file_count} files")
-    return total
+    live_total = len(desired)
+    print(
+        f"indexed {live_total} live edges (+{tombstoned} tombstoned) "
+        f"from {file_count} files"
+    )
+    return live_total
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +460,8 @@ def get_related(con: sqlite3.Connection, slug: str, depth: int = 1) -> list[dict
             f"""
             SELECT from_slug, to_slug, edge_type, source_file, event_date, recorded_at
             FROM edges
-            WHERE from_slug IN ({placeholders}) OR to_slug IN ({placeholders})
+            WHERE (from_slug IN ({placeholders}) OR to_slug IN ({placeholders}))
+              AND valid_until IS NULL
             """,
             tuple(frontier) * 2,
         ).fetchall()
@@ -361,6 +483,7 @@ def most_referenced_slugs(con: sqlite3.Connection, limit: int = 10) -> list[tupl
         """
         SELECT to_slug, COUNT(*) AS n
         FROM edges
+        WHERE valid_until IS NULL
         GROUP BY to_slug
         ORDER BY n DESC, to_slug ASC
         LIMIT ?
@@ -576,9 +699,16 @@ def render_index_markdown(con: sqlite3.Connection, vault_root: Path | None = Non
     today = dt.date.today().isoformat()
     now = dt.datetime.now().isoformat(timespec="seconds")
 
-    edges_total = con.execute("SELECT COUNT(*) AS n FROM edges").fetchone()["n"]
+    # Current-valid only: tombstoned (valid_until IS NOT NULL) history rows must
+    # not inflate the totals or the type distribution the brief/planner read.
+    edges_total = con.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE valid_until IS NULL"
+    ).fetchone()["n"]
     type_counts = Counter(
-        row["edge_type"] for row in con.execute("SELECT edge_type FROM edges")
+        row["edge_type"]
+        for row in con.execute(
+            "SELECT edge_type FROM edges WHERE valid_until IS NULL"
+        )
     )
 
     top_refs = most_referenced_slugs(con, limit=10)

@@ -39,6 +39,16 @@ def _edges(con):
     return [dict(r) for r in con.execute("SELECT * FROM edges ORDER BY id")]
 
 
+def _live_edges(con):
+    """Only currently-valid edges (``valid_until IS NULL``), id-ordered."""
+    return [
+        dict(r)
+        for r in con.execute(
+            "SELECT * FROM edges WHERE valid_until IS NULL ORDER BY id"
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # A guard for the guard
 # ---------------------------------------------------------------------------
@@ -287,12 +297,21 @@ def test_scan_replaces_rather_than_accumulates(isolated_vault):
     gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
     first = len(_edges(con))
     gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
+    # A second identical scan neither inserts nor tombstones: the one row stays.
     assert len(_edges(con)) == first == 1
+    original = _edges(con)[0]
 
-    # Removing the source removes its edges on the next scan (clear_edges + reinsert).
+    # Removing the source tombstones its edge on the next scan — the incremental
+    # valid_until path, not clear_edges + reinsert. The live set empties, but the
+    # history row survives in place with its original id and recorded_at.
     (isolated_vault.root / "Notes" / "a.md").unlink()
     gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
-    assert _edges(con) == []
+    assert _live_edges(con) == []
+    survivors = _edges(con)
+    assert len(survivors) == 1
+    assert survivors[0]["id"] == original["id"]
+    assert survivors[0]["valid_until"] is not None
+    assert survivors[0]["recorded_at"] == original["recorded_at"]
     con.close()
 
 
