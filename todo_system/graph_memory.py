@@ -28,7 +28,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 from . import paths
 
@@ -933,6 +933,241 @@ def get_related(con: sqlite3.Connection, slug: str, depth: int = 1) -> list[dict
         frontier = next_frontier
 
     return results
+
+
+# --- hybrid query (memory v2 · G3): semantic KNN + structural BFS -----------
+#
+# ``query_related`` blends two orthogonal, separately-testable signals and returns a
+# ranked list whose items each carry provenance + a split score:
+#
+#   * semantic — an embedding-KNN over the G2 ``vec_embeddings`` vec0 table
+#     (``_knn_seeds``), behind the same lazy ``_load_sqlite_vec`` seam and the same
+#     graceful-degradation contract as ``embed_vault``;
+#   * structural — a ``get_related``-style BFS from the task's own slug over the G1
+#     bi-temporal ``edges`` table (``_traverse_from_slug``), honouring an ``as_of``
+#     time axis.
+#
+# ``get_related`` is left byte-for-byte unchanged (parallel change / 병존); the BFS
+# here is a *separate* function so its SELECT can add provenance columns and the
+# time predicate without disturbing the current-valid reader everything else uses.
+
+
+@dataclass(frozen=True)
+class RelatedScore:
+    """Split score for one hybrid-query hit. Both components are always returned
+    separately — the blend weight is a G4-tunable knob (design §5.2)."""
+
+    vector: float  # semantic KNN component; 0.0 if no hit / embeddings unavailable
+    graph: float  # structural BFS component; 0.0 if not reached from the task slug
+    combined: float  # vector_weight*vector + graph_weight*graph
+
+
+@dataclass(frozen=True)
+class RelatedItem:
+    """One ranked hybrid-query result with its provenance and split score."""
+
+    slug: str  # the related node (file stem / edge endpoint)
+    source_file: str | None  # connecting edge's source, else the KNN doc's path
+    run_id: str | None  # from the connecting edge; None for a pure-semantic hit
+    commit_sha: str | None  # from the connecting edge; None for a pure-semantic hit
+    score: RelatedScore
+    edge_type: str | None  # discovering edge's type; None for a pure-semantic hit
+    hops: int | None  # BFS hop distance from the task slug; None if only semantic
+
+
+def _task_query_text(task: Mapping[str, Any]) -> str:
+    """Compose the KNN query text from a task identity — ``slug`` + ``title`` +
+    ``touches`` (+ ``outcome`` / ``next_action`` when present) — mirroring
+    :func:`_embed_input_text`'s "stem + summary fields" shape so a task queries the
+    corpus in the same vocabulary it was embedded in. ``task`` is read with
+    ``.get()`` so missing keys are tolerated (R4: "slug·제목·touches 로 질의")."""
+    parts: list[str] = []
+    for key in ("slug", "title"):
+        val = task.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    touches = task.get("touches")
+    if isinstance(touches, (list, tuple)):
+        parts.extend(str(t).strip() for t in touches if str(t).strip())
+    elif isinstance(touches, str) and touches.strip():
+        parts.append(touches.strip())
+    for key in ("outcome", "next_action"):
+        val = task.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    return "\n".join(parts)
+
+
+def _traverse_from_slug(
+    con: sqlite3.Connection,
+    slug: str,
+    depth: int,
+    as_of: str | None,
+) -> dict[str, dict[str, Any]]:
+    """BFS from ``slug`` over ``edges`` (both directions), returning — per reached
+    slug, the start excluded — the ``{hop, source_file, run_id, commit_sha,
+    edge_type}`` of the edge that *first* discovered it (``ORDER BY id`` + a
+    ``visited`` set, so the lowest-id discovering edge wins and the result is
+    deterministic).
+
+    Separate from :func:`get_related` on purpose — its SELECT adds the provenance
+    columns and a time predicate. When ``as_of is None`` the window is the
+    current-valid one (``valid_until IS NULL``, identical to ``get_related``);
+    otherwise it is the set of edges valid at that instant:
+    ``recorded_at <= as_of AND (valid_until IS NULL OR valid_until > as_of)``.
+    """
+    if not slug:
+        return {}
+    if as_of is None:
+        time_clause = "AND valid_until IS NULL"
+        time_params: tuple[str, ...] = ()
+    else:
+        time_clause = "AND recorded_at <= ? AND (valid_until IS NULL OR valid_until > ?)"
+        time_params = (as_of, as_of)
+
+    visited: set[str] = {slug}
+    frontier: set[str] = {slug}
+    found: dict[str, dict[str, Any]] = {}
+
+    for hop in range(1, max(1, depth) + 1):
+        if not frontier:
+            break
+        placeholders = ",".join(["?"] * len(frontier))
+        rows = con.execute(
+            f"""
+            SELECT from_slug, to_slug, edge_type, source_file, run_id, commit_sha
+            FROM edges
+            WHERE (from_slug IN ({placeholders}) OR to_slug IN ({placeholders}))
+              {time_clause}
+            ORDER BY id
+            """,
+            tuple(frontier) * 2 + time_params,
+        ).fetchall()
+        next_frontier: set[str] = set()
+        for row in rows:
+            r = dict(row)
+            for key in ("from_slug", "to_slug"):
+                other = r[key]
+                if other in visited:
+                    continue
+                visited.add(other)
+                next_frontier.add(other)
+                found[other] = {
+                    "hop": hop,
+                    "source_file": r["source_file"],
+                    "run_id": r["run_id"],
+                    "commit_sha": r["commit_sha"],
+                    "edge_type": r["edge_type"],
+                }
+        frontier = next_frontier
+
+    return found
+
+
+def _knn_seeds(
+    con: sqlite3.Connection,
+    query_text: str,
+    *,
+    k: int,
+    embedder: Callable[[str], Sequence[float]],
+    dim: int,
+) -> dict[str, dict[str, Any]]:
+    """Semantic layer: the ``k`` nearest embedded corpus docs to ``query_text`` as
+    ``{slug: {"vector": score, "source_file": path}}``.
+
+    Phase 3 fills this in. In Phase 2 it is a stub that yields no hits, so
+    ``query_related`` is BFS-only until the KNN layer lands.
+    """
+    return {}  # vector layer — Phase 3
+
+
+def query_related(
+    con: sqlite3.Connection,
+    task: Mapping[str, Any],
+    *,
+    k: int = 10,
+    depth: int = 1,
+    as_of: str | None = None,
+    embedder: Callable[[str], Sequence[float]] = _default_embedder,
+    dim: int = EMBED_DIM,
+    vector_weight: float = 0.5,
+    graph_weight: float = 0.5,
+) -> list[RelatedItem]:
+    """Hybrid retrieval for a task identity: blend a semantic embedding-KNN with a
+    structural bi-temporal BFS and return a provenance-carrying, ranked list.
+
+    Given ``task`` (a mapping read with ``.get()`` — ``slug`` + ``title`` +
+    ``touches`` + ``outcome`` / ``next_action``), the query (1) **semantically**
+    finds the ``k`` nearest embedded corpus docs (:func:`_knn_seeds`, over the G2
+    vec0 table) and (2) **structurally** expands the task's own slug through the G1
+    ``edges`` graph (:func:`_traverse_from_slug`, ``depth`` hops, ``as_of``-filtered),
+    then unions the two candidate sets into :class:`RelatedItem`\\ s.
+
+    Each item keeps both score components separately (``vector`` / ``graph``) plus
+    their weighted ``combined``; the list is ranked by ``combined`` **desc**,
+    tie-broken by ``slug`` **asc**, with the task's own slug excluded. Provenance
+    precedence: a structurally-reached slug carries its connecting edge's
+    ``source_file`` / ``run_id`` / ``commit_sha`` / ``edge_type`` / ``hops``; a
+    pure-semantic hit carries the KNN doc's ``source_file`` with
+    ``run_id = commit_sha = edge_type = hops = None``.
+
+    **Graceful fallback** (never raises): when sqlite-vec is unavailable or the vault
+    was never embedded, the semantic layer yields nothing and the result is BFS-only
+    — the same contract :func:`embed_vault` honours.
+
+    **Time semantics**: ``as_of`` narrows only the *structural* traversal to the
+    edges valid at that instant. The vector KNN is a latest-snapshot layer (vectors
+    are a derived cache with no per-vector validity window), so ``as_of`` does not
+    rewind it — a documented G3 limitation, not solved here. The graph layer is
+    seeded from the task's **own slug only**; seeding BFS additionally from the
+    semantic hits is a G4 blend-tuning option, out of G3 scope (keeps the two signals
+    orthogonal and separately testable).
+    """
+    task_slug = task.get("slug")
+    graph_hits = (
+        _traverse_from_slug(con, task_slug, depth, as_of) if task_slug else {}
+    )
+
+    query_text = _task_query_text(task)
+    vector_hits = _knn_seeds(con, query_text, k=k, embedder=embedder, dim=dim)
+
+    items: list[RelatedItem] = []
+    for slug in set(graph_hits) | set(vector_hits):
+        if slug == task_slug:
+            continue
+        g = graph_hits.get(slug)
+        v = vector_hits.get(slug)
+        vector_score = v["vector"] if v else 0.0
+        graph_score = 1.0 / (1.0 + g["hop"]) if g else 0.0
+        combined = vector_weight * vector_score + graph_weight * graph_score
+        if g is not None:
+            source_file = g["source_file"]
+            run_id = g["run_id"]
+            commit_sha = g["commit_sha"]
+            edge_type = g["edge_type"]
+            hops = g["hop"]
+        else:
+            source_file = v["source_file"]
+            run_id = None
+            commit_sha = None
+            edge_type = None
+            hops = None
+        items.append(
+            RelatedItem(
+                slug=slug,
+                source_file=source_file,
+                run_id=run_id,
+                commit_sha=commit_sha,
+                score=RelatedScore(
+                    vector=vector_score, graph=graph_score, combined=combined
+                ),
+                edge_type=edge_type,
+                hops=hops,
+            )
+        )
+
+    items.sort(key=lambda it: (-it.score.combined, it.slug))
+    return items
 
 
 def most_referenced_slugs(con: sqlite3.Connection, limit: int = 10) -> list[tuple[str, int]]:
