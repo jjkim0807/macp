@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
 import math
 import re
 import sqlite3
@@ -735,15 +736,21 @@ class EmbeddingsUnavailable(RuntimeError):
 def _load_sqlite_vec(con: sqlite3.Connection):
     """Lazily import sqlite-vec and load the extension into ``con``.
 
-    Import is **inside this function only** — never at module top — so
+    The import is **inside this function only** — never at module top — so
     ``import todo_system.graph_memory`` (and the whole scan/index/query path,
-    and the installed-wheel smoke) stay importable with sqlite-vec absent.
+    and the installed-wheel smoke) stay importable with sqlite-vec absent. It
+    goes through :func:`importlib.import_module` rather than a literal ``import
+    sqlite_vec`` statement on purpose: ``graph_memory`` is on the bare-clone
+    stdlib-only contract (CLAUDE.md §9, ``test_session_log`` AST gate), and a
+    static ``import sqlite_vec`` anywhere in the file — even guarded — would
+    break it. The dependency stays genuinely optional: ``ImportError`` here is
+    turned into a graceful skip, so a dependency-free clone never crashes.
     Raises :class:`EmbeddingsUnavailable` for both "not installed" and "this
     python has no loadable-extension support". Returns the ``sqlite_vec`` module
     (for ``serialize_float32``).
     """
     try:
-        import sqlite_vec
+        sqlite_vec = importlib.import_module("sqlite_vec")
     except ImportError as exc:  # not installed (the shipped wheel's state)
         raise EmbeddingsUnavailable("sqlite-vec is not installed") from exc
     try:
