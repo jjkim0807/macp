@@ -229,3 +229,50 @@ def test_cli_queue_depth_missing_db_is_zero_and_not_created(vault, capsys):
     assert ka.main(["queue-depth"]) == 0
     assert capsys.readouterr().out.strip() == "0"
     assert not (vault / "Todo" / "todo.db").exists()
+
+
+# --- scheduled (near-future not_before = alive, not starved) ----------------------
+
+
+def _in_days(days: float) -> str:
+    import datetime as dt
+    return (dt.datetime.now() + dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+
+
+def test_scheduled_slugs_window_and_exclusions(tmp_path):
+    db = _db(tmp_path, [
+        ("ok-soon", "open", 0, "auto", _in_days(2)),
+        ("ok-soon-T", "open", 0, "delegate", _in_days(6.5).replace(" ", "T")),
+        ("no-now", "open", 0, "auto", None),
+        ("no-past", "open", 0, "auto", "2000-01-01"),
+        ("no-far", "open", 0, "auto", _in_days(30)),
+        ("no-quick", "open", 0, "quick", _in_days(1)),
+        ("no-done", "done", 0, "auto", _in_days(1)),
+        ("no-parent", "open", 1, "auto", _in_days(1)),
+        ("no-failed", "open", 0, "auto", _in_days(1)),
+    ])
+    d = _assign(tmp_path, **{"no-failed": "failed"})
+    assert ka.scheduled_slugs(db, d) == {"ok-soon", "ok-soon-T"}
+    # scheduled tasks never count as queue depth
+    assert ka.actionable_slugs(db, d) == {"no-now", "no-past"}
+
+
+def test_cli_emit_context_silent_when_next_task_is_scheduled_soon(vault, capsys):
+    _policy(vault, _POLICY_A)
+    _db(vault, [("proj-a-next", "open", 0, "auto", _in_days(3))])
+    assert ka.main(["emit-context"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_emit_context_still_starved_when_scheduled_far_off(vault, capsys):
+    _policy(vault, _POLICY_A)
+    _db(vault, [("proj-a-next", "open", 0, "auto", _in_days(30))])
+    assert ka.main(["emit-context"]) == 0
+    assert "- [proj-a-]" in capsys.readouterr().out
+
+
+def test_cli_queue_depth_ignores_scheduled(vault, capsys):
+    _db(vault, [("proj-a-next", "open", 0, "auto", _in_days(3)),
+                ("proj-b-now", "open", 0, "auto", None)])
+    assert ka.main(["queue-depth"]) == 0
+    assert capsys.readouterr().out == "1\n"

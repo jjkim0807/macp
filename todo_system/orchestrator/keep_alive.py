@@ -58,6 +58,24 @@ ACTIONABLE_SQL = (
     "AND replace(trim(not_before),'T',' ') > "
     "strftime('%Y-%m-%d %H:%M:%S','now','localtime'))")
 
+# A keep-alive chain whose next task is merely SCHEDULED — open, actionable mode,
+# not_before in the near future — is alive, not starved. Counting it as starved
+# woke the planner every tick with nothing it may create (the next task already
+# exists, gated to when its input lands), so it answered `verdict: error` and
+# paged a human each time: 45 times for one task gated over a weekend
+# (2026-11-06). The horizon keeps a far-off not_before from parking a chain
+# indefinitely: beyond it the project is starved again, as before.
+SCHEDULED_HORIZON_DAYS = 7
+
+SCHEDULED_SQL = (
+    "SELECT slug FROM tasks WHERE status='open' AND is_parent=0 "
+    "AND worker_mode IN ('auto','delegate','discover') "
+    "AND COALESCE(not_before,'') GLOB '[0-9][0-9][0-9][0-9]-*' "
+    "AND replace(trim(not_before),'T',' ') > "
+    "strftime('%Y-%m-%d %H:%M:%S','now','localtime') "
+    "AND replace(trim(not_before),'T',' ') <= "
+    "strftime('%Y-%m-%d %H:%M:%S','now','localtime', ?)")
+
 HEADING = "## keep-alive starved 프로젝트 (planner_tick 주입)"
 
 
@@ -89,6 +107,20 @@ def actionable_slugs(db_path: Path | None = None,
     finally:
         con.close()
     return open_auto - failed_task_ids(assignments_dir)
+
+
+def scheduled_slugs(db_path: Path | None = None,
+                    assignments_dir: Path | None = None,
+                    horizon_days: int = SCHEDULED_HORIZON_DAYS) -> set[str]:
+    """Open actionable slugs held by a not_before within `horizon_days` from
+    now, minus failed ones. Read-only like `actionable_slugs`; errors propagate."""
+    db = Path(db_path) if db_path else DB_PATH
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        rows = {r[0] for r in con.execute(SCHEDULED_SQL, (f"+{int(horizon_days)} days",))}
+    finally:
+        con.close()
+    return rows - failed_task_ids(assignments_dir)
 
 
 def load_policy(path: Path | None = None) -> list[dict]:
@@ -145,8 +177,9 @@ def render_context(starved_list: list[dict]) -> str:
         "있으면 먼저 읽고 그 방향을 잇는다.",
         "- 이 프로젝트를 `exhausted`·수렴으로 판정하지 않는다. `auto queue depth limit reached`와 "
         "`no trigger events since last exhausted plan` skip도 이 프로젝트에는 적용하지 않는다.",
-        "- `worker_mode: auto` 또는 `delegate`로 만들고 `not_before`는 비우거나 과거로 둔다 "
-        "(quick·미래 not_before 태스크는 실행 가능으로 세지 않아 다음 틱에도 굶은 상태로 남는다).",
+        "- `worker_mode: auto` 또는 `delegate`로 만든다. 입력 데이터가 아직 없어 기다려야 하면 "
+        f"`not_before`를 {SCHEDULED_HORIZON_DAYS}일 이내로 둔다 — 그 기간의 예약 태스크는 연쇄가 살아 있는 "
+        "것으로 세어 다음 틱에 다시 깨우지 않는다. quick이나 그보다 먼 not_before는 굶은 상태로 남는다.",
         "- 가드레일은 그대로다: `max_new_tasks_per_invocation`이 전체 상한이고 굶은 프로젝트가 "
         "먼저 채운다(넘치는 것은 다음 틱), `blocked_patterns`와 `required_fields`도 그대로 지킨다.",
         "- 생성이 정말 불가능하면 `verdict: error tasks=0 reason=\"keep-alive <접두사>: <사유>\"`로 "
@@ -180,8 +213,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         policy = load_policy(args.policy)
         if policy:
-            sys.stdout.write(render_context(
-                starved(policy, actionable_slugs(args.db, args.assignments_dir))))
+            alive = (actionable_slugs(args.db, args.assignments_dir)
+                     | scheduled_slugs(args.db, args.assignments_dir))
+            sys.stdout.write(render_context(starved(policy, alive)))
     except Exception:
         pass
     return 0
