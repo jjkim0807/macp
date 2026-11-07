@@ -282,6 +282,22 @@ class MarkDoneTest(unittest.TestCase):
                          f"- {dt.date.today().isoformat()}: closed by orchestrator")
         self.assertEqual(self._status(), "done")
 
+    def test_close_trace_carries_a_note(self):
+        # The no-op close rides its reason on the SAME trace line, in the one
+        # write that also sets status: done. The bytes BEFORE this close are what
+        # reconcile_closed fingerprints, so a note (part of the close write) never
+        # changes that evidence.
+        self.assertTrue(tasks.mark_done("t-close", items_dir=self.items, db_path=self.db,
+                                        note="no-op: 변경할 것 없음(점검으로 충족)"))
+        text = (self.items / "t-close.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            text.splitlines()[-1],
+            f"- {dt.date.today().isoformat()}: closed by orchestrator — "
+            "no-op: 변경할 것 없음(점검으로 충족)")
+        self.assertEqual(self._status(), "done")
+        # a note does not create a SECOND trace line
+        self.assertEqual(text.count("closed by orchestrator"), 1)
+
     def test_an_already_done_task_gets_no_trace(self):
         # Re-closing what a human already closed ("todo already closed") must not
         # claim the orchestrator closed it.
