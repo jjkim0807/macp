@@ -812,6 +812,50 @@ def rebase_conflict_park(run_dir: Path, last_stage: str) -> bool:
         art.read_text(encoding="utf-8", errors="replace"))
 
 
+def parse_no_op(text: str) -> bool:
+    """report.md/quick.md declares `no_op: true` when the agent EXPLICITLY judged
+    the task a verified no-op — nothing to change, 0 commits made. Same shape as
+    parse_report_rebase_conflict: a frontmatter `no_op: true | yes` line. Absent /
+    `false` / a value that appears only in the prose body = False.
+
+    This is one half of the close decision; the count of commits on the branch is
+    the other (see no_op_run). The signal alone never closes a task — a 0-commit
+    run is as easily a silent agent failure as a genuine no-op — so the explicit
+    signal AND a 0-commit branch must agree."""
+    return bool(re.search(r"^no_op:\s*(true|yes)\b",
+                          text or "", re.I | re.M))
+
+
+def no_op_run(run_dir: Path, last_stage: str, branch: str,
+              repo: str | Path | None = None) -> bool:
+    """Did this run PROVE it had nothing to do — so the runner closes it with a
+    Progress-Log note instead of parking it awaiting_human?
+
+    Same shape as review_hold()/rebase_conflict_park(): read the LAST stage's
+    artifact (report.md for staged, quick.md for quick) for the marker the agent
+    is told to stamp. But a declared no-op is trusted ONLY when the branch really
+    carries 0 commits — a 0-commit run where the agent failed SILENTLY would
+    otherwise be closed as 'nothing to change' with no human ever looking. So both
+    must hold:
+      1. the agent wrote `no_op: true` (parse_no_op), AND
+      2. `origin/<default>..<branch>` counts exactly 0 commits on the checkout.
+    The count base is `origin/<default>` — the exact ref prepare_external_branch
+    cuts the branch at — taken on the checkout `repo`. branch_commits_ahead returns
+    -1 on any git failure, and `-1 == 0` is False, so an uncountable branch PARKS:
+    the conservative default the task mandates ('못 세면 보수적 False'). Every
+    uncertain path (missing artifact, no signal, no repo, uncountable branch)
+    collapses to False → park."""
+    art = Path(run_dir) / STAGE_ARTIFACT.get(last_stage, "report.md")
+    if not art.exists():
+        return False
+    if not parse_no_op(art.read_text(encoding="utf-8", errors="replace")):
+        return False
+    if repo is None:
+        return False
+    default = default_branch(Path(repo))
+    return branch_commits_ahead(Path(repo), branch, base=f"origin/{default}") == 0
+
+
 def gh_pr_merged(branch: str, repo: str | None = None) -> bool | None:
     """Ask GitHub (via `gh`) whether the PR for `branch` actually merged.
 
