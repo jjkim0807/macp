@@ -1312,7 +1312,13 @@ class Orchestrator:
         None = the byte-identical close every other caller does."""
         try:
             from . import tasks
-            tasks.mark_done(slug, note=note)
+            # Forward `note` ONLY when set: the common close stays the byte-identical
+            # mark_done(slug) call every existing caller (and the tests/lambdas that
+            # pin it) expects; the no-op close is the one path that threads a note.
+            if note is None:
+                tasks.mark_done(slug)
+            else:
+                tasks.mark_done(slug, note=note)
         except Exception as e:  # noqa: BLE001 - a close failure must not break collect
             # …but it must not be silent either. play-store-3 (2026-09-10) went
             # ledger=done with its markdown still `open` and nothing said why;
@@ -1339,7 +1345,12 @@ class Orchestrator:
             a.close_fingerprint = tasks.md_fingerprint(a.task_id)
         except Exception:  # noqa: BLE001 - missing evidence only means the old re-close
             a.close_fingerprint = ""
-        self._close_task(a.task_id, note=note)
+        # Same reason as _close_task: keep the note=None close byte-identical to the
+        # call every other caller makes; only the no-op close passes a note.
+        if note is None:
+            self._close_task(a.task_id)
+        else:
+            self._close_task(a.task_id, note=note)
 
     # A DONE row older than this is history, not a close in progress: its task
     # may legitimately have been reopened by a human since. Bounding the sweep
