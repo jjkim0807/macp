@@ -1356,6 +1356,11 @@ class StagedExecutor(ClaudeCodeExecutor):
                                            {"branch": branch, "run_dir": str(run_dir),
                                             "verify": "FAIL", "stages": completed})
             merge_note = ""
+            # A proven no-op closes instead of parking; this flag rides the RESULT
+            # payload (extra["no_op"]) so the orchestrator writes the close note.
+            # Initialised here so the merged-is-True and vault/no-repo paths — which
+            # never reach the no-op check below — leave it False.
+            no_op_close = False
             # #4 (vault half — deliberately NOT gated here, by design): vault
             # tasks (no repo_url) skip the landed-check on purpose. Their merge
             # semantics are unlike a PR — work can land as direct commits to main
@@ -1374,25 +1379,39 @@ class StagedExecutor(ClaudeCodeExecutor):
                 merged = stages.merge_landed(run_dir, last_stage,
                                              branch=branch, repo=repo_url)
                 if merged is not True:
-                    review = True
-                    # Three causes, one park — but they need different notes.
-                    # (1) A LATER concurrent same-repo PR that could not rebase
-                    # cleanly onto a moved origin/main: the report stage aborted
-                    # the rebase (NEVER auto-resolved) and stamped the marker, so
-                    # the overlap judge is what to reconcile — the fixed reason
-                    # string is owned HERE, not by the agent's prose. Checked
-                    # first so a rebase conflict is never mislabelled as a plain
-                    # merge failure. (2) A deliberate hold (agent recommended
-                    # `review` because the task's own guardrails outrank the
-                    # injected auto_merge) is the pipeline working. (3) Anything
-                    # else is a real 'conflict/CI/perm' merge failure.
-                    if stages.rebase_conflict_park(run_dir, last_stage):
-                        merge_note = (" — 동시 실행 충돌 — 겹침 오판 "
-                                      "(rebase 충돌; 자동 해결 안 함, 사람 검토)")
-                    elif stages.review_hold(run_dir, last_stage):
-                        merge_note = " — merge withheld for human review (agent's call, not a failure)"
+                    # A PROVEN no-op is not a park. The agent declared
+                    # `no_op: true` AND the branch carries 0 commits (no_op_run
+                    # requires both; it parks on any uncertainty, and the 0-commit
+                    # floor is what stops a SILENT agent failure — also 0 commits,
+                    # but no signal — from being closed as 'nothing to change').
+                    # There was nothing to merge because there was nothing to do:
+                    # close it (review=False) with a Progress-Log note instead of
+                    # paging a human with 'auto_merge did NOT land'. Checked FIRST
+                    # so a no-op never also stamps one of the three park notes.
+                    if stages.no_op_run(run_dir, last_stage, branch, repo):
+                        review = False
+                        no_op_close = True
+                        merge_note = " — no-op — 변경할 것 없음(점검으로 충족)"
                     else:
-                        merge_note = " — auto_merge did NOT land (conflict/red check/perm); needs review"
+                        review = True
+                        # Three causes, one park — but they need different notes.
+                        # (1) A LATER concurrent same-repo PR that could not rebase
+                        # cleanly onto a moved origin/main: the report stage aborted
+                        # the rebase (NEVER auto-resolved) and stamped the marker, so
+                        # the overlap judge is what to reconcile — the fixed reason
+                        # string is owned HERE, not by the agent's prose. Checked
+                        # first so a rebase conflict is never mislabelled as a plain
+                        # merge failure. (2) A deliberate hold (agent recommended
+                        # `review` because the task's own guardrails outrank the
+                        # injected auto_merge) is the pipeline working. (3) Anything
+                        # else is a real 'conflict/CI/perm' merge failure.
+                        if stages.rebase_conflict_park(run_dir, last_stage):
+                            merge_note = (" — 동시 실행 충돌 — 겹침 오판 "
+                                          "(rebase 충돌; 자동 해결 안 함, 사람 검토)")
+                        elif stages.review_hold(run_dir, last_stage):
+                            merge_note = " — merge withheld for human review (agent's call, not a failure)"
+                        else:
+                            merge_note = " — auto_merge did NOT land (conflict/red check/perm); needs review"
                 else:
                     # Merge confirmed — the deterministic, non-LLM "it landed" event
                     # an app-repo Firebase beta follows. Regression-safe: a no-op
@@ -1425,6 +1444,10 @@ class StagedExecutor(ClaudeCodeExecutor):
             pr_url = stages.parse_report_pr_url(report_txt)
             extra = {"branch": branch, "run_dir": str(run_dir), "stages": completed,
                      "review_required": review, "repo": repo_url}
+            if no_op_close:
+                # review_required is already False for a no-op; this tells the
+                # orchestrator's RESULT close path to stamp the Progress-Log note.
+                extra["no_op"] = True
             if acct:
                 extra["account"] = acct     # the claude account this run spent on
             if pr_url:
