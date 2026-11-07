@@ -460,11 +460,19 @@ def md_fingerprint(slug: str, items_dir: str | Path | None = None) -> str:
         return ""
 
 
-def _with_close_trace(text: str, today: str) -> str:
+def _with_close_trace(text: str, today: str, note: str | None = None) -> str:
     """`text` with `- <today>: closed by orchestrator` appended under its
     `## Progress Log` (created when absent) — beta_publish.append_progress_log's
-    shape, on a string, so it can ride mark_done's single write."""
+    shape, on a string, so it can ride mark_done's single write.
+
+    An optional `note` (e.g. the no-op close's 'no-op: 변경할 것 없음(점검으로 충족)')
+    is appended after a ` — ` so a close that carries a reason leaves it as the
+    same single evidence line. With no `note` the line is byte-identical to
+    before — every caller but the no-op close passes none, so their close bytes
+    (and the reconcile_closed fingerprint they feed) are unchanged."""
     entry = f"- {today}: {CLOSE_TRACE}"
+    if note:
+        entry = f"{entry} — {note}"
     text = text.rstrip("\n")
     if "## Progress Log" in text:
         return f"{text}\n{entry}\n"
@@ -472,7 +480,7 @@ def _with_close_trace(text: str, today: str) -> str:
 
 
 def mark_done(slug: str, items_dir: str | Path | None = None,
-              db_path: str | Path | None = None) -> bool:
+              db_path: str | Path | None = None, note: str | None = None) -> bool:
     """Close a todo task after a successful pipeline (policy A): set the markdown
     status=done + check its boxes, then refresh the local DB — matching the
     legacy worker's close, so the task is not re-dispatched. No-op if the task
@@ -488,6 +496,8 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
     close leaves the pre-close bytes behind exactly, while a reopen — hand edit or
     `cli reopen` — keeps the trace and so never matches them. Re-closing an md
     that already says done adds nothing (a human closed it; the line would lie).
+    An optional `note` suffixes that trace line (e.g. the no-op close's reason);
+    callers that pass none get the byte-identical line they always did.
 
     Status, `updated` and the trace go down in ONE write, and only then are the
     boxes checked. With the boxes first, a failure between the two writes left
@@ -508,7 +518,7 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
     content = cli.update_frontmatter_value(content, "updated", today)
     content = cli.update_frontmatter_value(content, "status", "done")
     if fm and not already_done:   # no frontmatter = no status written = nothing to trace
-        content = _with_close_trace(content, today)
+        content = _with_close_trace(content, today, note)
     path.write_text(content, encoding="utf-8")
     try:
         cli.update_markdown_checkboxes(path, mode="complete")

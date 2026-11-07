@@ -2879,6 +2879,78 @@ class ReviewNotifyTest(unittest.TestCase):
         self.assertIn("delegate.md", text)                         # the artifact pointer
 
 
+class NoOpCloseNotifyTest(unittest.TestCase):
+    """A RESULT the runner tagged `no_op: true` (a verified 0-commit no-op, NOT
+    review_required) closes the task with a Progress-Log note and NO alert — the
+    opposite of the review_required park. A plain success (no `no_op`) still closes
+    with note=None, and review_required still wins (park + ping) if both are set.
+    The user-facing reason string is owned here, like _notify_review's headlines."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mb = FileMailbox(self.tmp / "agents")
+        self.ledger = Ledger(self.tmp / "assignments")
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        self.sent: list = []
+        self.orch = Orchestrator(
+            self.mb, self.reg, self.ledger,
+            notify=lambda t, link=None: self.sent.append(t))
+        self.orch._task_title = lambda slug: slug
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _collect(self, payload):
+        """Dispatch, reply RESULT, route via collect(); capture the (slug, note)
+        mark_done was called with so the close note is observable without the real
+        Todo/items/ tree."""
+        a = self.orch.dispatch(Task("t", {"summary": "x"}))
+        self.mb.send(m.Envelope(to=m.ORCHESTRATOR, type=m.RESULT, frm="w",
+                                task_id=a.task_id, corr_id=a.corr_id, payload=payload))
+        calls: list = []
+
+        def fake_mark_done(slug, **kw):
+            calls.append((slug, kw.get("note")))
+            return True
+
+        with mock.patch.object(tasks, "mark_done", side_effect=fake_mark_done), \
+                mock.patch.object(tasks, "task_status", return_value="open"):
+            self.orch.collect()
+        return calls
+
+    def _payload(self, **kw):
+        p = {"branch": "worker/t", "run_dir": "/v/Worker/runs/20261107T233711-t",
+             "repo": "git@github.com:x/y.git",
+             "stages": ["research", "plan", "implement", "verify", "report"]}
+        p.update(kw)
+        return p
+
+    def test_no_op_result_closes_with_the_note_and_no_alert(self):
+        calls = self._collect(self._payload(no_op=True))
+        self.assertEqual(self.sent, [], f"a no-op close must not alert, got {self.sent}")
+        self.assertEqual(self.ledger.load("t").state, A.DONE)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0][1], "no-op: 변경할 것 없음(점검으로 충족)")
+
+    def test_plain_success_closes_with_no_note(self):
+        # a RESULT without `no_op` (and without review_required) is the ordinary
+        # close — note stays None, no alert, byte-identical to before this feature.
+        calls = self._collect(self._payload())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.ledger.load("t").state, A.DONE)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIsNone(calls[0][1])
+
+    def test_review_required_overrides_no_op_and_parks(self):
+        # Defense-in-depth: the runner never sets both (the no-op arm sets
+        # review=False), but if it did, review_required is checked first — park +
+        # ping, and no close note is written.
+        calls = self._collect(self._payload(review_required=True, no_op=True))
+        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
+        self.assertEqual(calls, [])                      # parked, not closed
+        self.assertEqual(len(self.sent), 1, self.sent)   # the review ping fired
+
+
 class AlertKindStampTest(unittest.TestCase):
     """어느 알림 분기가 실제 발화했는지가 어사인먼트에 남아야 한다.
 

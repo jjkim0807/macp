@@ -1021,6 +1021,92 @@ class RebaseConflictParkRunnerTest(unittest.TestCase):
         self.assertIn("did NOT land", out.summary)
 
 
+class NoOpCloseRunnerTest(unittest.TestCase):
+    """A run that declared `no_op: true` AND left 0 commits must CLOSE (not park):
+    the merge arm sets review_required=False and tags the payload `no_op: true` so
+    the orchestrator closes with a Progress-Log note and no result-no-pr alert. A
+    `no_op: true` with commits still present parks as the ordinary not-landed case —
+    the 0-commit floor is enforced here. Same landed-gate harness as
+    RebaseConflictParkRunnerTest, with branch_commits_ahead stubbed so the count is
+    deterministic without a real branch."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs = self.tmp / "runs"
+        self.runs.mkdir()
+        self.clone = self.tmp / "clone"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_dir(self) -> Path:
+        dirs = list(self.runs.iterdir())
+        self.assertEqual(len(dirs), 1, dirs)
+        return dirs[0]
+
+    def _run(self, report_body: str, commits_ahead: int):
+        def fake_run(argv, **kw):
+            (self._run_dir() / stages.STAGE_ARTIFACT["report"]).write_text(
+                report_body, encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        vp = subprocess.CompletedProcess([], 0, "", "")
+        vp.problem = None
+        vp.orphaned_commits = None
+        payload = {"repo": "git@github.com:x/y.git", "auto_merge": True,
+                   "model_tier": "heavy"}
+        msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="t", payload=payload)
+        with contextlib.ExitStack() as stack:
+            for p in (
+                mock.patch.object(repos, "ensure_worktree", return_value=self.clone),
+                mock.patch.object(stages, "restore_main"),
+                mock.patch.object(stages, "install_push_guard"),
+                mock.patch.object(stages, "default_branch", return_value="main"),
+                mock.patch.object(stages, "prepare_external_branch",
+                                  return_value=subprocess.CompletedProcess([], 0, "", "")),
+                mock.patch.object(stages, "prepare_vault_branch", return_value=vp),
+                mock.patch.object(stages, "remote_branch_exists", return_value=True),
+                mock.patch.object(stages, "RUNS_DIR", self.runs),
+                mock.patch.object(stages, "build_stage_argv", return_value=["true"]),
+                mock.patch.object(stages, "checkpoint_push",
+                                  return_value={"pushed": False, "note": "", "tip": None}),
+                mock.patch.object(stages, "cleanup_build_daemons", return_value={}),
+                mock.patch.object(stages, "remove_worktree"),
+                # force the landed gate to fire without a live `gh pr view`
+                mock.patch.object(stages, "merge_landed", return_value=False),
+                # deterministic 0-commit (or N-commit) count without a real branch
+                mock.patch.object(stages, "branch_commits_ahead", return_value=commits_ahead),
+                mock.patch.object(runner_mod.followups, "append_followups"),
+                mock.patch.object(StagedExecutor, "_account_env", return_value=(None, "")),
+                mock.patch.object(StagedExecutor, "_live_sibling_hold", return_value=None),
+                mock.patch.object(StagedExecutor, "_acquire_checkout_lease", return_value=None),
+                mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
+                mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("report",)),
+                mock.patch("todo_system.worker.runner_heartbeat_start"),
+                mock.patch.object(stages, "run_stage_subprocess", side_effect=fake_run),
+                mock.patch("subprocess.run", side_effect=fake_run),
+            ):
+                stack.enter_context(p)
+            return StagedExecutor().execute(msg, _agent(), progress=lambda _: None)
+
+    def test_signal_and_zero_commits_close_without_alert(self):
+        out = self._run("---\nmerged: n/a\nno_op: true\n---\n# report\n", commits_ahead=0)
+        self.assertTrue(out.ok, out.summary)                 # terminal success, closes
+        self.assertFalse(out.payload.get("review_required"))  # NOT parked
+        self.assertTrue(out.payload.get("no_op"))             # tells the orchestrator to note the close
+        self.assertIn("no-op", out.summary)
+        # a no-op must never also stamp a park note
+        self.assertNotIn("did NOT land", out.summary)
+        self.assertNotIn("동시 실행 충돌", out.summary)
+
+    def test_signal_but_commits_present_still_parks(self):
+        out = self._run("---\nmerged: no\nno_op: true\n---\n# report\n", commits_ahead=3)
+        self.assertTrue(out.ok, out.summary)
+        self.assertTrue(out.payload.get("review_required"))   # 0-commit floor not met → park
+        self.assertIsNone(out.payload.get("no_op"))
+        self.assertIn("did NOT land", out.summary)
+
+
 class CapacityCheckpointTest(unittest.TestCase):
     """A stage DEFERRED on a usage/rate limit must checkpoint-push the external
     branch — the same save the timeout path does — and report capacity_limited=True.

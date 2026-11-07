@@ -1002,7 +1002,14 @@ class Orchestrator:
                             a.state = AWAITING_HUMAN      # PR opened, not merged —
                             self._notify_review(a, msg)   # park for human approval
                         else:
-                            self._close_with_evidence(a)  # done -> close the todo task
+                            # A proven no-op (runner tagged the payload `no_op`)
+                            # closes with a Progress-Log evidence line and NO alert;
+                            # every other success closes exactly as before
+                            # (note=None). The user-facing string is owned here,
+                            # like _notify_review's headlines.
+                            note = ("no-op: 변경할 것 없음(점검으로 충족)"
+                                    if (msg.payload or {}).get("no_op") else None)
+                            self._close_with_evidence(a, note=note)  # done -> close the todo task
                     elif a.state == FAILED and getattr(a, "blocked_on", ""):
                         # Verify named an external blocker. Retrying cannot clear
                         # it — the precondition lives outside this task — so park
@@ -1298,12 +1305,20 @@ class Orchestrator:
         text = human.compose_alert(headline, lines)
         self._notify_routed(text, None, event_key=f"blocker-cancelled:{a.task_id}")
 
-    def _close_task(self, slug: str) -> None:
+    def _close_task(self, slug: str, note: str | None = None) -> None:
         """Close the todo task on success so it is not re-dispatched. A close
-        failure must never break collect."""
+        failure must never break collect. An optional `note` (the no-op close's
+        reason) rides mark_done's single write as a Progress-Log evidence suffix;
+        None = the byte-identical close every other caller does."""
         try:
             from . import tasks
-            tasks.mark_done(slug)
+            # Forward `note` ONLY when set: the common close stays the byte-identical
+            # mark_done(slug) call every existing caller (and the tests/lambdas that
+            # pin it) expects; the no-op close is the one path that threads a note.
+            if note is None:
+                tasks.mark_done(slug)
+            else:
+                tasks.mark_done(slug, note=note)
         except Exception as e:  # noqa: BLE001 - a close failure must not break collect
             # …but it must not be silent either. play-store-3 (2026-09-10) went
             # ledger=done with its markdown still `open` and nothing said why;
@@ -1314,18 +1329,28 @@ class Orchestrator:
                   f"{type(e).__name__}: {e}")
         self._propagate_downstream(slug)
 
-    def _close_with_evidence(self, a: Assignment) -> None:
+    def _close_with_evidence(self, a: Assignment, note: str | None = None) -> None:
         """`_close_task`, after stamping the evidence reconcile_closed reads: the
         md's fingerprint as it was just BEFORE this close. If the close write is
         lost or rewound, the md still matches it; once a human reopens the task
         it never will. Persisting `a` is the caller's job — both callers save it
-        right after."""
+        right after.
+
+        The fingerprint is sampled BEFORE the close write, so an optional `note`
+        (the no-op close's reason, written AS PART OF that close) never changes the
+        bytes reconcile_closed compares against — a lost close still leaves the
+        pre-close bytes behind exactly. Callers that pass no note are unchanged."""
         try:
             from . import tasks
             a.close_fingerprint = tasks.md_fingerprint(a.task_id)
         except Exception:  # noqa: BLE001 - missing evidence only means the old re-close
             a.close_fingerprint = ""
-        self._close_task(a.task_id)
+        # Same reason as _close_task: keep the note=None close byte-identical to the
+        # call every other caller makes; only the no-op close passes a note.
+        if note is None:
+            self._close_task(a.task_id)
+        else:
+            self._close_task(a.task_id, note=note)
 
     # A DONE row older than this is history, not a close in progress: its task
     # may legitimately have been reopened by a human since. Bounding the sweep

@@ -887,6 +887,96 @@ class RebaseConflictParkTest(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class NoOpRunTest(unittest.TestCase):
+    """A run that EXPLICITLY declared a verified no-op (nothing to change, 0
+    commits) closes instead of parking — but ONLY when the agent's `no_op: true`
+    signal AND a 0-commit branch agree. The signal alone never closes (a 0-commit
+    run can be a silent agent failure), and every uncertain path parks."""
+
+    def test_parse_no_op(self):
+        self.assertTrue(stages.parse_no_op("no_op: true"))
+        self.assertTrue(stages.parse_no_op("no_op: yes"))
+        self.assertTrue(stages.parse_no_op("---\nmerged: n/a\nNo_Op: TRUE\n---\n"))  # case-insensitive
+        self.assertFalse(stages.parse_no_op("no_op: false"))
+        self.assertFalse(stages.parse_no_op("no_op: no"))
+        self.assertFalse(stages.parse_no_op("no such field"))
+        # a mention mid-line (not a frontmatter field) is not a signal
+        self.assertFalse(stages.parse_no_op("- notes: it was a no_op: true kind of run"))
+
+    def test_signal_plus_zero_commits_closes(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / stages.STAGE_ARTIFACT["report"]).write_text(
+                "---\nmerged: n/a\nno_op: true\n---\n", encoding="utf-8")
+            with mock.patch.object(stages, "default_branch", return_value="main"), \
+                    mock.patch.object(stages, "branch_commits_ahead", return_value=0) as cnt:
+                self.assertTrue(stages.no_op_run(d, "report", "worker/x", d))
+            # counted from origin/<default>, the base prepare_external_branch cuts at
+            cnt.assert_called_once_with(d, "worker/x", base="origin/main")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_signal_but_commits_present_parks(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / stages.STAGE_ARTIFACT["report"]).write_text(
+                "---\nmerged: no\nno_op: true\n---\n", encoding="utf-8")
+            with mock.patch.object(stages, "default_branch", return_value="main"), \
+                    mock.patch.object(stages, "branch_commits_ahead", return_value=2):
+                self.assertFalse(stages.no_op_run(d, "report", "worker/x", d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_signal_zero_commits_parks(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            # 0 commits with no explicit signal is a silent-failure candidate — park
+            (d / stages.STAGE_ARTIFACT["report"]).write_text(
+                "---\nmerged: no\n---\n", encoding="utf-8")
+            with mock.patch.object(stages, "default_branch", return_value="main"), \
+                    mock.patch.object(stages, "branch_commits_ahead", return_value=0):
+                self.assertFalse(stages.no_op_run(d, "report", "worker/x", d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_quick_artifact_is_read_for_a_quick_run(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / stages.STAGE_ARTIFACT["quick"]).write_text(
+                "---\noverall_status: skip\nno_op: true\n---\n", encoding="utf-8")
+            with mock.patch.object(stages, "default_branch", return_value="main"), \
+                    mock.patch.object(stages, "branch_commits_ahead", return_value=0):
+                self.assertTrue(stages.no_op_run(d, "quick", "worker/x", d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_uncountable_branch_parks(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / stages.STAGE_ARTIFACT["report"]).write_text(
+                "---\nmerged: n/a\nno_op: true\n---\n", encoding="utf-8")
+            # branch_commits_ahead returns -1 on any git failure; -1 == 0 is False → park
+            with mock.patch.object(stages, "default_branch", return_value="main"), \
+                    mock.patch.object(stages, "branch_commits_ahead", return_value=-1):
+                self.assertFalse(stages.no_op_run(d, "report", "worker/x", d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_missing_artifact_and_no_repo_park(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            # missing artifact → False without ever counting
+            with mock.patch.object(stages, "branch_commits_ahead") as cnt:
+                self.assertFalse(stages.no_op_run(d, "report", "worker/x", d))
+                cnt.assert_not_called()
+            # signal present but repo is None (nothing to count against) → park
+            (d / stages.STAGE_ARTIFACT["report"]).write_text(
+                "---\nno_op: true\n---\n", encoding="utf-8")
+            self.assertFalse(stages.no_op_run(d, "report", "worker/x", None))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class StagedExecutorTest(unittest.TestCase):
     def test_make_executor(self):
         ex = make_executor("live-staged")
