@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from todo_system import paths
 from todo_system import usage_guard as ug
 
 NOW = 1_800_000_000.0  # fixed epoch for deterministic math
@@ -395,28 +396,34 @@ def test_status_shows_last_good_on_no_data(tmp_path, monkeypatch, capsys):
 # reimport: each test sets the environment, reloads the module, asserts, then a trailing
 # clean reload (outside the monkeypatch context, env already restored) puts ROOT back to
 # the real repo root for the tests that follow.
+#
+# The byte-identity / install-pin cases hold when the engine runs from a combined
+# layout (a .macp/config.toml marker at the checkout root). Since the engine split
+# no real checkout carries that marker, so they build one with the
+# ``combined_layout`` fixture (tests/conftest.py) and point paths.__file__ into it:
+# inside the context ROOT == the combined root; with the patch undone, on the real
+# tree engine_root() == this module's parents[1]. Together: the original claim.
 
 
-# byte-identity / install-pin hold only in the combined vault layout (a
-# .macp/config.toml marker at the repo root); an engine-only export tree has no
-# marker and reload() raises VaultRootError by design, so these two skip there
-# (public-split-10 AC2 vault-only / AC4). The live vault has the marker and runs them.
-_vault_only_byte_identity = pytest.mark.skipif(
-    not (Path(ug.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-    reason="vault-only: byte-identity holds only in the combined vault layout "
-           "(.macp/config.toml at the repo root); the engine-only export tree has no marker.",
-)
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
 
 
-@_vault_only_byte_identity
-def test_root_no_env_is_byte_identical_repo_root(monkeypatch):
-    # No MACP_VAULT_ROOT and no cwd override -> the resolver returns the install
-    # marker directory, exactly the pre-resolver Path(__file__).resolve().parents[1].
+def test_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
+    # No MACP_VAULT_ROOT and no cwd override, engine checked out in a combined
+    # layout -> the resolver returns the install marker directory, exactly the
+    # pre-resolver Path(__file__).resolve().parents[1].
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(ug)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
+        assert mod.ROOT == paths.engine_root()
     importlib.reload(ug)
+    # real tree: the install root the resolver anchors at is this module's parents[1]
+    assert paths.engine_root() == Path(ug.__file__).resolve().parents[1]
 
 
 def test_root_env_redirects_module_and_state_path(monkeypatch, tmp_path):
@@ -431,8 +438,7 @@ def test_root_env_redirects_module_and_state_path(monkeypatch, tmp_path):
     importlib.reload(ug)
 
 
-@_vault_only_byte_identity
-def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     # A bogus .macp/config.toml in the cwd must NOT capture ROOT: the module pins
     # start= to its install dir, so resolution ignores the cwd-upward search. If it
     # resolved from cwd instead, ROOT would become '/bogus'.
@@ -442,10 +448,12 @@ def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(ug)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
         assert mod.ROOT != Path("/bogus")
     importlib.reload(ug)
+    assert paths.engine_root() == Path(ug.__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
