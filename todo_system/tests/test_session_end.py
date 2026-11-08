@@ -16,8 +16,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from todo_system import paths, session_end, session_log
 
 
@@ -395,36 +393,45 @@ def test_cli_parser_wires_the_session_end_subcommand():
 # so we assert against the resolver called with the module's own start= anchor
 # rather than reloading (reload would risk polluting the module globals the rest of
 # the suite monkeypatches).
+#
+# Byte-identity holds when the engine runs from a combined layout (a
+# .macp/config.toml marker at the checkout root); since the engine split no real
+# checkout carries it, so (b) is split in two: inside a monkeypatch context the
+# ``combined_layout`` fixture (tests/conftest.py) stands in for that checkout and
+# the resolver returns it unchanged; with the patch undone, on the real tree the
+# resolver's anchor is this module's own parents[1].
 # ---------------------------------------------------------------------------
 
 
-# byte-identity holds only in the combined vault layout (a .macp/config.toml marker
-# at the repo root); an engine-only export tree has no marker and vault_root() raises
-# by design, so this case skips there (public-split-10 AC2 vault-only / AC4). The live
-# vault has the marker, so it runs the assertion exactly as before.
-_vault_only_byte_identity = pytest.mark.skipif(
-    not (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-    reason="vault-only: byte-identity holds only in the combined vault layout "
-           "(.macp/config.toml at the repo root); the engine-only export tree has no marker.",
-)
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
 
 
-@_vault_only_byte_identity
-def test_root_is_byte_identical_repo_root_when_env_unset(monkeypatch):
+def test_root_is_byte_identical_repo_root_when_env_unset(monkeypatch, combined_layout):
     env = os.environ.get("MACP_VAULT_ROOT")    # what the module saw at import
-    monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    with monkeypatch.context() as m:
+        m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
+        # The exact expression session_end.py:43 evaluates: in a combined layout the
+        # .macp marker at the install root makes the resolver return that root
+        # unchanged — the value the old hard-coded parents[1] produced.
+        assert paths.vault_search_start() == combined_layout
+        assert paths.vault_root(start=paths.vault_search_start()) == combined_layout
+    # real tree: the anchor is this module's own parents[1], a real engine root
     install = Path(session_end.__file__).resolve().parents[1]
-    # The .macp marker at the install root makes the resolver return that root
-    # unchanged — exactly the value the old hard-coded parents[1] produced.
-    assert paths.vault_root(start=install) == install
-    assert (install / "todo_system" / "session_end.py").is_file()  # a real root
-    # ...and the module actually holds that value (the env vault instead when
+    assert paths.vault_search_start() == install
+    assert (install / "todo_system" / "session_end.py").is_file()
+    # ...and the module holds the resolver's import-time value (the env vault when
     # a worker stage set MACP_VAULT_ROOT before import).
-    assert session_end.ROOT == (Path(env).expanduser() if env else install)
+    expected = (Path(env).expanduser() if env
+                else paths.vault_root(start=paths.vault_search_start()))
+    assert session_end.ROOT == expected
 
 
 def test_root_is_redirectable_via_macp_vault_root_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MACP_VAULT_ROOT", str(tmp_path))
     install = Path(session_end.__file__).resolve().parents[1]
-    # Same expression session_end.py:38 evaluates — env wins over the anchor.
+    # Same expression session_end.py:43 evaluates — env wins over the anchor.
     assert paths.vault_root(start=install) == tmp_path
