@@ -130,22 +130,16 @@ def test_compose_alert_a_url_placed_whole_is_never_split():
 # Byte-identity to parents[1] holds when the engine runs from a combined layout (a
 # .macp/config.toml marker at the checkout root). No real engine checkout carries
 # that marker since the split, so the case builds one with the ``combined_layout``
-# fixture (tests/conftest.py) and points paths.__file__ into it: inside the context
+# fixture (todo_system/conftest.py) and points paths.__file__ into it: inside the context
 # _vault_root() == the combined root; with the patch undone, on the real tree
 # engine_root() == this module's parents[1]. Together: the original claim.
 
 
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
-
-
-def test_vault_root_falls_back_to_shared_resolver_when_all_env_unset(monkeypatch, combined_layout):
+def test_vault_root_falls_back_to_shared_resolver_when_all_env_unset(monkeypatch, combined_layout, install_engine_at):
     monkeypatch.delenv("KAKAO_VAULT_DIR", raising=False)
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
     with monkeypatch.context() as m:
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         # Combined layout, no env: the install root, proven to go through the shared
         # resolver rather than any private computation. _vault_root() resolves at
         # call time, so no reload is needed.

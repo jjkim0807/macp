@@ -282,7 +282,7 @@ def test_layer_a_fallback_matches_primary(tmp_path, monkeypatch):
 # dropped; the default root is still pinned to cli.ROOT and to a real Todo/ tree.
 # Byte-identity to parents[1] holds when the engine runs from a combined layout (a
 # .macp/config.toml marker at the checkout root), which no real checkout carries any
-# more, so it is retargeted at the ``combined_layout`` fixture (tests/conftest.py).
+# more, so it is retargeted at the ``combined_layout`` fixture (todo_system/conftest.py).
 
 
 def test_default_root_is_the_live_vault():
@@ -310,18 +310,12 @@ def test_default_root_is_the_live_vault():
 # unchanged; with the patch undone, on the real tree the anchor is parents[1].
 
 
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
-
-
 def test_default_vault_root_is_byte_identical_repo_root_when_env_unset(
-        monkeypatch, combined_layout):
+        monkeypatch, combined_layout, install_engine_at):
     env = os.environ.get("MACP_VAULT_ROOT")    # what the module saw at import
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         # The exact expression task_export.py:66 evaluates: in a combined layout the
         # .macp marker at the install root makes the resolver return that root
         # unchanged — the value the old hard-coded parents[1] produced.

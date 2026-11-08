@@ -124,6 +124,10 @@ on a test, class or method. Limits: a spawned process sees only the env
 redirect, not the fetch or git block, and a test that reloads either module
 (``importlib.reload``) gets the real functions back for the rest of that test.
 
+Two shared, non-autouse fixtures live here too, so both suites see one copy:
+``combined_layout`` (a throwaway engine checkout that is also the vault) and
+``install_engine_at`` (points ``paths.__file__`` into such a tree).
+
 Bare ``python -m unittest`` never loads this file, so it gets none of these layers.
 """
 
@@ -139,7 +143,7 @@ from typing import NamedTuple
 
 import pytest
 
-from todo_system import cli, maintenance_disk, usage_guard, worker
+from todo_system import cli, maintenance_disk, paths, usage_guard, worker
 from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
 from todo_system.orchestrator import orchestrator as _orch_mod
 
@@ -573,3 +577,45 @@ def real_auto_side_effects():
         "pull_main": _REAL_PULL_MAIN,
         "check_divergence": _REAL_CHECK_DIVERGENCE,
     })
+
+
+# --- combined layout: the engine checkout that is also the vault -------------------
+# Before the engine split the vault and the engine were one tree, with
+# .macp/config.toml at its root; vault_root()'s step-4 fallback, engine_root() and
+# vault_search_start() all anchored at that root. The engine checkout no longer
+# carries the marker, so the tests that pin that behaviour build this throwaway tree
+# and point paths.__file__ into it (inside their own monkeypatch context).
+# Lives here, not in tests/conftest.py, so the orchestrator suite sees it too.
+
+
+@pytest.fixture
+def combined_layout(tmp_path_factory) -> Path:
+    """A throwaway combined layout: ``.macp/config.toml`` beside ``todo_system/`` and
+    ``scripts/`` (no ``todo_system/_engine`` marker, so it reads as a checkout).
+
+    Built under its own ``mktemp`` dir — a sibling of the test's ``tmp_path``, never
+    an ancestor — so a bogus ``.macp`` a test writes into ``tmp_path`` (and a start
+    dir under it) never walks up into this marker. The config carries no
+    ``vault_root`` key, so the marker directory itself is the vault root."""
+    root = tmp_path_factory.mktemp("combined").resolve()
+    (root / "todo_system").mkdir()
+    (root / "scripts").mkdir()
+    (root / ".macp").mkdir()
+    (root / ".macp" / "config.toml").write_text("profile = 'test-host'\n", encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def install_engine_at():
+    """``(m, root) -> None``: point ``paths.__file__`` into ``root``.
+
+    Pass the test's ``monkeypatch`` or a ``monkeypatch.context()`` as ``m``; the
+    patch is undone with it. engine_root(), vault_search_start() and the step-4
+    fallback all derive from ``paths.__file__``, so they move together."""
+
+    def _install(m, root):
+        """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+        were checked out at ``root`` (``root/todo_system/paths.py``)."""
+        m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
+
+    return _install

@@ -397,23 +397,17 @@ def test_cli_parser_wires_the_session_end_subcommand():
 # Byte-identity holds when the engine runs from a combined layout (a
 # .macp/config.toml marker at the checkout root); since the engine split no real
 # checkout carries it, so (b) is split in two: inside a monkeypatch context the
-# ``combined_layout`` fixture (tests/conftest.py) stands in for that checkout and
+# ``combined_layout`` fixture (todo_system/conftest.py) stands in for that checkout and
 # the resolver returns it unchanged; with the patch undone, on the real tree the
 # resolver's anchor is this module's own parents[1].
 # ---------------------------------------------------------------------------
 
 
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
-
-
-def test_root_is_byte_identical_repo_root_when_env_unset(monkeypatch, combined_layout):
+def test_root_is_byte_identical_repo_root_when_env_unset(monkeypatch, combined_layout, install_engine_at):
     env = os.environ.get("MACP_VAULT_ROOT")    # what the module saw at import
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         # The exact expression session_end.py:43 evaluates: in a combined layout the
         # .macp marker at the install root makes the resolver return that root
         # unchanged — the value the old hard-coded parents[1] produced.

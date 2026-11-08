@@ -46,14 +46,8 @@ ENGINE = Path(__file__).resolve().parents[2]
 
 # Byte-identity through vault_root() needs the vault marker at the checkout root
 # (the combined layout); this checkout has none, so those cases build one — the
-# combined_layout fixture (tests/conftest.py) in-process, combined_copy below for
+# combined_layout fixture (todo_system/conftest.py) in-process, combined_copy below for
 # the fresh-interpreter probes.
-
-
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
 
 
 @pytest.fixture(scope="module")
@@ -186,22 +180,22 @@ def test_vault_search_start_ignores_vault_redirect(tmp_path, monkeypatch):
     assert paths.vault_search_start() == ENGINE
 
 
-def test_vault_root_via_search_start_is_byte_identical_in_checkout(monkeypatch, combined_layout):
+def test_vault_root_via_search_start_is_byte_identical_in_checkout(monkeypatch, combined_layout, install_engine_at):
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
-    _install_engine_at(monkeypatch, combined_layout)
+    install_engine_at(monkeypatch, combined_layout)
     legacy = paths.vault_root(start=Path(paths.__file__).resolve().parents[1])
     assert paths.vault_root(start=paths.vault_search_start()) == legacy == combined_layout
     assert paths.engine_root() == combined_layout
 
 
-def test_vault_root_via_search_start_pins_engine_not_cwd(tmp_path, monkeypatch, combined_layout):
+def test_vault_root_via_search_start_pins_engine_not_cwd(tmp_path, monkeypatch, combined_layout, install_engine_at):
     # The reason start= is passed at all: a bogus marker in the cwd must not win
     # in a checkout, where the anchor is the engine root.
     (tmp_path / ".macp").mkdir()
     (tmp_path / ".macp" / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
     monkeypatch.chdir(tmp_path)
-    _install_engine_at(monkeypatch, combined_layout)
+    install_engine_at(monkeypatch, combined_layout)
     got = paths.vault_root(start=paths.vault_search_start())
     assert got == combined_layout
     assert got == paths.engine_root()

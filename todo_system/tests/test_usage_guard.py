@@ -400,24 +400,18 @@ def test_status_shows_last_good_on_no_data(tmp_path, monkeypatch, capsys):
 # The byte-identity / install-pin cases hold when the engine runs from a combined
 # layout (a .macp/config.toml marker at the checkout root). Since the engine split
 # no real checkout carries that marker, so they build one with the
-# ``combined_layout`` fixture (tests/conftest.py) and point paths.__file__ into it:
+# ``combined_layout`` fixture (todo_system/conftest.py) and point paths.__file__ into it:
 # inside the context ROOT == the combined root; with the patch undone, on the real
 # tree engine_root() == this module's parents[1]. Together: the original claim.
 
 
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
-
-
-def test_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
+def test_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout, install_engine_at):
     # No MACP_VAULT_ROOT and no cwd override, engine checked out in a combined
     # layout -> the resolver returns the install marker directory, exactly the
     # pre-resolver Path(__file__).resolve().parents[1].
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         mod = importlib.reload(ug)
         assert mod.ROOT == combined_layout
         assert mod.ROOT == paths.engine_root()
@@ -438,7 +432,7 @@ def test_root_env_redirects_module_and_state_path(monkeypatch, tmp_path):
     importlib.reload(ug)
 
 
-def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
+def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout, install_engine_at):
     # A bogus .macp/config.toml in the cwd must NOT capture ROOT: the module pins
     # start= to its install dir, so resolution ignores the cwd-upward search. If it
     # resolved from cwd instead, ROOT would become '/bogus'.
@@ -448,7 +442,7 @@ def test_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_lay
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         mod = importlib.reload(ug)
         assert mod.ROOT == combined_layout
         assert mod.ROOT != Path("/bogus")
