@@ -22,12 +22,6 @@ import pytest
 
 from todo_system.orchestrator import beta_publish as bp
 
-# The shipped canon now lives in the VAULT (.macp/), not in the engine package, so
-# an argument-less bp.load_config() follows MACP_VAULT_ROOT. The shipped-config
-# tests below must assert about THIS checkout's canon regardless of the runtime
-# env, so they anchor the path explicitly instead of taking the module default.
-_SHIPPED_CONFIG = Path(bp.__file__).resolve().parents[2] / ".macp" / "beta_publish_config.json"
-
 REPO = "if-then-habits"
 APP_ID = "1:493678352690:android:a8d8b840897be693e8df2b"
 PROJECT = "ifthenhabits-app"
@@ -640,17 +634,6 @@ def test_copy_files_entry_escaping_the_clone_is_rejected(env, tmp_path):
     assert not run.has(":app:assembleBeta")
 
 
-@pytest.mark.skipif(
-    not _SHIPPED_CONFIG.is_file(),
-    reason="vault-only: the beta_publish canon (.macp/beta_publish_config.json) is vault "
-           "data (moved out of the engine package in split-8), not in the engine code "
-           "export set — absent in an engine-only tree (public-split-10 AC2).",
-)
-def test_shipped_config_stages_mulkko_backup_settings():
-    cfg = bp.load_config(_SHIPPED_CONFIG)
-    assert cfg["if-then-habits"]["copy_files"] == {".secrets/mulkko.json": ".secrets/mulkko.json"}
-
-
 # --- build_props: gitignored gradle-property secrets (advote endpoint/key) -----
 
 def _with_build_props(env, tmp_path, *, props_from=".secrets/advote.json",
@@ -773,41 +756,6 @@ def test_build_props_failure_does_not_stage_copy_files_secret(env, tmp_path):
         _publish_in(env, run, vault)
     assert not dest.exists()                                       # copy_files secret never staged
     assert not run.has(":app:assembleBeta")
-
-
-@pytest.mark.skipif(
-    not _SHIPPED_CONFIG.is_file(),
-    reason="vault-only: the beta_publish canon (.macp/beta_publish_config.json) is vault "
-           "data (moved out of the engine package in split-8), not in the engine code "
-           "export set — absent in an engine-only tree (public-split-10 AC2).",
-)
-def test_shipped_config_wires_dripcoffee_advote_build_props():
-    """The real shipped config wires DripCoffee to .secrets/advote.json; if-then-habits
-    stays unwired so its build argv cannot change."""
-    cfg = bp.load_config(_SHIPPED_CONFIG)
-    dc = cfg["DripCoffee"]
-    assert dc["build_props_from"] == ".secrets/advote.json"
-    assert dc["build_props"] == {"advote.endpoint": "endpoint", "advote.appKey": "ingest_key"}
-    assert "build_props_from" not in cfg["if-then-habits"]
-
-
-@pytest.mark.skipif(
-    not _SHIPPED_CONFIG.is_file(),
-    reason="vault-only: the beta_publish canon (.macp/beta_publish_config.json) is vault "
-           "data (moved out of the engine package in split-8), not in the engine code "
-           "export set — absent in an engine-only tree (public-split-10 AC2).",
-)
-def test_shipped_config_wires_dancemirror_advote_build_props():
-    """The real shipped config wires DanceMirror to .secrets/advote.json with its OWN
-    ingest key (its own advote tenant since 2026-10-13 — sharing DripCoffee's key filed
-    DanceMirror feedback/usage under the dripcoffee app); if-then-habits stays unwired
-    so its build argv cannot change."""
-    cfg = bp.load_config(_SHIPPED_CONFIG)
-    dm = cfg["DanceMirror"]
-    assert dm["build_props_from"] == ".secrets/advote.json"
-    assert dm["build_props"] == {"advote.endpoint": "endpoint",
-                                 "advote.appKey": "dancemirror_ingest_key"}
-    assert "build_props_from" not in cfg["if-then-habits"]
 
 
 # --- canon location: vault .macp/, redirectable via MACP_VAULT_ROOT -----------
