@@ -168,28 +168,11 @@ class RunnerVaultDataRootSplitTest(unittest.TestCase):
     LiveSiblingCheckoutGuardTest (test_runner) and the Vault* classes below; this
     pins the CONSTANT the 11 lines read, which is what makes the "byte-identical
     when unset" claim testable at all.
-    """
 
-    @unittest.skipUnless(
-        (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-        "vault-only: byte-identity to the engine root holds only in the combined vault "
-        "layout (.macp/config.toml at the repo root); the engine-only export tree has "
-        "no marker and vault_root() raises by design (public-split-10 AC2 / AC4).",
-    )
-    def test_byte_identical_to_engine_root_when_env_unset(self):
-        """AC#2: with MACP_VAULT_ROOT unset (the installed config) every replaced
-        line resolves to the exact path the REPO_ROOT alias always returned."""
-        anchor = Path(stages.__file__).resolve().parents[2]
-        env = os.environ.get("MACP_VAULT_ROOT")    # what stages saw at import
-        # The resolver, env cleared, returns the engine anchor — the value
-        # _VAULT_DATA_ROOT is computed from at import in the shipped config.
-        with mock.patch.dict(os.environ, clear=False):
-            os.environ.pop("MACP_VAULT_ROOT", None)
-            self.assertEqual(paths.vault_root(start=anchor), anchor)
-        # …and the imported constants agree, so the 11 runner lines are unchanged.
-        # A worker stage sets the env before import; the constant then holds it.
-        self.assertEqual(stages._VAULT_DATA_ROOT, Path(env).expanduser() if env else anchor)
-        self.assertEqual(stages._ENGINE_ROOT, anchor)
+    The byte-identity pin is the module-level
+    ``test_byte_identical_to_engine_root_when_env_unset`` right below this class:
+    it needs the ``combined_layout`` fixture, which a TestCase method cannot take.
+    """
 
     def test_the_split_is_not_a_rename_redirect_moves_only_vault_data(self):
         """The migration would be pointless if the two roots could never differ:
@@ -204,6 +187,37 @@ class RunnerVaultDataRootSplitTest(unittest.TestCase):
         # The engine root never moved — the env only steers the vault-data root.
         self.assertEqual(stages._ENGINE_ROOT,
                          Path(stages.__file__).resolve().parents[2])
+
+
+def test_byte_identical_to_engine_root_when_env_unset(monkeypatch, combined_layout,
+                                                      install_engine_at):
+    """AC#2: with MACP_VAULT_ROOT unset (the installed config) every replaced
+    runner line resolves to the exact path the REPO_ROOT alias always returned.
+
+    Byte-identity holds in the combined layout (.macp/config.toml at the engine
+    checkout root). No real engine checkout carries that marker since the split,
+    so the case points paths.__file__ into the throwaway ``combined_layout`` and
+    evaluates stages.py's own two expressions there — value comparisons only, no
+    reload, so the live _VAULT_DATA_ROOT / RUNS_DIR are never touched."""
+    anchor = Path(stages.__file__).resolve().parents[2]
+    env = os.environ.get("MACP_VAULT_ROOT")    # what stages saw at import
+    with monkeypatch.context() as m:
+        install_engine_at(m, combined_layout)
+        m.delenv("MACP_VAULT_ROOT", raising=False)
+        # stages.py's _ENGINE_ROOT / _VAULT_DATA_ROOT expressions, env cleared: the
+        # vault-data root IS the engine root, and the resolver returns the anchor
+        # unchanged — the value _VAULT_DATA_ROOT is computed from in the shipped config.
+        engine = paths.engine_root()
+        vault_data = paths.vault_root(start=paths.vault_search_start())
+        assert engine == combined_layout
+        assert vault_data == engine
+        assert paths.vault_root(start=combined_layout) == combined_layout
+    # Patch undone, real tree: the imported constants agree, so the 11 runner lines
+    # are unchanged. A worker stage sets the env before import; the constant then
+    # holds it.
+    assert paths.engine_root() == anchor
+    assert stages._VAULT_DATA_ROOT == (Path(env).expanduser() if env else anchor)
+    assert stages._ENGINE_ROOT == anchor
 
 
 class StageTimeoutForTest(unittest.TestCase):
