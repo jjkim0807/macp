@@ -9,7 +9,7 @@ They now resolve from the engine checkout (_INSTALL_DIR), like
 scripts/claude_auth_watch.py. The vault-side constants stay on VAULT.
 
 The combined layout (engine == vault) is pinned on the ``combined_layout``
-fixture (tests/conftest.py), so both layouts run on any engine checkout.
+fixture (todo_system/conftest.py), so both layouts run on any engine checkout.
 
 Only the constants are inspected: nothing is sent and no subprocess runs.
 """
@@ -22,12 +22,6 @@ from pathlib import Path
 from todo_system import paths
 
 _ENGINE = Path(__file__).resolve().parents[2]
-
-
-def _install_engine_at(m, root):
-    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
-    were checked out at ``root`` (``root/todo_system/paths.py``)."""
-    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
 
 
 def _vault_skeleton(root: Path) -> Path:
@@ -99,17 +93,17 @@ def test_kakao_digest_send_send_sh_resolves_to_engine(tmp_path, monkeypatch):
 # Combined layout (engine == vault): the sender is VAULT/scripts/kakao_send.sh, the
 # same path as before the split-11 fix. No real engine checkout carries a
 # .macp/config.toml marker since the split, so these build one with the
-# ``combined_layout`` fixture (tests/conftest.py) and point paths.__file__ into it.
+# ``combined_layout`` fixture (todo_system/conftest.py) and point paths.__file__ into it.
 # The fixture's scripts/ is empty by design: a stub sender written there would make
 # an .exists() check a tautology, so existence is pinned on the real tree instead,
 # with the patch undone — the resolver's install root really ships the sender.
 
 
-def test_health_report_kakao_send_sh_combined_layout(monkeypatch, combined_layout):
+def test_health_report_kakao_send_sh_combined_layout(monkeypatch, combined_layout, install_engine_at):
     monkeypatch.delenv("KAKAO_VAULT_DIR", raising=False)
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
     with monkeypatch.context() as m:
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         C = _load(m, "health_report", "health_report_11c_combined")
         assert Path(C.VAULT) == combined_layout
         assert C._INSTALL_DIR == combined_layout
@@ -121,13 +115,13 @@ def test_health_report_kakao_send_sh_combined_layout(monkeypatch, combined_layou
     assert (paths.engine_root() / "scripts" / "kakao_send.sh").is_file()
 
 
-def test_kakao_digest_send_send_sh_combined_layout(monkeypatch, combined_layout):
+def test_kakao_digest_send_send_sh_combined_layout(monkeypatch, combined_layout, install_engine_at):
     # KAKAO_VAULT_DIR is this module's top-priority VAULT override (and conftest's
     # autouse sets it), so it must be unset or VAULT never reaches the resolver.
     monkeypatch.delenv("KAKAO_VAULT_DIR", raising=False)
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
     with monkeypatch.context() as m:
-        _install_engine_at(m, combined_layout)
+        install_engine_at(m, combined_layout)
         C = _load(m, "kakao_digest_send", "kakao_digest_send_11c_combined")
         assert Path(C.VAULT) == combined_layout
         assert C._INSTALL_DIR == combined_layout
