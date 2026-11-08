@@ -20,8 +20,11 @@ Two helpers come with it:
   where no vault marker can ever be.
 
 The dev-checkout cases run against this repo; the installed cases use fake
-layouts under ``tmp_path`` through the ``package_dir`` seam. Nothing touches
-the live vault. No literal from the identifier gate's pattern may appear in
+layouts under ``tmp_path`` through the ``package_dir`` seam. The combined-layout
+cases (a checkout that is also the vault, marker at its root) run against a
+throwaway tree: in-process through the ``combined_layout`` fixture with
+``paths.__file__`` pointed into it, and in a fresh interpreter against a real
+copy of the engine tree with the marker added. Nothing touches the live vault. No literal from the identifier gate's pattern may appear in
 this file: it sits inside the scanned tree.
 """
 
@@ -30,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -40,13 +44,33 @@ from todo_system import paths
 
 ENGINE = Path(__file__).resolve().parents[2]
 
-# Byte-identity through vault_root() needs the vault marker at the repo root
-# (the combined layout this vault runs); an engine-only export tree has none and
-# the resolver raises by design on both sides of the comparison.
-_vault_only = pytest.mark.skipif(
-    not (ENGINE / ".macp" / "config.toml").is_file(),
-    reason="vault-only: needs .macp/config.toml at the repo root (combined layout)",
-)
+# Byte-identity through vault_root() needs the vault marker at the checkout root
+# (the combined layout); this checkout has none, so those cases build one — the
+# combined_layout fixture (tests/conftest.py) in-process, combined_copy below for
+# the fresh-interpreter probes.
+
+
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
+
+
+@pytest.fixture(scope="module")
+def combined_copy(tmp_path_factory) -> Path:
+    """A real combined layout: a copy of the engine tree (the sdist set minus the
+    tests) with a vault marker at its root, so every module ``__file__`` really
+    lives under it. A copy, not a symlink: ``resolve()`` would lead back here."""
+    root = tmp_path_factory.mktemp("combined-copy").resolve()
+    shutil.copytree(ENGINE / "todo_system", root / "todo_system",
+                    ignore=shutil.ignore_patterns("tests", "__pycache__", "*.pyc", "_engine"))
+    shutil.copytree(ENGINE / "scripts", root / "scripts",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    if (ENGINE / ".claude" / "commands").is_dir():
+        shutil.copytree(ENGINE / ".claude" / "commands", root / ".claude" / "commands")
+    (root / ".macp").mkdir()
+    (root / ".macp" / "config.toml").write_text("", encoding="utf-8")
+    return root
 
 
 def _fake_checkout(root: Path) -> Path:
@@ -162,22 +186,26 @@ def test_vault_search_start_ignores_vault_redirect(tmp_path, monkeypatch):
     assert paths.vault_search_start() == ENGINE
 
 
-@_vault_only
-def test_vault_root_via_search_start_is_byte_identical_in_checkout(monkeypatch):
+def test_vault_root_via_search_start_is_byte_identical_in_checkout(monkeypatch, combined_layout):
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    _install_engine_at(monkeypatch, combined_layout)
     legacy = paths.vault_root(start=Path(paths.__file__).resolve().parents[1])
-    assert paths.vault_root(start=paths.vault_search_start()) == legacy == ENGINE
+    assert paths.vault_root(start=paths.vault_search_start()) == legacy == combined_layout
+    assert paths.engine_root() == combined_layout
 
 
-@_vault_only
-def test_vault_root_via_search_start_pins_engine_not_cwd(tmp_path, monkeypatch):
+def test_vault_root_via_search_start_pins_engine_not_cwd(tmp_path, monkeypatch, combined_layout):
     # The reason start= is passed at all: a bogus marker in the cwd must not win
     # in a checkout, where the anchor is the engine root.
     (tmp_path / ".macp").mkdir()
     (tmp_path / ".macp" / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
     monkeypatch.chdir(tmp_path)
-    assert paths.vault_root(start=paths.vault_search_start()) == ENGINE
+    _install_engine_at(monkeypatch, combined_layout)
+    got = paths.vault_root(start=paths.vault_search_start())
+    assert got == combined_layout
+    assert got == paths.engine_root()
+    assert got != Path("/bogus")
 
 
 def test_vault_root_with_none_start_searches_from_cwd(tmp_path, monkeypatch):
@@ -296,8 +324,9 @@ _ANCHORED_SOURCES = (
     "scripts/claude_auth_watch.py",
     "scripts/claude_model_autoswitch.py",
     "scripts/export_db_snapshot.py",
-    "scripts/claude_remote_control_watchdog.py",
-    "scripts/claude_upgrade.py",
+    # claude_remote_control_watchdog.py and claude_upgrade.py were here until the
+    # 2026-10-19 engine split moved both to the vault's ops/ — they are no longer
+    # part of this tree, so there is nothing here left to ratchet.
     "todo_system/advote_bridge.py",
 )
 # Scripts that looked config keys up at the engine instead of the vault.
@@ -310,8 +339,8 @@ _CONFIG_KEY_SOURCES = (
 
 @pytest.mark.parametrize("source", _ANCHORED_SOURCES)
 def test_no_engine_anchored_vault_root_left(source):
-    if not (ENGINE / source).is_file():
-        pytest.skip(f"{source} is vault-only (scripts/public_export_exclude.txt)")
+    # Every listed source lives in this tree; a move must update the list, not skip.
+    assert (ENGINE / source).is_file(), source
     src = (ENGINE / source).read_text(encoding="utf-8")
     assert re.search(r"vault_root\(start=(Path\(__file__\)|_INSTALL_DIR)", src) is None, source
     assert "paths.vault_root(start=paths.vault_search_start())" in src, source
@@ -347,11 +376,11 @@ _PROBE_MODULES = (
 )
 
 
-def _probe_modules(cwd: Path, env_vault: Path | None) -> dict[str, Path]:
+def _probe_modules(cwd: Path, env_vault: Path | None, engine: Path = ENGINE) -> dict[str, Path]:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB}
     if env_vault is not None:
         env["MACP_VAULT_ROOT"] = str(env_vault)
-    env["PYTHONPATH"] = str(ENGINE)
+    env["PYTHONPATH"] = str(engine)
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE_MODULES], cwd=str(cwd), env=env,
         capture_output=True, text=True, timeout=120,
@@ -380,22 +409,23 @@ def test_module_vault_constants_converge_in_a_fresh_interpreter(tmp_path):
         assert got[key] == vault, (key, got[key])
 
 
-@_vault_only
-def test_checkout_modules_ignore_cwd_vault_without_env(tmp_path):
+def test_checkout_modules_ignore_cwd_vault_without_env(tmp_path, combined_copy):
     # No env, cwd inside a *different* vault: in a checkout the anchor is the
-    # engine root, so the modules still resolve this repo (never the cwd vault).
+    # engine root, so the modules still resolve that checkout (never the cwd
+    # vault). The checkout is a combined-layout copy of this engine tree.
+    assert combined_copy != ENGINE
     other = tmp_path / "other-vault"
     (other / ".macp").mkdir(parents=True)
     (other / ".macp" / "config.toml").write_text("", encoding="utf-8")
-    got = _probe_modules(cwd=other, env_vault=None)
-    assert got.pop("search_start") == ENGINE
-    _expect_scratch_under(got, ENGINE)
+    got = _probe_modules(cwd=other, env_vault=None, engine=combined_copy)
+    assert got.pop("search_start") == combined_copy
+    _expect_scratch_under(got, combined_copy)
     for key in (f"{m}.{a}" for m, a in _MODULE_ROOTS):
-        assert got[key] == ENGINE, (key, got[key])
+        assert got[key] == combined_copy, (key, got[key])
 
 
-@_vault_only
-def test_checkout_modules_resolve_without_env_from_a_bare_cwd(tmp_path):
-    got = _probe_modules(cwd=tmp_path, env_vault=None)
+def test_checkout_modules_resolve_without_env_from_a_bare_cwd(tmp_path, combined_copy):
+    assert combined_copy != ENGINE
+    got = _probe_modules(cwd=tmp_path, env_vault=None, engine=combined_copy)
     for key in (f"{m}.{a}" for m, a in _MODULE_ROOTS):
-        assert got[key] == ENGINE, (key, got[key])
+        assert got[key] == combined_copy, (key, got[key])

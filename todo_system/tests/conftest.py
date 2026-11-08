@@ -218,6 +218,31 @@ def isolated_vault(tmp_path, monkeypatch) -> IsolatedVault:
     return vault
 
 
+# --- combined layout: the engine checkout that is also the vault -------------------
+# Before the engine split the vault and the engine were one tree, with
+# .macp/config.toml at its root; vault_root()'s step-4 fallback, engine_root() and
+# vault_search_start() all anchored at that root. The engine checkout no longer
+# carries the marker, so the tests that pin that behaviour build this throwaway tree
+# and point paths.__file__ into it (inside their own monkeypatch context).
+
+
+@pytest.fixture
+def combined_layout(tmp_path_factory) -> Path:
+    """A throwaway combined layout: ``.macp/config.toml`` beside ``todo_system/`` and
+    ``scripts/`` (no ``todo_system/_engine`` marker, so it reads as a checkout).
+
+    Built under its own ``mktemp`` dir — a sibling of the test's ``tmp_path``, never
+    an ancestor — so a bogus ``.macp`` a test writes into ``tmp_path`` (and a start
+    dir under it) never walks up into this marker. The config carries no
+    ``vault_root`` key, so the marker directory itself is the vault root."""
+    root = tmp_path_factory.mktemp("combined").resolve()
+    (root / "todo_system").mkdir()
+    (root / "scripts").mkdir()
+    (root / ".macp").mkdir()
+    (root / ".macp" / "config.toml").write_text("profile = 'test-host'\n", encoding="utf-8")
+    return root
+
+
 # --- installed wheel, built once per session ---------------------------------------
 
 _UV = os.environ.get("UV") or shutil.which("uv")

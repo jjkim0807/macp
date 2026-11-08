@@ -6,7 +6,9 @@ fallback's byte-identity guarantee: with neither ``MACP_VAULT_ROOT`` nor a
 ``.macp`` marker on the cwd path, ``vault_root()`` returns exactly the
 pre-resolver value when the install location carries a ``.macp/config.toml``
 marker (so the live daemon keeps resolving the same root), and otherwise raises
-``VaultRootError`` naming the two fixes.
+``VaultRootError`` naming the two fixes. No real checkout carries that marker any
+more, so the byte-identity cases run against a throwaway combined layout (the
+``combined_layout`` fixture) that ``paths.__file__`` is pointed into.
 
 Every case drives the ``start=`` seam against a throwaway ``tmp_path`` (or sets
 the env var to one), so none of them walk into or write the real vault. The
@@ -30,21 +32,23 @@ requires_tomllib = pytest.mark.skipif(
     reason="config-key resolution needs the stdlib tomllib (Python 3.11+)",
 )
 
-# The byte-identity / install-pin invariants below hold only when the engine is
-# installed *inside* a vault — the "combined layout" that carries a
-# .macp/config.toml marker at the repo root (exactly what vault_root()'s step-4
-# fallback checks). In the public engine-only export tree that marker is absent,
-# so vault_root() raises VaultRootError by design and these cases would fail
-# spuriously; they skip there instead (public-split-10 AC2 vault-only skip / AC4:
-# "assert only when the engine is inside the vault", never delete the assertion).
-# The live vault (and any worktree of it) has the marker, so nothing skips there —
-# the byte-identity assertions run exactly as before.
-_vault_only_byte_identity = pytest.mark.skipif(
-    not (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-    reason="vault-only: byte-identity/install-pin holds only in the combined vault "
-           "layout (.macp/config.toml at the repo root); the engine-only export tree "
-           "has no marker and vault_root() raises by design.",
-)
+# The byte-identity / install-pin invariants below hold when the engine runs from
+# a "combined layout" — a checkout that carries a .macp/config.toml marker at its
+# root (exactly what vault_root()'s step-4 fallback checks). Since the engine split
+# no real checkout has that marker, so these cases build one: the
+# ``combined_layout`` fixture (tests/conftest.py) is a throwaway tree with the
+# marker beside todo_system/ and scripts/, and _install_engine_at() points
+# paths.__file__ into it — which moves engine_root(), vault_search_start() and the
+# step-4 fallback together, exactly as the live combined vault anchored at itself.
+# Each case asserts the module's root == that combined root, and (patch undone)
+# that on the real tree engine_root() == the module's own parents[N]; together
+# those are the original "no-env root is byte-identical to parents[N]" claim.
+
+
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
 
 
 def test_env_var_wins_over_config(monkeypatch, tmp_path):
@@ -82,14 +86,15 @@ def test_marker_directory_without_key(monkeypatch, tmp_path):
     assert paths.vault_root(start=deep) == tmp_path.resolve()
 
 
-@_vault_only_byte_identity
-def test_fallback_is_byte_identical_repo_root(monkeypatch, tmp_path):
+def test_fallback_is_byte_identical_repo_root(monkeypatch, tmp_path, combined_layout):
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    _install_engine_at(monkeypatch, combined_layout)
     # No env var and no .macp marker anywhere above start → legacy fallback,
     # which must equal parents[1] of this module (the pre-resolver value).
     start = tmp_path / "no" / "macp" / "here"
     start.mkdir(parents=True)
     expected = Path(paths.__file__).resolve().parents[1]
+    assert expected == combined_layout
     assert paths.vault_root(start=start) == expected
 
 
@@ -524,12 +529,17 @@ def test_no_tomllib_ignores_non_strings_and_nested_tables(monkeypatch, tmp_path)
 
 
 @requires_tomllib
-def test_no_tomllib_fallback_agrees_with_tomllib_on_the_real_vault_config():
-    """Byte-identity on this vault's own config (read-only): a 3.9 launchd daemon
-    must resolve exactly what the 3.11+ runtime does for every pinned key."""
-    cfg = Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml"
-    if not cfg.is_file():
-        pytest.skip("engine-only checkout: no vault config")
+def test_no_tomllib_fallback_agrees_with_tomllib_on_a_vault_shaped_config(tmp_path):
+    """Byte-identity on a vault-shaped config: a 3.9 launchd daemon must resolve
+    exactly what the 3.11+ runtime does for every pinned key. (This read the live
+    vault's own config until the engine split left the checkout without one.)"""
+    top, table = _VAULT_SHAPED_CONFIG.split("\n[table]\n")
+    # vault_root must sit above the [table] header, or both parsers nest it.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f"{top}\nvault_root = '/srv/vault'\n\n[table]\n{table}", encoding="utf-8")
+    # not vacuous: the pinned keys really resolve to values, not None == None
+    assert paths._read_config_key(cfg, "vault_root") == "/srv/vault"
+    assert paths._read_config_key(cfg, "label_prefix") == "com.example."
     for key in ("label_prefix", "calendar_id", "repo_slug", "profile", "vault_root"):
         assert paths._read_config_key_minimal(cfg, key) == paths._read_config_key(cfg, key), key
 
@@ -542,17 +552,20 @@ def test_no_tomllib_fallback_agrees_with_tomllib_on_the_real_vault_config():
 # real-root ROOT. `importlib.reload` comes from the module-level `import importlib.util`.
 
 
-@_vault_only_byte_identity
-def test_worker_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_worker_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.worker as worker
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(worker)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
+        assert mod.ROOT == paths.engine_root()
         # derived path constants follow ROOT
-        assert mod.TODO_DIR == mod.ROOT / "Todo"
-        assert mod.WORKER_DIR == mod.ROOT / "Worker"
+        assert mod.TODO_DIR == combined_layout / "Todo"
+        assert mod.WORKER_DIR == combined_layout / "Worker"
     importlib.reload(worker)
+    # real tree: the install root the resolver anchors at is this module's parents[1]
+    assert paths.engine_root() == Path(worker.__file__).resolve().parents[1]
 
 
 def test_worker_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -568,8 +581,7 @@ def test_worker_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path
     importlib.reload(worker)
 
 
-@_vault_only_byte_identity
-def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     # A bogus .macp/config.toml in the cwd must NOT capture ROOT: start= pins the
     # install dir, so resolution ignores the cwd-upward search. If it resolved from
     # cwd instead, ROOT would become '/bogus'.
@@ -580,10 +592,12 @@ def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(worker)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
         assert mod.ROOT != Path("/bogus")
     importlib.reload(worker)
+    assert paths.engine_root() == Path(worker.__file__).resolve().parents[1]
 
 
 # --- orchestrator/macp module roots honor the resolver (public-split step 3 follow-up) --
@@ -596,15 +610,18 @@ def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
 # takes effect; a trailing clean reload (env restored, cwd normal) puts the real root back.
 
 
-@_vault_only_byte_identity
-def test_jobs_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_jobs_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.jobs as jobs
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(jobs)
-        assert mod.REPO_ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod.JOBS_DIR == mod.REPO_ROOT / "Worker" / "jobs"
+        assert mod.REPO_ROOT == combined_layout
+        assert mod.REPO_ROOT == paths.engine_root()
+        assert mod.JOBS_DIR == combined_layout / "Worker" / "jobs"
     importlib.reload(jobs)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(jobs.__file__).resolve().parents[2]
 
 
 def test_jobs_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -617,8 +634,7 @@ def test_jobs_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
     importlib.reload(jobs)
 
 
-@_vault_only_byte_identity
-def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -626,24 +642,28 @@ def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(jobs)
-        assert mod.REPO_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod.REPO_ROOT == combined_layout
         assert mod.REPO_ROOT != Path("/bogus")
     importlib.reload(jobs)
+    assert paths.engine_root() == Path(jobs.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_metrics_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_metrics_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.metrics as metrics
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(metrics)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod.LEDGER == mod._ROOT / "Worker" / "assignments"
-        assert mod.RUNS == mod._ROOT / "Worker" / "runs"
-        assert mod.DB == mod._ROOT / "Todo" / "todo.db"
-        assert mod.DEFAULT_OUT == mod._ROOT / "Todo" / "Metrics.md"
+        assert mod._ROOT == combined_layout
+        assert mod._ROOT == paths.engine_root()
+        assert mod.LEDGER == combined_layout / "Worker" / "assignments"
+        assert mod.RUNS == combined_layout / "Worker" / "runs"
+        assert mod.DB == combined_layout / "Todo" / "todo.db"
+        assert mod.DEFAULT_OUT == combined_layout / "Todo" / "Metrics.md"
     importlib.reload(metrics)
+    assert paths.engine_root() == Path(metrics.__file__).resolve().parents[2]
 
 
 def test_metrics_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -659,8 +679,7 @@ def test_metrics_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_pat
     importlib.reload(metrics)
 
 
-@_vault_only_byte_identity
-def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -668,21 +687,25 @@ def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(metrics)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(metrics)
+    assert paths.engine_root() == Path(metrics.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_model_select_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_model_select_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.model_select as model_select
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(model_select)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod._CACHE == mod._ROOT / "Worker" / "_state" / "model_pref.json"
+        assert mod._ROOT == combined_layout
+        assert mod._ROOT == paths.engine_root()
+        assert mod._CACHE == combined_layout / "Worker" / "_state" / "model_pref.json"
     importlib.reload(model_select)
+    assert paths.engine_root() == Path(model_select.__file__).resolve().parents[2]
 
 
 def test_model_select_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -695,8 +718,7 @@ def test_model_select_root_env_redirects_module_and_derived_dirs(monkeypatch, tm
     importlib.reload(model_select)
 
 
-@_vault_only_byte_identity
-def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -704,23 +726,27 @@ def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path)
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(model_select)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(model_select)
+    assert paths.engine_root() == Path(model_select.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_deps_vault_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_deps_vault_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.macp.deps as deps
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(deps)
-        expected = Path(mod.__file__).resolve().parents[2]
+        expected = combined_layout
         assert mod.VAULT_ROOT == expected
+        assert mod.VAULT_ROOT == paths.engine_root()
         # write_integration_task() builds Todo/items from VAULT_ROOT at call time.
         assert mod.VAULT_ROOT / "Todo" / "items" == expected / "Todo" / "items"
     importlib.reload(deps)
+    assert paths.engine_root() == Path(deps.__file__).resolve().parents[2]
 
 
 def test_deps_vault_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -733,8 +759,7 @@ def test_deps_vault_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_
     importlib.reload(deps)
 
 
-@_vault_only_byte_identity
-def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -742,10 +767,12 @@ def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(deps)
-        assert mod.VAULT_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod.VAULT_ROOT == combined_layout
         assert mod.VAULT_ROOT != Path("/bogus")
     importlib.reload(deps)
+    assert paths.engine_root() == Path(deps.__file__).resolve().parents[2]
 
 
 # --- orchestrator/beta_publish: engine root immune, vault-data root redirectable --
@@ -762,13 +789,14 @@ def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
 # inspect.signature pins the function-default wiring, not just the module constant.
 
 
-@_vault_only_byte_identity
-def test_beta_publish_roots_no_env_byte_identical_and_wired(monkeypatch):
+def test_beta_publish_roots_no_env_byte_identical_and_wired(monkeypatch, combined_layout):
     import todo_system.orchestrator.beta_publish as beta_publish
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(beta_publish)
-        root = Path(mod.__file__).resolve().parents[2]
+        root = combined_layout
+        assert root == paths.engine_root()
         # engine root + its runtime lock dir
         assert mod._ENGINE_ROOT == root
         assert mod.LOCK_DIR == root / "Worker" / "_state" / "beta_locks"
@@ -781,6 +809,8 @@ def test_beta_publish_roots_no_env_byte_identical_and_wired(monkeypatch):
         for fn in (mod.stage_build_files, mod.build_prop_args, mod.maybe_publish):
             assert inspect.signature(fn).parameters["vault_root"].default == mod._VAULT_DATA_ROOT
     importlib.reload(beta_publish)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(beta_publish.__file__).resolve().parents[2]
 
 
 def test_beta_publish_env_redirects_data_root_only_engine_immune(monkeypatch, tmp_path):
@@ -803,8 +833,7 @@ def test_beta_publish_env_redirects_data_root_only_engine_immune(monkeypatch, tm
     importlib.reload(beta_publish)
 
 
-@_vault_only_byte_identity
-def test_beta_publish_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_beta_publish_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -812,12 +841,14 @@ def test_beta_publish_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(beta_publish)
-        # start= pins parents[2]; the cwd-upward .macp (vault_root='/bogus') must
-        # not capture the data root — that is the whole reason start= is passed.
-        assert mod._VAULT_DATA_ROOT == Path(mod.__file__).resolve().parents[2]
+        # start= pins the install root; the cwd-upward .macp (vault_root='/bogus')
+        # must not capture the data root — that is the whole reason start= is passed.
+        assert mod._VAULT_DATA_ROOT == combined_layout
         assert mod._VAULT_DATA_ROOT != Path("/bogus")
     importlib.reload(beta_publish)
+    assert paths.engine_root() == Path(beta_publish.__file__).resolve().parents[2]
 
 
 # --- orchestrator/human + stages: engine root immune, vault-data root redirectable --
@@ -843,13 +874,14 @@ def test_beta_publish_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_
 # paths is stdlib-only too, so the new import keeps that guarantee).
 
 
-@_vault_only_byte_identity
-def test_human_roots_no_env_byte_identical_and_wired(monkeypatch):
+def test_human_roots_no_env_byte_identical_and_wired(monkeypatch, combined_layout):
     import todo_system.orchestrator.human as human
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(human)
-        root = Path(mod.__file__).resolve().parents[2]
+        root = combined_layout
+        assert root == paths.engine_root()
         # engine root + the kakao script it anchors (immune, __file__-anchored)
         assert mod._ENGINE_ROOT == root
         assert mod.KAKAO_SCRIPT == root / "scripts" / "kakao_send.sh"
@@ -859,6 +891,8 @@ def test_human_roots_no_env_byte_identical_and_wired(monkeypatch):
         assert mod._VAULT_DATA_ROOT / "Worker" / "assignments" == \
             root / "Worker" / "assignments"
     importlib.reload(human)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(human.__file__).resolve().parents[2]
 
 
 def test_human_env_redirects_ledger_only_engine_immune(monkeypatch, tmp_path):
@@ -878,8 +912,7 @@ def test_human_env_redirects_ledger_only_engine_immune(monkeypatch, tmp_path):
     importlib.reload(human)
 
 
-@_vault_only_byte_identity
-def test_human_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_human_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -887,22 +920,25 @@ def test_human_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(human)
-        # start= pins parents[2]; the cwd-upward .macp (vault_root='/bogus') must
-        # not capture the data root, and the engine root is never cwd-derived.
-        assert mod._VAULT_DATA_ROOT == Path(mod.__file__).resolve().parents[2]
+        # start= pins the install root; the cwd-upward .macp (vault_root='/bogus')
+        # must not capture the data root, and the engine root is never cwd-derived.
+        assert mod._VAULT_DATA_ROOT == combined_layout
         assert mod._VAULT_DATA_ROOT != Path("/bogus")
-        assert mod._ENGINE_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ENGINE_ROOT == combined_layout
     importlib.reload(human)
+    assert paths.engine_root() == Path(human.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_stages_roots_no_env_byte_identical_and_wired(monkeypatch):
+def test_stages_roots_no_env_byte_identical_and_wired(monkeypatch, combined_layout):
     import todo_system.orchestrator.stages as stages
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(stages)
-        root = Path(mod.__file__).resolve().parents[2]
+        root = combined_layout
+        assert root == paths.engine_root()
         # engine root + the .claude/commands prompts it anchors (immune),
         # all byte-identical to the engine root.
         assert mod._ENGINE_ROOT == root
@@ -912,6 +948,8 @@ def test_stages_roots_no_env_byte_identical_and_wired(monkeypatch):
         assert mod._VAULT_DATA_ROOT == root
         assert mod.RUNS_DIR == root / "Worker" / "runs"
     importlib.reload(stages)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(stages.__file__).resolve().parents[2]
 
 
 def test_stages_env_redirects_runs_only_engine_immune(monkeypatch, tmp_path):
@@ -931,8 +969,7 @@ def test_stages_env_redirects_runs_only_engine_immune(monkeypatch, tmp_path):
     importlib.reload(stages)
 
 
-@_vault_only_byte_identity
-def test_stages_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_stages_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -940,15 +977,16 @@ def test_stages_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(stages)
-        # start= pins parents[2]; the cwd-upward .macp must not capture the data
-        # root, and COMMANDS_DIR / the engine root are never cwd-derived.
-        assert mod._VAULT_DATA_ROOT == Path(mod.__file__).resolve().parents[2]
+        # start= pins the install root; the cwd-upward .macp must not capture the
+        # data root, and COMMANDS_DIR / the engine root are never cwd-derived.
+        assert mod._VAULT_DATA_ROOT == combined_layout
         assert mod._VAULT_DATA_ROOT != Path("/bogus")
-        assert mod.COMMANDS_DIR == \
-            Path(mod.__file__).resolve().parents[2] / ".claude" / "commands"
-        assert mod._ENGINE_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod.COMMANDS_DIR == combined_layout / ".claude" / "commands"
+        assert mod._ENGINE_ROOT == combined_layout
     importlib.reload(stages)
+    assert paths.engine_root() == Path(stages.__file__).resolve().parents[2]
 
 
 # --- scripts/*.py vault-root constants (묶음 A + B) -------------------------
@@ -1003,13 +1041,32 @@ def _load_script_module(stem):
     return mod
 
 
-@_vault_only_byte_identity
+def _load_script_module_unpatched(monkeypatch, tmp_path, stem):
+    """Load ``stem`` with the real ``paths.__file__`` and an env-pinned tmp vault.
+
+    Called before a patched load, it imports every ``todo_system`` module the script
+    pulls in while ``paths`` still anchors at the real checkout, so none of them
+    first-imports (and freezes a root constant) under the combined-layout patch.
+    Called after, it replaces ``sys.modules[stem]`` so the tmp combined root does not
+    outlive the case. The env pin makes both calls independent of the runner's env."""
+    with monkeypatch.context() as m:
+        m.setenv("MACP_VAULT_ROOT", str(tmp_path / "ambient"))
+        return _load_script_module(stem)
+
+
 @pytest.mark.parametrize("stem,attr", _SCRIPT_ROOT_ATTRS)
-def test_script_root_no_env_is_byte_identical_install_dir(monkeypatch, stem, attr):
+def test_script_root_no_env_is_byte_identical_install_dir(monkeypatch, tmp_path, combined_layout,
+                                                          stem, attr):
+    _load_script_module_unpatched(monkeypatch, tmp_path, stem)
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = _load_script_module(stem)
-        assert getattr(mod, attr) == Path(mod.__file__).resolve().parents[1]
+        assert getattr(mod, attr) == combined_layout
+        assert getattr(mod, attr) == paths.engine_root()
+    mod = _load_script_module_unpatched(monkeypatch, tmp_path, stem)
+    # real tree: the install root the resolver anchors at is the script's parents[1]
+    assert paths.engine_root() == Path(mod.__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("stem,attr", _SCRIPT_ROOT_ATTRS)
@@ -1020,18 +1077,22 @@ def test_script_root_env_redirects_constant(monkeypatch, tmp_path, stem, attr):
         assert getattr(mod, attr) == tmp_path
 
 
-@_vault_only_byte_identity
 @pytest.mark.parametrize("stem,attr", _SCRIPT_ROOT_ATTRS)
-def test_script_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, stem, attr):
+def test_script_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout,
+                                                    stem, attr):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
+    _load_script_module_unpatched(monkeypatch, tmp_path, stem)
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = _load_script_module(stem)
-        assert getattr(mod, attr) == Path(mod.__file__).resolve().parents[1]
+        assert getattr(mod, attr) == combined_layout
         assert getattr(mod, attr) != Path("/bogus")
+    mod = _load_script_module_unpatched(monkeypatch, tmp_path, stem)
+    assert paths.engine_root() == Path(mod.__file__).resolve().parents[1]
 
 
 def _tmp_vault(root, prefix=None):
@@ -1082,11 +1143,11 @@ def test_claude_auth_watch_rc_label_follows_label_prefix(monkeypatch, tmp_path):
 # script gets a dedicated three-case contract instead of joining _SCRIPT_ROOT_ATTRS.
 
 
-@_vault_only_byte_identity
-def test_kakao_digest_send_vault_dir_priority(monkeypatch, tmp_path):
+def test_kakao_digest_send_vault_dir_priority(monkeypatch, tmp_path, combined_layout):
     """KAKAO_VAULT_DIR outranks MACP_VAULT_ROOT; the resolver only owns the fallback.
 
-    (a) neither env set          -> byte-identical install-dir fallback (live default);
+    (a) neither env set          -> byte-identical install-dir fallback (live default),
+                                    checked against a tmp combined layout;
     (b) both env set             -> KAKAO_VAULT_DIR wins over MACP_VAULT_ROOT;
     (c) only MACP_VAULT_ROOT set -> the resolver's env branch supplies the root.
 
@@ -1094,15 +1155,20 @@ def test_kakao_digest_send_vault_dir_priority(monkeypatch, tmp_path):
     environment cannot leak into (a)/(c). _load_script_module re-execs the module
     fresh under the case's env, so VAULT is recomputed every time.
     """
+    # warm the script's engine import before (a) patches paths.__file__
+    import todo_system.kakao_format  # noqa: F401
     kakao_root = tmp_path / "kakao-root"
     macp_root = tmp_path / "macp-root"
 
-    # (a) neither env set -> byte-identical to the former parents[1] fallback.
+    # (a) neither env set -> byte-identical to the former parents[1] fallback: the
+    # install root (here a tmp combined layout) is the vault.
     with monkeypatch.context() as m:
         m.delenv("KAKAO_VAULT_DIR", raising=False)
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = _load_script_module("kakao_digest_send")
-        assert mod.VAULT == Path(mod.__file__).resolve().parents[1]
+        assert mod.VAULT == combined_layout
+        assert mod.VAULT == paths.engine_root()
 
     # (b) both set -> KAKAO_VAULT_DIR takes precedence over MACP_VAULT_ROOT.
     with monkeypatch.context() as m:
@@ -1117,6 +1183,9 @@ def test_kakao_digest_send_vault_dir_priority(monkeypatch, tmp_path):
         m.setenv("MACP_VAULT_ROOT", str(macp_root))
         mod = _load_script_module("kakao_digest_send")
         assert mod.VAULT == macp_root
+
+    # real tree: the install root the resolver anchors at is the script's parents[1]
+    assert paths.engine_root() == Path(mod.__file__).resolve().parents[1]
 
 
 # --- orchestrator/discovery + followups + orchestrator + trace: vault-data root
@@ -1143,13 +1212,14 @@ def test_kakao_digest_send_vault_dir_priority(monkeypatch, tmp_path):
 # guaranteed-absent unique slug under the engine tree, never a real vault file.
 
 
-@_vault_only_byte_identity
-def test_discovery_roots_no_env_byte_identical(monkeypatch):
+def test_discovery_roots_no_env_byte_identical(monkeypatch, combined_layout):
     import todo_system.orchestrator.discovery as discovery
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(discovery)
-        root = Path(mod.__file__).resolve().parents[2]
+        root = combined_layout
+        assert root == paths.engine_root()
         # vault-data root byte-identical to the engine root when the env is unset;
         # all five constants derive from it.
         assert mod._ROOT == root
@@ -1159,6 +1229,8 @@ def test_discovery_roots_no_env_byte_identical(monkeypatch):
         assert mod.ITEMS_DIR == root / "Todo" / "items"
         assert mod.EPISODES_DIR == root / "Memory" / "episodes"
     importlib.reload(discovery)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(discovery.__file__).resolve().parents[2]
 
 
 def test_discovery_env_redirects_all_vault_data(monkeypatch, tmp_path):
@@ -1179,8 +1251,7 @@ def test_discovery_env_redirects_all_vault_data(monkeypatch, tmp_path):
     importlib.reload(discovery)
 
 
-@_vault_only_byte_identity
-def test_discovery_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_discovery_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -1188,26 +1259,31 @@ def test_discovery_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_pat
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(discovery)
-        # start= pins parents[2]; the cwd-upward .macp (vault_root='/bogus') must
-        # not capture the data root — that is the whole reason start= is passed.
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        # start= pins the install root; the cwd-upward .macp (vault_root='/bogus')
+        # must not capture the data root — that is the whole reason start= is passed.
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(discovery)
+    assert paths.engine_root() == Path(discovery.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_followups_roots_no_env_byte_identical(monkeypatch):
+def test_followups_roots_no_env_byte_identical(monkeypatch, combined_layout):
     import todo_system.orchestrator.followups as followups
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(followups)
-        root = Path(mod.__file__).resolve().parents[2]
+        root = combined_layout
+        assert root == paths.engine_root()
         assert mod._ROOT == root
         assert mod.FOLLOWUPS_PATH == root / "Worker" / "_state" / "followups.jsonl"
         assert mod.REJECTIONS_PATH == root / "Worker" / "_state" / "followups_rejected.jsonl"
         assert mod.ITEMS_DIR == root / "Todo" / "items"
     importlib.reload(followups)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(followups.__file__).resolve().parents[2]
 
 
 def test_followups_env_redirects_all_vault_data(monkeypatch, tmp_path):
@@ -1225,8 +1301,7 @@ def test_followups_env_redirects_all_vault_data(monkeypatch, tmp_path):
     importlib.reload(followups)
 
 
-@_vault_only_byte_identity
-def test_followups_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_followups_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -1234,10 +1309,12 @@ def test_followups_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_pat
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(followups)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(followups)
+    assert paths.engine_root() == Path(followups.__file__).resolve().parents[2]
 
 
 # A slug that cannot exist in the live Todo/items — so the per-call RED control
@@ -1293,16 +1370,21 @@ def test_trace_repo_dir_fallback_reads_from_env_vault_per_call(monkeypatch, tmp_
     assert captured == [tmp_path]
 
 
-@_vault_only_byte_identity
-def test_trace_repo_dir_fallback_no_env_is_engine_root(monkeypatch, tmp_path):
+def test_trace_repo_dir_fallback_no_env_is_engine_root(monkeypatch, tmp_path, combined_layout):
     from todo_system.orchestrator import trace
     empty_runs = tmp_path / "runs"
     empty_runs.mkdir()
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         captured = _trace_captured_repo_dir(empty_runs)
-    # byte-identical to the pre-migration fallback (stages.REPO_ROOT) when unset.
-    assert captured == [Path(trace.__file__).resolve().parents[2]]
+        engine = paths.engine_root()
+    # byte-identical to the pre-migration fallback (stages.REPO_ROOT, the engine
+    # root) when unset: in the combined layout the fallback is that layout's root.
+    assert captured == [combined_layout]
+    assert captured == [engine]
+    # real tree: the engine root is this module's parents[2]
+    assert paths.engine_root() == Path(trace.__file__).resolve().parents[2]
 
 
 # --- vault_root_or_cwd(): the base for relative CLI arguments ------------------
