@@ -127,27 +127,36 @@ def test_compose_alert_a_url_placed_whole_is_never_split():
 # them pass vacuously (the `else` branch never runs).
 
 
-# byte-identity to parents[1] holds only in the combined vault layout (a
-# .macp/config.toml marker at the repo root); an engine-only export tree has no
-# marker and the shared resolver raises by design, so this case skips there
-# (public-split-10 AC2 vault-only / AC4). The live vault has the marker and runs it.
-_vault_only_byte_identity = pytest.mark.skipif(
-    not (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-    reason="vault-only: byte-identity holds only in the combined vault layout "
-           "(.macp/config.toml at the repo root); the engine-only export tree has no marker.",
-)
+# Byte-identity to parents[1] holds when the engine runs from a combined layout (a
+# .macp/config.toml marker at the checkout root). No real engine checkout carries
+# that marker since the split, so the case builds one with the ``combined_layout``
+# fixture (tests/conftest.py) and points paths.__file__ into it: inside the context
+# _vault_root() == the combined root; with the patch undone, on the real tree
+# engine_root() == this module's parents[1]. Together: the original claim.
 
 
-@_vault_only_byte_identity
-def test_vault_root_falls_back_to_shared_resolver_when_all_env_unset(monkeypatch):
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
+
+
+def test_vault_root_falls_back_to_shared_resolver_when_all_env_unset(monkeypatch, combined_layout):
     monkeypatch.delenv("KAKAO_VAULT_DIR", raising=False)
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    with monkeypatch.context() as m:
+        _install_engine_at(m, combined_layout)
+        # Combined layout, no env: the install root, proven to go through the shared
+        # resolver rather than any private computation. _vault_root() resolves at
+        # call time, so no reload is needed.
+        assert kakao_format._vault_root() == combined_layout
+        assert kakao_format._vault_root() == paths.vault_root(start=combined_layout)
+        assert kakao_format._vault_root() == paths.engine_root()
+    # Patch undone, real tree: the install root the resolver anchors at is this
+    # module's parents[1], and it is a real engine root.
     install = Path(kakao_format.__file__).resolve().parents[1]
-    # Byte-identical to the old parents[1], and proven to go through the shared
-    # resolver rather than any private computation.
-    assert kakao_format._vault_root() == install
-    assert kakao_format._vault_root() == paths.vault_root(start=install)
-    assert (install / "todo_system" / "kakao_format.py").is_file()  # a real root
+    assert paths.engine_root() == install
+    assert (install / "todo_system" / "kakao_format.py").is_file()
 
 
 def test_vault_root_fallback_honours_macp_vault_root(monkeypatch, tmp_path):
