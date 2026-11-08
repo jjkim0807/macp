@@ -1,11 +1,10 @@
-"""Worker stages may read the phone-SMS inbox (CLAUDE.md §11) without a task
-`allowed_tools` edit.
+"""Worker stages may read the phone-SMS inbox without a task `allowed_tools`
+edit.
 
 The whitelist splits on spaces, so the CLI is granted through one space-free
 PATH wrapper rule, stages.SMS_TOOL_RULE == `Bash(macp-sms:*)`. These tests pin
 which stages get it, that delegate gets nothing broader, that research/plan
-stay read-only, that a task's own list keeps it, and that §11 documents the
-same command name the whitelist grants.
+stay read-only, that a task's own list keeps it, and that the wrapper runs.
 """
 
 from __future__ import annotations
@@ -20,14 +19,7 @@ from todo_system import task_validate
 from todo_system.orchestrator import stages
 
 REPO_ROOT = Path(stages.__file__).resolve().parents[2]
-CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
 WRAPPER = REPO_ROOT / "scripts" / "macp-sms"
-
-
-def _section_11(text: str) -> str:
-    body = text[text.index("\n## 11.") + 1:]
-    end = body.find("\n## ")
-    return body if end == -1 else body[:end]
 
 
 class SmsToolWiringTest(unittest.TestCase):
@@ -78,13 +70,10 @@ class SmsToolWiringTest(unittest.TestCase):
         self.assertEqual(stages._safe_tools("verify", "Read,Bash(gcloud:*)"),
                          stages.STAGE_TOOLS["verify"].split())
 
-    @unittest.skipUnless(CLAUDE_MD.is_file(),
-                         "vault-only: the engine-only export tree has no vault CLAUDE.md")
-    def test_claude_md_section_11_names_the_wrapper(self):
-        section = _section_11(CLAUDE_MD.read_text(encoding="utf-8"))
-        self.assertIn(f"{stages.SMS_CLI} wait-code", section)
-        self.assertIn(stages.SMS_TOOL_RULE, section)
-        self.assertNotIn("uv run --directory", section)
+    # No pin on the vault's CLAUDE.md §11 here: that is a vault-repo document the
+    # engine repo neither ships nor versions, so it cannot be held from this tree. The
+    # engine side of the contract (rule, stage grants, wrapper) is pinned above and
+    # below.
 
     @unittest.skipUnless(WRAPPER.is_file(), "scripts/macp-sms not in this tree")
     def test_wrapper_runs_from_any_cwd(self):

@@ -1,5 +1,5 @@
-"""Worker stages may drive the HQ's logged-in Chrome (CLAUDE.md §12) without a
-task `allowed_tools` edit.
+"""Worker stages may drive the HQ's logged-in Chrome without a task
+`allowed_tools` edit.
 
 The whitelist splits on spaces, so the tools are granted through one
 space-free PATH wrapper rule, stages.BROWSER_TOOL_RULE == `Bash(macp-browser:*)`.
@@ -27,16 +27,9 @@ from todo_system import task_validate
 from todo_system.orchestrator import stages
 
 REPO_ROOT = Path(stages.__file__).resolve().parents[2]
-CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
 WRAPPER = REPO_ROOT / "scripts" / "macp-browser"
 RULE = stages.BROWSER_TOOL_RULE
 OWNER_ENV = "MACP_BROWSER_OWNER"
-
-
-def _section_12(text: str) -> str:
-    body = text[text.index("\n## 12.") + 1:]
-    end = body.find("\n## ")
-    return body if end == -1 else body[:end]
 
 
 class BrowserToolWiringTest(unittest.TestCase):
@@ -128,26 +121,10 @@ class BrowserToolWiringTest(unittest.TestCase):
         source = Path(stages.__file__).read_text(encoding="utf-8")
         self.assertNotIn(".config/macp-browser", source)
 
-    @unittest.skipUnless(CLAUDE_MD.is_file(),
-                         "vault-only: the engine-only export tree has no vault CLAUDE.md")
-    def test_claude_md_section_12_names_the_wrapper(self):
-        section = _section_12(CLAUDE_MD.read_text(encoding="utf-8"))
-        for needle in (RULE, f"{stages.BROWSER_CLI} status", f"{stages.BROWSER_CLI} up",
-                       f"{stages.BROWSER_CLI} login-check", f"{stages.BROWSER_CLI} probe",
-                       f"{stages.BROWSER_CLI} steps", f"{stages.BROWSER_CLI} text",
-                       "console.mjs", "text.mjs", "connectOverCDP",
-                       "launchPersistentContext", "reset-vnc", "vnc.html",
-                       "명시적으로 허용",
-                       # the lease: one owner at a time, humans and one-off
-                       # CDP scripts included, plus the tab etiquette
-                       f"{stages.BROWSER_CLI} lease acquire",
-                       f"{stages.BROWSER_CLI} lease release",
-                       f"{stages.BROWSER_CLI} lease status", "exit 75",
-                       "--owner human-vnc", "bringToFront", stages.BROWSER_OWNER_ENV,
-                       # the install step survives every wrapper change
-                       "cp scripts/macp-browser ~/.local/bin/macp-browser"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, section)
+    # No pin on the vault's CLAUDE.md §12 here: that is a vault-repo document the
+    # engine repo neither ships nor versions, so it cannot be held from this tree. The
+    # engine side of the contract (stage prompt, rule, wrapper, lease) is pinned above
+    # and below.
 
 
 _STUB_NODE = '#!/bin/sh\necho "node $*" >> "$MARK"\nexit "${STUB_RC:-0}"\n'
