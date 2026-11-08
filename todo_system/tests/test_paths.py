@@ -30,15 +30,25 @@ requires_tomllib = pytest.mark.skipif(
     reason="config-key resolution needs the stdlib tomllib (Python 3.11+)",
 )
 
-# The byte-identity / install-pin invariants below hold only when the engine is
-# installed *inside* a vault — the "combined layout" that carries a
-# .macp/config.toml marker at the repo root (exactly what vault_root()'s step-4
-# fallback checks). In the public engine-only export tree that marker is absent,
-# so vault_root() raises VaultRootError by design and these cases would fail
-# spuriously; they skip there instead (public-split-10 AC2 vault-only skip / AC4:
-# "assert only when the engine is inside the vault", never delete the assertion).
-# The live vault (and any worktree of it) has the marker, so nothing skips there —
-# the byte-identity assertions run exactly as before.
+# The byte-identity / install-pin invariants below hold when the engine runs from
+# a "combined layout" — a checkout that carries a .macp/config.toml marker at its
+# root (exactly what vault_root()'s step-4 fallback checks). Since the engine split
+# no real checkout has that marker, so these cases build one: the
+# ``combined_layout`` fixture (tests/conftest.py) is a throwaway tree with the
+# marker beside todo_system/ and scripts/, and _install_engine_at() points
+# paths.__file__ into it — which moves engine_root(), vault_search_start() and the
+# step-4 fallback together, exactly as the live combined vault anchored at itself.
+# Each case asserts the module's root == that combined root, and (patch undone)
+# that on the real tree engine_root() == the module's own parents[N]; together
+# those are the original "no-env root is byte-identical to parents[N]" claim.
+
+
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
+
+
 _vault_only_byte_identity = pytest.mark.skipif(
     not (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
     reason="vault-only: byte-identity/install-pin holds only in the combined vault "
@@ -82,14 +92,15 @@ def test_marker_directory_without_key(monkeypatch, tmp_path):
     assert paths.vault_root(start=deep) == tmp_path.resolve()
 
 
-@_vault_only_byte_identity
-def test_fallback_is_byte_identical_repo_root(monkeypatch, tmp_path):
+def test_fallback_is_byte_identical_repo_root(monkeypatch, tmp_path, combined_layout):
     monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    _install_engine_at(monkeypatch, combined_layout)
     # No env var and no .macp marker anywhere above start → legacy fallback,
     # which must equal parents[1] of this module (the pre-resolver value).
     start = tmp_path / "no" / "macp" / "here"
     start.mkdir(parents=True)
     expected = Path(paths.__file__).resolve().parents[1]
+    assert expected == combined_layout
     assert paths.vault_root(start=start) == expected
 
 
@@ -542,17 +553,20 @@ def test_no_tomllib_fallback_agrees_with_tomllib_on_the_real_vault_config():
 # real-root ROOT. `importlib.reload` comes from the module-level `import importlib.util`.
 
 
-@_vault_only_byte_identity
-def test_worker_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_worker_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.worker as worker
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(worker)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
+        assert mod.ROOT == paths.engine_root()
         # derived path constants follow ROOT
-        assert mod.TODO_DIR == mod.ROOT / "Todo"
-        assert mod.WORKER_DIR == mod.ROOT / "Worker"
+        assert mod.TODO_DIR == combined_layout / "Todo"
+        assert mod.WORKER_DIR == combined_layout / "Worker"
     importlib.reload(worker)
+    # real tree: the install root the resolver anchors at is this module's parents[1]
+    assert paths.engine_root() == Path(worker.__file__).resolve().parents[1]
 
 
 def test_worker_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -568,8 +582,7 @@ def test_worker_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path
     importlib.reload(worker)
 
 
-@_vault_only_byte_identity
-def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     # A bogus .macp/config.toml in the cwd must NOT capture ROOT: start= pins the
     # install dir, so resolution ignores the cwd-upward search. If it resolved from
     # cwd instead, ROOT would become '/bogus'.
@@ -580,10 +593,12 @@ def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(worker)
-        assert mod.ROOT == Path(mod.__file__).resolve().parents[1]
+        assert mod.ROOT == combined_layout
         assert mod.ROOT != Path("/bogus")
     importlib.reload(worker)
+    assert paths.engine_root() == Path(worker.__file__).resolve().parents[1]
 
 
 # --- orchestrator/macp module roots honor the resolver (public-split step 3 follow-up) --
@@ -596,15 +611,18 @@ def test_worker_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
 # takes effect; a trailing clean reload (env restored, cwd normal) puts the real root back.
 
 
-@_vault_only_byte_identity
-def test_jobs_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_jobs_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.jobs as jobs
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(jobs)
-        assert mod.REPO_ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod.JOBS_DIR == mod.REPO_ROOT / "Worker" / "jobs"
+        assert mod.REPO_ROOT == combined_layout
+        assert mod.REPO_ROOT == paths.engine_root()
+        assert mod.JOBS_DIR == combined_layout / "Worker" / "jobs"
     importlib.reload(jobs)
+    # real tree: the install root the resolver anchors at is this module's parents[2]
+    assert paths.engine_root() == Path(jobs.__file__).resolve().parents[2]
 
 
 def test_jobs_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -617,8 +635,7 @@ def test_jobs_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
     importlib.reload(jobs)
 
 
-@_vault_only_byte_identity
-def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -626,24 +643,28 @@ def test_jobs_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(jobs)
-        assert mod.REPO_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod.REPO_ROOT == combined_layout
         assert mod.REPO_ROOT != Path("/bogus")
     importlib.reload(jobs)
+    assert paths.engine_root() == Path(jobs.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_metrics_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_metrics_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.metrics as metrics
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(metrics)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod.LEDGER == mod._ROOT / "Worker" / "assignments"
-        assert mod.RUNS == mod._ROOT / "Worker" / "runs"
-        assert mod.DB == mod._ROOT / "Todo" / "todo.db"
-        assert mod.DEFAULT_OUT == mod._ROOT / "Todo" / "Metrics.md"
+        assert mod._ROOT == combined_layout
+        assert mod._ROOT == paths.engine_root()
+        assert mod.LEDGER == combined_layout / "Worker" / "assignments"
+        assert mod.RUNS == combined_layout / "Worker" / "runs"
+        assert mod.DB == combined_layout / "Todo" / "todo.db"
+        assert mod.DEFAULT_OUT == combined_layout / "Todo" / "Metrics.md"
     importlib.reload(metrics)
+    assert paths.engine_root() == Path(metrics.__file__).resolve().parents[2]
 
 
 def test_metrics_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -659,8 +680,7 @@ def test_metrics_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_pat
     importlib.reload(metrics)
 
 
-@_vault_only_byte_identity
-def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -668,21 +688,25 @@ def test_metrics_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(metrics)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(metrics)
+    assert paths.engine_root() == Path(metrics.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_model_select_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_model_select_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.orchestrator.model_select as model_select
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(model_select)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
-        assert mod._CACHE == mod._ROOT / "Worker" / "_state" / "model_pref.json"
+        assert mod._ROOT == combined_layout
+        assert mod._ROOT == paths.engine_root()
+        assert mod._CACHE == combined_layout / "Worker" / "_state" / "model_pref.json"
     importlib.reload(model_select)
+    assert paths.engine_root() == Path(model_select.__file__).resolve().parents[2]
 
 
 def test_model_select_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -695,8 +719,7 @@ def test_model_select_root_env_redirects_module_and_derived_dirs(monkeypatch, tm
     importlib.reload(model_select)
 
 
-@_vault_only_byte_identity
-def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -704,23 +727,27 @@ def test_model_select_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path)
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(model_select)
-        assert mod._ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod._ROOT == combined_layout
         assert mod._ROOT != Path("/bogus")
     importlib.reload(model_select)
+    assert paths.engine_root() == Path(model_select.__file__).resolve().parents[2]
 
 
-@_vault_only_byte_identity
-def test_deps_vault_root_no_env_is_byte_identical_repo_root(monkeypatch):
+def test_deps_vault_root_no_env_is_byte_identical_repo_root(monkeypatch, combined_layout):
     import todo_system.macp.deps as deps
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(deps)
-        expected = Path(mod.__file__).resolve().parents[2]
+        expected = combined_layout
         assert mod.VAULT_ROOT == expected
+        assert mod.VAULT_ROOT == paths.engine_root()
         # write_integration_task() builds Todo/items from VAULT_ROOT at call time.
         assert mod.VAULT_ROOT / "Todo" / "items" == expected / "Todo" / "items"
     importlib.reload(deps)
+    assert paths.engine_root() == Path(deps.__file__).resolve().parents[2]
 
 
 def test_deps_vault_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_path):
@@ -733,8 +760,7 @@ def test_deps_vault_root_env_redirects_module_and_derived_dirs(monkeypatch, tmp_
     importlib.reload(deps)
 
 
-@_vault_only_byte_identity
-def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
+def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, combined_layout):
     macp = tmp_path / ".macp"
     macp.mkdir()
     (macp / "config.toml").write_text("vault_root = '/bogus'\n", encoding="utf-8")
@@ -742,10 +768,12 @@ def test_deps_vault_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.delenv("MACP_VAULT_ROOT", raising=False)
         m.chdir(tmp_path)
+        _install_engine_at(m, combined_layout)
         mod = importlib.reload(deps)
-        assert mod.VAULT_ROOT == Path(mod.__file__).resolve().parents[2]
+        assert mod.VAULT_ROOT == combined_layout
         assert mod.VAULT_ROOT != Path("/bogus")
     importlib.reload(deps)
+    assert paths.engine_root() == Path(deps.__file__).resolve().parents[2]
 
 
 # --- orchestrator/beta_publish: engine root immune, vault-data root redirectable --
