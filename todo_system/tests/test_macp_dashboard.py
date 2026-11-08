@@ -46,15 +46,6 @@ def _load():
 
 M = _load()
 
-# docs/brand/macp-logo.svg and docs/dashboard-parity.md are vault docs, not part of
-# the engine code export set (AC1 = 3 code paths: todo_system, scripts, .claude/
-# commands). In an engine-only export tree they are absent, so the tests that read
-# them skip there (public-split-10 AC2 vault-only); the live vault ships them and runs.
-_HAVE_BRAND_DOCS = (
-    (VAULT / "docs" / "brand" / "macp-logo.svg").is_file()
-    and (VAULT / "docs" / "dashboard-parity.md").is_file()
-)
-
 try:                                     # read_task_repo needs PyYAML to parse frontmatter
     import yaml  # noqa: F401
     _HAVE_YAML = True
@@ -1231,24 +1222,13 @@ def _path_points(d):
     return pts
 
 
-@unittest.skipUnless(
-    _HAVE_BRAND_DOCS,
-    "vault-only: the canonical logo (docs/brand/macp-logo.svg) and the parity doc "
-    "(docs/dashboard-parity.md) are vault docs, not in the engine code export set "
-    "(AC1 = 3 code paths) — absent in an engine-only tree (public-split-10 AC2).",
-)
 class LogoFaviconTests(unittest.TestCase):
-    """The canonical logo (docs/brand/macp-logo.svg) — web favicon and the app's
-    adaptive-icon source. See docs/dashboard-parity.md "로고"."""
-
-    LOGO = VAULT / "docs" / "brand" / "macp-logo.svg"
-    PARITY = VAULT / "docs" / "dashboard-parity.md"
+    """The canonical logo is the engine's own `LOGO_SVG` constant — the web
+    favicon and the app's adaptive-icon source. The engine ships the logo only as
+    this constant, so every property below is pinned against it (no vault file)."""
 
     def _root(self):
-        return ET.fromstring(self.LOGO.read_text(encoding="utf-8"))
-
-    def test_canonical_svg_matches_embedded_constant(self):
-        self.assertEqual(self.LOGO.read_text(encoding="utf-8"), M.LOGO_SVG)
+        return ET.fromstring(M.LOGO_SVG)
 
     def test_head_favicon_decodes_to_canonical_svg(self):
         m = re.search(r'<link rel="icon" type="image/svg\+xml" '
@@ -1305,12 +1285,6 @@ class LogoFaviconTests(unittest.TestCase):
         self.assertEqual(_path_points("M1 2h3v4l-1-1z"), [(1, 2), (4, 2), (4, 6), (3, 5)])
         with self.assertRaises(AssertionError):
             _path_points("M0 0C1 1 2 2 3 3")
-
-    def test_parity_doc_has_logo_contract(self):
-        doc = self.PARITY.read_text(encoding="utf-8")
-        for needle in ("로고", "docs/brand/macp-logo.svg", "#0d1117", "#58a6ff",
-                       "vector drawable", "macp-dashboard-android-app-logo"):
-            self.assertIn(needle, doc, needle)
 
 
 class WorkerRunningDetection(unittest.TestCase):
@@ -1809,19 +1783,6 @@ class GroupFoldShell(unittest.TestCase):
     def test_no_external_urls_in_fold_additions(self):
         self.assertNotIn("https://", self.HTML)
         self.assertNotIn("http://", self.HTML)
-
-    @unittest.skipUnless(
-        _HAVE_BRAND_DOCS,
-        "vault-only: docs/dashboard-parity.md is a vault doc, not in the engine code "
-        "export set (AC1 = 3 code paths) — absent in an engine-only tree (public-split-10 AC2).",
-    )
-    def test_parity_doc_exists_and_documents_the_contract(self):
-        p = VAULT / "docs" / "dashboard-parity.md"
-        self.assertTrue(p.exists(), "docs/dashboard-parity.md missing")
-        txt = p.read_text(encoding="utf-8")
-        self.assertIn("group", txt)
-        self.assertIn("mdash.grp.", txt)                            # localStorage key contract
-        self.assertIn("macp-dashboard-android-4-task-grouping", txt)  # app parity task link
 
 
 # ---- "사람 몫" triage: discover excluded, not_before → human_later, urgent flag ----
