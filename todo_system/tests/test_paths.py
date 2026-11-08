@@ -529,12 +529,17 @@ def test_no_tomllib_ignores_non_strings_and_nested_tables(monkeypatch, tmp_path)
 
 
 @requires_tomllib
-def test_no_tomllib_fallback_agrees_with_tomllib_on_the_real_vault_config():
-    """Byte-identity on this vault's own config (read-only): a 3.9 launchd daemon
-    must resolve exactly what the 3.11+ runtime does for every pinned key."""
-    cfg = Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml"
-    if not cfg.is_file():
-        pytest.skip("engine-only checkout: no vault config")
+def test_no_tomllib_fallback_agrees_with_tomllib_on_a_vault_shaped_config(tmp_path):
+    """Byte-identity on a vault-shaped config: a 3.9 launchd daemon must resolve
+    exactly what the 3.11+ runtime does for every pinned key. (This read the live
+    vault's own config until the engine split left the checkout without one.)"""
+    top, table = _VAULT_SHAPED_CONFIG.split("\n[table]\n")
+    # vault_root must sit above the [table] header, or both parsers nest it.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f"{top}\nvault_root = '/srv/vault'\n\n[table]\n{table}", encoding="utf-8")
+    # not vacuous: the pinned keys really resolve to values, not None == None
+    assert paths._read_config_key(cfg, "vault_root") == "/srv/vault"
+    assert paths._read_config_key(cfg, "label_prefix") == "com.example."
     for key in ("label_prefix", "calendar_id", "repo_slug", "profile", "vault_root"):
         assert paths._read_config_key_minimal(cfg, key) == paths._read_config_key(cfg, key), key
 
