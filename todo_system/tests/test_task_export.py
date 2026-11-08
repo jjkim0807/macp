@@ -277,20 +277,14 @@ def test_layer_a_fallback_matches_primary(tmp_path, monkeypatch):
     assert primary["title"] == "Full Contract Task"
 
 
-# "the default root is the live vault" (contains todo_system/) and byte-identity to
-# parents[1] hold only in the combined vault layout (a .macp/config.toml marker at
-# the repo root); an engine-only export tree has no marker and its resolved root is a
-# separate vault dir, so these two skip there (public-split-10 AC2 vault-only / AC4).
-# The live vault has the marker and runs them.
-_vault_only_byte_identity = pytest.mark.skipif(
-    not (Path(paths.__file__).resolve().parents[1] / ".macp" / "config.toml").is_file(),
-    reason="vault-only: the default-root-is-the-vault / byte-identity invariants hold "
-           "only in the combined vault layout (.macp/config.toml at the repo root); "
-           "the engine-only export tree has no marker.",
-)
+# Since the engine split the vault carries data, not engine code, so "the default
+# root contains todo_system/task_export.py" can no longer hold anywhere and was
+# dropped; the default root is still pinned to cli.ROOT and to a real Todo/ tree.
+# Byte-identity to parents[1] holds when the engine runs from a combined layout (a
+# .macp/config.toml marker at the checkout root), which no real checkout carries any
+# more, so it is retargeted at the ``combined_layout`` fixture (tests/conftest.py).
 
 
-@_vault_only_byte_identity
 def test_default_root_is_the_live_vault():
     """AC5: the default really is the live vault, not a redirected stand-in.
 
@@ -298,7 +292,10 @@ def test_default_root_is_the_live_vault():
     default pointed somewhere harmless.
     """
     assert tx.DEFAULT_VAULT_ROOT == _cli.ROOT
-    assert (tx.DEFAULT_VAULT_ROOT / "todo_system" / "task_export.py").is_file()
+    # Since the engine split the vault carries data, not engine code: its Todo/ tree
+    # is what the default export_all() reads (test_default_call_writes_nothing below
+    # pins that it is non-empty).
+    assert (tx.DEFAULT_VAULT_ROOT / "Todo").is_dir()
 
 
 # DEFAULT_VAULT_ROOT now flows through the shared paths.vault_root resolver
@@ -308,26 +305,43 @@ def test_default_root_is_the_live_vault():
 # Path(__file__).resolve().parents[1], and (a) the exact expression the module
 # uses is redirectable via MACP_VAULT_ROOT. The constant is import-time, so we
 # assert against the resolver called with the module's own start= anchor rather
-# than reloading.
+# than reloading. (b) is split in two: inside a monkeypatch context the
+# combined_layout stands in for the combined checkout and the resolver returns it
+# unchanged; with the patch undone, on the real tree the anchor is parents[1].
 
 
-@_vault_only_byte_identity
-def test_default_vault_root_is_byte_identical_repo_root_when_env_unset(monkeypatch):
+def _install_engine_at(m, root):
+    """Inside a monkeypatch context ``m``: make ``paths`` resolve as if the engine
+    were checked out at ``root`` (``root/todo_system/paths.py``)."""
+    m.setattr(paths, "__file__", str(root / "todo_system" / "paths.py"))
+
+
+def test_default_vault_root_is_byte_identical_repo_root_when_env_unset(
+        monkeypatch, combined_layout):
     env = os.environ.get("MACP_VAULT_ROOT")    # what the module saw at import
-    monkeypatch.delenv("MACP_VAULT_ROOT", raising=False)
+    with monkeypatch.context() as m:
+        m.delenv("MACP_VAULT_ROOT", raising=False)
+        _install_engine_at(m, combined_layout)
+        # The exact expression task_export.py:66 evaluates: in a combined layout the
+        # .macp marker at the install root makes the resolver return that root
+        # unchanged — the value the old hard-coded parents[1] produced.
+        assert paths.vault_search_start() == combined_layout
+        assert paths.vault_root(start=paths.vault_search_start()) == combined_layout
+    # real tree: the anchor is this module's own parents[1], a real engine root
     install = Path(tx.__file__).resolve().parents[1]
-    # The .macp marker at the install root makes the resolver return that root
-    # unchanged — exactly the value the old hard-coded parents[1] produced.
-    assert paths.vault_root(start=install) == install
-    # The constant holds the resolver's import-time value: the install root
-    # when the env was unset, the env vault when a worker stage set it.
-    assert tx.DEFAULT_VAULT_ROOT == (Path(env).expanduser() if env else install)
+    assert paths.vault_search_start() == install
+    assert (install / "todo_system" / "task_export.py").is_file()
+    # The constant holds the resolver's import-time value (the env vault when a
+    # worker stage set MACP_VAULT_ROOT before import).
+    expected = (Path(env).expanduser() if env
+                else paths.vault_root(start=paths.vault_search_start()))
+    assert tx.DEFAULT_VAULT_ROOT == expected
 
 
 def test_default_vault_root_is_redirectable_via_macp_vault_root_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MACP_VAULT_ROOT", str(tmp_path))
     install = Path(tx.__file__).resolve().parents[1]
-    # Same expression task_export.py:60 evaluates — env wins over the anchor.
+    # Same expression task_export.py:66 evaluates — env wins over the anchor.
     assert paths.vault_root(start=install) == tmp_path
 
 
