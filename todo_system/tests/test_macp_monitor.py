@@ -56,16 +56,6 @@ M = _load()
 class PathConstantTest(unittest.TestCase):
     """Guards the promotion from Worker/_state/ into scripts/."""
 
-    @unittest.skipUnless(
-        (VAULT / ".macp" / "config.toml").is_file(),
-        "vault-only: ROOT==vault (holding pyproject.toml) is a combined-layout fact; "
-        "an engine-only export tree resolves ROOT to a separate vault dir with no "
-        "pyproject.toml (public-split-10 AC2/AC4). The live vault has the marker and runs it.",
-    )
-    def test_root_is_the_vault(self):
-        self.assertTrue((M.ROOT / "pyproject.toml").exists(),
-                        f"ROOT should be the vault root, got {M.ROOT}")
-
     def test_state_dir_stays_under_worker_state(self):
         # Must NOT follow __file__ into scripts/ — state stays git-ignored.
         self.assertEqual(M.STATE_DIR, M.ROOT / "Worker" / "_state" / "macp_monitor")
@@ -75,6 +65,26 @@ class PathConstantTest(unittest.TestCase):
     def test_state_files_live_beside_the_state_dir(self):
         self.assertEqual(M.STATE_FILE.parent, M.STATE_DIR)
         self.assertEqual(M.LATEST_FILE.parent, M.STATE_DIR)
+
+
+def test_root_is_the_vault_in_combined_layout(monkeypatch, combined_layout):
+    """ROOT is the combined root (the tree holding pyproject.toml) when the engine
+    runs from a combined layout, and — patch undone — engine_root() on the real tree
+    is this module's own parents[1]. Together: the pre-split "ROOT is the vault"
+    claim, proven on a throwaway tree instead of the live vault.
+
+    ROOT is an import-time constant, so the module is exec'd afresh inside the
+    patch; the result is a local module object and the shared `M` is untouched."""
+    from todo_system import paths
+    (combined_layout / "pyproject.toml").write_text("[project]\nname = 'combined'\n",
+                                                    encoding="utf-8")
+    with monkeypatch.context() as m:
+        m.delenv("MACP_VAULT_ROOT", raising=False)     # root conftest seeds a default
+        m.setattr(paths, "__file__", str(combined_layout / "todo_system" / "paths.py"))
+        mod = _load()
+        assert mod.ROOT == combined_layout
+        assert (mod.ROOT / "pyproject.toml").is_file()
+    assert paths.engine_root() == _SRC.resolve().parents[1]
 
 
 class UsageHoldReasonTest(unittest.TestCase):
@@ -348,29 +358,27 @@ class ReleaseFreshnessTest(unittest.TestCase):
         # must live in the tracked Worker/ top level to keep its edit history.
         self.assertEqual(M.RELEASE_CHANNELS, M.ROOT / "Worker" / "release_channels.json")
 
-    @unittest.skipUnless(
-        M.RELEASE_CHANNELS.is_file(),
-        "vault-only: the release_channels.json seed is vault data, not in the engine "
-        "code export set — absent in an engine-only tree (public-split-10 AC2). The "
-        "live vault ships the seed and runs this validation.",
-    )
-    def test_seed_config_is_valid(self):
-        # The real tracked seed must stay loadable and well-formed: a typo in
-        # this human-edited file fails *silently* at runtime (skip-by-design),
-        # so the test suite is where it has to turn red instead.
+    def test_default_config_path_follows_vault_root_and_is_read(self):
+        # The engine claim behind the old real-seed check: with no config_path the
+        # check reads ROOT/Worker/release_channels.json — and actually reads it (a
+        # path that resolves but is never opened would fail open to silence). The
+        # vault is a throwaway tree seeded here, never the live one.
         import json
-        cfg = json.loads(M.RELEASE_CHANNELS.read_text())
-        apps = cfg["apps"]
-        self.assertIsInstance(apps, list)
-        self.assertTrue(apps)
-        slugs = [a["slug"] for a in apps]
-        self.assertEqual(len(slugs), len(set(slugs)), "slugs must be unique")
-        for a in apps:
-            self.assertTrue(a["slug"])
-            self.assertIsInstance(a["repo_dirs"], list, a["slug"])
-            if a.get("released_at") is not None:
-                self.assertIsNotNone(M._parse_ts(a["released_at"]),
-                                     f"unparseable released_at for {a['slug']}")
+        import os
+        from unittest import mock
+        vault = self._tmp()
+        (vault / "Worker").mkdir()
+        repo = self._write_reflog(self._tmp() / "r", "main", [self._epoch(8)])
+        (vault / "Worker" / "release_channels.json").write_text(
+            json.dumps({"apps": [self._app([repo])]}))
+        with mock.patch.dict(os.environ, {"MACP_VAULT_ROOT": str(vault)}):
+            mod = _load()
+        self.assertEqual(mod.RELEASE_CHANNELS, vault / "Worker" / "release_channels.json")
+        findings: list = []
+        mod.check_release_freshness(findings)          # no config_path → module default
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["fingerprint"],
+                         "release-freshness:dancemirror-app:2026-07-22")
 
 
 # "caller did not pass open_prs" — distinct from an explicit `open_prs=None`,
