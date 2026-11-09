@@ -1313,6 +1313,16 @@ class Orchestrator:
         text = human.compose_alert(headline, lines)
         self._notify_routed(text, None, event_key=f"blocker-cancelled:{a.task_id}")
 
+    def _notify_close_failed(self, slug: str, note: str | None = None) -> None:
+        """mark_done returned False (md missing, or CAS gave up after retries) — the
+        close did NOT land, so the ledger and md may disagree. One ping; never break
+        collect on a notify failure (reconcile_closed still retries next tick)."""
+        headline = i18n.t("alert.close_failed", slug=slug)
+        lines = [f"📋 {self._task_title(slug)}"]
+        tail = i18n.t("alert.recent_reason", note=note) if note else ""
+        text = human.compose_alert(headline, lines, tail=tail)
+        self._notify_routed(text, None, event_key=f"close-failed:{slug}")
+
     def _close_task(self, slug: str, note: str | None = None) -> None:
         """Close the todo task on success so it is not re-dispatched. A close
         failure must never break collect. An optional `note` (the no-op close's
@@ -1324,9 +1334,9 @@ class Orchestrator:
             # mark_done(slug) call every existing caller (and the tests/lambdas that
             # pin it) expects; the no-op close is the one path that threads a note.
             if note is None:
-                tasks.mark_done(slug)
+                result = tasks.mark_done(slug)
             else:
-                tasks.mark_done(slug, note=note)
+                result = tasks.mark_done(slug, note=note)
         except Exception as e:  # noqa: BLE001 - a close failure must not break collect
             # …but it must not be silent either. play-store-3 (2026-09-10) went
             # ledger=done with its markdown still `open` and nothing said why;
@@ -1335,6 +1345,17 @@ class Orchestrator:
             # human which of the two is lying.
             print(f"[orchestrator] _close_task: mark_done({slug}) failed — "
                   f"{type(e).__name__}: {e}")
+        else:
+            # mark_done returns bool; a `False` means the close did not land (md
+            # missing, or CAS gave up). Until now that slid silently into
+            # _propagate_downstream — the same play-store-3 shape the exception
+            # branch guards, just reached by a return instead of a raise. Surface
+            # it. Gate strictly on `is False`, NOT `not result`: many close callers
+            # (and tests) mock mark_done to return None, which must stay a no-op.
+            if result is False:
+                print(f"[orchestrator] _close_task: mark_done({slug}) returned False — "
+                      f"close did not land; see reconcile_closed next tick")
+                self._notify_close_failed(slug, note)
         self._propagate_downstream(slug)
 
     def _close_with_evidence(self, a: Assignment, note: str | None = None) -> None:
