@@ -677,21 +677,4 @@ def test_script_is_stdlib_and_free_of_legacy_literals():
     assert "unit_name(" in source and "SECONDBRAIN_PREFIX" in source and "LABEL_PREFIX" in source
 
 
-@pytest.mark.skipif(not (REPO / "docs" / "claude-accounts.md").is_file(),
-                    reason="vault-only: docs/ is not in the public engine export")
-def test_docs_section_7_lists_human_steps():
-    text = (REPO / "docs" / "claude-accounts.md").read_text(encoding="utf-8")
-    assert "## 7." in text
-    head, sec7 = text.split("## 7.", 1)
-    assert "§7" in head                       # §6 points here instead of promising it
-    for needle in ("--rollback", "--i-stopped-daemons", "systemctl --user stop",
-                   "claude_accounts_migrate.py --apply", "_migration-", "automation-token",
-                   "CLAUDE_CODE_OAUTH_TOKEN", "USAGE_GUARD_WEEKLY_ALLOWANCE",
-                   "USAGE_GUARD_WEEKLY_HARD_CAP", "USAGE_GUARD_SESSION_HARD_CAP",
-                   "--resume", "Keychain", "profile_before", "account add dev",
-                   "setup-token", "⑤"):
-        assert needle in sec7, needle
-    for unit in MIG.HARD_UNITS + MIG.ADVISORY_UNITS:
-        assert unit in sec7, unit
-    for sub in ("### 7.1", "### 7.2", "### 7.3", "### 7.4", "### 7.5"):
-        assert sub in sec7, sub
+# docs/claude-accounts.md is vault-owned (not in the engine export); its §7 coverage is not pinned here.
