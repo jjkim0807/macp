@@ -246,6 +246,283 @@ if __name__ == "__main__":
         self.assertEqual(self._mode("down"), "manual")
 
 
+class HumanDepsReadyTest(unittest.TestCase):
+    """`human_deps_ready` — "it is a person's turn" as a pure function.
+
+    A human-owned task that declares `depends_on` used to go completely
+    unannounced when its upstream closed: `auto_unblock` only flips tasks into
+    *worker* modes, so a `manual` leaf just silently became actionable and waited
+    for someone to notice (2026-11-09). This is the predicate the tick sweeps.
+
+    Generic slugs only (`task-a`, `upstream-1`) — this is a public repo.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "nodb.db"          # absent → status comes from md only
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _w(self, slug, status="open", worker_mode="", depends_on=None,
+           on_unblock=None, extra=""):
+        lines = ["---", f"status: {status}"]
+        if worker_mode:
+            lines.append(f"worker_mode: {worker_mode}")
+        if depends_on is not None:
+            lines.append("depends_on:")
+            lines += [f"  - {d}" for d in depends_on]
+        if on_unblock:
+            lines.append(f"on_unblock: {on_unblock}")
+        if extra:
+            lines += extra.strip("\n").split("\n")
+        lines += ["---", "", "# task", ""]
+        (self.tmp / f"{slug}.md").write_text("\n".join(lines), encoding="utf-8")
+
+    def _ready(self, **kw):
+        return TD.human_deps_ready(TD.scan_items(self.tmp), self.db, **kw)
+
+    def _slugs(self, **kw):
+        rows, _ = self._ready(**kw)
+        return [r["slug"] for r in rows]
+
+    # --- the core judgement -------------------------------------------------
+
+    def test_all_deps_done_is_ready(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"],
+                extra="next_action: 서류 제출\nif_then: 월요일 9시에 포털에서 제출")
+        rows, warnings = self._ready()
+        self.assertEqual([r["slug"] for r in rows], ["task-a"])
+        self.assertEqual(warnings, [])
+        self.assertEqual(rows[0]["depends_on"], ["upstream-1"])
+        self.assertEqual(rows[0]["last_dep"], "upstream-1")
+        self.assertEqual(rows[0]["next_action"], "서류 제출")
+        self.assertEqual(rows[0]["if_then"], "월요일 9시에 포털에서 제출")
+        self.assertFalse(rows[0]["deferred"])
+
+    def test_one_open_dep_is_not_ready(self):
+        self._w("upstream-1", status="done")
+        self._w("upstream-2", status="open")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1", "upstream-2"])
+        self.assertEqual(self._slugs(), [])
+
+    def test_unknown_dep_is_not_ready_and_warns(self):
+        """A typo'd slug can never be done; treating it as satisfied would page
+        someone for work that is still genuinely blocked."""
+        self._w("task-a", worker_mode="manual", depends_on=["no-such-task"])
+        rows, warnings = self._ready()
+        self.assertEqual(rows, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("task-a", warnings[0])
+        self.assertIn("no-such-task", warnings[0])
+
+    def test_no_depends_on_is_never_ready(self):
+        """This alert is strictly about a chain closing — a plain human to-do has
+        its own due date and is not news."""
+        self._w("task-a", worker_mode="manual")
+        self.assertEqual(self._slugs(), [])
+
+    def test_db_done_counts_even_when_md_says_open(self):
+        """Same done test as resolve_unblocks: md OR db (_done_test)."""
+        import sqlite3
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, status TEXT)")
+        con.execute("INSERT INTO tasks VALUES ('upstream-1', 'done')")
+        con.commit()
+        con.close()
+        self._w("upstream-1", status="open")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"])
+        rows, _ = TD.human_deps_ready(TD.scan_items(self.tmp), db)
+        self.assertEqual([r["slug"] for r in rows], ["task-a"])
+
+    def test_dep_known_only_to_the_db_is_not_an_unknown_dep(self):
+        import sqlite3
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, status TEXT)")
+        con.execute("INSERT INTO tasks VALUES ('archived-1', 'done')")
+        con.commit()
+        con.close()
+        self._w("task-a", worker_mode="manual", depends_on=["archived-1"])
+        rows, warnings = TD.human_deps_ready(TD.scan_items(self.tmp), db)
+        self.assertEqual([r["slug"] for r in rows], ["task-a"])
+        self.assertEqual(warnings, [])
+
+    # --- whose job is it? ---------------------------------------------------
+
+    def test_auto_modes_are_excluded(self):
+        self._w("upstream-1", status="done")
+        for mode in TD.AUTO_WORKER_MODES:
+            self._w("task-a", worker_mode=mode, depends_on=["upstream-1"])
+            self.assertEqual(self._slugs(), [], mode)
+
+    def test_blocked_with_auto_on_unblock_is_the_workers_job(self):
+        """resolve_unblocks is about to hand it to a worker — nobody must act."""
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="blocked", depends_on=["upstream-1"],
+                on_unblock="auto")
+        self.assertEqual(self._slugs(), [])
+
+    def test_blocked_with_manual_on_unblock_is_a_persons_job(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="blocked", depends_on=["upstream-1"],
+                on_unblock="manual")
+        self.assertEqual(self._slugs(), ["task-a"])
+
+    def test_blocked_with_a_decision_marker_is_a_persons_job(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="blocked", depends_on=["upstream-1"],
+                on_unblock="auto", extra="needs_decision: true")
+        self.assertEqual(self._slugs(), ["task-a"])
+
+    def test_review_mode_is_a_persons_job(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="review", depends_on=["upstream-1"])
+        self.assertEqual(self._slugs(), ["task-a"])
+
+    def test_decision_tag_without_a_worker_mode_is_a_persons_job(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", depends_on=["upstream-1"],
+                extra="tags:\n  - todo\n  - decision")
+        self.assertEqual(self._slugs(), ["task-a"])
+
+    def test_needs_decision_with_an_inline_comment_still_reads_true(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", depends_on=["upstream-1"],
+                extra="needs_decision: true  # 방향 결정")
+        self.assertEqual(self._slugs(), ["task-a"])
+
+    def test_unrouted_backlog_is_silent(self):
+        """No worker_mode, no owner, no decision marker → unrouted backlog. Paging
+        on it would make every closed chain noise."""
+        self._w("upstream-1", status="done")
+        self._w("task-a", depends_on=["upstream-1"])
+        self.assertEqual(self._slugs(), [])
+
+    def test_registry_human_owner_makes_it_a_persons_job(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", depends_on=["upstream-1"])
+        self.assertEqual(self._slugs(is_human_owned=lambda s: s == "task-a"),
+                         ["task-a"])
+
+    def test_a_broken_owner_resolver_does_not_raise(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"])
+
+        def boom(_slug):
+            raise RuntimeError("registry gone")
+        self.assertEqual(self._slugs(is_human_owned=boom), ["task-a"])
+
+    # --- skips --------------------------------------------------------------
+
+    def test_done_task_is_excluded(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", status="done", worker_mode="manual", depends_on=["upstream-1"])
+        self.assertEqual(self._slugs(), [])
+
+    def test_parent_is_excluded(self):
+        """A parent carries no work of its own; reconcile_parents announces it."""
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"],
+                extra="is_parent: true")
+        self.assertEqual(self._slugs(), [])
+
+    def test_cycle_is_excluded_and_warns(self):
+        self._w("task-a", worker_mode="manual", depends_on=["task-b"])
+        self._w("task-b", status="done", worker_mode="manual", depends_on=["task-a"])
+        rows, warnings = self._ready()
+        self.assertEqual([r["slug"] for r in rows], [])
+        self.assertTrue(any("cycle" in w for w in warnings), warnings)
+
+    # --- deferral, fingerprint, last dep ------------------------------------
+
+    def test_future_not_before_is_flagged_deferred_not_dropped(self):
+        """Returned so the caller can skip the alert WITHOUT pruning its dedup
+        state — a human's deferral must survive, and must not re-fire later."""
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"],
+                extra="not_before: 2099-01-01")
+        rows, _ = self._ready()
+        self.assertEqual([r["slug"] for r in rows], ["task-a"])
+        self.assertTrue(rows[0]["deferred"])
+
+    def test_past_not_before_is_not_deferred(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"],
+                extra="not_before: 2000-01-01")
+        rows, _ = self._ready()
+        self.assertFalse(rows[0]["deferred"])
+
+    def test_fingerprint_depends_only_on_the_dep_set(self):
+        self._w("upstream-1", status="done")
+        self._w("upstream-2", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1", "upstream-2"])
+        first = self._ready()[0][0]["fingerprint"]
+        # same set, written in the other order → same fingerprint
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-2", "upstream-1"])
+        self.assertEqual(self._ready()[0][0]["fingerprint"], first)
+        # a dep ADDED → different fingerprint (that is what re-arms the alert)
+        self._w("upstream-3", status="done")
+        self._w("task-a", worker_mode="manual",
+                depends_on=["upstream-1", "upstream-2", "upstream-3"])
+        self.assertNotEqual(self._ready()[0][0]["fingerprint"], first)
+
+    def test_last_dep_comes_from_the_injected_resolver(self):
+        self._w("upstream-1", status="done")
+        self._w("upstream-2", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1", "upstream-2"])
+        at = {"upstream-1": "2026-11-09T10:00:00", "upstream-2": "2026-11-09T17:30:00"}
+        rows, _ = self._ready(dep_done_at=at.get)
+        self.assertEqual(rows[0]["last_dep"], "upstream-2")
+        self.assertEqual(rows[0]["last_dep_at"], "2026-11-09T17:30:00")
+
+    def test_no_resolver_leaves_the_timestamp_unknown(self):
+        self._w("upstream-1", status="done")
+        self._w("upstream-2", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1", "upstream-2"])
+        rows, _ = self._ready()
+        self.assertIsNone(rows[0]["last_dep_at"])
+        self.assertEqual(rows[0]["last_dep"], "upstream-2")   # alphabetical stand-in
+
+    def test_a_broken_dep_done_at_does_not_raise(self):
+        self._w("upstream-1", status="done")
+        self._w("task-a", worker_mode="manual", depends_on=["upstream-1"])
+
+        def boom(_dep):
+            raise OSError("ledger gone")
+        rows, _ = self._ready(dep_done_at=boom)
+        self.assertEqual([r["slug"] for r in rows], ["task-a"])
+        self.assertIsNone(rows[0]["last_dep_at"])
+
+    # --- the additive scan_items fields ------------------------------------
+
+    def test_scan_items_keeps_every_pre_existing_key(self):
+        """The new fields are additive — apply_unblocks/task_export read the old
+        ones unchanged."""
+        self._w("task-a", worker_mode="blocked", depends_on=["upstream-1"],
+                on_unblock="manual")
+        t = TD.scan_items(self.tmp)["task-a"]
+        for k in ("path", "status", "worker_mode", "depends_on", "on_unblock",
+                  "on_unblock_explicit", "auto_activate", "human_gate"):
+            self.assertIn(k, t)
+        for k in ("tags", "needs_decision", "is_parent", "not_before",
+                  "next_action", "if_then"):
+            self.assertIn(k, t)
+        self.assertEqual(t["on_unblock"], "manual")
+
+    def test_tags_are_lowercased(self):
+        self._w("task-a", extra="tags:\n  - Todo\n  - Decision")
+        self.assertEqual(TD.scan_items(self.tmp)["task-a"]["tags"], ["todo", "decision"])
+
+    def test_prose_fields_keep_a_hash(self):
+        """`next_action`/`if_then` are free text where `#` is legitimate; only the
+        structured fields get the inline-comment strip."""
+        self._w("task-a", extra="next_action: PR #390 리뷰")
+        self.assertEqual(TD.scan_items(self.tmp)["task-a"]["next_action"], "PR #390 리뷰")
+
+
 class OrchestratorAutoUnblockTest(unittest.TestCase):
     """orchestrator.auto_unblock: the every-tick dependency release."""
 
