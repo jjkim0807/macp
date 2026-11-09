@@ -479,6 +479,34 @@ def _with_close_trace(text: str, today: str, note: str | None = None) -> str:
     return f"{text}\n\n## Progress Log\n\n{entry}\n"
 
 
+# How many times mark_done re-derives its close patch when the md moves under it.
+# A vault merge lands once; three attempts covers that with room to spare, and a
+# bounded loop can never spin against a file something is rewriting continuously.
+_CLOSE_WRITE_ATTEMPTS = 3
+
+
+def _apply_close(text: str, today: str, note: str | None) -> str:
+    """The close patch as a pure function of the md's CURRENT bytes: `updated`,
+    `status: done`, and — only when the task is not already done — the
+    CLOSE_TRACE line.
+
+    Pure on purpose. mark_done re-reads the file and re-derives this on every
+    compare-and-swap attempt, so the patch must never carry state from an
+    earlier read; that staleness is exactly what reverted merged task md.
+    Returns `text` unchanged when there is nothing to write (already done with
+    `updated` current, or no frontmatter at all).
+    """
+    from todo_system import cli
+
+    fm, _ = cli.parse_frontmatter(text)
+    already_done = str(fm.get("status") or "").strip().lower() == "done"
+    out = cli.update_frontmatter_value(text, "updated", today)
+    out = cli.update_frontmatter_value(out, "status", "done")
+    if fm and not already_done:   # no frontmatter = no status written = nothing to trace
+        out = _with_close_trace(out, today, note)
+    return out
+
+
 def mark_done(slug: str, items_dir: str | Path | None = None,
               db_path: str | Path | None = None, note: str | None = None) -> bool:
     """Close a todo task after a successful pipeline (policy A): set the markdown
@@ -504,6 +532,25 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
     "boxes checked, status open" — bytes matching no pre-close state, which
     reconcile_closed would read as a human edit and never heal. Now the only
     partial outcome is "done, boxes unchecked", which is harmless.
+
+    That write is a COMPARE-AND-SWAP, not a read-modify-write. The md lives in the
+    live vault checkout, which git also writes: a tick's `_pull_main` merge — or
+    any PR landing in the vault — can rewrite this file between our read and our
+    write, and a patch derived from the stale read puts the pre-merge content back.
+    That really happened (vault merge `36655ee53`, 2026-11-09): two task md files
+    lost a delegate agent's merged Progress Log, and the next `sync vault state`
+    commit recorded the reverted bytes because `Todo/items/` is swept by `git add`.
+    So the patch is re-derived from fresh bytes on each attempt (`_apply_close` is
+    pure for this reason) and only written if the file has not moved since; after
+    `_CLOSE_WRITE_ATTEMPTS` it returns False rather than writing stale content.
+
+    What this does NOT give: the re-read and the write are two syscalls, so a
+    merge landing precisely between them is still possible. CAS shrinks the window
+    from "the whole patch computation" to that gap; closing it entirely needs the
+    writers and the vault's git operations to share a lock, which is deliberately
+    out of scope here. The close line's wording and position are untouched —
+    `_with_close_trace` and CLOSE_TRACE are byte-for-byte what they were, so the
+    evidence reconcile_closed compares against keeps its meaning.
     """
     from todo_system import cli
 
@@ -512,14 +559,31 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
         print(f"[orchestrator] mark_done: no task markdown at {path} — not closed")
         return False
     today = dt.date.today().isoformat()
-    content = path.read_text(encoding="utf-8")
-    fm, _ = cli.parse_frontmatter(content)
-    already_done = str(fm.get("status") or "").strip().lower() == "done"
-    content = cli.update_frontmatter_value(content, "updated", today)
-    content = cli.update_frontmatter_value(content, "status", "done")
-    if fm and not already_done:   # no frontmatter = no status written = nothing to trace
-        content = _with_close_trace(content, today, note)
-    path.write_text(content, encoding="utf-8")
+    # Compare-and-swap, not read-modify-write: re-read right before writing and
+    # re-derive the patch if the bytes moved. The live vault checkout is shared
+    # with git — a tick's `_pull_main` merge (or any PR landing in it) can rewrite
+    # this very file between our read and our write, and a patch computed from the
+    # old read puts the PRE-merge content back. See MarkDoneMergeRaceTest.
+    for _ in range(_CLOSE_WRITE_ATTEMPTS):
+        before = path.read_text(encoding="utf-8")
+        patched = _apply_close(before, today, note)
+        if patched == before:
+            break                  # nothing to write (already done / no frontmatter)
+        if path.read_text(encoding="utf-8") != before:
+            continue               # something landed inside the window — re-derive
+        path.write_text(patched, encoding="utf-8")
+        break
+    else:
+        # Never write the stale patch anyway: that is the bug this guards. Both
+        # callers treat False as "retry next tick" — reconcile_parents leaves the
+        # row unrecorded, reconcile_closed re-closes — so giving up is recoverable
+        # while silently winning the race is not. Returning early also skips the
+        # checkbox pass on purpose: ticking boxes on a task whose status is still
+        # `open` is the one partial state the ordering below exists to prevent.
+        print(f"[orchestrator] mark_done: {slug} markdown kept changing under the "
+              f"close ({_CLOSE_WRITE_ATTEMPTS} attempts) — not closed; "
+              f"reconcile_closed retries next tick")
+        return False
     try:
         cli.update_markdown_checkboxes(path, mode="complete")
     except Exception as exc:
