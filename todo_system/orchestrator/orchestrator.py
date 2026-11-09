@@ -1527,12 +1527,13 @@ class Orchestrator:
     def _nudge(self, agent: Agent, a: Assignment) -> None:
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=a.task_id,
                          payload=a.payload)
-        # Immediate on purpose — unlike the first-delivery [assign] FYI
-        # (human.deliver_pending, digest tier), a re-nudge only fires after a
-        # human has sat on the ask for days (1d/3d/7d backoff): it IS the
-        # escalation. No event key — last_nudge_ts/backoff already pace it, and
-        # the router's window runs on the wall clock, which would fight the
-        # injected-now clock the backoff (and its tests) are driven by.
+        # Immediate on purpose: a re-nudge only fires after a human has sat on the
+        # ask for days (1d/3d/7d backoff) — it IS the escalation. (First delivery
+        # in human.deliver_pending is immediate too since 2026-11-09; it was
+        # digest-tier when this comment was written.) No event key —
+        # last_nudge_ts/backoff already pace it, and the router's window runs on
+        # the wall clock, which would fight the injected-now clock the backoff
+        # (and its tests) are driven by.
         self._notify_routed(human.compose_kakao(env, agent), None)
         a.last_nudge_ts = m.now_iso()
         a.nudge_index += 1
