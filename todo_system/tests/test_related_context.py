@@ -166,10 +166,42 @@ def test_title_comes_from_the_items_own_frontmatter(isolated_vault):
     assert rc.title_for(isolated_vault.root, "episode-00") == "진짜 제목"
 
 
-def test_title_falls_back_to_the_slug_when_there_is_no_frontmatter(isolated_vault):
-    isolated_vault.write("Memory/episodes/episode-00.md", "no frontmatter at all\n")
+def test_title_comes_from_the_first_h1_when_frontmatter_has_none(isolated_vault):
+    """Where this vault actually keeps titles: neither the task template nor the
+    episode writer emits a `title:` field, so without this leg the title column
+    was the slug for almost every record."""
+    isolated_vault.write(
+        "Todo/items/task-without-title.md",
+        "---\nstatus: open\ntags:\n  - todo\n---\n\n# 7. 실계좌 소액 운영\n\n- [ ] 단계\n")
+
+    assert rc.title_for(isolated_vault.root, "task-without-title") == "7. 실계좌 소액 운영"
+
+
+def test_only_the_first_h1_near_the_top_is_read(isolated_vault):
+    """An H1 deep in a document is prose structure, not the doc's title — and
+    lifting arbitrary body lines out is exactly what R5 forbids."""
+    body = "\n".join(["filler"] * (rc.HEADING_SCAN_LINES + 5) + ["# 너무 깊은 제목"])
+    isolated_vault.write("Notes/deep-heading.md", f"---\nstatus: open\n---\n\n{body}\n")
+    isolated_vault.write("Notes/two-headings.md",
+                         "---\nstatus: open\n---\n\n# 첫 제목\n\ntext\n\n# 둘째 제목\n")
+
+    assert rc.title_for(isolated_vault.root, "deep-heading") == "deep-heading"
+    assert rc.title_for(isolated_vault.root, "two-headings") == "첫 제목"
+
+
+def test_frontmatter_title_wins_over_the_h1(isolated_vault):
+    isolated_vault.write("Memory/episodes/episode-00.md",
+                         "---\ntitle: 프론트매터 제목\n---\n\n# H1 제목\n")
+
+    assert rc.title_for(isolated_vault.root, "episode-00") == "프론트매터 제목"
+
+
+def test_title_falls_back_to_the_slug_when_there_is_neither(isolated_vault):
+    isolated_vault.write("Memory/episodes/episode-00.md", "no frontmatter, no heading\n")
+    isolated_vault.write("Notes/empty-heading.md", "---\nstatus: open\n---\n\n# \n")
 
     assert rc.title_for(isolated_vault.root, "episode-00") == "episode-00"
+    assert rc.title_for(isolated_vault.root, "empty-heading") == "empty-heading"
     assert rc.title_for(isolated_vault.root, "nothing-on-disk") == "nothing-on-disk"
 
 

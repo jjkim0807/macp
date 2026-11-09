@@ -86,6 +86,7 @@ KILL_ENV = "MACP_RELATED_CONTEXT"
 MAX_ITEMS = 8          # AC#1: "최대 8개" per task, in related.md and per prompt row
 DEFAULT_TASKS = 5      # planner passes --limit 5; brief passes --limit 3
 MIN_KNN = 10           # never ask query_related for fewer seeds than its own default
+HEADING_SCAN_LINES = 40  # how far into a body `title_for` looks for its first H1
 
 RELATED_FILENAME = "related.md"
 SNAPSHOT_REL = ("Todo", "Snapshots", "latest.json")
@@ -170,19 +171,35 @@ def _own_doc(root: Path, slug: str, source_file: str | None) -> Path | None:
 
 
 def title_for(root: Path, slug: str, source_file: str | None = None) -> str:
-    """The doc's frontmatter ``title``, else the slug. Metadata only, so no R5
-    concern; every failure falls back to the slug **silently** (a title is a
-    nicety, and a missing one must not cost the whole item)."""
+    """The doc's own title: frontmatter ``title``, else its first ``# `` heading,
+    else the slug.
+
+    The H1 leg is not a nicety — it is where this vault actually keeps titles.
+    Neither the task template (CLAUDE.md §3) nor the episode writer emits a
+    ``title:`` field, so frontmatter-only resolution fell back to the slug for
+    almost every record and the title column carried no information at all
+    (measured against the live vault, 2026-11-09).
+
+    Still metadata only, so no R5 concern: a document's own heading is the same
+    class of fact as a ``title:`` field and strictly less than any body prose.
+    Only the FIRST H1 is read, and only within the first
+    ``HEADING_SCAN_LINES`` lines of the body, so a ``#`` deeper in the document
+    can never be lifted out. Every failure falls back to the slug **silently** —
+    a missing title must not cost the whole item.
+    """
     own = _own_doc(Path(root), slug, source_file)
     if own is None:
         return slug
     try:
-        fm, _body = gm.parse_frontmatter(own.read_text(encoding="utf-8"))
+        fm, body = gm.parse_frontmatter(own.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return slug
     raw = fm.get("title")
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
+    for line in body.splitlines()[:HEADING_SCAN_LINES]:
+        if line.startswith("# "):
+            return line[2:].strip() or slug
     return slug
 
 
