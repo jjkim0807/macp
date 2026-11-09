@@ -152,6 +152,10 @@ _ENGINE_MODULES = {
     "todo_system.orchestrator.followups", "todo_system.orchestrator.discovery",
     "todo_system.orchestrator.lease", "todo_system.orchestrator.usage_probe",
     "todo_system.orchestrator.keep_alive", "todo_system.cli",
+    # memory v2 wiring: the related-records prompt section. The planner's own
+    # tools are unchanged — the ENGINE runs the query, which is why the module
+    # shows up in this set at all.
+    "todo_system.orchestrator.related_context",
 }
 
 # The four the AC names, with their exact installed argv.

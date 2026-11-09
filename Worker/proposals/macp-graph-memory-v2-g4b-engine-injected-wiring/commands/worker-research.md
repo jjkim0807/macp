@@ -14,7 +14,7 @@ Use absolute paths for artifact files. The stage runs with the vault root as its
 1. The task markdown file — `task_path` from the Run metadata if present, otherwise `Todo/items/<slug>.md` — frontmatter and body in full.
 2. `CLAUDE.md` — vault operating rules.
 3. `Memory/index.md` if it exists. Skip without error if missing.
-3b. **관련 과거 기록 질의 (memory v2)** — if it is available, query this task's slug / title / `touches` for related past 실패 회고·결정 with `python -m todo_system.orchestrator.eval_memory query --slug <slug> --title "<title>"` (it degrades to BFS-only automatically when sqlite-vec is absent; read-only on the vault). Fold any returned episode / decision slugs into "Open questions" and "Out of scope" so the run does not repeat a past failure. Skip without error if the command or its vault DB is unavailable.
+3b. **관련 과거 기록 (memory v2)** — `<run_dir>/related.md` 가 있으면 읽어라. 엔진이 이 스테이지가 시작되기 전에 `graph_memory.query_related` 로 뽑아 둔 목록이고, **슬러그·제목·출처 경로·점수만** 담는다 (본문 발췌 없음). 거기 나온 에피소드·결정 슬러그를 "Open questions"·"Out of scope" 에 접어 넣어 과거 실패를 반복하지 않게 하고, 더 알아야 할 것이 있으면 그 `source` 경로를 직접 Read 하라. 파일이 없으면 엔진이 만들지 못한 것이고 **실패가 아니다** — 그냥 진행하라. 이 스테이지의 도구는 `Read Write` 뿐이므로 직접 질의할 수 없고, 할 필요도 없다.
 4. Any files referenced by wikilinks inside the task body (`[[...]]`) that you can resolve under `Notes/`, `Memory/`, `Decisions/`, or `Todo/items/`.
 
 ## Output

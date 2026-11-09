@@ -989,6 +989,23 @@ class StagedExecutor(ClaudeCodeExecutor):
             # Structured counterpart to the `account: <name>` progress line above
             # (resolved at :741, recorded now that run_dir exists) — multi-account.
             stages.record_account(run_dir, acct)
+        # Related past records, as a file the research stage can Read. HERE and not
+        # in the stage prompt because research's tools are `Read Write` — it cannot
+        # run a query, and a task's allowed_tools cannot widen it. HERE and not
+        # later because research is the first stage to run, and before
+        # resumable_run / inherit_artifacts because this is an input, not an
+        # artifact to inherit. `summary` is the payload's title key (NOT `title`),
+        # and query_related reads `title` — passing the payload raw would silently
+        # drop the title from the query text. None when there is nothing to say.
+        rel = stages.record_related(run_dir, {
+            "slug": msg.task_id,
+            "title": payload.get("summary"),
+            "touches": payload.get("touches"),
+            "outcome": payload.get("outcome"),
+            "next_action": payload.get("next_action"),
+        })
+        if rel:
+            progress(rel)
         if on_run_start is not None:
             # Tell the claim which run this envelope became, the moment it exists.
             # This is the back-reference that replaces the report stage guessing

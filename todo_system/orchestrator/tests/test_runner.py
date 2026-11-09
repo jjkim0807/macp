@@ -2071,7 +2071,7 @@ class StageUsageLoopTest(unittest.TestCase):
         dirs = list(runs.iterdir())
         self.assertEqual(len(dirs), 1, dirs)
         log = dirs[0] / "run.log"
-        return {"out": out, "argv": seen.get("argv"),
+        return {"out": out, "argv": seen.get("argv"), "run_id": dirs[0].name,
                 "run_log": log.read_text(encoding="utf-8") if log.exists() else None,
                 "progress": json.loads((dirs[0] / stages.STAGE_PROGRESS)
                                        .read_text(encoding="utf-8")),
@@ -2192,8 +2192,21 @@ class StageUsageLoopTest(unittest.TestCase):
         self.assertNotIn(stages.SESSION_ID_FLAG, off["argv"])
         self.assertNotIn("usage", off["progress"])
         i = on["argv"].index(stages.SESSION_ID_FLAG)
-        # argv[2] is the prompt, which names each run's own run_id
-        self.assertEqual(on["argv"][3:i] + on["argv"][i + 2:], off["argv"][3:])
+        # argv[2] is the prompt, which names each run's own run_id. So does the
+        # serialised --mcp-config (MACP_BROWSER_OWNER), which is NOT argv[2]: run
+        # ids have one-second resolution, so two passes that straddle a second
+        # boundary differed there and the comparison failed at random. Normalise
+        # each run's own id out of every arg rather than excluding one more index.
+        def _norm(args, run_id):
+            return [a.replace(run_id, "<run-id>") for a in args]
+
+        # Not a no-op: each run's own id really is inside one of those args, so a
+        # regression that stopped normalising would fail whenever the ids differ.
+        for got in (on, off):
+            self.assertTrue(any(got["run_id"] in a for a in got["argv"]),
+                            "no arg carries the run id — normalisation is vacuous")
+        self.assertEqual(_norm(on["argv"][3:i] + on["argv"][i + 2:], on["run_id"]),
+                         _norm(off["argv"][3:], off["run_id"]))
         # a real, fresh id with no transcript behind it here
         self.assertEqual(on["progress"]["usage"],
                          {"implement": {"unavailable": "transcript not found"}})

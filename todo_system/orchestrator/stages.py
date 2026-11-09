@@ -2142,6 +2142,33 @@ def record_disk_guard(run_dir: Path, record: dict) -> None:
     _update_progress(run_dir, disk_guard=record)
 
 
+def record_related(run_dir: Path, task: dict) -> str | None:
+    """Write `<run_dir>/related.md` — the task's related past records, queried by
+    the ENGINE because the stage that needs them cannot query for itself.
+
+    A file and not a stages.json key (the rest of this family) because its reader
+    is an agent, not a dashboard: `STAGE_TOOLS["research"]` is `"Read Write"`, so
+    the research stage has no Bash to run a query with and no way to widen that
+    (`TASK_TOOLS_STAGES` is implement-only). A file it can Read is the only
+    channel that exists.
+
+    Deliberately NOT in `STAGE_ARTIFACT`: related.md is an INPUT, not an output.
+    The required-artifact check would fail the research stage every time the file
+    is absent — and "absent" is a legitimate, documented outcome (no edge DB, no
+    edges table, nothing related). Nor in `APPENDED_ARTIFACTS` / the
+    `inherit_artifacts` list, for the same reason.
+
+    Returns the one progress line, or None when nothing was written. Best-effort
+    like every other `record_*`: a run must never fail over a hint, so the
+    delegate swallows its own errors and the import is function-local (this
+    module's convention for orchestrator siblings — see `effective_tier`)."""
+    try:
+        from .related_context import write_related
+        return write_related(run_dir, task, run_id=Path(run_dir).name)
+    except Exception:       # noqa: BLE001 - a hint never breaks a run
+        return None
+
+
 def record_timeout(run_dir: Path, stage: str, checkpoint_sha: str | None = None) -> None:
     """Persist that `stage` hit its subprocess timeout, plus the sha checkpoint_push
     saved to origin (None when nothing was pushed). `previous_timeout_context`
