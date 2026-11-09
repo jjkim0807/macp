@@ -72,6 +72,7 @@ slug: <slug>
 branch: worker/<slug>
 generated: <ISO timestamp>
 overall_status: pass | fail | skip
+no_op: true | false
 ---
 
 # Quick — <task title>
@@ -87,3 +88,11 @@ overall_status: pass | fail | skip
 Set `overall_status: pass` when the change is made + PR opened (merged or left for
 review as policy dictates), `fail` if you could not complete it, `skip` if the
 task was a no-op. Then print one line: `quick complete: <PR url or branch> status=<...>`.
+
+When `overall_status: skip` because the task is a **genuine no-op you verified** —
+the code already does what `outcome` asks, nothing to change, and you made **0
+commits** — also set `no_op: true`. The runner then closes the task with a
+Progress-Log note and no human review, instead of parking it. Set it **only** on
+such a verified 0-commit no-op: never on `fail`, never on a blocked run, and never
+when you committed anything. The signal + 0 commits is treated as "nothing to do",
+so using it to escape a real failure buries the task where no one looks.
