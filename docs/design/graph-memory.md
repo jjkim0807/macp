@@ -353,12 +353,18 @@ R4 의 질의("이 태스크와 관련된 과거 실패·결정")가 실제로 �
 ### 5.2 베이스라인 대비 (v2 vs v1, 한 표로)
 
 **같은 라벨셋 `L`** 에서 두 방식의 적중률을 한 표로 비교한다 — 개선이 숫자로 보이게. 아래는
-**측정 대상 표**(G4 평가 하니스가 채운다 — 지금 숫자를 지어내지 않는다):
+G4 평가 하니스(`eval_memory table`)가 **2026-11-09 골든셋으로 채운 측정값**이다(해싱 임베더):
 
 | 방식 | precision@5 | recall@10 | 질의 지연 p50 | 색인 비용 |
 |---|---|---|---|---|
-| **v1** (현행: `get_related` BFS + `index.md` 집계, wikilink/frontmatter 문자열 매칭) | _측정_ | _측정_ | _측정_ | 매 틱 전체 재빌드(`clear_edges`+전체 DELETE) |
-| **v2** (임베딩 KNN + 그래프 BFS 하이브리드, R3) | _측정_ | _측정_ | _측정_ | 증분(append+tombstone) |
+| **v1** (현행: `get_related` BFS + `index.md` 집계, wikilink/frontmatter 문자열 매칭) | 0.286 | 0.604 | 16.1ms | 매 틱 전체 재빌드(`clear_edges`+전체 DELETE) |
+| **v2** (임베딩 KNN + 그래프 BFS 하이브리드, R3) | 0.321 | 0.901 | 6.6ms | 증분(append+tombstone) |
+
+> 측정: 2026-11-09, 골든셋 `golden-20261109.json`(33 태스크·76 쌍, 볼트 전용 — 공개 리포엔 수치만).
+> 전체 지표: v1 P@10 0.168·R@5 0.493 / v2 P@10 0.254·R@5 0.626. **pooling 한계**: 후보 풀이 v1·v2 가
+> 낸 것뿐이라 둘 다 놓친 관련 기록은 라벨에 없다(적중률이 실제보다 낙관적일 수 있다). 질의 지연은
+> run 마다 변동(시스템 property). 재현: `eval_memory table --vault-root <볼트> --golden <…>/golden-20261109.json`
+> (= §5.5 `bench --embedders hash` 의 v1·① 행과 동일).
 
 판정 규칙: v2 가 같은 `k`에서 precision·recall **양쪽** 또는 적어도 recall 을 유의하게 올리지
 못하면 하이브리드의 값어치가 없다는 뜻이므로, G3/G4 는 임베딩 모델·`k`·blend 가중치를 재조정하거나
@@ -379,8 +385,54 @@ R4 의 질의("이 태스크와 관련된 과거 실패·결정")가 실제로 �
   돌리고 §5.2 표를 출력한다. 회귀는 로컬 `uv run pytest todo_system/tests/test_graph_memory_eval.py`
   로 고정(지표가 임계 밑으로 떨어지면 FAIL). **"CI green" 아님** — 전부 로컬 명령
   ([[Decisions/2026-09-11-no-github-actions-local-release-lane]]).
+- **세 임베더 비교(§5.5)**는 `eval_memory bench --golden <셋> --work-dir <스크래치> [--embedders hash,local,vertex]`
+  가 낸다. `--work-dir` 는 **필수**다 — 세 방식이 서로 다른 dim 으로 **전체 재임베딩**하므로 변종별
+  스크래치 DB 에서 돌아야 하고, 라이브 `Memory/relations.sqlite`(maintenance 틱이 증분 embed 로 쓰는
+  중)와 경합·오염을 코드가 거부한다(`--work-dir` 가 볼트 `Memory/` 면 `ValueError`). 한 방식의 의존성·
+  인증 부재는 그 행만 `미측정`/`보류` 로 만들고 표 전체를 망치지 않는다.
 - 골든셋은 볼트 안(민감 아님: 태스크 slug·과거 기록 slug 쌍)에 두되, **공개 리포엔 실명·개인
   데이터가 섞이지 않는 합성/익명 픽스처**만 둔다(R5).
+
+### 5.5 임베더 비교 (①해싱 ②로컬 소형 ③Vertex) — G4 §5 벤치
+
+임베더는 설정값 **`MACP_EMBEDDER=hash|local|vertex`** 로 선택 가능하다(`todo_system/graph_memory.py`
+의 호출 시점 해석 — 색인·질의 양쪽이 같은 백엔드를 따른다). **기본값은 `hash` 그대로**다(아래는
+권장일 뿐 전환이 아니다). dim 이 달라지는 백엔드로 바꿀 때는 vec0 를 `--rebuild` 로 재구축한다.
+같은 골든셋(`golden-20261109.json`)으로 세 방식을 `eval_memory bench` 로 돌린 결과(2026-11-10):
+
+| 방식 | dim | P@5 | P@10 | R@5 | R@10 | 질의 p50(ms) | 색인(s) | 벡터 디스크(MB) | 1회 임베딩 비용 | 상태 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v1 (BFS + index.md 집계 기준선) | — | 0.286 | 0.168 | 0.493 | 0.604 | 10.4 | — | — | $0 | 측정 |
+| ① 해싱 (stdlib feature-hashing, **기본값**) | 256 | 0.321 | 0.254 | 0.626 | 0.901 | 3.4 | 2.9 | 5.1 | $0 (오프라인) | 측정 |
+| ② 로컬 ONNX (multilingual-e5-small 계열) | 384\* | — | — | — | — | — | — | — | $0 (오프라인) | **보류(디스크)** |
+| ③ Vertex AI (text-multilingual-embedding-002) | 768\* | — | — | — | — | — | — | — | 입력 7,931,890자 × 공식 단가 | **미측정(인증 없음)** |
+
+\* 미측정 행의 dim 은 모델의 공표 차원(측정 전 기대값). 측정값은 §5.2 와 같은 정확도(해싱 재현 일치).
+
+- **② 로컬 = 보류(디스크)**: 설치 전 본부 루트 여유가 **7.1 GiB**(사용 92.6%)로 AC 임계 **10 GiB**
+  미만 → 모델·의존성을 **설치하지 않았다**(`uv sync --extra embed-local` 미실행). 코드 seam·배선은
+  가짜 임베더 테스트로 증명돼 있으니, 디스크를 확보한 뒤 설치하면 이 행이 채워진다. ONNX 경로를 택한
+  이유: `sentence-transformers`+`torch` 는 PyPI 휠이 CUDA `nvidia-*` 패키지를 끌어와 "모델+의존성 ≤ 3 GiB"
+  예산을 사실상 초과한다. 로컬 모델 파일은 리포 밖(`~/.cache` 등)에 두고 `MACP_EMBEDDER_LOCAL_MODEL`
+  로 가리킨다(워크트리에 모델을 두지 않는다).
+- **③ Vertex = 미측정(인증 없음)**: 본부 ADC 자격증명은 있으나 기본 프로젝트가 해결되지 않고
+  (`MACP_VERTEX_PROJECT` 미설정) `:predict` 를 호출할 수 없다. 전체 **4,088 문서** 임베딩은 실과금이라
+  프로젝트 지정·과금 동의는 사람 결정이다. **1회 임베딩 비용(추정)**: corpus 입력 **7,931,890자**
+  (4,088 문서, `iter_embed_corpus` 로 실측) × 공식 단가. 단가 출처 = Vertex AI 생성형 AI 가격표
+  (`https://cloud.google.com/vertex-ai/generative-ai/pricing`, 텍스트 임베딩 섹션) — **실행 시점 단가
+  미확인**(이 작업 환경에 WebFetch/WebSearch 가 없다). 호출이 가능해지면 응답의 `statistics.token_count`
+  로 분모를 실측 토큰으로 교체한다.
+
+**권장(전환 아님)**: 현재 측정만으로는 **① 해싱이 v1 대비 recall@10 0.604→0.901·precision@5
+0.286→0.321 로 유의하게 우세**하며 $0·오프라인·R5(PII 경계) 정합이다. 로컬/Vertex 는 측정이 막혀
+비교 불가다. 따라서 **기본값은 `hash` 를 유지**하고, 로컬 또는 Vertex 로의 전환은 각각의 선결 조건
+(로컬: 디스크 ≥ 10 GiB 확보 후 설치; Vertex: 프로젝트·과금 동의)이 풀린 뒤 **사람이** 결정한다(AC#5).
+전환은 두 줄이다:
+
+```
+export MACP_EMBEDDER=local     # 또는 vertex
+python -m todo_system.graph_memory embed --rebuild   # dim 이 바뀌므로 --rebuild 필수(vec0 재구축)
+```
 
 ---
 
@@ -395,8 +447,12 @@ R4 의 질의("이 태스크와 관련된 과거 실패·결정")가 실제로 �
 5. **원격 질의** = state-store.md ⑦ (a) **본부 HTTP 상태 API 재사용**(메모리 질의 엔드포인트
    추가). SQLite SoT 는 본부 한 곳, 새 네트워크 서비스 불요. 상시 DB 필요 시 ⑦ (b) Cloud SQL —
    사람 게이트(§3.4).
-6. **임베딩** = 본부 VM **로컬 모델 1차**($0·PII 경계·오프라인), 관리형 API 는 §5 지표 부족 시
-   사람 게이트 에스컬레이션. 정확 모델·차원은 구현 leaf 가 벤치로 선택(미확인)(§3.4).
+6. **임베딩** = 설정값 `MACP_EMBEDDER=hash|local|vertex` 로 **선택 가능한 seam**(호출 시점 해석,
+   dim 변경 시 vec0 `--rebuild` 재구축 포함), **기본값 `hash`**(stdlib feature-hashing 256차원,
+   $0·PII 경계·오프라인). G4 §5 벤치(2026-11-10, 골든셋 `golden-20261109.json`): 해싱 v2 가 v1 대비
+   recall@10 0.604→0.901 로 우세(**확정**). 로컬 소형(ONNX e5-small 계열, 384)·Vertex(768)는 각각
+   **보류(디스크 여유 7.1 GiB < 10 GiB)**·**미측정(ADC 프로젝트 미해결)** 로 수치 미확정 — 전환은 그
+   선결 조건이 풀린 뒤 사람 결정(§5.5). 관리형 API 는 여전히 사람 게이트 에스컬레이션(§3.4).
 7. **PII 경계** = SMS·메일 본문·건강 원자료는 저장도 임베딩도 **안 함**; 요약/메타만(R5).
 8. **평가** = precision@k·recall@k **vs v1 베이스라인**(같은 골든셋), `eval_memory.py` 하니스 +
    로컬 pytest. 측정이 설계를 반증할 수 있다(§5).
