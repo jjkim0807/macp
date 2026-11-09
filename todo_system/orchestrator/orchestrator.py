@@ -1347,7 +1347,18 @@ class Orchestrator:
         The fingerprint is sampled BEFORE the close write, so an optional `note`
         (the no-op close's reason, written AS PART OF that close) never changes the
         bytes reconcile_closed compares against — a lost close still leaves the
-        pre-close bytes behind exactly. Callers that pass no note are unchanged."""
+        pre-close bytes behind exactly. Callers that pass no note are unchanged.
+
+        Known interaction with a vault merge, left as it is on purpose: if a merge
+        rewrites the md between this sampling and the close, the fingerprint is the
+        PRE-merge bytes while the md on disk is the merged ones, so a close lost
+        after that point does not match and reconcile_closed reads it as a human
+        reopen — it logs `reopen-respected` and leaves the task open rather than
+        re-closing it. That is why the 2026-11-09 revert stayed visibly open
+        instead of being healed silently. Keep it that way: respecting an apparent
+        human reopen is the conservative side of this trade, and the fix for the
+        revert itself belongs in the writer (tasks.mark_done's compare-and-swap),
+        not in loosening this evidence."""
         try:
             from . import tasks
             a.close_fingerprint = tasks.md_fingerprint(a.task_id)
