@@ -44,6 +44,7 @@
 | `todo_system/orchestrator/orchestrator.py:_notify_timeout_park` | ⏱️ 연속 stage timeout 대기 전환 | 즉시 | long_job 전환 판단 필요. event_key `timeout-park:<task>` |
 | `todo_system/orchestrator/orchestrator.py:_notify_blocker_cancelled` | 🔗 상류 취소로 진행 불가 | 즉시 | 태스크 존폐 판단 필요. event_key `blocker-cancelled:<task>` |
 | `todo_system/orchestrator/orchestrator.py:_notify_parent_complete` | 🧭 하위 완료된 상위 태스크 open (구 `[상위태스크 점검]`) | 즉시 | 닫을지 판단 필요. `_record_parent_surfaced`가 1회성 보장(자체 쿨다운) |
+| `todo_system/orchestrator/orchestrator.py:_notify_human_ready` | 🙋 사람이 할 차례 — 기다리던 선행 작업 전부 done | 즉시 | 사람이 **지금** 해야 하는 일이고, 체인에 남은 게 사람뿐이라 요약으로 미루면 최대 하루 늦는다. event_key `human-ready:<slug>` + `_human_ready_seen`의 dep 집합 fingerprint 1회성(자체 쿨다운) — ready를 벗어나면 엔트리가 prune돼 재무장하고, 첫 배포에는 24h 안에 닫힌 체인만 알린다 |
 | `todo_system/orchestrator/orchestrator.py:_propagate_downstream` | 🔗 하류 통합검증 N개 생성 | **요약** | 자동 생성 FYI — 검증 결과는 별도 알림이 옴 |
 | `todo_system/orchestrator/orchestrator.py:_nudge` | 🙋 파킹된 할당 재촉 (1d/3d/7d 백오프) | 즉시 | 사람 응답을 며칠째 기다리는 의도적 에스컬레이션. event_key 없음 — last_nudge_ts 백오프가 이미 페이싱(자체 쿨다운) |
 | `todo_system/orchestrator/human.py:deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | **요약** | 2026-09-16 감사: 5건 전부 FYI — 직전 검토요청과 중복. QUERY/CANCEL/WAKE/PING은 즉시 유지(애매하면 즉시) |

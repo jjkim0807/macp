@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import human, message as m, stages
-from .. import i18n, kakao_format, paths
+from .. import i18n, kakao_format, not_before as _nb, paths
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
     ACCEPTED, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS, REJECTED,
@@ -208,6 +209,13 @@ class Task:
 # per ledger row, on every 5-minute tick, burying every other signal. Three keeps
 # the first occurrences debuggable; the rest become a count.
 _SKIP_LINE_CAP = 3
+# A GitHub PR URL inside a run's report.md — the only durable record of a closed
+# task's PR (the Assignment never persists `pr_url`). Used by _dep_run_link.
+_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# How recently a dependency must have closed for the FIRST-EVER sweep to alert on
+# it. Without this, deploying the feature onto a vault with months of closed
+# chains would page the human once per historical task in a single tick.
+HUMAN_READY_BACKFILL_WINDOW_S = 24 * 3600.0
 # The summary line quotes the cause, and `str(e)` is unbounded — an unabridged
 # key would re-create the flood the cap exists to end.
 _SKIP_KEY_MAXLEN = 120
@@ -2157,6 +2165,256 @@ class Orchestrator:
             return []
         return processed
 
+    # -- "it is your turn" alerts (deps-ready human tasks) -------------------
+    # A human-owned task that declares `depends_on` had NO announcement path:
+    # auto_unblock only flips tasks into worker modes, so a `manual` leaf whose
+    # upstream closed just became quietly actionable and waited to be noticed
+    # (2026-11-09). These three helpers are the once-only state, the alert body,
+    # and the PR link; `reconcile_human_ready` below sweeps them every tick.
+
+    def _human_ready_seen_path(self) -> Path:
+        """Gitignored, same place and shape as `_parent_seen_path`."""
+        return self.ledger.root.parent / "_state" / "human_ready.json"
+
+    def _human_ready_seen(self) -> dict:
+        """`{slug: {"fp": <dep-set fingerprint>, "ts": iso}}` — {} if unreadable.
+
+        The fingerprint, not the timestamp, is the dedup key: a timestamp alone
+        could not tell "already told them" from "a dep was reopened and closed
+        again", so the alert would never re-arm.
+        """
+        try:
+            seen = json.loads(self._human_ready_seen_path().read_text(encoding="utf-8"))
+            return seen if isinstance(seen, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_human_ready(self, state: dict) -> None:
+        try:
+            p = self._human_ready_seen_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _dep_run_link(self, dep_slug: str, runs_dir: Path | None = None) -> str | None:
+        """Best-effort PR URL from the dependency's newest run report.
+
+        The Assignment never persists `pr_url` (it exists only in the delivering
+        payload, `_notify_review`), so the closed upstream's own report.md is the
+        only durable place its PR is written down. It rides in the `link` arg —
+        the "Open" button — never in the body: a URL in the text can be clipped
+        mid-token by the length budget. None whenever anything is missing.
+        """
+        if not dep_slug:
+            return None
+        try:
+            runs = stages.runs_for(dep_slug, runs_dir or stages.RUNS_DIR)
+            for run in reversed(runs):                  # newest first
+                report = run / "report.md"
+                try:
+                    text = report.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                hit = _PR_URL_RE.search(text)
+                if hit:
+                    return hit.group(0)
+        except Exception:
+            pass
+        return None
+
+    def _notify_human_ready(self, row: dict, runs_dir: Path | None = None) -> None:
+        """One immediate ping: this task is now a person's to act on.
+
+        Immediate tier is the whole point — the person is the only thing left in
+        the chain, and a digest would park "your turn" for up to a day. Lines are
+        ordered most-actionable first because `compose_alert` DROPS a line that
+        would overflow (never cuts it), so the title and next_action survive even
+        when a long If-Then does not. The event key is a second belt behind
+        `_human_ready_seen`; `_notify_routed` already swallows notifier failures.
+        """
+        slug = row.get("slug") or "?"
+        lines = [f"📋 {self._task_title(slug)}"]
+        if row.get("next_action"):
+            lines.append(i18n.t("alert.human_ready_next", next_action=row["next_action"]))
+        if row.get("if_then"):
+            lines.append(i18n.t("alert.human_ready_ifthen", if_then=row["if_then"]))
+        if row.get("last_dep"):
+            lines.append(i18n.t("alert.human_ready_dep", dep=row["last_dep"]))
+        self._notify_routed(
+            human.compose_alert(i18n.t("alert.human_ready"), lines),
+            self._dep_run_link(row.get("last_dep") or "", runs_dir),
+            level=kakao_format.LEVEL_IMMEDIATE, event_key=f"human-ready:{slug}")
+
+    def _is_human_owned(self, slug: str) -> bool:
+        """Whether the registry routes this task to a human agent. False on any
+        lookup failure — a broken registry must not invent an owner to page."""
+        try:
+            owner = self.route(slug)
+            return bool(owner is not None and getattr(owner, "is_human", False))
+        except Exception:
+            return False
+
+    def _dep_done_at(self, dep: str, items_dir: Path | str | None = None) -> str | None:
+        """When the dependency finished: its ledger row's `updated_ts`, else its
+        markdown `updated:`, else None.
+
+        `items_dir` is passed by the sweep so the md fallback reads the SAME
+        directory the scan read — otherwise a sweep pointed at one items dir
+        could take a timestamp from another. Only the first-ever sweep's backfill
+        guard consults this, and it treats None as "too old to announce"."""
+        try:
+            a = self.ledger.load(dep)
+            ts = getattr(a, "updated_ts", None) if a else None
+            if ts:
+                return str(ts)
+        except Exception:
+            pass
+        try:
+            from . import repos
+            from .. import cli
+            base = Path(items_dir) if items_dir is not None else Path(cli.ITEMS_DIR)
+            fm = repos._frontmatter(base / f"{dep}.md")
+            updated = str(fm.get("updated") or "").split("#")[0].strip()
+            return updated or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _within_backfill_window(iso: str | None, now: dt.datetime | None = None) -> bool:
+        """Whether `iso` is recent enough for the first-ever sweep to announce.
+
+        Unparseable or absent → False (conservative): on a vault with months of
+        closed chains, guessing "recent" would page the human once per historical
+        task in a single tick. A silenced row is still RECORDED, so its next
+        genuine ready event alerts normally.
+        """
+        if not iso:
+            return False
+        try:
+            stamp = dt.datetime.fromisoformat(str(iso).strip().replace("Z", "+00:00"))
+        except Exception:
+            try:
+                stamp = dt.datetime.fromisoformat(str(iso).strip()[:10])
+            except Exception:
+                return False
+        now = now or dt.datetime.now()
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone().replace(tzinfo=None)
+        if now.tzinfo is not None:
+            now = now.astimezone().replace(tzinfo=None)
+        return 0 <= (now - stamp).total_seconds() <= HUMAN_READY_BACKFILL_WINDOW_S
+
+    def reconcile_human_ready(self, unblock_flips: list | None = None, *,
+                              items_dir: Path | str | None = None,
+                              db: Path | str | None = None,
+                              runs_dir: Path | None = None,
+                              dep_done_at=None,
+                              now: dt.datetime | None = None) -> list[str]:
+        """Tell the human, once, about every task that just became THEIR turn.
+
+        The gap this closes: `auto_unblock` (which runs immediately before this,
+        in `_main`) only flips tasks into *worker* modes. A `manual` / `review` /
+        `decision` leaf whose upstream closed simply became actionable with no
+        announcement anywhere — no Slack, no dashboard urgency — and waited to be
+        noticed (2026-11-09).
+
+        Two sources merge into one row per slug:
+
+        * the sweep — every open human task whose `depends_on` is fully done
+          (`task_deps.human_deps_ready`, the same done test `resolve_unblocks`
+          uses), and
+        * this tick's `unblock_flips`, keeping only flips into a HUMAN mode. A
+          flip to auto/delegate/quick/discover is a worker's cue, not a person's.
+
+        Both paths key on the dep-set fingerprint, so a task that the flip and the
+        sweep both find is one row and one alert.
+
+        Once-only, but re-arming: `_human_ready_seen` stores `{slug: {fp, ts}}`,
+        and an entry is PRUNED when its slug is still in the scan but no longer
+        ready — so reopening a dep (or the task) and closing it again alerts
+        again. Only slugs the scan actually saw may be pruned: a failed scan
+        yields an empty ready set, and pruning on that would wipe the whole file
+        and flood on the next healthy tick.
+
+        Two flood guards: a `deferred` row (future `not_before`) is neither
+        alerted nor pruned, and on the very first sweep — no state file yet — only
+        chains whose last dep closed inside `HUMAN_READY_BACKFILL_WINDOW_S` are
+        announced; the rest are recorded silently.
+
+        Never raises into `tick()`: per-row isolation via `_SkipTally` plus an
+        outer net, like `reconcile_parents`.
+        """
+        notified: list[str] = []
+        skips = _SkipTally("reconcile_human_ready")
+        try:
+            from .. import cli, task_deps
+            items = Path(items_dir) if items_dir is not None else Path(cli.ITEMS_DIR)
+            database = Path(db) if db is not None else Path(cli.DB_PATH)
+            scan = task_deps.scan_items(items)
+            rows, warnings = task_deps.human_deps_ready(
+                scan, database, is_human_owned=self._is_human_owned,
+                dep_done_at=(dep_done_at if dep_done_at is not None
+                             else lambda d: self._dep_done_at(d, items)),
+                now=now)
+            for w in warnings:
+                print(f"[orchestrator] reconcile_human_ready: {w}")
+
+            # Merge this tick's human-mode flips. Already-present slugs are left
+            # alone so the two paths cannot double-send.
+            have = {r["slug"] for r in rows}
+            for flip in unblock_flips or []:
+                try:
+                    slug, mode = flip[0], flip[1]
+                except Exception:
+                    continue
+                if slug in have or mode not in task_deps.HUMAN_WORK_MODES:
+                    continue
+                t = scan.get(slug)
+                if not t or not t.get("depends_on"):
+                    continue          # nothing to say about a task we cannot read
+                deps = sorted(t["depends_on"])
+                rows.append({
+                    "slug": slug, "depends_on": deps, "last_dep": deps[-1],
+                    "last_dep_at": None,
+                    "fingerprint": task_deps._fingerprint(deps),
+                    "deferred": _nb.is_deferred(t.get("not_before"), now),
+                    "next_action": t.get("next_action") or "",
+                    "if_then": t.get("if_then") or ""})
+                have.add(slug)
+
+            state_path = self._human_ready_seen_path()
+            first_sweep = not state_path.exists()
+            seen = self._human_ready_seen()
+            stamp = m.now_iso()
+            for r in rows:
+                try:
+                    if r["deferred"]:
+                        continue                 # not alerted, and not pruned below
+                    prev = seen.get(r["slug"])
+                    if isinstance(prev, dict) and prev.get("fp") == r["fingerprint"]:
+                        continue                 # already told them about this chain
+                    if first_sweep and not self._within_backfill_window(
+                            r.get("last_dep_at"), now):
+                        seen[r["slug"]] = {"fp": r["fingerprint"], "ts": stamp,
+                                           "backfilled": True}
+                        continue
+                    self._notify_human_ready(r, runs_dir)
+                    notified.append(r["slug"])
+                    seen[r["slug"]] = {"fp": r["fingerprint"], "ts": stamp}
+                except Exception as e:  # noqa: BLE001 — per-row isolation
+                    skips.record((r.get("slug") if isinstance(r, dict) else None) or "?", e)
+            skips.flush()
+            still = {r["slug"] for r in rows}     # includes deferred rows on purpose
+            for slug in list(seen):
+                if slug in scan and slug not in still:
+                    del seen[slug]                # re-arm: ready again later = new alert
+            self._write_human_ready(seen)
+        except Exception as e:  # noqa: BLE001 — never raise into tick()
+            print(f"[orchestrator] reconcile_human_ready: sweep aborted: {e}")
+            return notified
+        return notified
+
     def _close_split_parent_row(self, a: Assignment, note: str, kind: str) -> None:
         """Transition a parked split-parent ledger row to DONE, reusing
         reconcile_merged's battle-tested close shape: record any false alarm (inert
@@ -2547,7 +2805,8 @@ class Orchestrator:
             print(f"[orchestrator] rescope sweep skipped (fail-open): {e}")
             return []
 
-    def tick(self, tasks: list[Task], now: float | None = None) -> dict:
+    def tick(self, tasks: list[Task], now: float | None = None, *,
+             unblock_flips: list | None = None) -> dict:
         reaped = self.reap_stale(now)
         usage_hold = self.usage_hold()
         # stop starting new work; in-flight replies below are still collected
@@ -2596,6 +2855,11 @@ class Orchestrator:
         closed = self.reconcile_closed(now)     # ledger done but todo open -> close
         unblocked = self.reconcile_unblocked()  # blocker resolved -> stop waiting
         parents = self.reconcile_parents()     # children all done -> tell a human
+        # Beside reconcile_parents on purpose — both answer "what does a PERSON
+        # now have to do". Runs AFTER collect/reconcile_closed so a dep closed in
+        # THIS tick already reads as done. `unblock_flips` are the flips
+        # `_main`'s auto_unblock just applied; fail-open, never raises.
+        human_ready = self.reconcile_human_ready(unblock_flips)
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
         self._advote_bridge_tick()             # advote feedback → task bridge (fail-open, min-poll+main guarded)
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
@@ -2608,6 +2872,7 @@ class Orchestrator:
                 "rescoped": rescoped,
                 "split_parents": split_parents,
                 "parents": parents,
+                "human_ready": human_ready,
                 "project_stalls": project_stalls,
                 "requeued": requeued, "renudged": nudged,
                 "budget_reached": self.budget_exceeded(), "paused": self.paused(),
@@ -3030,7 +3295,10 @@ def _main(argv: list[str] | None = None) -> int:
         # Until 2026-10-26 only planner_tick.sh (30-min timer) ran task_deps, so a
         # serial chain idled up to 30 min between links (mulkko-133 done 18:54,
         # mulkko-134 still blocked until the 18:59 planner tick).
-        auto_unblock(db, base / args.items_dir)
+        # The flips are carried into the tick so reconcile_human_ready can alert on
+        # the ones that landed in a HUMAN mode — those have no worker to pick them
+        # up, and before 2026-11-09 nothing announced them at all.
+        flips = auto_unblock(db, base / args.items_dir)
         try:
             cands = tasks.load_dispatchable(db)
         except sqlite3.OperationalError:
@@ -3041,7 +3309,7 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"[orchestrator] no task database at {db} — run "
                   "`python -m todo_system.cli import-md` first", file=sys.stderr)
             cands = []
-        result = orch.tick(cands)
+        result = orch.tick(cands, unblock_flips=flips)
         budget = f" BUDGET-REACHED (runs today={orch._runs_today()}/{orch.daily_run_budget})" \
             if result.get("budget_reached") else ""
         budget += " PAUSED" if result.get("paused") else ""
@@ -3055,7 +3323,11 @@ def _main(argv: list[str] | None = None) -> int:
               f"unparked={len(result.get('unparked', []))} "
               f"split_parents={len(result.get('split_parents', []))} "
               f"parents={len(result.get('parents', []))} "
-              f"requeued={len(result['requeued'])}{budget}")
+              f"requeued={len(result['requeued'])} "
+              # Appended at the END on purpose: macp_monitor keys off the
+              # `candidates=N dispatched=N` prefix and the trailing hold suffixes,
+              # and test_orchestrator_cli asserts the existing token run verbatim.
+              f"human_ready={len(result.get('human_ready', []))}{budget}")
         for a in result["dispatched"]:
             print(f"  dispatched {a.task_id} -> {a.agent_id}")
         return 0
