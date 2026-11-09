@@ -474,25 +474,19 @@ class PlannerTickWiringTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# worker-planner.md branch pin — shipped as a proposal (.claude/** is hard-gated)
+# worker-planner.md branch pin — rule lives directly in .claude/commands/
 # ---------------------------------------------------------------------------
-class BranchPinProposalTest(unittest.TestCase):
-    PROPOSAL = (REPO_ROOT / "Worker" / "proposals"
-                / "macp-planner-tick-checkout-lease-branch-pin"
-                / ".claude" / "commands" / "worker-planner.md")
+class BranchPinRuleTest(unittest.TestCase):
+    PROMPT = (REPO_ROOT / ".claude" / "commands" / "worker-planner.md")
 
-    def test_proposal_exists_and_pins_the_default_branch(self):
-        if not self.PROPOSAL.exists():
-            self.skipTest(
-                "vault-only: Worker/proposals/… is a vault artifact (a proposal for a "
-                ".claude/ file), not in the engine code export set (public-split-10 AC2)."
-            )
-        self.assertTrue(self.PROPOSAL.exists(),
-                        "branch-pin proposal for worker-planner.md is missing")
-        txt = self.PROPOSAL.read_text(encoding="utf-8")
+    def test_worker_planner_doc_pins_the_default_branch(self):
+        self.assertTrue(self.PROMPT.exists(),
+                        "worker-planner.md branch-pin rule is missing")
+        txt = self.PROMPT.read_text(encoding="utf-8")
         self.assertIn("symbolic-ref", txt)         # the HEAD check the rule prescribes
+        self.assertIn("## CRITICAL: Branch pin", txt)
         # the rule: do not commit when HEAD is not the default branch
-        self.assertRegex(txt, r"(?s)기본 브랜치.*커밋")
+        self.assertRegex(txt, r"(?s)not the default branch.*do not stage")
 
 
 if __name__ == "__main__":
