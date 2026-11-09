@@ -107,6 +107,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🚧 {n}회 재실패로 자동 재시도를 멈췄어요 — "
             "원인 확인 후 수동 처리가 필요합니다"),
         "alert.recent_reason": "최근 사유: {note}",
+        "alert.close_failed": (
+            "🔒 {slug} 닫기 실패(mark_done=False) — md 없음 또는 CAS 재시도 소진; "
+            "원장과 md가 어긋났을 수 있어 확인이 필요합니다"),
         "alert.timeout_park": (
             "⏱️ {n}회 연속 stage timeout으로 대기 전환 — "
             "더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다"),
@@ -269,6 +272,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🚧 Auto-retry stopped after {n} repeated failures — "
             "find the cause and handle it by hand"),
         "alert.recent_reason": "last reason: {note}",
+        "alert.close_failed": (
+            "🔒 Closing {slug} failed (mark_done=False) — md missing or CAS retries "
+            "exhausted; the ledger and md may disagree, so check it"),
         "alert.timeout_park": (
             "⏱️ Parked after {n} consecutive stage timeouts — "
             "decide whether to split it further or run it as a long_job"),
