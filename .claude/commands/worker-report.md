@@ -36,6 +36,7 @@ generated: <ISO timestamp>
 overall_status: pass | fail
 pr_url: <url or null>
 merged: yes | no | n/a
+no_op: true | false
 ---
 
 <!-- `merged`: set truthfully after the merge step. `yes` = the PR was actually
@@ -102,6 +103,22 @@ frontmatter (the runner reads the first match, so write only the one that applie
 it burning a retry on something that is not broken. Explain the reason in
 "사람이 검토해야 할 부분" (needs human review) either way — the field routes the alert, the
 prose justifies it.
+
+#### `no_op: true` — the merge did not land because there was nothing to do
+
+There is a third reason the merge did not land, distinct from both above: you
+opened the task, verified it, and found **nothing to change** — the code already
+satisfies `outcome`, you made **0 commits**, and opened no PR. That is not a park.
+Set `no_op: true` (with `merged: n/a`) in the frontmatter, and the runner closes
+the task with a Progress-Log note and **no alert**, instead of paging a human with
+"auto_merge did NOT land".
+
+Set it **only** on a genuine, verified no-op where you committed **0 commits**.
+Never to escape a real failure (that is `merged: no` + `worker_mode_recommendation:
+auto`), never on a blocked run, and never beside a deliberate `review` hold — the
+runner trusts the 0-commit signal to close with no human review, so a wrong
+`no_op: true` buries a task no one looks at. Say what you verified in
+"사람이 검토해야 할 부분".
 
 ### 2. `<vault_root>/Memory/episodes/<YYYY-MM-DD>-worker-<slug>.md`
 
