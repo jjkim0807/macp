@@ -1075,9 +1075,40 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
     except Exception:
         pass
 
-    items.sort(key=lambda r: (not r["urgent"], WHY_ORDER.get(r["why"], 9),
-                              r["due"] or "9999", r["slug"]))
+    items.sort(key=_human_sort_key)
     return items
+
+
+def _human_sort_key(r: dict) -> tuple:
+    """Human-list order: urgent first, then WHY_ORDER, due, slug."""
+    return (not r["urgent"], WHY_ORDER.get(r["why"], 9), r["due"] or "9999", r["slug"])
+
+
+def collect_proposals(root=None) -> list[dict]:
+    """Unapplied Worker/proposals/<slug>/ prompt proposals as human `todo` rows.
+    Headless workers can't write .claude/**, so a person applies them with one cp;
+    without this row nothing announced them. Fail-soft: any error → []."""
+    try:
+        from todo_system.orchestrator.proposals import pending_proposals
+        return pending_proposals(root or _INSTALL_DIR)
+    except Exception:
+        return []
+
+
+def _merge_proposals(human_all: list[dict], proposals: list[dict]) -> list[dict]:
+    """Add proposal rows whose slug isn't already a human row, re-sorted with the
+    same key as collect_human (the human/human_later split and group stamping in
+    collect_status then apply unchanged)."""
+    if not proposals:
+        return human_all
+    try:
+        seen = {r.get("slug") for r in human_all}
+        merged = human_all + [p for p in proposals if p.get("slug") not in seen]
+        merged.sort(key=lambda r: (not r.get("urgent"), WHY_ORDER.get(r.get("why"), 9),
+                                   r.get("due") or "9999", r.get("slug") or ""))
+        return merged
+    except Exception:
+        return human_all                    # never break /api/status over a reminder
 
 
 def _title_map() -> dict:
@@ -1534,6 +1565,7 @@ def collect_status() -> dict:
     projects_rows = collect_projects(a)
     human_all = collect_human(a, projects={p["slug"] for p in projects_rows},
                               umbrellas=umbrellas)
+    human_all = _merge_proposals(human_all, collect_proposals())
     human = [r for r in human_all if not r.get("later")]
     human_later = [r for r in human_all if r.get("later")]
     for r in (*active, *attention, *human, *human_later):
