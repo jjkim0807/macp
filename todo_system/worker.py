@@ -41,6 +41,7 @@ from .claude_auth import claude_env
 from . import browser_watch
 from . import kakao_format
 from . import maintenance_disk
+from . import maintenance_embed
 from . import not_before as nb_gate
 from . import paths
 from .kakao_format import LEVEL_DIGEST, compose_alert
@@ -2193,6 +2194,10 @@ def cmd_maintenance() -> int:
       - maintenance_disk.check_and_prune: below 8 GiB free on the root disk,
         prunes re-downloadable caches (uv, old Gradle version caches and
         build-cache entries); silent when healthy, pages once a day if still low.
+      - maintenance_embed.embed_tick: re-embeds the vault corpus incrementally
+        (content-hash diff — unchanged docs are skipped), so query_related's
+        semantic half does not answer from a stale snapshot; silent when nothing
+        changed, one throttled line when sqlite-vec is absent.
 
     doctor_recover_queue is deliberately NOT here: it heals Worker/queue.json,
     which is exactly the store the cutover retires.
@@ -2319,6 +2324,17 @@ def cmd_maintenance() -> int:
                 print(line)
         except Exception as exc:
             print(f"disk-prune: error — {exc}")
+            rc = 1
+        # graph_memory.embed_vault has been incremental since G2 but nothing ever
+        # ran it on a schedule, so query_related's semantic half answered from a
+        # single manual run (2026-11-09) and silently degraded to BFS-only for
+        # everything written since.
+        try:
+            line = maintenance_embed.embed_tick()
+            if line:
+                print(line)
+        except Exception as exc:
+            print(f"embed-tick: error — {exc}")
             rc = 1
     return rc
 

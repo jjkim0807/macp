@@ -93,6 +93,17 @@ sets its kill switch (``MACP_DISK_PRUNE=0``) and points ``HOME_DIR``,
 dir that is never created. The module's own tests lift the switch and build a
 fake home there.
 
+The maintenance vault embedding (``todo_system/maintenance_embed.py``) is the
+other new step of ``worker.cmd_maintenance``, and a worse offender than the
+prune: it has no threshold to sit behind. Every unisolated ``cmd_maintenance``
+test would walk the REAL vault's ~4,000-doc corpus and write vectors into the
+real ``Memory/relations.sqlite`` (or, under the gate command's
+``MACP_VAULT_ROOT=vault-template``, into the template's).
+``_embed_tick_isolated`` sets its kill switch (``MACP_EMBED_TICK=0``) and points
+``VAULT_ROOT``, ``DB_PATH`` and ``STATE_DIR`` into a tmp dir that is never
+created, so a forgotten seam finds an empty vault rather than the live one. The
+module's own tests lift the switch and build a tmp vault there.
+
 The ``auto`` tick's own side effects — ``orchestrator main auto`` reaches three
 things no test may do for real. ``usage_hold()`` calls ``usage_guard.check()``,
 whose ``get_snapshot`` sends a GET to the Anthropic OAuth usage endpoint (its
@@ -143,7 +154,7 @@ from typing import NamedTuple
 
 import pytest
 
-from todo_system import cli, maintenance_disk, paths, usage_guard, worker
+from todo_system import cli, maintenance_disk, maintenance_embed, paths, usage_guard, worker
 from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
 from todo_system.orchestrator import orchestrator as _orch_mod
 
@@ -474,6 +485,19 @@ def _disk_prune_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(maintenance_disk, "STATE_DIR", base / "state")
     monkeypatch.setattr(maintenance_disk, "VAULT_ROOT", base / "vault")
     monkeypatch.setattr(maintenance_disk, "PROC_DIR", str(base / "no-proc"))
+
+
+@pytest.fixture(autouse=True)
+def _embed_tick_isolated(tmp_path_factory, monkeypatch):
+    # Switched off AND pointed at a tmp dir (see the module docstring). The dirs
+    # are never created, so an embed test that forgets a seam finds no corpus.
+    base = tmp_path_factory.mktemp("embed-tick")
+    monkeypatch.setenv(maintenance_embed.KILL_ENV, "0")
+    monkeypatch.setenv(maintenance_embed.STATE_DIR_ENV, str(base / "state"))
+    monkeypatch.setattr(maintenance_embed, "VAULT_ROOT", base / "vault")
+    monkeypatch.setattr(maintenance_embed, "DB_PATH",
+                        base / "vault" / "Memory" / "relations.sqlite")
+    monkeypatch.setattr(maintenance_embed, "STATE_DIR", base / "state")
 
 
 @pytest.fixture(autouse=True)
