@@ -29,6 +29,8 @@ provenance (public repo — no real name/token/host/abs-home path).
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from todo_system import graph_memory as gm
@@ -305,3 +307,150 @@ def test_emit_candidates_scaffold_and_roundtrip(isolated_vault):
         assert ls.labels[0].task["slug"] == "task-main"
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Three-way embedder bench (design §5.5) — scratch DBs, live-DB guard (AC#4)
+# ---------------------------------------------------------------------------
+
+
+def _fake_backend(dim: int):
+    """A registry factory for a deterministic dim-``dim`` fake embedder — enough for
+    run_bench to build + KNN-query a scratch index without a real model."""
+
+    def factory():
+        def fn(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            return [digest[i % len(digest)] / 255.0 for i in range(dim)]
+
+        return fn, dim
+
+    return factory
+
+
+def test_run_bench_fills_rows_for_measured_backends(isolated_vault, monkeypatch, tmp_path):
+    """Two fake backends of different dims each get a 측정 row with dim / index time /
+    vector disk / metrics filled, and the embedder-independent v1 baseline is captured."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple orchard [[banana]] harvest\n")
+    isolated_vault.write("Notes/banana.md", "banana tree tropical\n")
+
+    monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "fakea", _fake_backend(3))
+    monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "fakeb", _fake_backend(5))
+    labelset = em.LabelSet(
+        status="golden",
+        labels=[
+            em.LabelEntry(
+                task={"slug": "apple", "title": "apple harvest"},
+                relevant=["banana"],
+                label_source="golden",
+            )
+        ],
+    )
+
+    rows, v1_metrics = em.run_bench(
+        labelset,
+        vault_root=isolated_vault.root,
+        work_dir=tmp_path / "bench",
+        names=("fakea", "fakeb"),
+        ks=(5, 10),
+    )
+
+    assert {r.name for r in rows} == {"fakea", "fakeb"}
+    assert {r.dim for r in rows} == {3, 5}
+    for r in rows:
+        assert r.status == "측정"
+        assert r.metrics is not None
+        assert set(r.metrics.precision_at) == {5, 10}
+        assert 0.0 <= r.metrics.precision_at[5] <= 1.0
+        assert 0.0 <= r.metrics.recall_at[10] <= 1.0
+        assert r.index_seconds is not None and r.index_seconds >= 0.0
+        assert r.vector_bytes is not None
+    assert v1_metrics is not None  # BFS baseline captured from the first measured variant
+
+    # the scratch DBs live under work_dir, NOT in the vault's Memory/
+    assert (tmp_path / "bench" / "bench-fakea.sqlite").exists()
+    assert not (isolated_vault.root / "Memory" / "relations.sqlite").exists()
+
+
+def test_run_bench_unavailable_backend_becomes_unmeasured_row(isolated_vault, monkeypatch, tmp_path):
+    """A backend whose factory raises EmbedderUnavailable yields a 미측정 row (no
+    metrics) while the available backend in the same run still produces a 측정 row."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple orchard\n")
+
+    def _dead():
+        raise gm.EmbedderUnavailable("no model on this host")
+
+    monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "deadbackend", _dead)
+    monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "fakea", _fake_backend(3))
+    labelset = em.LabelSet(
+        status="golden",
+        labels=[em.LabelEntry(task={"slug": "apple"}, relevant=["x"], label_source="golden")],
+    )
+
+    rows, _v1 = em.run_bench(
+        labelset,
+        vault_root=isolated_vault.root,
+        work_dir=tmp_path / "bench",
+        names=("deadbackend", "fakea"),
+        ks=(5, 10),
+    )
+    by_name = {r.name: r for r in rows}
+    assert by_name["deadbackend"].status.startswith("미측정")
+    assert by_name["deadbackend"].metrics is None
+    assert by_name["fakea"].status == "측정"  # one absent backend does not sink the run
+
+
+def test_run_bench_refuses_live_memory_dir(isolated_vault, tmp_path):
+    """The most important safety test: pointing --work-dir at the vault's live Memory/
+    dir (where the maintenance tick writes relations.sqlite) is refused outright."""
+    labelset = em.LabelSet(status="golden", labels=[])
+    with pytest.raises(ValueError):
+        em.run_bench(
+            labelset,
+            vault_root=isolated_vault.root,
+            work_dir=isolated_vault.root / "Memory",
+            names=("hash",),
+            ks=(5, 10),
+        )
+
+
+def test_render_bench_table_carries_hold_and_unmeasured_strings():
+    """The renderer prints the status strings verbatim — ``보류(디스크)`` and
+    ``미측정(인증 없음)`` must survive into the table — plus a v1 reference row, metric
+    headers, and a 권장 footer; the weak caption appears only when weak."""
+    v1 = em.Metrics(
+        precision_at={5: 0.30, 10: 0.20}, recall_at={5: 0.50, 10: 0.60}, latency_p50_ms=5.0
+    )
+    rows = [
+        em.BenchRow(
+            name="hash",
+            status="측정",
+            dim=256,
+            metrics=em.Metrics(
+                precision_at={5: 0.32, 10: 0.25},
+                recall_at={5: 0.63, 10: 0.90},
+                latency_p50_ms=6.6,
+            ),
+            index_seconds=3.1,
+            vector_bytes=2_000_000,
+            docs=100,
+            cost="$0 (오프라인)",
+        ),
+        em.BenchRow(name="local", status="보류(디스크)", cost="$0 (오프라인)"),
+        em.BenchRow(name="vertex", status="미측정(인증 없음)", cost="입력 ~1,000자 기준"),
+    ]
+
+    table = em.render_bench_table(rows, v1, weak=False)
+    assert "보류(디스크)" in table
+    assert "미측정(인증 없음)" in table
+    assert "P@5" in table and "R@10" in table
+    assert "0.320" in table  # hash P@5
+    assert "0.900" in table  # hash R@10
+    assert "권장" in table
+    assert "v1 (BFS" in table
+    assert "약한 라벨(참고)" not in table
+
+    weak_table = em.render_bench_table(rows, v1, weak=True)
+    assert "약한 라벨(참고)" in weak_table

@@ -533,3 +533,462 @@ def test_cli_embed_real_run_builds_vectors(tmp_path):
         assert con.execute("SELECT COUNT(*) FROM vec_sources").fetchone()[0] == 1
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — embedder selection seam + dim-aware vec0 rebuild (G4 §5 bench)
+# ---------------------------------------------------------------------------
+#
+# These pin AC#1: the embedder is selectable by config (``MACP_EMBEDDER``,
+# default ``hash``), resolution happens at **call time** (so a backend registered
+# after import — the shape G4b's injected call sites rely on — is honoured), and a
+# dimension change is either refused (no silent data loss) or rebuilt with the
+# ``--rebuild`` flag. Every case uses a **fake embedder** (no model download / no
+# network); the sqlite-vec ones guard with ``importorskip`` like the Phase 4 block.
+
+
+def _onehot16(text: str) -> list[float]:
+    """A 16-dim one-hot fake keyed on a fruit substring, so a crafted query has a
+    predictable nearest neighbour even after a dim change to 16."""
+    t = text.lower()
+    v = [0.0] * 16
+    if "apple" in t:
+        v[0] = 1.0
+    elif "banana" in t:
+        v[1] = 1.0
+    else:
+        v[2] = 1.0
+    return v
+
+
+def _make_fake_backend(dim: int):
+    """A registry factory returning ``(fn, dim)`` for a deterministic dim-``dim``
+    fake — the exact shape ``_EMBEDDER_BACKENDS`` entries have."""
+
+    def factory():
+        def fn(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            return [digest[i % len(digest)] / 255.0 for i in range(dim)]
+
+        return fn, dim
+
+    return factory
+
+
+def test_embedder_name_defaults_to_hash(monkeypatch):
+    """Unset MACP_EMBEDDER resolves to the stdlib feature-hashing default (AC#5:
+    the default is never silently switched)."""
+    monkeypatch.delenv("MACP_EMBEDDER", raising=False)
+    assert gm.embedder_name() == "hash"
+    assert gm.EMBEDDER_DEFAULT == "hash"
+
+
+def test_embedder_name_reads_env_and_rejects_unknown(monkeypatch):
+    """A known value is honoured; an unknown one is a loud ValueError listing the
+    allowed names — a typo must not silently fall back to hash and mislabel a row."""
+    monkeypatch.setenv("MACP_EMBEDDER", "local")
+    assert gm.embedder_name() == "local"
+
+    monkeypatch.setenv("MACP_EMBEDDER", "nope")
+    with pytest.raises(ValueError) as excinfo:
+        gm.embedder_name()
+    msg = str(excinfo.value)
+    assert "nope" in msg
+    for name in ("hash", "local", "vertex"):
+        assert name in msg
+
+
+def test_resolve_embedder_default_is_hash_256(monkeypatch):
+    """resolve_embedder() with no args resolves the env default to (hash fn, 256)."""
+    monkeypatch.delenv("MACP_EMBEDDER", raising=False)
+    fn, dim, name = gm.resolve_embedder()
+    assert name == "hash"
+    assert dim == 256
+    assert len(list(fn("some summary text"))) == 256
+
+
+def test_resolve_embedder_passes_explicit_injection_through():
+    """An explicit (embedder, dim) pair is returned verbatim — the path the fake-
+    embedder vec0 tests (and v2 bench) use, byte-identical to before this change."""
+    def fake(text):
+        return [0.0, 1.0]
+
+    fn, dim, _name = gm.resolve_embedder(fake, 2)
+    assert fn is fake
+    assert dim == 2
+
+
+def test_embed_vault_resolves_backend_at_call_time(isolated_vault, monkeypatch):
+    """embed_vault with NO embedder= arg resolves MACP_EMBEDDER at call time, so a
+    backend registered after import is used and its dim (not EMBED_DIM) is built."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    isolated_vault.write("Notes/b.md", "beta fact\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", _make_fake_backend(5))
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+
+        result = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert result.skipped_reason is None
+        assert result.embedded == 2
+        assert result.dim == 5  # the registered fake's dim, not the hash default
+
+        import re as _re
+        sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_embeddings'"
+        ).fetchone()[0]
+        assert _re.search(r"float\[5\]", sql)
+    finally:
+        con.close()
+
+
+def test_query_related_resolves_backend_at_call_time(isolated_vault, monkeypatch):
+    """query_related with NO embedder= arg also resolves the configured backend at
+    call time — the property that lets G4b's injected call sites follow MACP_EMBEDDER
+    without any signature change."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple orchard harvest season\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", lambda: (_onehot_embedder, 3))
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+
+        result = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert result.embedded == 1
+        assert result.dim == 3
+
+        items = gm.query_related(con, {"slug": "q", "title": "apple harvest"}, k=5)
+        assert any(it.slug == "apple" and it.score.vector > 0.0 for it in items)
+    finally:
+        con.close()
+
+
+def test_dim_change_without_rebuild_is_refused_and_preserves_index(isolated_vault, monkeypatch):
+    """Switching dim with no --rebuild is refused: skipped_reason names the mismatch
+    and the --rebuild fix, and the existing vec0 rows / vec_sources.dim are untouched
+    (neither silently kept nor crashed)."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    isolated_vault.write("Notes/b.md", "beta fact\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", _make_fake_backend(8))
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+        r1 = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert r1.embedded == 2 and r1.dim == 8
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 2
+        assert {row[0] for row in con.execute("SELECT dim FROM vec_sources")} == {8}
+
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", _make_fake_backend(16))
+        r2 = gm.embed_vault(con, vault_root=isolated_vault.root)  # rebuild=False
+        assert r2.skipped_reason is not None
+        assert "--rebuild" in r2.skipped_reason
+
+        # index unchanged: still 2 rows at the original dim 8
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 2
+        assert {row[0] for row in con.execute("SELECT dim FROM vec_sources")} == {8}
+        import re as _re
+        sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_embeddings'"
+        ).fetchone()[0]
+        assert _re.search(r"float\[8\]", sql)
+    finally:
+        con.close()
+
+
+def test_dim_change_with_rebuild_reindexes_at_new_dim(isolated_vault, monkeypatch):
+    """With --rebuild, the vec0 table is dropped and recreated at the new dim, every
+    corpus doc is re-embedded, and vectors are NOT lost (the DROP→UPDATE trap): a KNN
+    query over the rebuilt index still returns the expected nearest source."""
+    pytest.importorskip("sqlite_vec")
+    import sqlite_vec
+
+    isolated_vault.write("Notes/apple.md", "apple orchard harvest\n")
+    isolated_vault.write("Notes/banana.md", "banana tree tropical\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", lambda: (_onehot_embedder, 3))
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+        gm.embed_vault(con, vault_root=isolated_vault.root)  # dim 3
+
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", lambda: (_onehot16, 16))
+        r = gm.embed_vault(con, vault_root=isolated_vault.root, rebuild=True)
+        assert r.skipped_reason is None
+        assert r.dim == 16
+        assert r.embedded == 2
+
+        import re as _re
+        sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_embeddings'"
+        ).fetchone()[0]
+        assert _re.search(r"float\[16\]", sql)
+        assert con.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0] == 2
+        assert {row[0] for row in con.execute("SELECT dim FROM vec_sources")} == {16}
+
+        blob = sqlite_vec.serialize_float32([float(x) for x in _onehot16("apple orchard")])
+        row = con.execute(
+            "SELECT rowid FROM vec_embeddings WHERE embedding MATCH ? "
+            "ORDER BY distance LIMIT 1",
+            (blob,),
+        ).fetchone()
+        nearest = con.execute(
+            "SELECT source_file FROM vec_sources WHERE rowid = ?", (row["rowid"],)
+        ).fetchone()
+        assert nearest["source_file"] == "Notes/apple.md"
+    finally:
+        con.close()
+
+
+def test_query_dim_mismatch_degrades_to_bfs_only(isolated_vault, monkeypatch, capsys):
+    """Querying an index built at one dim with an embedder of another dim must not
+    crash: the semantic layer is skipped with a one-line warning and the result is
+    BFS-only (vector score 0.0)."""
+    pytest.importorskip("sqlite_vec")
+    isolated_vault.write("Notes/apple.md", "apple orchard\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.setitem(gm._EMBEDDER_BACKENDS, "local", lambda: (_onehot_embedder, 3))
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+        gm.embed_vault(con, vault_root=isolated_vault.root)  # index at dim 3
+
+        # a structural edge so BFS has a hit to return
+        gm.insert_edges(
+            con,
+            [
+                {
+                    "from_slug": "q",
+                    "to_slug": "struct-neighbor",
+                    "edge_type": "depends_on",
+                    "source_file": "Todo/items/q.md",
+                    "event_date": None,
+                    "recorded_at": "2026-11-09T00:00:00",
+                    "valid_until": None,
+                }
+            ],
+        )
+        capsys.readouterr()  # drop embed output
+
+        items = gm.query_related(
+            con, {"slug": "q", "title": "apple"}, k=5, embedder=_onehot16, dim=16
+        )
+        assert items  # BFS still produced the neighbour
+        assert all(it.score.vector == 0.0 for it in items)
+        out = capsys.readouterr().out
+        assert "dim" in out.lower()  # the skip warning was printed
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — local (ONNX) + vertex (ADC) backends, lazy-loaded (AC#2 / AC#3)
+# ---------------------------------------------------------------------------
+#
+# The real backend bodies load their libraries lazily via importlib and raise
+# EmbedderUnavailable (→ graceful skip) when deps/model/creds are absent. These
+# tests verify the WIRING only — no model download, no network — by injecting fake
+# ``onnxruntime`` / ``tokenizers`` / ``numpy`` modules and a fake
+# ``urllib.request.urlopen``. No real identifiers (public repo): project id is a
+# placeholder and never hardcoded in the module.
+
+
+def test_mean_pool_l2_masked_mean_then_normalize():
+    """Masked mean over a (seq, hidden) matrix, then L2-normalise. Works on plain
+    nested lists (numpy rows behave the same)."""
+    pooled = gm._mean_pool_l2([[3.0, 4.0], [100.0, 100.0]], [1, 0])
+    assert pooled == pytest.approx([0.6, 0.8])  # 2nd token masked out; [3,4]→unit
+    assert gm._mean_pool_l2([], []) == []
+
+
+class _FakeResp:
+    """Minimal context-manager HTTP response for the fake urlopen."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _install_fake_local_model(monkeypatch, tmp_path, *, hidden: int = 4):
+    """Inject fake ``tokenizers`` / ``onnxruntime`` / ``numpy`` modules and a model
+    dir, so ``_local_backend`` can be exercised without the extra or a download."""
+    import sys
+    import types
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"\x00")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    tok_mod = types.ModuleType("tokenizers")
+
+    class _Enc:
+        def __init__(self, ids):
+            self.ids = ids
+            self.attention_mask = [1] * len(ids)
+
+    class _Tok:
+        @classmethod
+        def from_file(cls, _path):
+            return cls()
+
+        def encode(self, text):
+            return _Enc(list(range(1, len(text.split()) + 2)))
+
+    tok_mod.Tokenizer = _Tok
+
+    ort_mod = types.ModuleType("onnxruntime")
+
+    class _Spec:
+        def __init__(self, name):
+            self.name = name
+
+    class _Session:
+        def __init__(self, _path):
+            pass
+
+        def get_inputs(self):
+            return [_Spec("input_ids"), _Spec("attention_mask")]
+
+        def run(self, _outputs, feed):
+            seq = len(feed["input_ids"][0])
+            # outputs = [last_hidden_state]; last_hidden_state = (batch=1, seq, hidden)
+            # with distinct rows so pooling is observably a mean.
+            return [[[[float(i + 1)] * hidden for i in range(seq)]]]
+
+    ort_mod.InferenceSession = _Session
+
+    np_mod = types.ModuleType("numpy")
+    np_mod.array = lambda x, dtype=None: x
+    np_mod.int64 = int
+
+    monkeypatch.setitem(sys.modules, "tokenizers", tok_mod)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_mod)
+    monkeypatch.setitem(sys.modules, "numpy", np_mod)
+    monkeypatch.setenv("MACP_EMBEDDER_LOCAL_MODEL", str(model_dir))
+    return model_dir
+
+
+def test_local_backend_wires_onnx_and_tokenizer(tmp_path, monkeypatch):
+    """With deps + model present, _local_backend returns (fn, probed_dim) and fn
+    emits a unit-length vector of the model's hidden width."""
+    _install_fake_local_model(monkeypatch, tmp_path, hidden=4)
+    fn, dim = gm._local_backend()
+    assert dim == 4
+    vec = fn("some korean 한국어 text")
+    assert len(vec) == 4
+    assert abs(sum(x * x for x in vec) ** 0.5 - 1.0) < 1e-9  # L2-normalised
+
+
+def test_local_backend_unavailable_without_model_env(monkeypatch):
+    monkeypatch.delenv("MACP_EMBEDDER_LOCAL_MODEL", raising=False)
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._local_backend()
+
+
+def test_local_backend_unavailable_when_deps_missing(tmp_path, monkeypatch):
+    """Model dir present but onnxruntime not importable → EmbedderUnavailable."""
+    import sys
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"\x00")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MACP_EMBEDDER_LOCAL_MODEL", str(model_dir))
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)  # None → ImportError
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._local_backend()
+
+
+def test_embed_vault_swallows_backend_unavailable(isolated_vault, monkeypatch):
+    """MACP_EMBEDDER=local with no model → the real _local_backend raises
+    EmbedderUnavailable, and embed_vault turns it into a skip (not a crash), before
+    ever touching sqlite-vec — so the maintenance tick survives a misconfig."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.delenv("MACP_EMBEDDER_LOCAL_MODEL", raising=False)
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+        result = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert result.skipped_reason is not None
+        assert result.embedded == 0
+        assert not gm._table_exists(con, "vec_embeddings")
+    finally:
+        con.close()
+
+
+def test_vertex_backend_posts_predict_and_counts(monkeypatch):
+    """_vertex_backend builds the correct :predict URL/body/auth, returns the
+    response embedding values, and accumulates request/char/token counters — all
+    against a fake ADC + fake urlopen (no network, no real project id)."""
+    import json as _json
+    import sys
+    import types
+
+    ga = types.ModuleType("google.auth")
+
+    class _Creds:
+        valid = True
+        token = "fake-token"
+
+        def refresh(self, _transport):
+            pass
+
+    ga.default = lambda scopes=None: (_Creds(), "placeholder-project")
+    monkeypatch.setitem(sys.modules, "google.auth", ga)
+    monkeypatch.setenv("MACP_VERTEX_LOCATION", "us-central1")
+    monkeypatch.delenv("MACP_VERTEX_PROJECT", raising=False)
+    monkeypatch.delenv("MACP_VERTEX_EMBED_MODEL", raising=False)
+
+    captured = {}
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["url"] = request.full_url
+        captured["body"] = _json.loads(request.data.decode("utf-8"))
+        captured["auth"] = request.headers.get("Authorization")
+        payload = {
+            "predictions": [
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 7}}}
+            ]
+        }
+        return _FakeResp(_json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    fn, dim = gm._vertex_backend()
+    assert dim == 768
+    vec = fn("한국어 텍스트")
+    assert vec == [0.1, 0.2, 0.3]
+
+    assert "publishers/google/models/text-multilingual-embedding-002:predict" in captured["url"]
+    assert "placeholder-project" in captured["url"]
+    assert captured["body"] == {"instances": [{"content": "한국어 텍스트"}]}
+    assert captured["auth"] == "Bearer fake-token"
+    assert fn.vertex_counters["requests"] == 1
+    assert fn.vertex_counters["input_chars"] == len("한국어 텍스트")
+    assert fn.vertex_counters["token_count"] == 7
+
+
+def test_vertex_backend_unavailable_without_adc(monkeypatch):
+    import sys
+    import types
+
+    ga = types.ModuleType("google.auth")
+
+    class _NoCreds(Exception):
+        pass
+
+    def _default(scopes=None):
+        raise _NoCreds("no ADC on this host")
+
+    ga.default = _default
+    monkeypatch.setitem(sys.modules, "google.auth", ga)
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._vertex_backend()
