@@ -12,8 +12,10 @@ from pathlib import Path
 
 from todo_system.orchestrator import proposals
 
+# The collect_human row shape these rows are merged into (see that function's
+# "Human-row contract"); `waiting_on`/`ready_since` joined it on 2026-11-09.
 HUMAN_KEYS = {"slug", "title", "action", "why", "due", "not_before", "urgent",
-              "later", "category", "project"}
+              "later", "category", "project", "waiting_on", "ready_since"}
 
 
 class PendingProposalsTest(unittest.TestCase):

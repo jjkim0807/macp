@@ -200,7 +200,12 @@ def _row(root: Path, slug_dir: Path, readme_text: str, unapplied: Path) -> dict:
     return {"slug": slug, "title": title_of(slug), "action": action[:ACTION_MAX],
             "why": "todo", "due": "", "not_before": "",
             "urgent": not cond, "later": False,
-            "category": "dev", "project": PROJECT}
+            "category": "dev", "project": PROJECT,
+            # A proposal has no task dependencies, but `_merge_proposals` folds
+            # these rows into the same list `humanRow` renders — one key set keeps
+            # the web/app parity contract (collect_human's docstring) true of
+            # every row in it.
+            "waiting_on": [], "ready_since": ""}
 
 
 def _judge(root: Path) -> list[dict]:
