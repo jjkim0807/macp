@@ -1347,7 +1347,18 @@ class Orchestrator:
         The fingerprint is sampled BEFORE the close write, so an optional `note`
         (the no-op close's reason, written AS PART OF that close) never changes the
         bytes reconcile_closed compares against — a lost close still leaves the
-        pre-close bytes behind exactly. Callers that pass no note are unchanged."""
+        pre-close bytes behind exactly. Callers that pass no note are unchanged.
+
+        Known interaction with a vault merge, left as it is on purpose: if a merge
+        rewrites the md between this sampling and the close, the fingerprint is the
+        PRE-merge bytes while the md on disk is the merged ones, so a close lost
+        after that point does not match and reconcile_closed reads it as a human
+        reopen — it logs `reopen-respected` and leaves the task open rather than
+        re-closing it. That is why the 2026-11-09 revert stayed visibly open
+        instead of being healed silently. Keep it that way: respecting an apparent
+        human reopen is the conservative side of this trade, and the fix for the
+        revert itself belongs in the writer (tasks.mark_done's compare-and-swap),
+        not in loosening this evidence."""
         try:
             from . import tasks
             a.close_fingerprint = tasks.md_fingerprint(a.task_id)
@@ -3022,7 +3033,22 @@ def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None
             # Neither landed this round: never leave the tree mid-merge, wait a
             # beat for the concurrent writer to settle, then try the whole round
             # again. A persistent (non-race) failure falls out of the loop below.
-            git("merge", "--abort")
+            #
+            # The abort's rc used to be discarded, so an abort that FAILED left
+            # MERGE_HEAD standing with nothing in the log — and a surviving
+            # MERGE_HEAD is what let the next `chore: sync vault state` commit
+            # inherit the merge and publish stale working-tree bytes as its
+            # resolution (36655ee53, 2026-11-09; two task md files lost). Not
+            # retried and nothing is reset: this is the tree stages check out
+            # into, so forcing it from a tick is a destructive guess. One line,
+            # plus sync_vault_state's own refusal to commit mid-merge, is the
+            # safe pair.
+            aborted = git("merge", "--abort")
+            if aborted.returncode != 0:
+                detail = (aborted.stderr or aborted.stdout or "").strip()
+                print(f"hq-host pull: merge --abort failed "
+                      f"({aborted.returncode}) — MERGE_HEAD may survive into the "
+                      f"next sync: {detail}")
             detail = (merged.stderr or merged.stdout
                       or ff.stderr or ff.stdout or "").strip()
             if i + 1 < attempts:

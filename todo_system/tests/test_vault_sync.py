@@ -182,6 +182,69 @@ class SyncVaultStateTest(unittest.TestCase):
         self.assertIn("Todo/items/x.md",
                       _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
 
+    def _pending_merge_with_a_clean_index(self):
+        """Leave MERGE_HEAD present while the index still matches HEAD.
+
+        This is the shape the incident had, and the reason the merge guard is not
+        redundant with the index guard above: a plain CONFLICTED merge leaves the
+        index dirty, so `diff --cached` already defers on that one. Only a merge
+        whose index was put back to HEAD — what `--autostash` re-application and
+        a failed `merge --abort` can leave behind — slips through to the commit.
+        Both preconditions are asserted, so this fixture can never quietly stop
+        reproducing the state and let the tests below pass on the other guard.
+        """
+        _git(self.repo, "branch", "-q", "side", "HEAD")
+        _git(self.repo, "checkout", "-q", "side")
+        (self.repo / "seed").write_text("incoming\n", encoding="utf-8")
+        _git(self.repo, "commit", "-qam", "incoming change")
+        _git(self.repo, "checkout", "-q", "main")
+        (self.repo / "ours").write_text("ours\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "our change")   # a real divergence
+        _git(self.repo, "merge", "--no-commit", "--no-ff", "side")
+        # put the index back at HEAD; MERGE_HEAD survives a path checkout
+        _git(self.repo, "checkout", "HEAD", "--", ".")
+        self.assertEqual(
+            _git(self.repo, "rev-parse", "--verify", "--quiet", "MERGE_HEAD").returncode,
+            0, "fixture left no pending merge — nothing is being tested")
+        self.assertEqual(
+            _git(self.repo, "diff", "--cached", "--quiet").returncode, 0,
+            "fixture left a DIRTY index — the index guard would defer and these "
+            "tests would pass without the merge guard existing")
+
+    def test_defers_while_a_merge_is_in_progress(self):
+        # `git commit` with MERGE_HEAD present inherits that second parent and
+        # publishes the WORKING TREE as the merge's resolution. That is how
+        # `chore: sync vault state (13 files)` (36655ee53, 2026-11-09) became a
+        # two-parent commit which dropped both task md files a just-merged PR had
+        # brought in: the orchestrator's close had left pre-merge bytes on disk
+        # and this commit recorded them as the merge result. The reflog action is
+        # `commit (merge)`, which git writes only for a commit finalising
+        # MERGE_HEAD, and `git show --stat` hides such a loss because a merge
+        # prints the combined diff.
+        self._pending_merge_with_a_clean_index()
+        self._write("Worker/assignments/t.json")
+
+        self.assertEqual(worker.sync_vault_state(), 0)
+        self.assertNotIn("sync vault state",
+                         _git(self.repo, "log", "--oneline").stdout)
+        # specifically: no merge commit was manufactured
+        parents = _git(self.repo, "log", "--format=%P", "-5").stdout.splitlines()
+        self.assertFalse([p for p in parents if len(p.split()) > 1],
+                         "a two-parent commit was created while merging")
+
+    def test_the_deferred_state_syncs_once_the_merge_is_resolved(self):
+        # Deferring is a delay, not a loss — the mirror of the other two deferral
+        # pairs. Over-firing here would stop the vault syncing forever, which is
+        # a quieter and longer outage than the one being fixed.
+        self._pending_merge_with_a_clean_index()
+        self._write("Worker/assignments/t.json")
+        self.assertEqual(worker.sync_vault_state(), 0)      # deferred
+        _git(self.repo, "merge", "--abort")                 # a person resolves it
+        self.assertEqual(worker.sync_vault_state(), 1)      # nothing was lost
+        self.assertIn("Worker/assignments/t.json",
+                      _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
+
     def test_nothing_to_do_is_a_clean_noop(self):
         self.assertEqual(worker.sync_vault_state(), 0)
         before = _git(self.repo, "rev-parse", "HEAD").stdout
@@ -226,13 +289,20 @@ class SyncVaultRePushTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _fake(self, push_results, pull_rc=0, head="main", staged="Worker/a.json",
-              diff_rc=0):
+              diff_rc=0, in_progress=()):
+        """`in_progress` names the merge/rebase refs that EXIST in this fake repo
+        (e.g. ("MERGE_HEAD",)); by default none do, which is the steady state."""
         pushes = list(push_results)
         calls = []
 
         def run(argv, **kw):
             calls.append(list(argv[1:]))
             sub = argv[1]
+            if sub == "rev-parse" and "--verify" in argv:
+                # the merge/rebase-in-progress probe: rc 0 = the ref exists
+                ref = argv[-1]
+                return subprocess.CompletedProcess(
+                    argv, 0 if ref in in_progress else 1, "", "")
             if sub == "rev-parse":
                 return subprocess.CompletedProcess(argv, 0, head + "\n", "")
             if sub == "diff":
@@ -306,6 +376,30 @@ class SyncVaultRePushTest(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual([c for c in calls if c[0] in ("commit", "push")], [])
         self.assertIn("index is not at HEAD", out)
+
+    def test_every_half_done_operation_defers_before_anything_is_staged(self):
+        # All four refs mean "git is mid-operation and `git commit` would finish
+        # it with whatever is on disk". The guard must run before add/commit/push
+        # so nothing is staged, and must name the ref so the log says which
+        # operation is stuck rather than the generic index diagnosis.
+        for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+            with self.subTest(ref=ref):
+                run, calls = self._fake(push_results=[0], in_progress=(ref,))
+                n, out = self._sync(run)
+                self.assertEqual(n, 0)
+                self.assertEqual(
+                    [c for c in calls if c[0] in ("add", "commit", "push")], [])
+                self.assertIn(ref, out)
+
+    def test_the_steady_state_does_not_trip_the_in_progress_guard(self):
+        # None of those refs exist on an ordinary tick, and a completed merge or
+        # rebase clears them — over-firing here would stop the vault syncing
+        # indefinitely, a quieter and longer outage than the loss it prevents.
+        run, calls = self._fake(push_results=[0])
+        n, out = self._sync(run)
+        self.assertEqual(n, 1)
+        self.assertIn(["commit", "-m", "chore: sync vault state (1 files)"], calls)
+        self.assertEqual(out, "")
 
 
 class RotateLogsTest(unittest.TestCase):
