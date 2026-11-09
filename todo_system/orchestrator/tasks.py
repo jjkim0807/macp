@@ -574,10 +574,12 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
         path.write_text(patched, encoding="utf-8")
         break
     else:
-        # Never write the stale patch anyway: that is the bug this guards. Both
-        # callers treat False as "retry next tick" — reconcile_parents leaves the
-        # row unrecorded, reconcile_closed re-closes — so giving up is recoverable
-        # while silently winning the race is not. Returning early also skips the
+        # Never write the stale patch anyway: that is the bug this guards. The
+        # reconcile callers treat False as "retry next tick" — reconcile_parents
+        # leaves the row unrecorded, reconcile_closed re-closes — while _close_task
+        # now surfaces False as a log line + alert rather than swallowing it, so
+        # giving up is recoverable (and no longer silent) while silently winning the
+        # race is not. Returning early also skips the
         # checkbox pass on purpose: ticking boxes on a task whose status is still
         # `open` is the one partial state the ordering below exists to prevent.
         print(f"[orchestrator] mark_done: {slug} markdown kept changing under the "
