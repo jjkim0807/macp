@@ -351,7 +351,7 @@ Project names come only from the vault policy; never assume which projects are l
     For each, EITHER create a task (step 10) stamped `from_followup: <id>`, OR append
     `{"id":"<id>","reason":"<one line>"}` to `Worker/_state/followups_rejected.jsonl`.
     Same max_new_tasks / dedup / guardrail limits — a follow-up is a candidate, not an override.
-6c. **관련 과거 기록 질의 (memory v2):** for each candidate you will weigh in step 7, query related past failures / decisions with `python -m todo_system.orchestrator.eval_memory query --slug <candidate-slug> --title "<title>"` (it degrades to BFS-only automatically when sqlite-vec is absent; read-only on the vault), and fold the returned 실패 회고·결정 into dedup (step 8) and quality validation (step 9) so you do not re-create a task that repeats a known past failure. Skip without error if the command or its vault DB is unavailable.
+6c. **관련 과거 기록 (memory v2):** 프롬프트 끝에 "## 관련 과거 기록" 섹션이 붙어 있으면 그것을 쓴다 — 엔진(`planner_tick.sh`)이 상위 열린 태스크마다 `graph_memory.query_related` 로 뽑아 둔 **슬러그·제목·출처**만의 목록이다 (본문 발췌 없음). 거기 나온 에피소드·결정을 step 8 중복 검사와 step 9 품질 검증에 접어 넣어, 과거에 실패했거나 이미 끝난 일을 새 슬러그로 다시 만들지 않게 하라. 더 알아야 하면 그 `source` 경로를 직접 Read 하라. 섹션이 없으면 관련 기록이 없거나 엔진이 만들지 못한 것이다 — 그대로 진행한다.
 7. Pick candidates in the priority order from "Safe work sources": main-fix for a
    red default branch (per "Default-branch health" — local evidence only, never
    `gh run list`) → keep-alive starved projects (per "Keep-alive projects") → the next defined leaf of an open parent in `Todo/items/*.md`
