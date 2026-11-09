@@ -503,7 +503,15 @@ def _write_state(state: dict) -> str | None:
 
 
 def _cooling(now: float, last: float, window: float) -> bool:
-    # A last stamp in the future (clock stepped back) does not suppress.
+    """Whether the previous notice is recent enough to suppress this one.
+
+    ``last <= 0`` means "never notified" and never suppresses — spelt out rather
+    than left to ``now - 0.0`` exceeding the window, which only holds because
+    real clocks return ~1.8e9. Under an injected clock its first notice would
+    otherwise be swallowed. A stamp in the future (the clock stepped back) does
+    not suppress either."""
+    if last <= 0:
+        return False
     return 0 <= now - last < window
 
 
