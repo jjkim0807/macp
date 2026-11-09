@@ -396,7 +396,10 @@ G4 평가 하니스(`eval_memory table`)가 **2026-11-09 골든셋으로 채운 
 ### 5.5 임베더 비교 (①해싱 ②로컬 소형 ③Vertex) — G4 §5 벤치
 
 임베더는 설정값 **`MACP_EMBEDDER=hash|local|vertex`** 로 선택 가능하다(`todo_system/graph_memory.py`
-의 호출 시점 해석 — 색인·질의 양쪽이 같은 백엔드를 따른다). **기본값은 `hash` 그대로**다(아래는
+의 호출 시점 해석 — 색인·질의 양쪽이 같은 백엔드를 따른다). 선택 우선순위는 **① env `MACP_EMBEDDER`
+→ ② `.macp/config.toml` 의 `embedder` 키(영속 설정, `paths.state_backend` 와 같은 패턴) → ③ 기본값
+`hash`** 이며, 두 소스 중 어느 쪽이든 알 수 없는 이름은 조용히 hash 로 떨어지지 않고 `ValueError` 로
+거부한다. **기본값은 `hash` 그대로**다(아래는
 권장일 뿐 전환이 아니다). dim 이 달라지는 백엔드로 바꿀 때는 vec0 를 `--rebuild` 로 재구축한다.
 같은 골든셋(`golden-20261109.json`)으로 세 방식을 `eval_memory bench` 로 돌린 결과(2026-11-10):
 
@@ -448,7 +451,8 @@ python -m todo_system.graph_memory embed --rebuild   # dim 이 바뀌므로 --re
    추가). SQLite SoT 는 본부 한 곳, 새 네트워크 서비스 불요. 상시 DB 필요 시 ⑦ (b) Cloud SQL —
    사람 게이트(§3.4).
 6. **임베딩** = 설정값 `MACP_EMBEDDER=hash|local|vertex` 로 **선택 가능한 seam**(호출 시점 해석,
-   dim 변경 시 vec0 `--rebuild` 재구축 포함), **기본값 `hash`**(stdlib feature-hashing 256차원,
+   dim 변경 시 vec0 `--rebuild` 재구축 포함; 선택 우선순위 env → `.macp/config.toml` 의 영속 `embedder`
+   키 → 기본값, env 가 config 를 오버라이드), **기본값 `hash`**(stdlib feature-hashing 256차원,
    $0·PII 경계·오프라인). G4 §5 벤치(2026-11-10, 골든셋 `golden-20261109.json`): 해싱 v2 가 v1 대비
    recall@10 0.604→0.901 로 우세(**확정**). 로컬 소형(ONNX e5-small 계열, 384)·Vertex(768)는 각각
    **보류(디스크 여유 7.1 GiB < 10 GiB)**·**미측정(ADC 프로젝트 미해결)** 로 수치 미확정 — 전환은 그

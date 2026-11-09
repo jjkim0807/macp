@@ -598,6 +598,50 @@ def test_embedder_name_reads_env_and_rejects_unknown(monkeypatch):
         assert name in msg
 
 
+def test_embedder_name_config_key_fallback(monkeypatch, tmp_path):
+    """With env unset, the ``embedder`` key of the nearest .macp/config.toml is
+    honoured — the new persistent selection source (AC#1 branch ②)."""
+    monkeypatch.delenv("MACP_EMBEDDER", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("embedder = 'local'\n", encoding="utf-8")
+    assert gm.embedder_name(start=tmp_path) == "local"
+
+
+def test_embedder_name_env_wins_over_config(monkeypatch, tmp_path):
+    """env MACP_EMBEDDER overrides a config.toml ``embedder`` key (AC#1 precedence)."""
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("embedder = 'local'\n", encoding="utf-8")
+    monkeypatch.setenv("MACP_EMBEDDER", "hash")
+    assert gm.embedder_name(start=tmp_path) == "hash"
+
+
+def test_embedder_name_default_when_env_and_config_absent(monkeypatch, tmp_path):
+    """Neither env nor a config key → byte-identical to the old env-only default
+    ("hash"); the base behaviour is unchanged (AC#1)."""
+    monkeypatch.delenv("MACP_EMBEDDER", raising=False)
+    start = tmp_path / "no" / "macp" / "here"
+    start.mkdir(parents=True)
+    assert gm.embedder_name(start=start) == "hash"
+
+
+def test_embedder_name_config_invalid_raises(monkeypatch, tmp_path):
+    """An unknown ``embedder`` config value is a loud ValueError listing the allowed
+    names — a typo in config must not silently fall back to hash (AC#2), exactly like
+    an unknown env value."""
+    monkeypatch.delenv("MACP_EMBEDDER", raising=False)
+    macp = tmp_path / ".macp"
+    macp.mkdir()
+    (macp / "config.toml").write_text("embedder = 'nope'\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        gm.embedder_name(start=tmp_path)
+    msg = str(excinfo.value)
+    assert "nope" in msg
+    for name in ("hash", "local", "vertex"):
+        assert name in msg
+
+
 def test_resolve_embedder_default_is_hash_256(monkeypatch):
     """resolve_embedder() with no args resolves the env default to (hash fn, 256)."""
     monkeypatch.delenv("MACP_EMBEDDER", raising=False)
