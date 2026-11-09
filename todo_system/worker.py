@@ -2636,6 +2636,31 @@ def sync_vault_state(paths: tuple[str, ...] = VAULT_SYNC_PATHS, _run=None) -> in
         if head != "main":
             print(f"vault-sync: HEAD is {head!r}, not main — deferring")
             return 0
+        # A pending merge turns the commit below into a MERGE commit: `git commit`
+        # with MERGE_HEAD present inherits that second parent and publishes the
+        # WORKING TREE as the merge's resolution. 2026-11-09: a tick's _pull_main
+        # left MERGE_HEAD behind (its `merge --abort` rc was discarded) and the
+        # next `chore: sync vault state (13 files)` (36655ee53) finalised it,
+        # dropping both task md files that PR #412 had just merged in — the
+        # orchestrator's close had left pre-merge bytes on disk, and this commit
+        # recorded them as what the merge decided. The reflog action is
+        # `commit (merge)`, written only for a commit concluding MERGE_HEAD.
+        #
+        # NOT redundant with the index guard below: a conflicted merge leaves the
+        # index dirty and is already deferred there, but this one's index was back
+        # at HEAD, so only the working tree was stale. Checked FIRST so the log
+        # carries the precise diagnosis rather than the generic one.
+        #
+        # Deliberately not healed here: aborting a merge someone else started —
+        # from a maintenance tick, in the tree stages run in — is a destructive
+        # guess. Defer, name the ref, and leave the state on disk for whoever
+        # resolves it. A successful merge or rebase clears these refs, so the
+        # steady state never trips this; only a genuinely half-done one does.
+        for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+            if git("rev-parse", "--verify", "--quiet", ref).returncode == 0:
+                print(f"vault-sync: {ref} present (merge/rebase in progress) — "
+                      "deferring rather than committing its resolution")
+                return 0
         existing = [p for p in paths if (ROOT / p).exists()]
         if not existing:
             return 0

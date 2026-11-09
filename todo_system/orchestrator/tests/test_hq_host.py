@@ -8,6 +8,7 @@ leak the machine's real identity into the assertions.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import shutil
 import socket
@@ -176,7 +177,8 @@ class OrchestratorGuardTest(unittest.TestCase):
 class PullMainTest(unittest.TestCase):
     """_pull_main via an injected `_run` — no test here executes a real git."""
 
-    def _recording_run(self, head_rc=0, head_out="main\n", fetch_rc=0, merge_rc=0):
+    def _recording_run(self, head_rc=0, head_out="main\n", fetch_rc=0, merge_rc=0,
+                       abort_rc=0):
         calls = []
 
         def run(cmd, **kw):
@@ -187,6 +189,12 @@ class PullMainTest(unittest.TestCase):
             if cmd[:2] == ["git", "fetch"]:
                 return SimpleNamespace(returncode=fetch_rc, stdout="",
                                        stderr="fetch boom")
+            # `merge --abort` is scored separately from the merge it cleans up:
+            # a failing merge is the ordinary race, a failing ABORT is what
+            # strands MERGE_HEAD. Matched first so merge_rc cannot speak for it.
+            if cmd[:3] == ["git", "merge", "--abort"]:
+                return SimpleNamespace(returncode=abort_rc, stdout="",
+                                       stderr="fatal: there is no merge to abort")
             if cmd[:2] == ["git", "merge"]:
                 return SimpleNamespace(returncode=merge_rc, stdout="",
                                        stderr="merge boom")
@@ -223,6 +231,35 @@ class PullMainTest(unittest.TestCase):
         self.assertGreaterEqual(
             len([c for c in calls if c[:2] == ["git", "fetch"]]), 2)
         self.assertTrue(any(c[:3] == ["git", "merge", "--ff-only"] for c in calls))
+
+    def test_a_failed_merge_abort_is_reported(self):
+        # The abort after a failed merge was fire-and-forget, so when IT failed
+        # the tree stayed mid-merge and nothing said so. That is the precondition
+        # for the 2026-11-09 loss: a surviving MERGE_HEAD let the next
+        # `chore: sync vault state` commit inherit the merge and publish stale
+        # working-tree bytes as its resolution (36655ee53). The abort is not
+        # retried and nothing is reset — doing either in the tree stages run in
+        # would be a destructive guess — but it must be visible in the log.
+        calls, run = self._recording_run(merge_rc=1, abort_rc=128)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            orch_mod._pull_main(Path("."), _run=run, _sleep=lambda *_a: None)
+        printed = buf.getvalue()
+        self.assertIn("merge --abort failed", printed)
+        self.assertIn("128", printed)
+        self.assertIn("MERGE_HEAD", printed)        # names what may survive
+        # the abort is attempted, not retried into a loop of its own
+        self.assertTrue(any(c[:3] == ["git", "merge", "--abort"] for c in calls))
+
+    def test_a_successful_abort_says_nothing(self):
+        # Silence on the normal path: the abort succeeding is the expected
+        # outcome of a racing merge, and logging it every tick would bury the
+        # line above.
+        calls, run = self._recording_run(merge_rc=1)   # abort returns rc 0 here
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            orch_mod._pull_main(Path("."), _run=run, _sleep=lambda *_a: None)
+        self.assertNotIn("merge --abort failed", buf.getvalue())
 
     def test_runner_exception_swallowed(self):
         def run(cmd, **kw):

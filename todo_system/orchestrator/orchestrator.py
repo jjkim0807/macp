@@ -3033,7 +3033,22 @@ def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None
             # Neither landed this round: never leave the tree mid-merge, wait a
             # beat for the concurrent writer to settle, then try the whole round
             # again. A persistent (non-race) failure falls out of the loop below.
-            git("merge", "--abort")
+            #
+            # The abort's rc used to be discarded, so an abort that FAILED left
+            # MERGE_HEAD standing with nothing in the log — and a surviving
+            # MERGE_HEAD is what let the next `chore: sync vault state` commit
+            # inherit the merge and publish stale working-tree bytes as its
+            # resolution (36655ee53, 2026-11-09; two task md files lost). Not
+            # retried and nothing is reset: this is the tree stages check out
+            # into, so forcing it from a tick is a destructive guess. One line,
+            # plus sync_vault_state's own refusal to commit mid-merge, is the
+            # safe pair.
+            aborted = git("merge", "--abort")
+            if aborted.returncode != 0:
+                detail = (aborted.stderr or aborted.stdout or "").strip()
+                print(f"hq-host pull: merge --abort failed "
+                      f"({aborted.returncode}) — MERGE_HEAD may survive into the "
+                      f"next sync: {detail}")
             detail = (merged.stderr or merged.stdout
                       or ff.stderr or ff.stdout or "").strip()
             if i + 1 < attempts:
