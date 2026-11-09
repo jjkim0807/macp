@@ -325,6 +325,186 @@ class MarkDoneTest(unittest.TestCase):
         self.assertEqual(self._status(), "done")
 
 
+_RACE_LEAF_MD = (
+    "---\ntags:\n  - todo\nstatus: open\nupdated: 2026-07-01\n"
+    'outcome: "ship it"\nnext_action: "go"\n---\n'
+    "# Leaf task\n- [ ] step 1\n- [ ] step 2\n")
+
+# A parent-shaped md: the ONLY parent the orchestrator closes by itself is an
+# `auto_rescoped` bundle, and it closes through this same mark_done — pinned by
+# ParentCloseWriterTest below.
+_RACE_PARENT_MD = (
+    "---\ntags:\n  - todo\nstatus: open\nupdated: 2026-07-01\n"
+    'outcome: "bundle finished"\nnext_action: "watch children"\n'
+    "auto_rescoped: true\n---\n"
+    "# Bundle\n- [ ] child one\n- [ ] child two\n")
+
+# What the merge brings in: one Progress Log line, the minimal shape of what a
+# delegate agent's merged PR actually added to the two lost files.
+_MERGED_LINE = "- 2026-11-09: merged from a PR while the close was in flight"
+
+
+class MarkDoneMergeRaceTest(unittest.TestCase):
+    """A vault merge landing BETWEEN mark_done's read and its write must survive.
+
+    Regression (vault merge `36655ee53`, 2026-11-09): mark_done read a task md,
+    the live vault checkout then took a merge that rewrote that same md (a
+    delegate agent's Progress Log, arriving via a merged PR), and mark_done's
+    single write put the PRE-merge bytes back with `status: done` appended. The
+    merged content never reached disk. The next `chore: sync vault state` commit
+    then recorded those stale bytes — `Todo/items/` is swept by `git add` — so
+    the loss surfaced as a merge commit whose result for that file equals its own
+    side while the incoming blob is dropped entirely. Files from the same merge
+    that were NOT dirty (`Memory/**`) survived, which is why the loss looked
+    selective and went unnoticed.
+
+    ONE body covers BOTH md-writing paths (criterion #2): the leaf close
+    (`_close_task` → mark_done) and the parent close (`reconcile_parents` →
+    mark_done). They are the same writer, so one fix covers both.
+    """
+
+    def setUp(self):
+        from todo_system import cli
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.items = self.tmp / "items"
+        self.items.mkdir()
+        self.db = self.tmp / "todo.db"
+        # parse_task_file stores path.relative_to(cli.ROOT) — same as MarkDoneTest.
+        self._root_patch = patch.object(cli, "ROOT", self.tmp)
+        self._root_patch.start()
+        self.addCleanup(self._root_patch.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _close_while_a_merge_lands(self, slug: str, path: Path, merged: str) -> bool:
+        """mark_done, with a vault merge rewriting `path` between its read and its
+        write.
+
+        The seam is mark_done's OWN single `cli.parse_frontmatter` call, which
+        happens after the read (tasks.py) and before the write — patching an
+        existing collaborator keeps a test-only argument out of production code.
+        Fires exactly once: a real merge lands once, and a shim that re-fired on
+        every retry would make the CAS loop look broken.
+        """
+        from todo_system import cli
+
+        real = cli.parse_frontmatter
+        self.injected = False
+
+        def merge_lands(content):
+            if not self.injected:
+                self.injected = True
+                path.write_text(merged, encoding="utf-8")
+            return real(content)
+
+        with patch.object(cli, "parse_frontmatter", side_effect=merge_lands):
+            result = tasks.mark_done(slug, items_dir=self.items, db_path=self.db)
+        # A silently-dead seam (parse_frontmatter moved out of the window) would
+        # let this whole test pass for the wrong reason. Fail loudly instead.
+        self.assertTrue(self.injected, "merge seam never fired — the test is vacuous")
+        return result
+
+    def test_a_merge_between_the_read_and_the_write_is_not_reverted(self):
+        today = dt.date.today().isoformat()
+        for kind, fixture in (("leaf", _RACE_LEAF_MD), ("parent", _RACE_PARENT_MD)):
+            with self.subTest(close_path=kind):
+                slug = f"t-{kind}"
+                path = self.items / f"{slug}.md"
+                path.write_text(fixture, encoding="utf-8")
+                merged = (fixture.rstrip("\n")
+                          + f"\n\n## Progress Log\n\n{_MERGED_LINE}\n")
+
+                self.assertTrue(self._close_while_a_merge_lands(slug, path, merged))
+
+                text = path.read_text(encoding="utf-8")
+                # (a) THE regression: the merged content is still on disk.
+                self.assertIn(_MERGED_LINE, text)
+                # (b) the close itself still landed
+                self.assertIn("status: done", text)
+                self.assertNotIn("- [ ]", text)
+                # (c) the close line is byte-identical to every other close's
+                self.assertEqual(text.splitlines()[-1],
+                                 f"- {today}: closed by orchestrator")
+                # (d) a retry must not stack traces
+                self.assertEqual(text.count("closed by orchestrator"), 1)
+
+    def test_an_md_changing_under_every_attempt_is_not_closed(self):
+        """If the md keeps moving, mark_done must report failure rather than write
+        stale bytes. Both callers treat False as "retry next tick"
+        (`reconcile_parents` leaves the row unrecorded; `reconcile_closed` re-closes),
+        so giving up is recoverable — silently winning the race is not.
+        """
+        from todo_system import cli
+
+        slug = "t-churn"
+        path = self.items / f"{slug}.md"
+        path.write_text(_RACE_LEAF_MD, encoding="utf-8")
+        real = cli.parse_frontmatter
+        self.rewrites = 0
+
+        def merge_lands_every_time(content):
+            self.rewrites += 1
+            path.write_text(
+                _RACE_LEAF_MD.rstrip("\n") + f"\n- rewrite {self.rewrites}\n",
+                encoding="utf-8")
+            return real(content)
+
+        with patch.object(cli, "parse_frontmatter", side_effect=merge_lands_every_time):
+            self.assertFalse(tasks.mark_done(slug, items_dir=self.items, db_path=self.db))
+        text = path.read_text(encoding="utf-8")
+        self.assertNotIn("closed by orchestrator", text)   # no stale write
+        self.assertIn("status: open", text)
+        self.assertGreater(self.rewrites, 1)               # it really did retry
+
+
+class ParentCloseWriterTest(unittest.TestCase):
+    """Criterion #2 rests on there being exactly ONE parent-md writer.
+
+    The orchestrator's only self-directed parent close is reconcile_parents'
+    `auto_rescoped` bundle close, and it goes through `tasks.mark_done` — so the
+    merge-race fix in mark_done covers the parent path too. Ordinary parents are
+    surfaced to a human, never written. If a second parent writer is ever added,
+    this test fails and that writer needs the same compare-and-swap treatment.
+    """
+
+    def setUp(self):
+        from todo_system.orchestrator.assignment import Ledger
+        from todo_system.orchestrator.mailbox import FileMailbox
+        from todo_system.orchestrator.orchestrator import Orchestrator
+        from todo_system.orchestrator.registry import Agent, Registry
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.pings: list[str] = []
+        self.orch = Orchestrator(
+            FileMailbox(self.tmp / "agents"),
+            Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")]),
+            Ledger(self.tmp / "assignments"),
+            notify=lambda text, *a, **k: self.pings.append(text))
+
+    def test_the_bundle_close_goes_through_mark_done(self):
+        from todo_system.orchestrator import repos
+
+        rows = [{"slug": "a-bundle", "title": "bundle", "n_children": 2}]
+        with patch.object(tasks, "parents_needing_review", return_value=rows), \
+             patch.object(repos, "_frontmatter", return_value={"auto_rescoped": "true"}), \
+             patch.object(tasks, "mark_done", return_value=True) as md:
+            self.assertEqual(self.orch.reconcile_parents(), ["a-bundle"])
+        md.assert_called_once_with("a-bundle")
+        self.assertEqual(self.pings, [])          # closed, not handed to a human
+
+    def test_an_ordinary_parent_md_is_never_written(self):
+        from todo_system.orchestrator import repos
+
+        rows = [{"slug": "a-plain", "title": "plain", "n_children": 2}]
+        with patch.object(tasks, "parents_needing_review", return_value=rows), \
+             patch.object(repos, "_frontmatter", return_value={}), \
+             patch.object(tasks, "mark_done") as md:
+            self.assertEqual(self.orch.reconcile_parents(), ["a-plain"])
+        md.assert_not_called()                    # surfacing only — no md write
+        self.assertEqual(len(self.pings), 1)
+
+
 class MdFingerprintTest(unittest.TestCase):
     """The close evidence reconcile_closed compares against: raw bytes in, "" for
     anything unreadable — never an exception, never a false match."""
