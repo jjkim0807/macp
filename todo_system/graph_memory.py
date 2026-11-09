@@ -779,18 +779,50 @@ _EMBEDDER_BACKENDS: dict[str, Callable[[], tuple[Callable[[str], Sequence[float]
 }
 
 
-def embedder_name() -> str:
-    """The configured backend name from ``MACP_EMBEDDER`` (default ``"hash"``).
+def embedder_name(start: Path | None = None) -> str:
+    """The configured backend name, resolved **at call time** from three sources.
 
-    An unknown value raises :class:`ValueError` listing the allowed names — a typo
-    must not silently fall back to hash and mislabel a whole bench row (the same
-    "no silent fallback" rule :func:`paths.state_backend` enforces)."""
+    Resolution order (mirrors :func:`paths.state_backend`):
+
+    1. The ``MACP_EMBEDDER`` environment variable, if set and non-empty.
+    2. The ``embedder`` key of the nearest ``.macp/config.toml`` found by walking
+       up from ``start`` (or the current working directory), reusing
+       :func:`paths._read_config_key`.
+    3. :data:`EMBEDDER_DEFAULT` (``"hash"``) — a fresh install with neither env nor
+       config key is byte-identical to the old env-only default.
+
+    An unknown value from *either* env or config raises :class:`ValueError` listing
+    the allowed names — a typo must not silently fall back to hash and mislabel a
+    whole bench row (the same "no silent fallback" rule :func:`paths.state_backend`
+    enforces). Validation reads the **live** :data:`_EMBEDDER_BACKENDS` registry, so
+    a test-registered backend is honoured.
+
+    ``start`` is the same test seam as :func:`paths.state_backend`: runtime callers
+    (:func:`resolve_embedder`) invoke ``embedder_name()`` with no args, so the config
+    walk begins at the current working directory.
+    """
+
+    def _validate(name: str, source: str) -> str:
+        normalised = name.strip().lower()
+        if normalised not in _EMBEDDER_BACKENDS:
+            allowed = ", ".join(sorted(_EMBEDDER_BACKENDS))
+            raise ValueError(f"unknown {source}={name!r} — allowed: {allowed}")
+        return normalised
+
     raw = os.environ.get("MACP_EMBEDDER")
-    name = (raw or EMBEDDER_DEFAULT).strip().lower()
-    if name not in _EMBEDDER_BACKENDS:
-        allowed = ", ".join(sorted(_EMBEDDER_BACKENDS))
-        raise ValueError(f"unknown MACP_EMBEDDER={name!r} — allowed: {allowed}")
-    return name
+    if raw:
+        return _validate(raw, "MACP_EMBEDDER")
+
+    base = (start or Path.cwd()).resolve()
+    for d in (base, *base.parents):
+        cfg = d / ".macp" / "config.toml"
+        if cfg.is_file():
+            key = paths._read_config_key(cfg, "embedder")
+            if key:
+                return _validate(key, "embedder config key")
+            break
+
+    return EMBEDDER_DEFAULT
 
 
 def resolve_embedder(
