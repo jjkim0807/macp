@@ -3215,6 +3215,37 @@ class ReconcileClosedTest(unittest.TestCase):
         self.assertIn("mark_done(ps3) failed", buf.getvalue())
         self.assertIn("RuntimeError", buf.getvalue())
 
+    def test_close_task_false_return_is_alerted_not_swallowed(self):
+        # mark_done returning False (md missing / CAS gave up) means the close did
+        # NOT land. _close_task must not slide that silently into propagate — it
+        # logs it AND fires the one-gate alert, while still propagating downstream.
+        self.orch._task_title = lambda slug: slug
+        buf = io.StringIO()
+        with mock.patch.object(tasks, "mark_done", return_value=False), \
+                mock.patch.object(self.orch, "_propagate_downstream") as prop, \
+                mock.patch.object(self.orch, "_notify_routed") as routed, \
+                contextlib.redirect_stdout(buf):
+            self.orch._close_task("ps3")
+        self.assertTrue(routed.called)                       # alert fired
+        self.assertIn("ps3", routed.call_args.kwargs.get("event_key", ""))
+        self.assertIn("returned False", buf.getvalue())      # logged
+        prop.assert_called_once_with("ps3")                  # propagate still runs
+
+    def test_close_task_none_return_does_not_alert(self):
+        # Guards the `is False` vs `not result` distinction: many close callers and
+        # tests mock mark_done to return None (a successful close that reports
+        # nothing). None must stay a no-op — no log, no alert — exactly as before.
+        self.orch._task_title = lambda slug: slug
+        buf = io.StringIO()
+        with mock.patch.object(tasks, "mark_done", return_value=None), \
+                mock.patch.object(self.orch, "_propagate_downstream") as prop, \
+                mock.patch.object(self.orch, "_notify_routed") as routed, \
+                contextlib.redirect_stdout(buf):
+            self.orch._close_task("ps3")
+        routed.assert_not_called()                           # no alert
+        self.assertNotIn("returned False", buf.getvalue())   # not logged as failure
+        prop.assert_called_once_with("ps3")                  # propagate still runs
+
 
 class _TmpVaultCase(unittest.TestCase):
     """A vault-shaped tmp tree driven by the REAL close/reopen code: the ledger at
