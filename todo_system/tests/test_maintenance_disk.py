@@ -640,6 +640,19 @@ class PassCooldownTest(_Case):
         self.assertIsNotNone(self.prune())
 
 
+class CoolingNeverNotifiedTest(unittest.TestCase):
+    def test_last_zero_does_not_suppress_under_injected_clock(self):
+        # Injected clock returns a small `now`; `last=0.0` means "never
+        # notified" and must not be mistaken for "just notified".
+        self.assertFalse(md._cooling(now=5.0, last=0.0, window=600.0))
+
+    def test_last_negative_does_not_suppress(self):
+        self.assertFalse(md._cooling(now=5.0, last=-1.0, window=600.0))
+
+    def test_real_last_within_window_still_suppresses(self):
+        self.assertTrue(md._cooling(now=100.0, last=50.0, window=600.0))
+
+
 class KillSwitchAndFailOpenTest(_Case):
     def test_kill_switch_skips_even_the_measurement(self):
         # (k)
