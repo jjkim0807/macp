@@ -113,9 +113,13 @@ def vault_root() -> Path:
     return Path(VAULT_ROOT) if VAULT_ROOT is not None else Path(gm.ROOT)
 
 
-def db_path() -> Path:
-    """The edges DB. A redirected vault root redirects the DB with it, so a CLI
-    run against another vault never silently reads this host's DB."""
+def db_path(root: Path | None = None) -> Path:
+    """The edges DB. A vault root always redirects the DB with it — an explicit
+    ``root`` (``--vault-root``) included, so a CLI run against another vault
+    cannot read this host's DB while rendering that vault's tasks. The filename
+    is taken from ``gm.DB_PATH`` so it is spelt in one place."""
+    if root is not None:
+        return Path(root) / "Memory" / Path(gm.DB_PATH).name
     if DB_PATH is not None:
         return Path(DB_PATH)
     if VAULT_ROOT is not None:
@@ -438,7 +442,9 @@ def emit_context(*, limit: int = DEFAULT_TASKS, per_task: int = MAX_ITEMS,
     tasks = top_open_tasks(base, limit=limit)
     if not tasks:
         return ""
-    con = _connect_ro()
+    # db_path(root), not db_path(): an explicit --vault-root has to move the DB
+    # too, or the block would pair one vault's tasks with another vault's edges.
+    con = _connect_ro(db_path(root))
     if con is None:
         return ""
     try:

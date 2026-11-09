@@ -287,6 +287,19 @@ if [ -n "$KCTX" ]; then
   echo "[planner-tick] injecting $(printf '%s' "$KCTX" | grep -c '^- \[') keep-alive starved project(s) into planner context"
   PROMPT="$PROMPT"$'\n\n'"$KCTX"
 fi
+# Related past records (todo_system/orchestrator/related_context.py): for the top
+# open tasks, which past episodes / decisions / notes the graph+vector memory ties
+# to each — slug, title and source path only, never a body excerpt (R5). The
+# ENGINE runs the query and the answer arrives as prompt text: the planner's
+# --allowed-tools line below is NOT touched, and a tick-computed section is
+# deterministic and bounded by the tick rather than by what the agent decides to
+# do. Same contract as the blocks above — empty when the vault has no edge DB or
+# nothing is related, so PROMPT stays byte-identical on that path.
+RCTX=$($PY -m todo_system.orchestrator.related_context emit-context --limit 5 2>/dev/null)
+if [ -n "$RCTX" ]; then
+  echo "[planner-tick] injecting related past records for $(printf '%s' "$RCTX" | grep -c '^### ') task(s) into planner context"
+  PROMPT="$PROMPT"$'\n\n'"$RCTX"
+fi
 
 # --- checkout lease: serialize THIS claude call against the orchestrator's vault
 # branch prep. The planner commits what it writes (CLAUDE.md §10.1); with no lock,

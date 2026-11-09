@@ -348,6 +348,18 @@ def test_emit_context_is_empty_without_a_db(isolated_vault):
     assert rc.emit_context(limit=3, root=isolated_vault.root) == ""
 
 
+def test_an_explicit_vault_root_moves_the_db_too(isolated_vault, tmp_path):
+    """Otherwise the block would pair one vault's tasks with another's edges."""
+    _seed(isolated_vault, 2)
+    other = tmp_path / "other-vault"
+    (other / "Todo" / "Snapshots").mkdir(parents=True)
+    (other / "Todo" / "Snapshots" / "latest.json").write_text(
+        json.dumps({"top_priority": [{"slug": TASK_SLUG}]}), encoding="utf-8")
+
+    assert rc.db_path(other) == other / "Memory" / "relations.sqlite"
+    assert rc.emit_context(limit=3, root=other) == "", "read another vault's edges"
+
+
 def test_the_cli_prints_nothing_when_the_switch_is_off(isolated_vault, monkeypatch):
     _seed(isolated_vault, 2)
     _snapshot(isolated_vault, [TASK_SLUG])

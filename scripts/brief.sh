@@ -112,6 +112,24 @@ PROMPT_BODY="$(awk '
   { if (in_fm == 0 && seen == 1) print }
 ' "$PROMPT_FILE")"
 
+# Related past records (todo_system/orchestrator/related_context.py): for the top
+# open tasks — which the snapshot export above has just re-ranked, so these ARE the
+# head of the list the brief agent then reads — which past episodes / decisions /
+# notes the graph+vector memory ties to each. Slug, title and source path only,
+# never a body excerpt (R5). The ENGINE runs the query because this agent's
+# --allowed-tools line below has no way to: it is Read/Write/Edit plus three git
+# subcommands, and that line is NOT touched here. `|| true` is mandatory under
+# `set -euo pipefail` — a non-zero rc in a command substitution would abort the
+# whole brief over a hint. Mirrors the two-branch shape of usage_probe below.
+REL_CTX=""
+if [[ "$INSTALLED" -eq 1 ]]; then
+  REL_CTX=$("$MACP_PYTHON" -P -m todo_system.orchestrator.related_context \
+    emit-context --limit 3 --vault-root "$VAULT_DIR" 2>/dev/null || true)
+elif command -v uv >/dev/null 2>&1; then
+  REL_CTX=$(uv run --directory "$ENGINE_DIR" python -m todo_system.orchestrator.related_context \
+    emit-context --limit 3 --vault-root "$VAULT_DIR" 2>/dev/null || true)
+fi
+
 # Append run metadata so the agent knows today and the output path
 FULL_PROMPT="$PROMPT_BODY
 
@@ -123,6 +141,16 @@ FULL_PROMPT="$PROMPT_BODY
 - Output path: Todo/Briefings/${TODAY}.md
 - Working directory: $VAULT_DIR
 "
+
+# Empty when there is nothing related (no edge DB, no hits, kill switch): then
+# FULL_PROMPT is byte-identical to what it was before this wiring existed.
+if [[ -n "$REL_CTX" ]]; then
+  # `|| echo 0`: a non-empty block always has a `### ` line today, but that is
+  # another module's invariant, and under `set -euo pipefail` a grep that found
+  # none would be one more way to lose the whole brief over a hint.
+  echo "[$NOW_TS] brief.sh: injecting related past records for $(printf '%s' "$REL_CTX" | grep -c '^### ' || echo 0) task(s)"
+  FULL_PROMPT="$FULL_PROMPT"$'\n'"$REL_CTX"
+fi
 
 echo "[$NOW_TS] brief.sh: invoking claude -p (max-turns=30)"
 
