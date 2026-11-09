@@ -778,3 +778,217 @@ def test_query_dim_mismatch_degrades_to_bfs_only(isolated_vault, monkeypatch, ca
         assert "dim" in out.lower()  # the skip warning was printed
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — local (ONNX) + vertex (ADC) backends, lazy-loaded (AC#2 / AC#3)
+# ---------------------------------------------------------------------------
+#
+# The real backend bodies load their libraries lazily via importlib and raise
+# EmbedderUnavailable (→ graceful skip) when deps/model/creds are absent. These
+# tests verify the WIRING only — no model download, no network — by injecting fake
+# ``onnxruntime`` / ``tokenizers`` / ``numpy`` modules and a fake
+# ``urllib.request.urlopen``. No real identifiers (public repo): project id is a
+# placeholder and never hardcoded in the module.
+
+
+def test_mean_pool_l2_masked_mean_then_normalize():
+    """Masked mean over a (seq, hidden) matrix, then L2-normalise. Works on plain
+    nested lists (numpy rows behave the same)."""
+    pooled = gm._mean_pool_l2([[3.0, 4.0], [100.0, 100.0]], [1, 0])
+    assert pooled == pytest.approx([0.6, 0.8])  # 2nd token masked out; [3,4]→unit
+    assert gm._mean_pool_l2([], []) == []
+
+
+class _FakeResp:
+    """Minimal context-manager HTTP response for the fake urlopen."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _install_fake_local_model(monkeypatch, tmp_path, *, hidden: int = 4):
+    """Inject fake ``tokenizers`` / ``onnxruntime`` / ``numpy`` modules and a model
+    dir, so ``_local_backend`` can be exercised without the extra or a download."""
+    import sys
+    import types
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"\x00")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    tok_mod = types.ModuleType("tokenizers")
+
+    class _Enc:
+        def __init__(self, ids):
+            self.ids = ids
+            self.attention_mask = [1] * len(ids)
+
+    class _Tok:
+        @classmethod
+        def from_file(cls, _path):
+            return cls()
+
+        def encode(self, text):
+            return _Enc(list(range(1, len(text.split()) + 2)))
+
+    tok_mod.Tokenizer = _Tok
+
+    ort_mod = types.ModuleType("onnxruntime")
+
+    class _Spec:
+        def __init__(self, name):
+            self.name = name
+
+    class _Session:
+        def __init__(self, _path):
+            pass
+
+        def get_inputs(self):
+            return [_Spec("input_ids"), _Spec("attention_mask")]
+
+        def run(self, _outputs, feed):
+            seq = len(feed["input_ids"][0])
+            # outputs = [last_hidden_state]; last_hidden_state = (batch=1, seq, hidden)
+            # with distinct rows so pooling is observably a mean.
+            return [[[[float(i + 1)] * hidden for i in range(seq)]]]
+
+    ort_mod.InferenceSession = _Session
+
+    np_mod = types.ModuleType("numpy")
+    np_mod.array = lambda x, dtype=None: x
+    np_mod.int64 = int
+
+    monkeypatch.setitem(sys.modules, "tokenizers", tok_mod)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_mod)
+    monkeypatch.setitem(sys.modules, "numpy", np_mod)
+    monkeypatch.setenv("MACP_EMBEDDER_LOCAL_MODEL", str(model_dir))
+    return model_dir
+
+
+def test_local_backend_wires_onnx_and_tokenizer(tmp_path, monkeypatch):
+    """With deps + model present, _local_backend returns (fn, probed_dim) and fn
+    emits a unit-length vector of the model's hidden width."""
+    _install_fake_local_model(monkeypatch, tmp_path, hidden=4)
+    fn, dim = gm._local_backend()
+    assert dim == 4
+    vec = fn("some korean 한국어 text")
+    assert len(vec) == 4
+    assert abs(sum(x * x for x in vec) ** 0.5 - 1.0) < 1e-9  # L2-normalised
+
+
+def test_local_backend_unavailable_without_model_env(monkeypatch):
+    monkeypatch.delenv("MACP_EMBEDDER_LOCAL_MODEL", raising=False)
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._local_backend()
+
+
+def test_local_backend_unavailable_when_deps_missing(tmp_path, monkeypatch):
+    """Model dir present but onnxruntime not importable → EmbedderUnavailable."""
+    import sys
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"\x00")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MACP_EMBEDDER_LOCAL_MODEL", str(model_dir))
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)  # None → ImportError
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._local_backend()
+
+
+def test_embed_vault_swallows_backend_unavailable(isolated_vault, monkeypatch):
+    """MACP_EMBEDDER=local with no model → the real _local_backend raises
+    EmbedderUnavailable, and embed_vault turns it into a skip (not a crash), before
+    ever touching sqlite-vec — so the maintenance tick survives a misconfig."""
+    isolated_vault.write("Notes/a.md", "alpha fact\n")
+    con = isolated_vault.connect()
+    try:
+        monkeypatch.delenv("MACP_EMBEDDER_LOCAL_MODEL", raising=False)
+        monkeypatch.setenv("MACP_EMBEDDER", "local")
+        result = gm.embed_vault(con, vault_root=isolated_vault.root)
+        assert result.skipped_reason is not None
+        assert result.embedded == 0
+        assert not gm._table_exists(con, "vec_embeddings")
+    finally:
+        con.close()
+
+
+def test_vertex_backend_posts_predict_and_counts(monkeypatch):
+    """_vertex_backend builds the correct :predict URL/body/auth, returns the
+    response embedding values, and accumulates request/char/token counters — all
+    against a fake ADC + fake urlopen (no network, no real project id)."""
+    import json as _json
+    import sys
+    import types
+
+    ga = types.ModuleType("google.auth")
+
+    class _Creds:
+        valid = True
+        token = "fake-token"
+
+        def refresh(self, _transport):
+            pass
+
+    ga.default = lambda scopes=None: (_Creds(), "placeholder-project")
+    monkeypatch.setitem(sys.modules, "google.auth", ga)
+    monkeypatch.setenv("MACP_VERTEX_LOCATION", "us-central1")
+    monkeypatch.delenv("MACP_VERTEX_PROJECT", raising=False)
+    monkeypatch.delenv("MACP_VERTEX_EMBED_MODEL", raising=False)
+
+    captured = {}
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["url"] = request.full_url
+        captured["body"] = _json.loads(request.data.decode("utf-8"))
+        captured["auth"] = request.headers.get("Authorization")
+        payload = {
+            "predictions": [
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 7}}}
+            ]
+        }
+        return _FakeResp(_json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    fn, dim = gm._vertex_backend()
+    assert dim == 768
+    vec = fn("한국어 텍스트")
+    assert vec == [0.1, 0.2, 0.3]
+
+    assert "publishers/google/models/text-multilingual-embedding-002:predict" in captured["url"]
+    assert "placeholder-project" in captured["url"]
+    assert captured["body"] == {"instances": [{"content": "한국어 텍스트"}]}
+    assert captured["auth"] == "Bearer fake-token"
+    assert fn.vertex_counters["requests"] == 1
+    assert fn.vertex_counters["input_chars"] == len("한국어 텍스트")
+    assert fn.vertex_counters["token_count"] == 7
+
+
+def test_vertex_backend_unavailable_without_adc(monkeypatch):
+    import sys
+    import types
+
+    ga = types.ModuleType("google.auth")
+
+    class _NoCreds(Exception):
+        pass
+
+    def _default(scopes=None):
+        raise _NoCreds("no ADC on this host")
+
+    ga.default = _default
+    monkeypatch.setitem(sys.modules, "google.auth", ga)
+    with pytest.raises(gm.EmbedderUnavailable):
+        gm._vertex_backend()

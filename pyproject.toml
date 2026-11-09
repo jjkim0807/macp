@@ -16,6 +16,21 @@ dependencies = [
 	"pyyaml>=6.0",   # orchestrator registry (Mac-side; transport stays stdlib-only)
 ]
 
+[project.optional-dependencies]
+# Candidate ② local ONNX embedder (memory v2 · G4 §5 bench). An OPT-IN extra, NOT
+# in [dependency-groups].dev and NOT in [project.dependencies]: dev is uv's default
+# group, so putting it there would force the ~hundreds-of-MB download on every
+# `uv sync`/`uv run` and every gate; a runtime-selected backend belongs behind an
+# extra (`uv sync --extra embed-local`). graph_memory imports onnxruntime/tokenizers
+# lazily, inside the local backend only — never at module top (bare-clone contract).
+# sentence-transformers+torch is deliberately avoided: its PyPI wheels pull CUDA
+# nvidia-* packages that blow AC#2's 3 GiB budget. The Vertex backend (candidate ③)
+# needs NO new dependency — google-auth is already a [project] dependency.
+embed-local = [
+	"onnxruntime>=1.18",
+	"tokenizers>=0.20",
+]
+
 [dependency-groups]
 dev = [
 	"pytest>=8.0",

@@ -578,24 +578,195 @@ def _hash_backend() -> tuple[Callable[[str], Sequence[float]], int]:
     return fn, dim
 
 
+def _mean_pool_l2(token_embeddings: Any, attention_mask: Sequence[Any]) -> list[float]:
+    """Mean-pool a ``(seq, hidden)`` token-embedding matrix over ``attention_mask``,
+    then L2-normalise — the sentence-transformers e5 pooling (mean of the attended
+    tokens, then unit-normalise), so the local backend emits a unit vector like the
+    hash default.
+
+    Pure Python over nested sequences: each row may be a numpy array or a plain list
+    (``list(row)`` + ``float(x)`` handle both), so this is unit-testable with a fake
+    model output and needs no numpy itself."""
+    rows = [list(r) for r in token_embeddings]
+    if not rows:
+        return []
+    hidden = len(rows[0])
+    summed = [0.0] * hidden
+    total = 0.0
+    for i, row in enumerate(rows):
+        mask = float(attention_mask[i]) if i < len(attention_mask) else 1.0
+        if mask == 0.0:
+            continue
+        total += mask
+        for j in range(hidden):
+            summed[j] += float(row[j]) * mask
+    if total > 0.0:
+        summed = [s / total for s in summed]
+    norm = math.sqrt(sum(v * v for v in summed))
+    if norm > 0.0:
+        summed = [v / norm for v in summed]
+    return summed
+
+
 def _local_backend() -> tuple[Callable[[str], Sequence[float]], int]:
-    """Local ONNX multilingual sentence-embedding backend. This placeholder keeps
-    the registry key present (so ``embedder_name()`` accepts ``"local"``) and reports
-    the backend unavailable; the real lazy-loading body ships with the
-    ``embed-local`` optional extra."""
-    raise EmbedderUnavailable(
-        "local ONNX embedder is not available — install the 'embed-local' extra "
-        "(uv sync --extra embed-local) and point MACP_EMBEDDER_LOCAL_MODEL at the model dir"
-    )
+    """Local ONNX multilingual sentence-embedding backend (candidate ②: $0, offline,
+    no external transfer — R5-aligned).
+
+    Requires the ``embed-local`` optional extra (``onnxruntime`` + ``tokenizers``,
+    and numpy which onnxruntime pulls in) and a model directory given by
+    ``MACP_EMBEDDER_LOCAL_MODEL`` containing ``model.onnx`` + ``tokenizer.json`` (an
+    int8-quantised multilingual-e5-small export is the intended ~hundreds-of-MB fit
+    under AC#2's 3 GiB budget — sentence-transformers+torch is deliberately avoided
+    because its PyPI wheels drag in CUDA packages that blow that budget). Everything
+    is loaded lazily through :func:`importlib.import_module` (string import) so the
+    module stays importable on a bare clone; a missing library / model / dir raises
+    :class:`EmbedderUnavailable`, which callers treat as a graceful skip.
+
+    The embedder mean-pools the model's last hidden state over the attention mask and
+    L2-normalises (:func:`_mean_pool_l2`). The ``dim`` is the probed output length, so
+    a model whose real width differs from the 384 expectation is used at its true dim
+    (with a warning from :func:`resolve_embedder`)."""
+    model_dir_env = os.environ.get("MACP_EMBEDDER_LOCAL_MODEL")
+    if not model_dir_env:
+        raise EmbedderUnavailable(
+            "local ONNX embedder needs MACP_EMBEDDER_LOCAL_MODEL pointing at a model "
+            "dir (model.onnx + tokenizer.json); install deps with "
+            "`uv sync --extra embed-local`"
+        )
+    model_dir = Path(model_dir_env).expanduser()
+    model_file = model_dir / "model.onnx"
+    tokenizer_file = model_dir / "tokenizer.json"
+    if not model_file.is_file() or not tokenizer_file.is_file():
+        raise EmbedderUnavailable(
+            f"local model dir {model_dir} must contain model.onnx and tokenizer.json"
+        )
+    try:
+        ort = importlib.import_module("onnxruntime")
+        tok_mod = importlib.import_module("tokenizers")
+        np = importlib.import_module("numpy")
+    except ImportError as exc:  # extra not installed
+        raise EmbedderUnavailable(
+            f"local ONNX embedder deps missing ({exc}); install with "
+            f"`uv sync --extra embed-local`"
+        ) from exc
+
+    tokenizer = tok_mod.Tokenizer.from_file(str(tokenizer_file))
+    session = ort.InferenceSession(str(model_file))
+    input_names = {spec.name for spec in session.get_inputs()}
+
+    def fn(text: str) -> list[float]:
+        enc = tokenizer.encode(text)
+        ids = list(enc.ids)
+        mask = list(getattr(enc, "attention_mask", None) or [1] * len(ids))
+        feed = {
+            "input_ids": np.array([ids], dtype=np.int64),
+            "attention_mask": np.array([mask], dtype=np.int64),
+            "token_type_ids": np.array([[0] * len(ids)], dtype=np.int64),
+        }
+        feed = {name: value for name, value in feed.items() if name in input_names}
+        outputs = session.run(None, feed)
+        # last_hidden_state: (batch, seq, hidden) → take batch 0
+        return _mean_pool_l2(outputs[0][0], mask)
+
+    probe = fn("probe")
+    return fn, len(probe)
+
+
+def _vertex_auth_transport(exc_cls: type[Exception]):
+    """A google-auth token-refresh transport, discovered lazily in preference order
+    (``requests`` → ``httplib2`` → ``urllib3``) via ``importlib`` so no transport
+    library is a hard dependency. Raises ``exc_cls`` if none is importable."""
+    try:
+        mod = importlib.import_module("google.auth.transport.requests")
+        return mod.Request()
+    except ImportError:
+        pass
+    try:
+        httplib2_mod = importlib.import_module("google_auth_httplib2")
+        httplib2 = importlib.import_module("httplib2")
+        return httplib2_mod.Request(httplib2.Http())
+    except ImportError:
+        pass
+    try:
+        mod = importlib.import_module("google.auth.transport.urllib3")
+        urllib3 = importlib.import_module("urllib3")
+        return mod.Request(urllib3.PoolManager())
+    except ImportError as exc:
+        raise exc_cls(
+            "no google-auth transport for token refresh (install one of "
+            "google-auth[requests], google-auth-httplib2)"
+        ) from exc
 
 
 def _vertex_backend() -> tuple[Callable[[str], Sequence[float]], int]:
-    """Vertex AI multilingual embedding backend. This placeholder keeps the registry
-    key present (so ``embedder_name()`` accepts ``"vertex"``) and reports the backend
-    unavailable; the real body uses HQ Application Default Credentials."""
-    raise EmbedderUnavailable(
-        "Vertex embedder is not available — configure Application Default Credentials"
+    """Vertex AI multilingual embedding backend (candidate ③). Zero NEW dependencies:
+    ``google-auth`` is already a project dependency, so ADC + a stdlib
+    ``urllib.request`` POST to the ``:predict`` endpoint covers it.
+
+    Credentials come from Application Default Credentials; the project is
+    ``MACP_VERTEX_PROJECT`` or the ADC-returned project (NEVER a hardcoded id — the
+    public-identifier gate would catch one). Model
+    (``MACP_VERTEX_EMBED_MODEL``, default ``text-multilingual-embedding-002``) and
+    location (``MACP_VERTEX_LOCATION``, default ``us-central1``) are env-tunable. No
+    ADC / no project → :class:`EmbedderUnavailable` (a graceful skip, recorded as
+    "미측정(인증 없음)" in the bench table).
+
+    The returned fn exposes ``vertex_counters`` (requests / input chars / token count
+    summed from each response's ``statistics.token_count``) so the one-time embedding
+    cost can be estimated from real usage. ``dim`` is declared from the expected 768
+    (not probed — probing would be a live billed call); the embed loop's length check
+    still fails loudly if a model returns a different width."""
+    try:
+        google_auth = importlib.import_module("google.auth")
+    except ImportError as exc:
+        raise EmbedderUnavailable(f"Vertex embedder needs google-auth ({exc})") from exc
+    urllib_request = importlib.import_module("urllib.request")
+    urllib_error = importlib.import_module("urllib.error")
+    _json = importlib.import_module("json")
+
+    model = os.environ.get("MACP_VERTEX_EMBED_MODEL") or "text-multilingual-embedding-002"
+    location = os.environ.get("MACP_VERTEX_LOCATION") or "us-central1"
+    try:
+        creds, adc_project = google_auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    except Exception as exc:  # DefaultCredentialsError and friends
+        raise EmbedderUnavailable(f"no Vertex ADC credentials ({exc})") from exc
+    project = os.environ.get("MACP_VERTEX_PROJECT") or adc_project
+    if not project:
+        raise EmbedderUnavailable(
+            "Vertex project unknown — set MACP_VERTEX_PROJECT or configure ADC with a project"
+        )
+
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}"
+        f"/locations/{location}/publishers/google/models/{model}:predict"
     )
+    counters = {"requests": 0, "input_chars": 0, "token_count": 0}
+
+    def fn(text: str) -> list[float]:
+        if not getattr(creds, "valid", False):
+            creds.refresh(_vertex_auth_transport(EmbedderUnavailable))
+        body = _json.dumps({"instances": [{"content": text}]}).encode("utf-8")
+        request = urllib_request.Request(endpoint, data=body, method="POST")
+        request.add_header("Authorization", f"Bearer {creds.token}")
+        request.add_header("Content-Type", "application/json")
+        try:
+            with urllib_request.urlopen(request) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+        except urllib_error.URLError as exc:
+            raise EmbedderUnavailable(f"Vertex predict request failed ({exc})") from exc
+        embeddings = payload["predictions"][0]["embeddings"]
+        values = [float(x) for x in embeddings["values"]]
+        counters["requests"] += 1
+        counters["input_chars"] += len(text)
+        counters["token_count"] += int(
+            embeddings.get("statistics", {}).get("token_count", 0) or 0
+        )
+        return values
+
+    fn.vertex_counters = counters  # type: ignore[attr-defined]
+    return fn, EMBEDDER_EXPECTED_DIMS["vertex"]
 
 
 # name → factory; a factory returns ``(embedder_fn, probed_dim)``. Monkeypatchable
