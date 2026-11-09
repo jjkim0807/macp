@@ -304,6 +304,218 @@ def render_table(m_v1: Metrics, m_v2: Metrics, *, weak: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Three-way embedder bench (design §5.5): ① hash ② local ③ Vertex, one table
+# ---------------------------------------------------------------------------
+#
+# ``bench`` runs the SAME golden label set against each embedder backend on its own
+# SCRATCH DB (never the live ``Memory/relations.sqlite`` — the maintenance tick
+# writes that concurrently), measuring v2 hit-rate + query p50 + index time + vector
+# disk, and renders a comparison table. A backend whose deps/model/creds are missing
+# yields a ``미측정(...)`` row and the rest of the table still completes (one absent
+# backend never sinks the whole run). The default is never switched — the footer
+# writes a 권장 only (AC#5). ``render_table`` / ``cmd_table`` above are untouched.
+
+
+@dataclass
+class BenchRow:
+    """One embedder variant's bench result. ``metrics`` is this backend's v2 hit-rate
+    (``None`` when not measured). ``status`` is the human cell: ``측정`` /
+    ``보류(디스크)`` / ``미측정(인증 없음)`` / ``미측정(<이유>)``."""
+
+    name: str
+    status: str
+    dim: int | None = None
+    metrics: Metrics | None = None
+    index_seconds: float | None = None
+    vector_bytes: int | None = None
+    docs: int | None = None
+    cost: str = "—"
+
+
+_BENCH_NAMES = {
+    "hash": "① 해싱 (stdlib feature-hashing, 기본값)",
+    "local": "② 로컬 ONNX (multilingual-e5-small 계열)",
+    "vertex": "③ Vertex AI (text-multilingual-embedding-002)",
+}
+
+
+def _bench_cost(name: str, corpus_chars: int) -> str:
+    """Per-backend one-time embedding-cost cell. hash/local run offline ($0); Vertex
+    is billed per input character — the numerator (measured corpus chars) is concrete,
+    the unit price is cited in the §5.5 footnote (no network tool here to fetch it)."""
+    if name == "vertex":
+        return f"입력 ~{corpus_chars:,}자 기준 (공식 단가×문자수 — §5.5 각주)"
+    return "$0 (오프라인)"
+
+
+def _corpus_size(vault_root: Path) -> tuple[int, int]:
+    """``(doc count, total embed-input chars)`` over the R5-filtered corpus — the
+    cost denominator, computed offline with zero network."""
+    docs = 0
+    chars = 0
+    for doc in gm.iter_embed_corpus(vault_root):
+        docs += 1
+        chars += len(doc.text)
+    return docs, chars
+
+
+def run_bench(
+    labelset: LabelSet,
+    *,
+    vault_root: Path,
+    work_dir: Path,
+    names: tuple[str, ...],
+    ks: tuple[int, ...] = (5, 10),
+) -> tuple[list[BenchRow], Metrics | None]:
+    """Run ``names`` embedder backends over ``labelset`` on scratch DBs under
+    ``work_dir`` and return ``(rows, v1_metrics)``.
+
+    The live ``<vault_root>/Memory/relations.sqlite`` is protected by code: ``work_dir``
+    may not BE the vault's live ``Memory/`` dir (where the maintenance tick writes),
+    and no resolved bench-DB path may equal the live DB — either raises ``ValueError``
+    before any work. Each backend gets a fresh ``work_dir/bench-<name>.sqlite`` (removed
+    first if present); the vault corpus is read-only. A backend that is
+    :class:`gm.EmbedderUnavailable` or returns a ``skipped_reason`` becomes a ``미측정``
+    row and the loop continues. ``v1_metrics`` (the embedder-independent BFS baseline)
+    is taken from the first measured variant (identical across variants — same edges)."""
+    vault_root = Path(vault_root)
+    work_dir = Path(work_dir)
+    live_db = (vault_root / "Memory" / "relations.sqlite").resolve()
+    if work_dir.resolve() == (vault_root / "Memory").resolve():
+        raise ValueError(
+            f"bench --work-dir must not be the vault's live Memory/ dir "
+            f"({vault_root / 'Memory'}); the maintenance tick writes "
+            f"Memory/relations.sqlite there — use a scratch dir"
+        )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _docs, corpus_chars = _corpus_size(vault_root)
+
+    rows: list[BenchRow] = []
+    v1_metrics: Metrics | None = None
+    for name in names:
+        cost = _bench_cost(name, corpus_chars)
+        db_path = work_dir / f"bench-{name}.sqlite"
+        if db_path.resolve() == live_db:
+            raise ValueError(f"bench DB path collides with the live edge DB: {db_path}")
+        if db_path.exists():
+            db_path.unlink()
+
+        try:
+            embed_fn, embed_dim, _n = gm.resolve_embedder(name=name)
+        except (gm.EmbedderUnavailable, ValueError) as exc:
+            rows.append(BenchRow(name=name, status=f"미측정({exc})", cost=cost))
+            continue
+
+        con = gm.init_relations_db(db_path)
+        try:
+            gm.scan_vault_and_index(vault_root=vault_root, con=con)
+            size_before = db_path.stat().st_size
+            t0 = time.perf_counter()
+            result = gm.embed_vault(
+                con, vault_root=vault_root, embedder=embed_fn, dim=embed_dim, rebuild=True
+            )
+            index_seconds = time.perf_counter() - t0
+            size_after = db_path.stat().st_size
+            if result.skipped_reason:
+                rows.append(
+                    BenchRow(
+                        name=name,
+                        status=f"미측정({result.skipped_reason})",
+                        dim=embed_dim,
+                        index_seconds=index_seconds,
+                        docs=result.total_corpus,
+                        cost=cost,
+                    )
+                )
+                continue
+            m_v1, m_v2 = run_eval(
+                con, labelset, ks=ks, v2_kwargs={"embedder": embed_fn, "dim": embed_dim}
+            )
+            if v1_metrics is None:
+                v1_metrics = m_v1
+            rows.append(
+                BenchRow(
+                    name=name,
+                    status="측정",
+                    dim=embed_dim,
+                    metrics=m_v2,
+                    index_seconds=index_seconds,
+                    vector_bytes=max(0, size_after - size_before),
+                    docs=result.embedded,
+                    cost=cost,
+                )
+            )
+        finally:
+            con.close()
+    return rows, v1_metrics
+
+
+def _metric_cell(metrics: Metrics | None, kind: str, k: int) -> str:
+    if metrics is None:
+        return "—"
+    table = metrics.precision_at if kind == "p" else metrics.recall_at
+    return f"{table.get(k, 0.0):.3f}"
+
+
+def _bench_row_md(row: BenchRow) -> str:
+    label = _BENCH_NAMES.get(row.name, row.name)
+    dim = str(row.dim) if row.dim is not None else "—"
+    p50 = f"{row.metrics.latency_p50_ms:.1f}" if row.metrics else "—"
+    idx = f"{row.index_seconds:.2f}" if row.index_seconds is not None else "—"
+    disk = f"{row.vector_bytes / 1_048_576:.1f}" if row.vector_bytes is not None else "—"
+    return (
+        f"| {label} | {dim} "
+        f"| {_metric_cell(row.metrics, 'p', 5)} | {_metric_cell(row.metrics, 'p', 10)} "
+        f"| {_metric_cell(row.metrics, 'r', 5)} | {_metric_cell(row.metrics, 'r', 10)} "
+        f"| {p50} | {idx} | {disk} | {row.cost} | {row.status} |"
+    )
+
+
+def _bench_recommendation(rows: list[BenchRow]) -> str:
+    measured = [r for r in rows if r.status == "측정" and r.metrics is not None]
+    if not measured:
+        return (
+            "**권장: hash 유지** — 측정된 변종이 없어(로컬/Vertex 모두 미측정) 비교 불가. "
+            "기본값은 hash 그대로이며 전환은 사람 결정이다."
+        )
+    best = max(measured, key=lambda r: r.metrics.recall_at.get(10, 0.0))  # type: ignore[union-attr]
+    unmeasured = [r.name for r in rows if r.status != "측정"]
+    tail = f" (미측정: {', '.join(unmeasured)})" if unmeasured else ""
+    return (
+        f"**권장: {_BENCH_NAMES.get(best.name, best.name)}** — 측정된 변종 중 recall@10 "
+        f"{best.metrics.recall_at.get(10, 0.0):.3f} 로 최고{tail}. 단 **기본값은 hash 그대로**이며 "
+        "실제 전환은 사람 결정이다 (`MACP_EMBEDDER=<name>` + `graph_memory embed --rebuild`)."
+    )
+
+
+def render_bench_table(rows: list[BenchRow], v1_metrics: Metrics | None, *, weak: bool) -> str:
+    """Render the design §5.5 three-way embedder comparison table. Unmeasured cells
+    show the status string (``보류(디스크)`` / ``미측정(인증 없음)`` / …) verbatim; the
+    footer writes a 권장 only — it never switches the default (AC#5)."""
+    lines: list[str] = []
+    if weak:
+        lines.append(_WEAK_CAPTION)
+        lines.append("")
+    lines.append(
+        "| 방식 | dim | P@5 | P@10 | R@5 | R@10 | 질의 p50(ms) | 색인(s) "
+        "| 벡터 디스크(MB) | 1회 비용 | 상태 |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    if v1_metrics is not None:
+        lines.append(
+            "| v1 (BFS+index.md 집계 기준선) | — "
+            f"| {v1_metrics.precision_at.get(5, 0.0):.3f} | {v1_metrics.precision_at.get(10, 0.0):.3f} "
+            f"| {v1_metrics.recall_at.get(5, 0.0):.3f} | {v1_metrics.recall_at.get(10, 0.0):.3f} "
+            f"| {v1_metrics.latency_p50_ms:.1f} | — | — | $0 (오프라인) | 측정 |"
+        )
+    for row in rows:
+        lines.append(_bench_row_md(row))
+    lines.append("")
+    lines.append(_bench_recommendation(rows))
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Reviewable weak-label scaffold (design §5.1/§5.4) + loader
 # ---------------------------------------------------------------------------
 
@@ -505,6 +717,21 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Run the §5.5 three-way embedder bench on scratch DBs and print the table. The
+    live edge DB is never touched (``--work-dir`` must be a scratch dir, enforced in
+    :func:`run_bench`)."""
+    labelset = load_labelset(args.golden)
+    ks = _parse_ks(args.k)
+    root, _db_path = _resolve_db(args)
+    names = tuple(n.strip() for n in str(args.embedders).split(",") if n.strip())
+    rows, v1_metrics = run_bench(
+        labelset, vault_root=root, work_dir=Path(args.work_dir), names=names, ks=ks
+    )
+    print(render_bench_table(rows, v1_metrics, weak=labelset.status != "golden"))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="graph memory v2 — 적중률 평가 하니스 (precision@k·recall@k, v1 vs v2)"
@@ -549,6 +776,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("--touches", nargs="*", default=None)
     p_query.add_argument("--k", type=int, default=10)
     p_query.set_defaults(func=cmd_query)
+
+    p_bench = sub.add_parser(
+        "bench",
+        help="Run ①hash ②local ③Vertex over a golden set on scratch DBs, print the §5.5 table",
+        parents=[common],
+    )
+    p_bench.add_argument("--golden", required=True, help="path to a golden/weak label-set JSON")
+    p_bench.add_argument(
+        "--work-dir",
+        required=True,
+        help="scratch dir for bench-<name>.sqlite DBs (must NOT be the vault's Memory/)",
+    )
+    p_bench.add_argument(
+        "--embedders",
+        default="hash,local,vertex",
+        help="comma-separated backends to bench (default: hash,local,vertex)",
+    )
+    p_bench.add_argument("--k", default="5,10", help="comma-separated k values (default: 5,10)")
+    p_bench.set_defaults(func=cmd_bench)
 
     return parser
 
