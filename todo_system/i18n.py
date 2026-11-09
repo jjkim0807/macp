@@ -47,6 +47,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.state.next_tick": "다음 틱에 디스패치 예정 ({n}건 대기)",
         "dash.state.no_work": "디스패치 가능한 태스크 없음",
         "dash.human.parked": "검토/승인 대기",
+        "dash.proposal.title": "프롬프트 제안 미반영: {slug}",
+        "dash.proposal.conditional": "[조건부: {cond}] ",
         "dash.sms.apply": "SMS 릴레이 앱에 설정 적용",
         "dash.sms.title": "SMS 릴레이 설정",
         # daily digest + route() merge suffix (kakao_format)
@@ -203,6 +205,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.state.next_tick": "dispatch on the next tick ({n} waiting)",
         "dash.state.no_work": "no dispatchable tasks",
         "dash.human.parked": "awaiting review/approval",
+        "dash.proposal.title": "Unapplied prompt proposal: {slug}",
+        "dash.proposal.conditional": "[conditional: {cond}] ",
         "dash.sms.apply": "Apply settings in the SMS Relay app",
         "dash.sms.title": "SMS relay setup",
         "digest.headline_fyi": "📮 macp digest — {n} alert(s), no action needed",
