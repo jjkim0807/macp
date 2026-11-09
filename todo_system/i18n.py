@@ -121,6 +121,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.parent_complete": (
             "🧭 하위 작업이 모두 끝난 상위 태스크 {n}건이 아직 open이에요 — "
             "닫을지 후속 작업을 추가할지 확인해주세요"),
+        "alert.human_ready": (
+            "🙋 사람이 할 차례가 됐어요 — 기다리던 선행 작업이 모두 끝났습니다"),
+        "alert.human_ready_dep": "마지막 선행: {dep}",
+        "alert.human_ready_next": "다음 행동: {next_action}",
+        "alert.human_ready_ifthen": "If-Then: {if_then}",
         "alert.closed_unmerged": (
             "⚠️ delegate PR이 머지 없이 닫혔어요 — "
             "다시 열지·재작업할지·접을지 판단해주세요"),
@@ -278,6 +283,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.parent_complete": (
             "🧭 {n} parent task(s) have all subtasks finished but are still open — "
             "close them or add follow-up work"),
+        "alert.human_ready": (
+            "🙋 Your turn — every upstream task this one waited on is done"),
+        "alert.human_ready_dep": "last upstream: {dep}",
+        "alert.human_ready_next": "next: {next_action}",
+        "alert.human_ready_ifthen": "If-Then: {if_then}",
         "alert.closed_unmerged": (
             "⚠️ delegate PR was closed without merging — "
             "decide whether to reopen, redo or drop it"),

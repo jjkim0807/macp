@@ -1898,7 +1898,7 @@ class HumanWhyDecisionVsTodo(unittest.TestCase):
 
     TODAY = dt.date(2049, 1, 10)
     KEYS = {"slug", "title", "action", "why", "due", "not_before", "urgent", "later",
-            "category", "project"}
+            "category", "project", "waiting_on", "ready_since"}
     # slug, title, next_action, tags, due, worker_mode, expected why
     ROWS = [
         ("h_tag", "h_tag", "", "todo,decision", "-", None, "owned"),
@@ -2031,6 +2031,184 @@ class HumanWhyDecisionVsTodo(unittest.TestCase):
                                               encoding="utf-8")
             self.assertIs(M._needs_decision(slug), want, val)
         self.assertFalse(M._needs_decision("h_missing"))
+
+
+class HumanDepsWaitingVsReady(unittest.TestCase):
+    """A human row's `depends_on` splits "not yet" from "your turn".
+
+    The dashboard half of macp-human-action-ready-alerts (2026-11-09): a
+    human-owned task waiting on an upstream leaf used to look identical to one
+    that was actionable right now, so the chain closing changed nothing a person
+    could see. Open deps → the waiting (`blocked`) family, never urgent; a
+    complete chain → `urgent` with `ready_since`.
+
+    No new `why` value on purpose — see collect_human's "Human-row contract".
+    """
+
+    TODAY = dt.date(2049, 1, 10)
+    # slug, worker_mode, tags, depends_on, expected (why, urgent)
+    ROWS = [
+        ("w_open", "manual", "todo", ["up_done", "up_open"], ("blocked", False)),
+        ("w_ready", "manual", "todo", ["up_done"], ("manual", True)),
+        ("w_decopen", None, "todo,decision", ["up_open"], ("blocked", False)),
+        ("w_decready", None, "todo,decision", ["up_done"], ("owned", True)),
+        ("w_nodeps", "manual", "todo", [], ("manual", False)),
+        ("w_missingdep", "manual", "todo", ["no_such"], ("blocked", False)),
+    ]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        items = self.tmp / "items"
+        items.mkdir()
+        for slug, _wm, _tags, deps, _want in self.ROWS:
+            body = ["---", "status: open"]
+            if deps:
+                body.append("depends_on:")
+                body += [f"  - {d}" for d in deps]
+            body += ["---", "", "# x", ""]
+            (items / f"{slug}.md").write_text("\n".join(body), encoding="utf-8")
+
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, title TEXT, status TEXT, due TEXT, "
+                    "not_before TEXT, next_action TEXT, tags TEXT, parent_slug TEXT, "
+                    "is_parent INTEGER, worker_mode TEXT, updated TEXT)")
+        con.executemany(
+            "INSERT INTO tasks VALUES (?,?,'open','-',NULL,'',?,NULL,0,?,NULL)",
+            [(s, s, tags, wm) for s, wm, tags, _d, _w in self.ROWS])
+        # the upstream leaves: one finished, one still running
+        con.executemany(
+            "INSERT INTO tasks VALUES (?,?,?,'-',NULL,'','auto',NULL,0,'auto',?)",
+            [("up_done", "up_done", "done", "2049-01-08"),
+             ("up_open", "up_open", "open", "2049-01-09")])
+        con.commit()
+        con.close()
+        self.db = db
+        self.items = items
+        self._patch(db, items)
+
+    def _patch(self, db, items):
+        # Only the w_dec* rows get a human owner, so the others keep the `why`
+        # their worker_mode gives them (a registry owner would outrank `manual`
+        # as `todo` — the pre-existing first-match-wins order).
+        reg = types.SimpleNamespace(
+            agents=[types.SimpleNamespace(id="me", kind="human")],
+            for_project=lambda slug: (types.SimpleNamespace(id="me")
+                                      if slug.startswith("w_dec") else None))
+        M._DEPS_CACHE.clear()
+        M._DECISION_CACHE.clear()
+        self.addCleanup(M._DEPS_CACHE.clear)
+        self.addCleanup(M._DECISION_CACHE.clear)
+        for p in (mock.patch.object(M, "TODO_DB", db),
+                  mock.patch.object(M, "ITEMS", items),
+                  mock.patch.object(M, "_repo_in_chain", return_value=False),
+                  mock.patch("todo_system.orchestrator.registry.load_registry",
+                             return_value=reg)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _rows(self):
+        return {r["slug"]: r for r in M.collect_human([], today=self.TODAY)}
+
+    def test_why_and_urgency_per_contract(self):
+        rows = self._rows()
+        for slug, _wm, _tags, _deps, (why, urgent) in self.ROWS:
+            self.assertEqual(rows[slug]["why"], why, slug)
+            self.assertIs(rows[slug]["urgent"], urgent, slug)
+
+    def test_open_deps_are_listed_in_waiting_on(self):
+        rows = self._rows()
+        self.assertEqual(rows["w_open"]["waiting_on"], ["up_open"])
+        self.assertEqual(rows["w_ready"]["waiting_on"], [])
+        self.assertEqual(rows["w_nodeps"]["waiting_on"], [])
+
+    def test_a_dep_missing_from_the_db_counts_as_open(self):
+        """Not-done is the safe reading: a typo'd or deleted upstream must not
+        announce someone's turn. Same direction as task_deps' unknown-dep warning."""
+        rows = self._rows()
+        self.assertEqual(rows["w_missingdep"]["waiting_on"], ["no_such"])
+        self.assertFalse(rows["w_missingdep"]["urgent"])
+
+    def test_ready_since_is_the_newest_dep_update(self):
+        rows = self._rows()
+        self.assertEqual(rows["w_ready"]["ready_since"], "2049-01-08")
+        self.assertEqual(rows["w_open"]["ready_since"], "")      # chain incomplete
+
+    def test_a_ready_row_is_urgent_without_any_due_date(self):
+        """Most deps-ready human tasks carry no `due`; gating urgency on one would
+        leave the alert's dashboard half silent."""
+        rows = self._rows()
+        self.assertEqual(rows["w_ready"]["due"], "")
+        self.assertTrue(rows["w_ready"]["urgent"])
+
+    def test_an_open_dep_beats_a_decision_marker(self):
+        """A decision whose inputs have not landed is not a decision yet — the
+        same direction as the existing blocked-beats-owned rule."""
+        rows = self._rows()
+        self.assertEqual(rows["w_decopen"]["why"], "blocked")
+        self.assertFalse(rows["w_decopen"]["urgent"])
+
+    def test_every_row_carries_the_new_keys(self):
+        keys = {"slug", "title", "action", "why", "due", "not_before", "urgent",
+                "later", "category", "project", "waiting_on", "ready_since"}
+        for r in self._rows().values():
+            self.assertEqual(set(r), keys, r["slug"])
+
+    def test_parked_rows_carry_them_too(self):
+        a = [{"task": "p1", "state": "awaiting_human", "note": "", "project": "x"}]
+        [row] = [r for r in M.collect_human(a, today=self.TODAY) if r["slug"] == "p1"]
+        self.assertEqual(row["why"], "parked")
+        self.assertEqual(row["waiting_on"], [])
+        self.assertEqual(row["ready_since"], "")
+
+    def test_a_db_without_an_updated_column_still_lists_people_work(self):
+        """The guard that matters: an unguarded `SELECT updated` raises
+        OperationalError into collect_human's broad except and empties the whole
+        human list — the rows would vanish, not degrade."""
+        db = self.tmp / "old.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, title TEXT, status TEXT, due TEXT, "
+                    "not_before TEXT, next_action TEXT, tags TEXT, parent_slug TEXT, "
+                    "is_parent INTEGER, worker_mode TEXT)")
+        con.executemany("INSERT INTO tasks VALUES (?,?,?,'-',NULL,'','todo',NULL,0,?)",
+                        [("w_ready", "w_ready", "open", "manual"),
+                         ("up_done", "up_done", "done", "auto")])
+        con.commit()
+        con.close()
+        with mock.patch.object(M, "TODO_DB", db):
+            rows = {r["slug"]: r for r in M.collect_human([], today=self.TODAY)}
+        self.assertIn("w_ready", rows)
+        self.assertTrue(rows["w_ready"]["urgent"])
+        self.assertEqual(rows["w_ready"]["ready_since"], "")     # unknowable, not fatal
+
+    def test_depends_on_is_cached_by_mtime(self):
+        from todo_system.orchestrator import repos
+        with mock.patch.object(repos, "read_task_depends_on",
+                               wraps=repos.read_task_depends_on) as rd:
+            self.assertEqual(M._task_depends_on("w_ready"), ["up_done"])
+            self.assertEqual(M._task_depends_on("w_ready"), ["up_done"])
+        self.assertEqual(rd.call_count, 1)
+
+    def test_a_wikilink_dep_resolves_to_the_bare_slug(self):
+        (self.items / "w_link.md").write_text(
+            "---\nstatus: open\ndepends_on:\n  - \"[[up_done|표시 이름]]\"\n---\n# x\n",
+            encoding="utf-8")
+        self.assertEqual(M._task_depends_on("w_link"), ["up_done"])
+
+    def test_an_unreadable_task_file_degrades_to_no_deps(self):
+        (self.items / "w_bad.md").write_bytes(b"\xff\xfe not frontmatter ---\n: :\n")
+        self.assertEqual(M._task_depends_on("w_bad"), [])
+        self.assertEqual(M._task_depends_on("w_absent"), [])
+
+    def test_why_order_and_unknown_why_sort_stay_intact(self):
+        """No new why key, and an unknown one still sorts last (9) — that is what
+        keeps the Android app safe from a value it does not know."""
+        self.assertEqual(M.WHY_ORDER, {"parked": 0, "owned": 1, "todo": 2,
+                                       "blocked": 3, "manual": 4, "backlog": 5})
+        self.assertEqual(
+            M._human_sort_key({"why": "nope", "urgent": False, "due": "", "slug": "z"}),
+            (True, 9, "9999", "z"))
 
 
 class HumanWhyTodoBadge(unittest.TestCase):
@@ -2444,8 +2622,11 @@ class StatusSingleFlightTests(unittest.TestCase):
 
 # 2026-10-30: +32 bytes = the `todo:['직접 할 일','b-blu'],` WHY entry (human why
 # decision-vs-todo); the rest of the page is byte-identical to the previous golden.
-_KO_HTML_SHA256 = "64edd8626f0a936a0633be5ef5401e9b690b165308ed76e0fd804e850e5cf777"
-_KO_HTML_LEN = 44170
+# 2026-11-09: +298 bytes = the `⛓ N` open-depends_on chip in `humanRow` and its
+# two comment lines (macp-human-action-ready-alerts). A symbol + a count, so no
+# new i18n key and no WHY/badge change; the rest of the page is byte-identical.
+_KO_HTML_SHA256 = "859c9758e2d1fc31232775b51ab163907401eb7b84b4ccbf837b5dbdf3a1e059"
+_KO_HTML_LEN = 44468
 _HANGUL = re.compile("[가-힣]")
 
 

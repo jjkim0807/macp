@@ -73,26 +73,54 @@ class DeliverReplyTest(unittest.TestCase):
             return []
         return read_digest_entries(self.digest.read_text(encoding="utf-8"))
 
-    def test_deliver_routes_the_assign_fyi_to_the_digest_then_acks(self):
-        """[할당] is digest tier since macp-kakao-alert-2-noise-tiers: the
-        2026-09-16 audit found all five were FYIs duplicating the review ping.
-        Delivery still happens exactly once — into the queue, not the phone."""
+    def test_deliver_rings_the_assign_immediately_then_acks(self):
+        """Reversal of the 2026-09-16 digest call (macp-human-action-ready-alerts,
+        2026-11-09): that audit's premise was that every [할당] trails another
+        alert about the same task. For a task assigned to a person because its
+        dependency chain just closed, the TASK_ASSIGN is the ONLY signal that it
+        is their turn — a digest would park it for up to a day."""
         assign = m.Envelope(to="alice", type=m.TASK_ASSIGN, task_id="withdrawal-a2",
                             payload={"summary": "A2 결정 점검"})
         self.mb.send(assign)
 
         delivered = self._deliver()
         self.assertEqual(len(delivered), 1)
-        self.assertEqual(self.sent, [])                     # zero individual sends
-        [entry] = self._queued()                            # ...but not lost
-        self.assertIn("withdrawal-a2", entry["msg"])
-        # acked -> not redelivered, not re-queued
+        self.assertEqual(len(self.sent), 1)                 # rings the phone
+        self.assertIn("withdrawal-a2", self.sent[0][0])
+        self.assertEqual(self._queued(), [])                # nothing parked
+        # acked -> not redelivered
         self.assertEqual(self._deliver(), [])
-        self.assertEqual(len(self._queued()), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_redelivery_of_the_same_assignment_merges_in_the_dedup_window(self):
+        """What keeps the reversal from reintroducing noise: `event_key` is still
+        `assign:<task>`, so a burst about ONE assignment is one buzz — while a
+        different task rings on its own."""
+        for _ in range(2):
+            self.mb.send(m.Envelope(to="alice", type=m.TASK_ASSIGN,
+                                    task_id="withdrawal-a2",
+                                    payload={"summary": "A2 결정 점검"}))
+            self._deliver()
+        self.assertEqual(len(self.sent), 1)                 # second merged away
+        self.mb.send(m.Envelope(to="alice", type=m.TASK_ASSIGN, task_id="other-task",
+                                payload={"summary": "다른 건"}))
+        self._deliver()
+        self.assertEqual(len(self.sent), 2)                 # a different key rings
+
+    def test_the_assign_delivery_is_immediate_tier(self):
+        """Pinned on the call itself, not just its effect: a future refactor must
+        not silently restore the digest level."""
+        self.mb.send(m.Envelope(to="alice", type=m.TASK_ASSIGN, task_id="t1"))
+        seen = []
+
+        def spy(text, *, level=None, event_key=None, **kw):
+            seen.append((level, event_key))
+            return "send", text
+        human.deliver_pending(self.mb, self.agent, notify=self._notify, route=spy)
+        self.assertEqual(seen, [("immediate", "assign:t1")])
 
     def test_deliver_query_still_rings_immediately(self):
-        """Only the TASK_ASSIGN FYI moved to the digest — a question the human
-        must answer stays an immediate send (when in doubt, immediate)."""
+        """QUERY was already immediate and stays so (when in doubt, immediate)."""
         self.mb.send(m.Envelope(to="alice", type=m.QUERY, task_id="t1",
                                 payload={"summary": "예산 확인 필요"}))
         self._deliver()
@@ -115,7 +143,7 @@ class DeliverReplyTest(unittest.TestCase):
         self.assertEqual(self._queued(), [])                # nothing queued either
         # a real run afterwards still delivers it
         self.assertEqual(len(self._deliver()), 1)
-        self.assertEqual(len(self._queued()), 1)
+        self.assertEqual(len(self.sent), 1)
 
     def test_reply_roundtrip_to_orchestrator(self):
         assign = m.Envelope(to="alice", type=m.TASK_ASSIGN, task_id="withdrawal-a2")

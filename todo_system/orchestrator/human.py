@@ -27,7 +27,7 @@ from .registry import Agent, load_registry
 # this module — it pulls PyYAML via .registry).
 from ..kakao_format import (  # noqa: F401
     KAKAO_TEXT_LIMIT,
-    LEVEL_DIGEST,
+    LEVEL_IMMEDIATE,
     clip_words,
     compose_alert,
 )
@@ -123,13 +123,20 @@ def deliver_pending(
 ) -> list[m.Envelope]:
     """Nudge the human about every new inbox message, then ack the delivery.
 
-    TASK_ASSIGN deliveries are digest-tier: the 2026-09-16 audit found every
-    "[할당]" ping was an FYI duplicating the review-request sent seconds earlier
-    (5/5 in the 09-11..16 log), so they queue for the daily summary instead of
-    ringing the phone. Everything else a human gets pushed (QUERY, CANCEL, WAKE,
-    PING) stays an immediate send — when in doubt, immediate. The route seam is
-    injectable for tests; it falls open to `notify` so a routing failure can
-    never swallow a delivery."""
+    Every type — TASK_ASSIGN included — is an immediate send. The assign tier was
+    digest from 2026-09-16, when an audit found all five "[할당]" pings in the
+    09-11..16 log were FYIs duplicating a review request sent seconds earlier.
+    That reasoning was reversed on 2026-11-09: it holds only while every
+    TASK_ASSIGN trails some other alert about the same task. A task assigned to a
+    person because its dependency chain just closed has no such companion — the
+    TASK_ASSIGN *is* the only signal that it is their turn, and a digest parks it
+    for up to a day. When in doubt, immediate.
+
+    `event_key=assign:<task>` is KEPT, so the router still merges a burst of
+    re-deliveries of the SAME assignment inside its 10-minute window into one
+    phone buzz — that is what stops the reversal from reintroducing noise. The
+    route seam is injectable for tests; it falls open to `notify` so a routing
+    failure can never swallow a delivery."""
     route = route or _kakao_format.route
     msgs = mailbox.receive(agent.id)
     delivered: list[m.Envelope] = []
@@ -139,7 +146,7 @@ def deliver_pending(
             print(f"[dry-run kakao -> {agent.id}] {text!r}")
         elif msg.type == m.TASK_ASSIGN:
             try:
-                verdict, routed = route(text, level=LEVEL_DIGEST,
+                verdict, routed = route(text, level=LEVEL_IMMEDIATE,
                                         event_key=f"assign:{msg.task_id or '-'}")
             except Exception:
                 verdict, routed = "send", text

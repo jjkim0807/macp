@@ -44,9 +44,10 @@
 | `todo_system/orchestrator/orchestrator.py:_notify_timeout_park` | ⏱️ 연속 stage timeout 대기 전환 | 즉시 | long_job 전환 판단 필요. event_key `timeout-park:<task>` |
 | `todo_system/orchestrator/orchestrator.py:_notify_blocker_cancelled` | 🔗 상류 취소로 진행 불가 | 즉시 | 태스크 존폐 판단 필요. event_key `blocker-cancelled:<task>` |
 | `todo_system/orchestrator/orchestrator.py:_notify_parent_complete` | 🧭 하위 완료된 상위 태스크 open (구 `[상위태스크 점검]`) | 즉시 | 닫을지 판단 필요. `_record_parent_surfaced`가 1회성 보장(자체 쿨다운) |
+| `todo_system/orchestrator/orchestrator.py:_notify_human_ready` | 🙋 사람이 할 차례 — 기다리던 선행 작업 전부 done | 즉시 | 사람이 **지금** 해야 하는 일이고, 체인에 남은 게 사람뿐이라 요약으로 미루면 최대 하루 늦는다. event_key `human-ready:<slug>` + `_human_ready_seen`의 dep 집합 fingerprint 1회성(자체 쿨다운) — ready를 벗어나면 엔트리가 prune돼 재무장하고, 첫 배포에는 24h 안에 닫힌 체인만 알린다 |
 | `todo_system/orchestrator/orchestrator.py:_propagate_downstream` | 🔗 하류 통합검증 N개 생성 | **요약** | 자동 생성 FYI — 검증 결과는 별도 알림이 옴 |
 | `todo_system/orchestrator/orchestrator.py:_nudge` | 🙋 파킹된 할당 재촉 (1d/3d/7d 백오프) | 즉시 | 사람 응답을 며칠째 기다리는 의도적 에스컬레이션. event_key 없음 — last_nudge_ts 백오프가 이미 페이싱(자체 쿨다운) |
-| `todo_system/orchestrator/human.py:deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | **요약** | 2026-09-16 감사: 5건 전부 FYI — 직전 검토요청과 중복. QUERY/CANCEL/WAKE/PING은 즉시 유지(애매하면 즉시) |
+| `todo_system/orchestrator/human.py:deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | 즉시 | 2026-11-09 번복(종전: **요약**). 2026-09-16 감사의 "5건 전부 직전 검토요청과 중복인 FYI"는 **모든 TASK_ASSIGN이 다른 알림을 뒤따를 때만** 성립한다 — dep 체인이 닫혀 사람에게 할당된 태스크엔 동반 알림이 없고 이 TASK_ASSIGN이 "당신 차례"라는 유일한 신호다. 소음은 등급이 아니라 event_key `assign:<task>`(10분 창)가 막는다: 같은 할당의 연타는 1건으로 합쳐지고 다른 태스크는 따로 울린다. QUERY/CANCEL/WAKE/PING은 종전처럼 즉시 |
 | `todo_system/orchestrator/followups.py:_notify_awaiting` | 🙋 사람 결정 대기(followups human): [id] 태스크 — planner가 `"route":"human"`으로 넘긴 report 후속 | **요약** | 결정 대기일 뿐 수 시간 안에 할 일은 아님. id당 평생 1회(`human_notified` 표식 — digest 등급엔 자체 dedup이 없음). 적재 실패 시 다음 reconcile이 재시도하고 즉시 발송으로 폴백하지 않음. 목록·결정은 `python -m todo_system.orchestrator.followups human` / `approve` / `dismiss` |
 | `todo_system/worker.py:cmd_maintenance` | ⚠️ 마이그레이션 미적용 | 즉시 | DB 스키마 확인 필요. `check_unapplied_migrations`가 판정, `cmd_maintenance`가 발송 |
 | `todo_system/worker.py:check_dispatch_silence` | 🤖⚠️ macp 정체 | 즉시 | 파이프라인 침묵의 유일한 감지기. SILENCE_COOLDOWN 자체 쿨다운 |

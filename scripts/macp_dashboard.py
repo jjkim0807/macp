@@ -592,6 +592,40 @@ def _task_repo(slug: str) -> str | None:
     return repo
 
 
+# (path, mtime) → depends_on cache, same shape as _REPO_CACHE. todo.db has NO
+# depends_on column, so the dashboard has to read the task markdown like
+# orchestrator.tasks.load_blocked does; the cache is what keeps that off the 3s
+# poll's hot path.
+_DEPS_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _task_depends_on(slug: str) -> list[str]:
+    """The `depends_on:` slugs of Todo/items/<slug>.md ([] if absent/unreadable).
+
+    Normalised through the same two helpers the orchestrator uses, so
+    `[[slug|alias]]` resolves to the bare slug and a dep can actually be matched
+    against a status row. Any parse/import error degrades to [] — a dashboard
+    must never break on one bad task file.
+    """
+    p = ITEMS / f"{slug}.md"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return []
+    hit = _DEPS_CACHE.get(slug)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    deps: list[str] = []
+    try:
+        from todo_system.orchestrator.repos import read_task_depends_on
+        from todo_system.orchestrator.tasks import _dep_slug
+        deps = [d for d in (_dep_slug(x) for x in read_task_depends_on(p)) if d]
+    except Exception:
+        deps = []
+    _DEPS_CACHE[slug] = (mtime, deps)
+    return deps
+
+
 def _repo_in_chain(slug: str, parent_map: dict[str, str]) -> bool:
     """True if the task or any ancestor declares a `repo:` — the structural
     'this is a coding project' signal, so a worker-made review-* child inherits its
@@ -729,10 +763,22 @@ def _parse_date(v) -> dt.date | None:
         return None
 
 
-def _is_urgent(why: str, due: str, today: dt.date) -> bool:
-    """parked (a PR/decision the pipeline is waiting on) or due ≤ today+URGENT_DAYS.
-    `blocked` is never urgent — it waits on something else (often depends_on worker
-    leaves that auto-unblock it), so a near due date isn't a person's action yet."""
+def _is_urgent(why: str, due: str, today: dt.date, *, deps_ready: bool = False) -> bool:
+    """parked (a PR/decision the pipeline is waiting on), a chain that just became
+    this person's turn, or due ≤ today+URGENT_DAYS.
+
+    `blocked` is never urgent — it waits on something else (often depends_on
+    worker leaves that auto-unblock it), so a near due date isn't a person's
+    action yet.
+
+    `deps_ready` (2026-11-09) wins over the due date entirely: a task whose every
+    dependency just closed IS the thing to do now, and most such tasks carry no
+    `due` at all — gating them on one would leave the alert's dashboard half
+    silent. Keyword-only with a False default, so every pre-existing caller
+    behaves exactly as before.
+    """
+    if deps_ready:
+        return True
     if why == "blocked":
         return False
     d = _parse_date(due)
@@ -1000,7 +1046,33 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
     `not_before` is still in the future (not actionable yet; collect_status moves
     those to `human_later` so they don't crowd the list). Host-local; a time of
     day is honored (`not_before` stays `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM` when it
-    has one). `today` alone means 00:00 that day; `now` pins the clock."""
+    has one). `today` alone means 00:00 that day; `now` pins the clock.
+
+    **Human-row contract (engine-side source of truth; the vault's
+    docs/dashboard-parity.md "human why" carries the same table).** Updated
+    2026-11-09 by macp-human-action-ready-alerts:
+
+    * `why` priority, first match wins: `parked` → `blocked` → `owned` → `todo` →
+      `manual` → `backlog`. `blocked` now has TWO routes into it: `worker_mode:
+      blocked`, and (new) *any* human row with an unfinished `depends_on`. No new
+      `why` value was introduced on purpose — the shell splits rows on
+      `why==='blocked'` alone to fold the "nothing to do yet" block away, the
+      badge map and the Android app would render an unknown value as `?`, and
+      WHY_ORDER stays exactly six keys.
+    * `waiting_on: list[str]` — the dependency slugs that are NOT done yet. `[]`
+      once the chain is complete. Same field name the queue-blocked rows use.
+    * `ready_since: str` — the newest `updated` among the dependencies, set only
+      when every one of them is done (else `""`). "Your turn since …".
+    * A row whose deps are all done is `urgent` regardless of `due` (see
+      _is_urgent), so the orchestrator's `_notify_human_ready` alert and this
+      list agree about what is actionable.
+
+    Dependency state is read from todo.db only, never from the task markdown: at
+    a 3s poll an md read per dep per row would be the dashboard's hottest path,
+    and the human rows themselves already come from the DB. The worst case is a
+    dep closed less than one import-daemon tick (5 min) ago still showing as
+    open. `_task_depends_on` IS an md read, but mtime-cached and only for rows
+    that already made the human list."""
     if now is None:
         now = dt.datetime.combine(today, dt.time.min) if today else dt.datetime.now()
     today = today or now.date()
@@ -1021,7 +1093,9 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
             items.append({"slug": r["task"], "title": r["task"], "category": "dev",
                           "action": r["note"] or i18n.t("dash.human.parked"), "why": "parked",
                           "project": r.get("project", ""), "due": "", "not_before": "",
-                          "urgent": True, "later": False})
+                          "urgent": True, "later": False,
+                          # Same key set on every row (test_category_and_row_keys_unchanged)
+                          "waiting_on": [], "ready_since": ""})
             seen.add(r["task"])
 
     # 2) every open, non-parent todo that is NOT auto-worked → a person must act
@@ -1035,6 +1109,19 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                                         "COALESCE(tags,'') FROM tasks"))
                 parent_map = {s: p for s, p, _ in rows}
                 labels = _project_labels(rows)
+                # A SECOND light query rather than widening the one above:
+                # _project_labels unpacks it as exactly `for s, p, _ in rows`.
+                # The `updated` column is guarded the way collect_projects guards
+                # it — older DBs (and the test fixtures) lack it, and an
+                # unguarded SELECT would raise OperationalError into the broad
+                # `except` below, silently emptying the whole human list.
+                cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
+                upd = "COALESCE(updated,'')" if "updated" in cols else "''"
+                dep_status, dep_updated = {}, {}
+                for s, st, up in con.execute(
+                        f"SELECT slug, COALESCE(status,''), {upd} FROM tasks"):
+                    dep_status[s] = (st or "").lower()
+                    dep_updated[s] = up or ""
                 for r in con.execute("SELECT slug, title, next_action, tags, "
                                      "COALESCE(due,'') due, COALESCE(not_before,'') nb, "
                                      "COALESCE(parent_slug,'') parent, "
@@ -1059,6 +1146,20 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                         why = "manual"                 # hand-developed
                     else:
                         why = "backlog"                # no worker_mode — decide / route it
+                    # depends_on: an unfinished dep means "not your turn yet", so
+                    # the row joins the waiting (`blocked`) family wherever it
+                    # landed above — right after `parked`, ahead of
+                    # owned/todo/manual/backlog, preserving first-match-wins. A
+                    # complete chain instead makes it urgent and stamps when it
+                    # became actionable.
+                    deps = _task_depends_on(slug)
+                    open_deps = [d for d in deps if dep_status.get(d) != "done"]
+                    deps_ready = bool(deps) and not open_deps
+                    if open_deps:
+                        why = "blocked"
+                    ready_since = ""
+                    if deps_ready:
+                        ready_since = max((dep_updated.get(d) or "") for d in deps)
                     # structural category: repo-in-chain (dev) > human-owner (life) > tags.
                     # only human-listed rows hit the (mtime-cached) file resolver.
                     repo_present = _repo_in_chain(slug, parent_map)
@@ -1066,11 +1167,14 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                                   "action": (r["next_action"] or "")[:110], "why": why,
                                   "due": r["due"] if _parse_date(r["due"]) else "",
                                   "not_before": _nb.display_not_before(r["nb"]),
-                                  "urgent": (_is_urgent(why, r["due"], today)
+                                  "urgent": (_is_urgent(why, r["due"], today,
+                                                        deps_ready=deps_ready)
                                              and not _planned_ahead(slug, now)),
                                   "later": _nb.is_deferred(r["nb"], now),
                                   "category": _category(r["tags"], repo_present, human_owned),
-                                  "project": labels.get(slug, "")})
+                                  "project": labels.get(slug, ""),
+                                  "waiting_on": open_deps,
+                                  "ready_since": ready_since})
                     seen.add(slug)
     except Exception:
         pass
@@ -1942,7 +2046,9 @@ const WHY={parked:['@@dash.js.why_parked@@','b-wait'],owned:['@@dash.js.why_owne
 const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m[1]}">${m[0]}</span>`};
 
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
-const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
+// `⛓ N` = N unfinished depends_on (title lists them). A symbol + a count, so no
+// new i18n key is needed and the ko/en DASHBOARD parity test is untouched.
+const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
