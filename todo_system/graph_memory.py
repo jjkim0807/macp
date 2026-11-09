@@ -23,6 +23,7 @@ import datetime as dt
 import hashlib
 import importlib
 import math
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -533,6 +534,131 @@ def _default_embedder(text: str, dim: int = EMBED_DIM) -> list[float]:
     return vec
 
 
+# --- embedder backend registry + call-time resolution (G4 §5 bench) ----------
+#
+# The embedder is selectable by config so the §5 bench can compare ① the stdlib
+# feature-hashing default ② a local ONNX sentence model ③ Vertex AI. Selection is
+# the env var ``MACP_EMBEDDER``; the DEFAULT STAYS ``"hash"`` — this leaf only
+# writes a *recommendation* to the design doc, it never switches the default.
+# Resolution happens at **call time** (never frozen into a module constant or a
+# default argument — the trap ``paths.worker_root``'s docstring warns about), so a
+# call site that passes no embedder follows ``MACP_EMBEDDER``, and a backend
+# registered into the table after import is honoured. Backend libraries are
+# lazy-loaded inside their factories via ``importlib.import_module`` (string
+# import): a static third-party import — even function-local — would break
+# graph_memory's bare-clone stdlib-only contract (``test_session_log`` AST gate).
+
+EMBEDDER_DEFAULT = "hash"
+
+# Expected native output dim per backend — a sanity constant, NOT authority: each
+# factory probes the real vector length, and :func:`resolve_embedder` warns (never
+# silently relabels) when a backend's probed dim differs. hash=256 (``EMBED_DIM``),
+# local=384 (multilingual-e5-small int8 ONNX), vertex=768
+# (text-multilingual-embedding-002).
+EMBEDDER_EXPECTED_DIMS: dict[str, int] = {"hash": 256, "local": 384, "vertex": 768}
+
+
+class EmbedderUnavailable(RuntimeError):
+    """A configured embedder backend could not be constructed — its library, model
+    file or credentials are missing. Callers turn this into a graceful skip
+    (``skipped_reason`` / BFS-only), exactly like :class:`EmbeddingsUnavailable`:
+    selecting a backend whose deps are absent must never take down the maintenance
+    tick or a query. An *unknown* backend name is different: that is a config typo
+    and raises :class:`ValueError` (loud), never a silent fallback to hash."""
+
+
+def _hash_backend() -> tuple[Callable[[str], Sequence[float]], int]:
+    """Factory for the stdlib feature-hashing default embedder (zero deps, offline,
+    deterministic). Returns ``(fn, EMBED_DIM)``."""
+    dim = EMBED_DIM
+
+    def fn(text: str) -> list[float]:
+        return _default_embedder(text, dim=dim)
+
+    return fn, dim
+
+
+def _local_backend() -> tuple[Callable[[str], Sequence[float]], int]:
+    """Local ONNX multilingual sentence-embedding backend. This placeholder keeps
+    the registry key present (so ``embedder_name()`` accepts ``"local"``) and reports
+    the backend unavailable; the real lazy-loading body ships with the
+    ``embed-local`` optional extra."""
+    raise EmbedderUnavailable(
+        "local ONNX embedder is not available — install the 'embed-local' extra "
+        "(uv sync --extra embed-local) and point MACP_EMBEDDER_LOCAL_MODEL at the model dir"
+    )
+
+
+def _vertex_backend() -> tuple[Callable[[str], Sequence[float]], int]:
+    """Vertex AI multilingual embedding backend. This placeholder keeps the registry
+    key present (so ``embedder_name()`` accepts ``"vertex"``) and reports the backend
+    unavailable; the real body uses HQ Application Default Credentials."""
+    raise EmbedderUnavailable(
+        "Vertex embedder is not available — configure Application Default Credentials"
+    )
+
+
+# name → factory; a factory returns ``(embedder_fn, probed_dim)``. Monkeypatchable
+# in tests (a fake backend is a one-liner), which is why resolution reads it at
+# call time rather than snapshotting it.
+_EMBEDDER_BACKENDS: dict[str, Callable[[], tuple[Callable[[str], Sequence[float]], int]]] = {
+    "hash": _hash_backend,
+    "local": _local_backend,
+    "vertex": _vertex_backend,
+}
+
+
+def embedder_name() -> str:
+    """The configured backend name from ``MACP_EMBEDDER`` (default ``"hash"``).
+
+    An unknown value raises :class:`ValueError` listing the allowed names — a typo
+    must not silently fall back to hash and mislabel a whole bench row (the same
+    "no silent fallback" rule :func:`paths.state_backend` enforces)."""
+    raw = os.environ.get("MACP_EMBEDDER")
+    name = (raw or EMBEDDER_DEFAULT).strip().lower()
+    if name not in _EMBEDDER_BACKENDS:
+        allowed = ", ".join(sorted(_EMBEDDER_BACKENDS))
+        raise ValueError(f"unknown MACP_EMBEDDER={name!r} — allowed: {allowed}")
+    return name
+
+
+def resolve_embedder(
+    embedder: Callable[[str], Sequence[float]] | None = None,
+    dim: int | None = None,
+    *,
+    name: str | None = None,
+) -> tuple[Callable[[str], Sequence[float]], int, str]:
+    """Resolve the ``(embedder fn, dim, name)`` to use, **at call time**.
+
+    * An explicit ``(embedder, dim)`` pair passes through verbatim (the fake-
+      injection path tests and the v2 bench use) — byte-identical to the old
+      default-argument behaviour, so nothing regresses.
+    * Otherwise the backend named by ``name`` (or ``embedder_name()`` →
+      ``MACP_EMBEDDER``) is built through its registry factory, which returns
+      ``(fn, dim)`` by probing the real output length. A factory may raise
+      :class:`EmbedderUnavailable` (deps/model/creds missing); the caller decides
+      fatal vs graceful skip.
+
+    The expected-dim constant is only a warning check: a backend whose probed dim
+    differs from :data:`EMBEDDER_EXPECTED_DIMS` is used anyway, with one warning
+    line, never silently relabelled."""
+    if embedder is not None and dim is not None:
+        return embedder, int(dim), (name or "custom")
+    resolved_name = name or embedder_name()
+    if resolved_name not in _EMBEDDER_BACKENDS:
+        allowed = ", ".join(sorted(_EMBEDDER_BACKENDS))
+        raise ValueError(f"unknown embedder {resolved_name!r} — allowed: {allowed}")
+    fn, probed_dim = _EMBEDDER_BACKENDS[resolved_name]()
+    probed_dim = int(probed_dim)
+    expected = EMBEDDER_EXPECTED_DIMS.get(resolved_name)
+    if expected is not None and probed_dim != expected:
+        print(
+            f"warning: embedder {resolved_name!r} produced dim {probed_dim}, "
+            f"expected {expected} — using the probed dim"
+        )
+    return fn, probed_dim, resolved_name
+
+
 def _content_hash(text: str) -> str:
     """sha256 of the embed-input text — the change-detection key for incremental
     re-embedding (a byte-identical summary is never re-embedded)."""
@@ -733,6 +859,16 @@ class EmbeddingsUnavailable(RuntimeError):
     graph_memory working — it is never fatal."""
 
 
+class VecDimMismatch(RuntimeError):
+    """The existing ``vec_embeddings`` vec0 table was declared at a different
+    dimension than the embedder now produces. A dim change needs the whole vector
+    index rebuilt (``init_vec0(..., rebuild=True)`` / ``embed --rebuild``); doing it
+    implicitly would either silently keep the stale-dim index or lose vectors, so
+    the non-rebuild path raises this and the caller turns it into a skip with a
+    one-line ``--rebuild`` hint. Distinct from :class:`EmbeddingsUnavailable` ('no
+    extension') so the two are caught separately."""
+
+
 def _load_sqlite_vec(con: sqlite3.Connection):
     """Lazily import sqlite-vec and load the extension into ``con``.
 
@@ -764,14 +900,52 @@ def _load_sqlite_vec(con: sqlite3.Connection):
     return sqlite_vec
 
 
-def init_vec0(con: sqlite3.Connection, dim: int) -> None:
-    """Create the ``vec_embeddings`` vec0 virtual table (idempotent). Requires
-    the extension already loaded (:func:`_load_sqlite_vec`). ``dim`` is int-coerced
-    into the DDL — it cannot be parameterised, so the coercion is the injection
-    guard. A pre-existing table with a different ``dim`` is left as-is by
-    ``IF NOT EXISTS`` (a dim change would need a rebuild — out of G2 scope)."""
+_VEC0_DIM_RE = re.compile(r"float\[(\d+)\]")
+
+
+def _vec0_declared_dim(con: sqlite3.Connection) -> int | None:
+    """The dimension the ``vec_embeddings`` vec0 table was declared with, read from
+    its ``CREATE VIRTUAL TABLE … vec0(embedding float[N])`` DDL in ``sqlite_master``;
+    ``None`` if the table does not exist (or its DDL does not parse). Needs no
+    extension loaded — ``sqlite_master`` is a plain table."""
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_embeddings'"
+    ).fetchone()
+    if row is None or not row["sql"]:
+        return None
+    match = _VEC0_DIM_RE.search(row["sql"])
+    return int(match.group(1)) if match else None
+
+
+def init_vec0(con: sqlite3.Connection, dim: int, *, rebuild: bool = False) -> None:
+    """Create the ``vec_embeddings`` vec0 virtual table at ``dim`` (idempotent).
+
+    Requires the extension already loaded (:func:`_load_sqlite_vec`). ``dim`` is
+    int-coerced into the DDL — it cannot be parameterised, so the coercion is the
+    injection guard.
+
+    Dimension handling (closing the G2 "``IF NOT EXISTS`` silently keeps the old
+    dim" gap): when a table already exists its declared dim is read from
+    ``sqlite_master``. Same dim → no-op. Different dim **with** ``rebuild`` →
+    ``DROP TABLE`` + recreate at the new dim (the caller's embed loop then
+    re-inserts every vector). Different dim **without** ``rebuild`` →
+    :class:`VecDimMismatch` with no mutation, so the index is neither silently kept
+    nor corrupted."""
+    dim = int(dim)
+    existing = _vec0_declared_dim(con)
+    if existing is not None:
+        if existing == dim:
+            return
+        if not rebuild:
+            raise VecDimMismatch(
+                f"vec_embeddings is declared float[{existing}] but the embedder "
+                f"produces dim {dim}; re-run embed with --rebuild to rebuild the "
+                f"vec0 index at the new dimension"
+            )
+        con.execute("DROP TABLE vec_embeddings")
+        con.commit()
     con.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(embedding float[{int(dim)}])"
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(embedding float[{dim}])"
     )
     con.commit()
 
@@ -793,8 +967,8 @@ def embed_vault(
     con: sqlite3.Connection,
     *,
     vault_root: Path = ROOT,
-    embedder: Callable[[str], Sequence[float]] = _default_embedder,
-    dim: int = EMBED_DIM,
+    embedder: Callable[[str], Sequence[float]] | None = None,
+    dim: int | None = None,
     dry_run: bool = False,
     rebuild: bool = False,
 ) -> EmbedResult:
@@ -805,20 +979,26 @@ def embed_vault(
 
     * ``dry_run=True`` — prints the plan and returns, touching **nothing** (no
       vec0 / vec_sources write, no sqlite-vec needed);
-    * sqlite-vec absent — prints a clear skip message and returns with
-      ``skipped_reason`` set (the rest of graph_memory is unaffected);
+    * configured embedder backend unavailable, or sqlite-vec absent, or a dim
+      change requested without ``rebuild`` — prints a clear skip message and returns
+      with ``skipped_reason`` set (the rest of graph_memory is unaffected);
     * otherwise — builds the tables, applies the plan (insert new vectors,
       update changed ones in place by rowid, delete gone/denied ones), and upserts
       ``vec_sources``.
 
-    ``embedder`` is the injectable seam (default: the stdlib feature-hashing
-    :func:`_default_embedder`); tests pass a fake. ``dim`` must match what the
-    embedder produces — a mismatch raises, so a wrong fake fails loudly.
+    ``embedder`` / ``dim`` are the injectable seam. **Left as ``None`` they are
+    resolved at call time** from ``MACP_EMBEDDER`` via :func:`resolve_embedder`
+    (default: the stdlib feature-hashing ``hash`` backend at 256) — so a call site
+    that passes nothing follows the configured backend. An explicit pair is used
+    verbatim (tests pass a fake). The embedder's output length must equal the
+    resolved ``dim`` — a mismatch raises, so a wrong fake fails loudly.
     """
     corpus = list(iter_embed_corpus(vault_root))
     to_embed, unchanged, to_remove = plan_embedding(con, corpus, rebuild=rebuild)
 
-    def _result(embedded: int, removed: int, skipped_reason: str | None, dry: bool) -> EmbedResult:
+    def _result(
+        embedded: int, removed: int, skipped_reason: str | None, dry: bool, *, dim_used: int
+    ) -> EmbedResult:
         return EmbedResult(
             total_corpus=len(corpus),
             to_embed=len(to_embed),
@@ -826,37 +1006,53 @@ def embed_vault(
             embedded=embedded,
             removed=removed,
             unchanged=len(unchanged),
-            dim=dim,
+            dim=dim_used,
             dry_run=dry,
             skipped_reason=skipped_reason,
         )
 
+    try:
+        embed_fn, embed_dim, _embed_name = resolve_embedder(embedder, dim)
+    except EmbedderUnavailable as exc:
+        print(f"embedder backend unavailable — skipping embed ({exc})")
+        return _result(0, 0, str(exc), dry_run, dim_used=(int(dim) if dim else 0))
+
     if dry_run:
-        _print_embed_plan(to_embed, unchanged, to_remove, dim=dim)
-        return _result(0, 0, None, True)
+        _print_embed_plan(to_embed, unchanged, to_remove, dim=embed_dim)
+        return _result(0, 0, None, True, dim_used=embed_dim)
 
     try:
         vec_ext = _load_sqlite_vec(con)
     except EmbeddingsUnavailable as exc:
         print(f"sqlite-vec not installed — skipping embed ({exc})")
-        return _result(0, 0, str(exc), False)
+        return _result(0, 0, str(exc), False, dim_used=embed_dim)
 
     init_vec_sources(con)
-    init_vec0(con, dim)
+    try:
+        init_vec0(con, embed_dim, rebuild=rebuild)
+    except VecDimMismatch as exc:
+        print(f"vec0 dim mismatch — skipping embed ({exc})")
+        return _result(0, 0, str(exc), False, dim_used=embed_dim)
 
     existing_rowids = {
         row["source_file"]: row["rowid"]
         for row in con.execute("SELECT rowid, source_file FROM vec_sources")
     }
+    # vec0 rowids present RIGHT NOW. After a --rebuild dim change the vec0 table was
+    # just dropped+recreated (empty) while vec_sources still holds the old rowids, so
+    # a doc can be "in vec_sources" yet have no vec0 row. The apply loop below reads
+    # this to decide INSERT-at-rowid vs UPDATE: a blind UPDATE there would match 0
+    # rows and silently lose every vector.
+    vec0_rowids = {row["rowid"] for row in con.execute("SELECT rowid FROM vec_embeddings")}
     now = dt.datetime.now().isoformat(timespec="seconds")
     serialize = vec_ext.serialize_float32
 
     embedded = 0
     for item in to_embed:
-        vector = list(embedder(item.text))
-        if len(vector) != dim:
+        vector = list(embed_fn(item.text))
+        if len(vector) != embed_dim:
             raise ValueError(
-                f"embedder returned {len(vector)} dims, expected {dim} "
+                f"embedder returned {len(vector)} dims, expected {embed_dim} "
                 f"(for {item.source_file}) — embedder/dim mismatch"
             )
         blob = serialize([float(x) for x in vector])
@@ -865,7 +1061,7 @@ def embed_vault(
             cur = con.execute(
                 "INSERT INTO vec_sources (source_file, content_hash, mtime, dim, embedded_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (item.source_file, item.content_hash, item.mtime, dim, now),
+                (item.source_file, item.content_hash, item.mtime, embed_dim, now),
             )
             con.execute(
                 "INSERT INTO vec_embeddings (rowid, embedding) VALUES (?, ?)",
@@ -875,11 +1071,19 @@ def embed_vault(
             con.execute(
                 "UPDATE vec_sources SET content_hash = ?, mtime = ?, dim = ?, embedded_at = ? "
                 "WHERE source_file = ?",
-                (item.content_hash, item.mtime, dim, now, item.source_file),
+                (item.content_hash, item.mtime, embed_dim, now, item.source_file),
             )
-            con.execute(
-                "UPDATE vec_embeddings SET embedding = ? WHERE rowid = ?", (blob, rowid)
-            )
+            if rowid in vec0_rowids:
+                con.execute(
+                    "UPDATE vec_embeddings SET embedding = ? WHERE rowid = ?", (blob, rowid)
+                )
+            else:
+                # vec0 row absent (e.g. the table was just rebuilt at a new dim) —
+                # re-insert at the vec_sources rowid so the two tables stay linked.
+                con.execute(
+                    "INSERT INTO vec_embeddings (rowid, embedding) VALUES (?, ?)",
+                    (rowid, blob),
+                )
         embedded += 1
 
     removed = 0
@@ -893,9 +1097,9 @@ def embed_vault(
     con.commit()
     print(
         f"embedded {embedded} docs ({len(unchanged)} unchanged, {removed} removed) "
-        f"into vec0[{dim}] from {len(corpus)} corpus docs"
+        f"into vec0[{embed_dim}] from {len(corpus)} corpus docs"
     )
-    return _result(embedded, removed, None, False)
+    return _result(embedded, removed, None, False, dim_used=embed_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,8 +1281,12 @@ def _knn_seeds(
 
     Graceful degradation, identical to :func:`embed_vault`: yields ``{}`` (never
     raises) when ``k <= 0``, when the vault was never embedded (``vec_embeddings`` /
-    ``vec_sources`` absent), or when sqlite-vec cannot be loaded at query time
-    (:class:`EmbeddingsUnavailable`). sqlite-vec stays behind the lazy
+    ``vec_sources`` absent), when sqlite-vec cannot be loaded at query time
+    (:class:`EmbeddingsUnavailable`), or when the index was built at a **different
+    dimension** than the query embedder produces (an index embedded under one
+    ``MACP_EMBEDDER`` then queried under another, before a ``--rebuild``). The last
+    case prints one warning line and returns ``{}`` rather than letting sqlite-vec
+    raise on the dimension-mismatched ``MATCH``. sqlite-vec stays behind the lazy
     :func:`_load_sqlite_vec` seam — no top-level ``import sqlite_vec`` (stdlib-only
     contract). An embedder whose output length ``!= dim`` is a loud ``ValueError``,
     matching ``embed_vault`` (a wrong fake fails fast, it is not a silent skip).
@@ -1096,6 +1304,15 @@ def _knn_seeds(
     try:
         vec_ext = _load_sqlite_vec(con)
     except EmbeddingsUnavailable:
+        return {}
+
+    stored_dim = _vec0_declared_dim(con)
+    if stored_dim is not None and stored_dim != dim:
+        print(
+            f"warning: vec_embeddings is dim {stored_dim} but the query embedder "
+            f"produces dim {dim}; skipping the semantic layer (re-embed with "
+            f"--rebuild) — BFS-only"
+        )
         return {}
 
     vector = list(embedder(query_text))
@@ -1135,8 +1352,8 @@ def query_related(
     k: int = 10,
     depth: int = 1,
     as_of: str | None = None,
-    embedder: Callable[[str], Sequence[float]] = _default_embedder,
-    dim: int = EMBED_DIM,
+    embedder: Callable[[str], Sequence[float]] | None = None,
+    dim: int | None = None,
     vector_weight: float = 0.5,
     graph_weight: float = 0.5,
 ) -> list[RelatedItem]:
@@ -1158,9 +1375,17 @@ def query_related(
     pure-semantic hit carries the KNN doc's ``source_file`` with
     ``run_id = commit_sha = edge_type = hops = None``.
 
-    **Graceful fallback** (never raises): when sqlite-vec is unavailable or the vault
-    was never embedded, the semantic layer yields nothing and the result is BFS-only
-    — the same contract :func:`embed_vault` honours.
+    ``embedder`` / ``dim`` default to ``None`` and are **resolved at call time** from
+    ``MACP_EMBEDDER`` (:func:`resolve_embedder`) — so a call site that passes nothing
+    (the brief/maintenance wiring) follows the configured backend without a signature
+    change. An explicit pair is used verbatim.
+
+    **Graceful fallback** (never raises): when the configured embedder backend is
+    unavailable, when sqlite-vec is unavailable, when the vault was never embedded, or
+    when the index dim ≠ the query embedder's dim, the semantic layer yields nothing
+    and the result is BFS-only — the same contract :func:`embed_vault` honours. (An
+    *unknown* ``MACP_EMBEDDER`` name still raises ``ValueError`` — a config typo is
+    loud, not a silent BFS-only degrade.)
 
     **Time semantics**: ``as_of`` narrows only the *structural* traversal to the
     edges valid at that instant. The vector KNN is a latest-snapshot layer (vectors
@@ -1176,7 +1401,13 @@ def query_related(
     )
 
     query_text = _task_query_text(task)
-    vector_hits = _knn_seeds(con, query_text, k=k, embedder=embedder, dim=dim)
+    try:
+        embed_fn, embed_dim, _embed_name = resolve_embedder(embedder, dim)
+        vector_hits = _knn_seeds(con, query_text, k=k, embedder=embed_fn, dim=embed_dim)
+    except EmbedderUnavailable:
+        # configured backend (local/vertex) could not be built — degrade to BFS-only,
+        # the same graceful contract as a missing sqlite-vec extension.
+        vector_hits = {}
 
     items: list[RelatedItem] = []
     for slug in set(graph_hits) | set(vector_hits):
@@ -1613,12 +1844,30 @@ def cmd_show_related(args: argparse.Namespace) -> int:
 
 def cmd_embed(args: argparse.Namespace) -> int:
     """Embed the vault corpus into the vec0 table (or just show the plan with
-    ``--dry-run``). Always returns 0 — a missing sqlite-vec is a graceful skip,
-    not an error."""
+    ``--dry-run``). Returns 0 even when the configured backend or sqlite-vec is
+    unavailable — both are graceful skips, not errors. Returns 2 only for an
+    unknown ``--embedder`` name (a config error, which argparse ``choices`` already
+    guards against for CLI input)."""
     root, db_path, _index_path = _cli_paths(args)
+    name = getattr(args, "embedder", None)
+    try:
+        embed_fn, embed_dim, _name = resolve_embedder(name=name)
+    except EmbedderUnavailable as exc:
+        print(f"embedder backend unavailable — skipping embed ({exc})")
+        return 0
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
     con = init_relations_db(db_path)
     try:
-        embed_vault(con, vault_root=root, dry_run=args.dry_run, rebuild=args.rebuild)
+        embed_vault(
+            con,
+            vault_root=root,
+            embedder=embed_fn,
+            dim=embed_dim,
+            dry_run=args.dry_run,
+            rebuild=args.rebuild,
+        )
     finally:
         con.close()
     return 0
@@ -1672,6 +1921,12 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     p_embed.add_argument(
+        "--embedder",
+        choices=sorted(_EMBEDDER_BACKENDS),
+        default=None,
+        help="embedder backend (default: $MACP_EMBEDDER, else 'hash')",
+    )
+    p_embed.add_argument(
         "--dry-run",
         action="store_true",
         help="show what would be embedded/removed without writing (needs no sqlite-vec)",
@@ -1679,7 +1934,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_embed.add_argument(
         "--rebuild",
         action="store_true",
-        help="re-embed every corpus doc, ignoring the incremental content-hash check",
+        help="re-embed every corpus doc, ignoring the incremental content-hash check "
+        "(REQUIRED when switching --embedder to one of a different dimension — it "
+        "rebuilds the vec0 index at the new dim)",
     )
     p_embed.set_defaults(func=cmd_embed)
 
