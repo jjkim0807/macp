@@ -32,7 +32,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from todo_system import cli
 from todo_system import maintenance_disk as md
+from todo_system import ops_alerts as oa
 from todo_system.orchestrator import disk_guard as dg
 from todo_system.orchestrator.assignment import Assignment
 
@@ -617,6 +619,46 @@ class AlertTest(_Case):
         self.prune()
         self.assertEqual(self.sent, [])
         self.assertEqual(self.state_json()["last_alert_ts"], 0.0)
+
+
+class OpsTaskTest(_Case):
+    """The ops-hq-disk human task: opened on the still-below alert, resolved when
+    free recovers, and NOT written on the healthy steady state (무음 보존)."""
+
+    def setUp(self):
+        super().setUp()
+        self.ops_vault = self.tmp / "ops-vault"
+        for attr, val in (("VAULT_ROOT", self.ops_vault), ("_today", lambda: "2049-01-10")):
+            p = mock.patch.object(oa, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self.ops_md = self.ops_vault / "Todo" / "items" / "ops-hq-disk.md"
+
+    def _status(self):
+        return cli.parse_frontmatter(self.ops_md.read_text(encoding="utf-8"))[0]["status"]
+
+    def test_healthy_run_writes_no_task(self):
+        self.disk.base = 8 * G
+        self.assertIsNone(self.prune())
+        self.assertFalse(self.ops_md.exists())
+        self.assertFalse(self.ops_vault.exists())      # resolve was a pure no-op
+
+    def test_still_below_after_a_pass_opens_the_task(self):
+        line = self.prune()                            # 6G → ~7.2G, still < 8G
+        self.assertIn("STILL below", line)
+        self.assertTrue(self.ops_md.is_file())
+        fm, _ = cli.parse_frontmatter(self.ops_md.read_text(encoding="utf-8"))
+        self.assertEqual(fm["status"], "open")
+        self.assertEqual(fm["worker_mode"], "manual")
+        self.assertEqual(fm["due"], "2049-01-10")
+        self.assertIn("ops", fm["tags"])
+
+    def test_recovery_resolves_the_task(self):
+        self.prune()
+        self.assertEqual(self._status(), "open")
+        self.disk.base = 9 * G                         # now above the trigger
+        self.assertIsNone(self.prune())
+        self.assertEqual(self._status(), "done")
 
 
 class PassCooldownTest(_Case):
