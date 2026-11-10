@@ -152,6 +152,20 @@ Follow `implementation_plan.md` phase by phase. For each phase:
    chore(worker): <slug> phase <N> — <short description>
    ```
 
+**Commit before you run out of turns.** Your stage has a hard turn limit; work that is
+green but uncommitted when it ends is stranded (a real case: the last phase went
+green, the stage hit "Reached max turns", nothing was committed, and a human had to
+rescue it). Commit each phase
+as soon as its gate is green — never batch several phases into one commit at the end.
+When you notice the session is long (many phases done, or roughly 150 tool calls
+used), commit what is green now, write the remaining phases to run.log as
+`## Not done`, and stop; the next stage re-dispatches from there.
+
+**Wire what you build.** A new component, setting or config value is not done until
+the real entry point uses it (a route, a screen, the app's default). If the plan
+puts the wiring in a later phase, do that phase; if it puts it in a later *task*,
+say so in run.log so Verify can accept it.
+
 ## Hard rules
 
 - Never run `rm -rf`, `git push --force`, `git reset --hard`, `git checkout -- .`, or any `--no-verify` flag.
