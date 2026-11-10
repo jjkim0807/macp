@@ -183,6 +183,18 @@ def invalidate_cache_if_unavailable(text: str) -> bool:
     return invalidate_cache() if model_unavailable(text) else False
 
 
+def _default_notify(message: str) -> None:
+    """Best-effort kakao alert, imported lazily so this module stays stdlib-only
+    AT IMPORT (``check_engine_isolation.sh`` archives and imports the tree, and
+    ``worker`` pulls in non-stdlib deps). The 24h-per-tier throttle lives in the
+    cache (``alerted_ts``), so this is a plain immediate send."""
+    try:
+        from .. import worker
+        worker.kakao_notify(message)
+    except Exception:       # noqa: BLE001 — notification is best-effort
+        pass
+
+
 def _read_cache() -> dict:
     try:
         c = json.loads(_CACHE.read_text(encoding="utf-8"))
@@ -220,14 +232,37 @@ def _cached_model(tier: str, now: float) -> str | None:
     return None
 
 
-def _store_model(tier: str, model: str, now: float) -> None:
+def _alerted_ts(tier: str) -> float:
+    """The tier's last downgrade-alert timestamp (0.0 if never alerted). Stored
+    in the tier's own cache entry so the 24h throttle is atomic with the choice
+    write and survives the hourly floor re-probe."""
+    entry = (_read_cache().get("tiers") or {}).get(tier)
+    if isinstance(entry, dict):
+        try:
+            return float(entry.get("alerted_ts", 0))
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _store_model(tier: str, model: str, now: float,
+                 *, alerted_ts: float | None = None) -> None:
     """Write the tier's choice without clobbering the other tiers' entries.
     The heavy choice is mirrored to the legacy top-level keys so anything that
-    still reads `model`/`ts` (tests, the memory playbook) sees the same value."""
+    still reads `model`/`ts` (tests, the memory playbook) sees the same value.
+
+    `alerted_ts`, when given, records when a downgrade alert last fired for this
+    tier (the 24h throttle). When None the prior value is preserved rather than
+    dropped, so a routine re-probe write does not reset the throttle window."""
     try:
         c = _read_cache()
         tiers = c.get("tiers") if isinstance(c.get("tiers"), dict) else {}
-        tiers[tier] = {"model": model, "ts": now}
+        prev = tiers.get(tier) if isinstance(tiers.get(tier), dict) else {}
+        entry = {"model": model, "ts": now}
+        carried = alerted_ts if alerted_ts is not None else prev.get("alerted_ts")
+        if carried is not None:
+            entry["alerted_ts"] = carried
+        tiers[tier] = entry
         c["tiers"] = tiers
         if tier == "heavy":
             c["model"], c["ts"] = model, now
@@ -237,20 +272,28 @@ def _store_model(tier: str, model: str, now: float) -> None:
         pass
 
 
-def resolve_model(*, use_cache: bool = True, tier: str = "heavy") -> str:
+def resolve_model(*, use_cache: bool = True, tier: str = "heavy",
+                  now: float | None = None, notify=_default_notify) -> str:
     """Return the first usable model id on `tier`'s ladder (default: the heavy
     ladder — Fable 5, else down FALLBACKS — which is what the planner and every
     pre-tier caller mean). WORKER_MODEL overrides every tier. The result is
-    cached per tier (24h) so this is cheap to call at import time. The last
-    rung is returned unprobed — if even that is unusable there is nothing
+    cached per tier (24h for the first rung, 1h for a fallback/floor so a
+    transient failure self-heals) so this is cheap to call at import time. The
+    last rung is returned unprobed — if even that is unusable there is nothing
     better to pick, and probing it only burns a call.
+
+    When a *fresh probe* resolves a tier to anything other than its first rung,
+    one downgrade alert is sent through `notify` (default: the lazy kakao path),
+    throttled to once per tier per 24h via the cached `alerted_ts`. `now` and
+    `notify` are injectable for tests (an injected clock + a fake notifier).
     """
     override = os.environ.get("WORKER_MODEL")
     if override:
         return override
     if tier not in LADDERS:
         tier = "heavy"
-    now = time.time()
+    if now is None:
+        now = time.time()
     if use_cache:
         cached = _cached_model(tier, now)
         if cached:
@@ -258,7 +301,16 @@ def resolve_model(*, use_cache: bool = True, tier: str = "heavy") -> str:
     candidates = LADDERS[tier]
     effort = TIER_EFFORT.get(tier, "max")
     model = next((m for m in candidates[:-1] if _probe(m, effort)), candidates[-1])
-    _store_model(tier, model, now)
+    # Fresh probe resolution only (never a cache hit, which returns above).
+    is_floor = model != candidates[0]
+    prev_alerted = _alerted_ts(tier)
+    should_alert = is_floor and (now - prev_alerted >= _TTL)
+    _store_model(tier, model, now,
+                 alerted_ts=now if should_alert else None)
+    if should_alert:
+        # After the write, so a notify failure never loses the cache entry.
+        notify(f"⚠️ model tier '{tier}' fell to {model} "
+               f"(prefer {candidates[0]}); re-probing hourly.")
     return model
 
 
