@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import ops_alerts
 from .kakao_format import compose_alert
 
 STATES = ("logged_in", "logged_out", "no_chrome", "unknown")
@@ -229,6 +230,29 @@ def _compose(kind: str) -> str:
     return compose_login_alert(kind.split(":", 1)[1])
 
 
+def _sync_ops_task(kind: str) -> None:
+    """Mirror the page into the durable `ops-hq-browser` vault human task.
+
+    `recover` closes it; any `alert:<state>` (logged_out / no_chrome / the unknown
+    3-streak) opens the single task with the same re-login steps the page carries.
+    Delegated to ops_alerts, which is idempotent and fail-open, so this never
+    perturbs the existing kakao paging/throttle regardless of call order."""
+    if kind == "recover":
+        ops_alerts.resolve_alert("hq-browser", "로그인 복구")
+    elif kind.startswith("alert:"):
+        state = kind.split(":", 1)[1]
+        ops_alerts.open_alert(
+            "hq-browser",
+            _HEADLINES.get(state, _HEADLINES["unknown"]),
+            [
+                "본부에서: browser.sh start",
+                f"맥에서: gcloud compute ssh {ssh_hint()} -- -L 6080:localhost:6080",
+                "맥 브라우저로 http://localhost:6080/vnc.html 열고 직접 로그인",
+            ],
+            level="alert",
+        )
+
+
 # -- entry point -------------------------------------------------------------
 
 def check_login_watch(now: float | None = None, *,
@@ -259,6 +283,7 @@ def check_login_watch(now: float | None = None, *,
         _write_state(new)
         if kind is None:
             return None
+        _sync_ops_task(kind)
         msg = _compose(kind)
         if notify is not None:
             try:
