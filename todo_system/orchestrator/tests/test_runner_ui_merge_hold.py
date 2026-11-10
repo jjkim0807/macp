@@ -489,5 +489,172 @@ class ExecuteWiringTest(unittest.TestCase):
         self.assertNotIn("ui_merge_hold", out.payload)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 — release tick + one-time alert (orchestrator)
+# ---------------------------------------------------------------------------
+
+class ReconcileMergeHoldsTest(unittest.TestCase):
+    def setUp(self):
+        from todo_system.orchestrator.assignment import Assignment, Ledger
+        from todo_system.orchestrator.mailbox import FileMailbox
+        from todo_system.orchestrator.orchestrator import Orchestrator
+        from todo_system.orchestrator.registry import Registry
+        self._Assignment = Assignment
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "Todo" / "items").mkdir(parents=True)
+        (self.root / "Worker" / "assignments").mkdir(parents=True)
+        (self.root / "Worker" / "runs").mkdir(parents=True)
+        (self.root / "Worker" / "_state").mkdir(parents=True)
+        self.ledger = Ledger(self.root / "Worker" / "assignments")
+        self.routed: list[tuple[str, object, object]] = []
+
+        def route(text, *, level=None, event_key=None, cooldown_s=0.0):
+            self.routed.append((text, level, event_key))
+            return "send", text
+
+        self.orch = Orchestrator(
+            FileMailbox(self.root / "Worker" / "mb" / "orchestrator"),
+            Registry([]), self.ledger,
+            notify=lambda text, link=None: None,
+            alert_route=route,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _seed(self, slug="task-x", *, state=AWAITING_HUMAN):
+        (self.root / "Todo" / "items" / f"{slug}.md").write_text(
+            f"---\nstatus: open\n---\n\n# {slug}\n", encoding="utf-8")
+        a = self._Assignment(task_id=slug, agent_id="ai-1", corr_id="c1",
+                             kind="ai-local", state=state)
+        self.ledger.save(a)
+        return a
+
+    def _hold(self, slug="task-x", *, now=None):
+        return merge_hold.schedule(
+            self.root, slug, held_sha=HELD_SHA, branch=f"worker/{slug}",
+            repo="git@github.com:o/r.git", pr_url="https://pr/1",
+            note="UI 미확인", now=now)
+
+    def _run(self, slug="task-x", *, name="20261111T040000", sha=HELD_SHA,
+             device_pass=True):
+        d = self.root / "Worker" / "runs" / f"{name}-{slug}"
+        d.mkdir()
+        (d / "verify.md").write_text("---\noverall_status: pass\n---\n",
+                                     encoding="utf-8")
+        note = (f"{screen_check.OK_NOTE_PREFIX} — screens/a.png" if device_pass
+                else "화면 확인 불가(노드 오류)")
+        screen_check.append_note(d, note)
+        if sha is not None:
+            (d / "head_sha.txt").write_text(sha + "\n", encoding="utf-8")
+        return d
+
+    def test_release_merges_and_closes_on_same_sha_pass(self):
+        self._seed()
+        self._hold()
+        self._run()
+        with mock.patch.object(stages, "merge_pr",
+                               return_value={"merged": True, "note": "ok"}) as mp:
+            released = self.orch.reconcile_merge_holds()
+        self.assertEqual(released, ["task-x"])
+        mp.assert_called_once()
+        self.assertEqual(self.ledger.load("task-x").state, DONE)
+        self.assertFalse(merge_hold.record_path(self.root, "task-x").exists())
+
+    def test_different_sha_waits_without_merging(self):
+        self._seed()
+        self._hold()
+        self._run(sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        with mock.patch.object(stages, "merge_pr") as mp:
+            released = self.orch.reconcile_merge_holds()
+        self.assertEqual(released, [])
+        mp.assert_not_called()
+        self.assertTrue(merge_hold.record_path(self.root, "task-x").exists())
+        self.assertEqual(self.ledger.load("task-x").state, AWAITING_HUMAN)
+
+    def test_no_device_pass_waits(self):
+        self._seed()
+        self._hold()
+        self._run(device_pass=False)
+        with mock.patch.object(stages, "merge_pr") as mp:
+            self.assertEqual(self.orch.reconcile_merge_holds(), [])
+        mp.assert_not_called()
+        self.assertTrue(merge_hold.record_path(self.root, "task-x").exists())
+
+    def test_unconfirmed_merge_keeps_the_hold(self):
+        self._seed()
+        self._hold()
+        self._run()
+        with mock.patch.object(stages, "merge_pr",
+                               return_value={"merged": False, "note": "no perm"}):
+            self.assertEqual(self.orch.reconcile_merge_holds(), [])
+        self.assertTrue(merge_hold.record_path(self.root, "task-x").exists(),
+                        "an unconfirmed merge never closes on an open PR")
+        self.assertEqual(self.ledger.load("task-x").state, AWAITING_HUMAN)
+
+    def test_expired_discards_the_record_and_alerts(self):
+        self._seed()
+        self._hold(now=merge_hold._now() - dt.timedelta(hours=72))  # expires_ts in the past
+        with mock.patch.object(stages, "merge_pr") as mp:
+            self.assertEqual(self.orch.reconcile_merge_holds(), [])
+        mp.assert_not_called()
+        self.assertFalse(merge_hold.record_path(self.root, "task-x").exists())
+        keys = [k for _, _, k in self.routed]
+        self.assertIn("ui-merge-hold-expired:task-x", keys)
+
+    def test_never_raises_into_the_tick(self):
+        self._seed()
+        self._hold()
+        self._run()
+        with mock.patch.object(merge_hold, "load_records",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(self.orch.reconcile_merge_holds(), [])
+
+
+class NotifyUiMergeHoldTest(unittest.TestCase):
+    def setUp(self):
+        from todo_system.orchestrator.assignment import Assignment, Ledger
+        from todo_system.orchestrator.mailbox import FileMailbox
+        from todo_system.orchestrator.orchestrator import (
+            ALERT_UI_MERGE_HOLD, Orchestrator)
+        from todo_system.orchestrator.registry import Registry
+        from todo_system import kakao_format
+        self._Assignment = Assignment
+        self._ALERT = ALERT_UI_MERGE_HOLD
+        self._LEVEL_IMMEDIATE = kakao_format.LEVEL_IMMEDIATE
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "Worker" / "assignments").mkdir(parents=True)
+        self.ledger = Ledger(self.root / "Worker" / "assignments")
+        self.routed: list[tuple[str, object, object]] = []
+        self.links: list[object] = []
+
+        def route(text, *, level=None, event_key=None, cooldown_s=0.0):
+            self.routed.append((text, level, event_key))
+            return "send", text
+
+        self.orch = Orchestrator(
+            FileMailbox(self.root / "Worker" / "mb" / "orchestrator"),
+            Registry([]), self.ledger,
+            notify=lambda text, link=None: self.links.append(link),
+            alert_route=route,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_dedicated_alert_is_immediate_keyed_and_links_the_pr(self):
+        a = self._Assignment(task_id="task-x", agent_id="ai-1", corr_id="c1",
+                             kind="ai-local", state=AWAITING_HUMAN)
+        msg = m.Envelope(to="o", type=m.RESULT, task_id="task-x",
+                         payload={"ui_merge_hold": True, "pr_url": "https://pr/1"})
+        self.orch._notify_ui_merge_hold(a, msg)
+        self.assertEqual(a.last_alert_kind, self._ALERT)
+        self.assertEqual(len(self.routed), 1)
+        _text, level, key = self.routed[0]
+        self.assertEqual(level, self._LEVEL_IMMEDIATE)
+        self.assertEqual(key, "ui-merge-hold:task-x")
+        self.assertEqual(self.links, ["https://pr/1"])
+
+
 if __name__ == "__main__":
     unittest.main()
