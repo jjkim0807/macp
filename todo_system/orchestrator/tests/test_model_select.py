@@ -315,5 +315,157 @@ class InvalidateCacheTest(unittest.TestCase):
         self.assertEqual(self.cache.read_bytes(), before)
 
 
+class FloorTTLTest(unittest.TestCase):
+    """A first-rung cache keeps 24h; any fallback/floor choice expires at 1h so
+    the next stage re-probes from the top (acceptance 1, injected clock)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cache = self.tmp / "model_pref.json"
+        patcher = mock.patch.object(ms, "_CACHE", self.cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(ms.os.environ, {"WORKER_MODEL": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _write(self, tier, model, ts):
+        self.cache.write_text(json.dumps({"tiers": {tier: {"model": model, "ts": ts}}}))
+
+    def test_first_rung_cache_kept_for_24h_then_reprobed(self):
+        base = 1_000_000.0
+        first = ms.LADDERS["standard"][0]
+        self._write("standard", first, base)
+        # served without probing right up to 24h
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="standard", now=base + ms._TTL - 1), first)
+        # just past 24h it re-probes from the top of the ladder
+        with mock.patch.object(ms, "_probe", return_value=True) as probe:
+            self.assertEqual(
+                ms.resolve_model(tier="standard", now=base + ms._TTL + 1), first)
+            probe.assert_called_once()
+
+    def test_non_first_choice_expires_at_1h_and_reprobes_from_top(self):
+        base = 1_000_000.0
+        floor = ms.LADDERS["standard"][-1]
+        first = ms.LADDERS["standard"][0]
+        self._write("standard", floor, base)
+        # still served inside the 1h floor window, no probe
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="standard", now=base + ms._FLOOR_TTL - 1), floor)
+        # at ts + 3601s the floor cache is stale -> re-probe returns the top rung
+        with mock.patch.object(ms, "_probe", return_value=True) as probe:
+            self.assertEqual(
+                ms.resolve_model(tier="standard", now=base + ms._FLOOR_TTL + 1), first)
+            probe.assert_called_once()
+
+    def test_legacy_flat_floor_cache_read_as_heavy_expires_at_1h(self):
+        base = 1_000_000.0
+        floor = ms.LADDERS["heavy"][-1]            # not PREFERRED -> floor TTL
+        self.cache.write_text(json.dumps({"model": floor, "ts": base}))
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="heavy", now=base + ms._FLOOR_TTL - 1), floor)
+        with mock.patch.object(ms, "_probe", return_value=True) as probe:
+            self.assertEqual(
+                ms.resolve_model(tier="heavy", now=base + ms._FLOOR_TTL + 1), ms.PREFERRED)
+            probe.assert_called_once()
+
+    def test_legacy_flat_first_rung_cache_read_as_heavy_keeps_24h(self):
+        base = 1_000_000.0
+        self.cache.write_text(json.dumps({"model": ms.PREFERRED, "ts": base}))
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="heavy", now=base + ms._TTL - 1), ms.PREFERRED)
+
+    def test_light_tier_floor_expires_but_first_rung_kept(self):
+        base = 1_000_000.0
+        # a cached floor id for light expires at 1h
+        self._write("light", ms.LADDERS["light"][-1], base)
+        with mock.patch.object(ms, "_probe", return_value=True) as probe:
+            self.assertEqual(
+                ms.resolve_model(tier="light", now=base + ms._FLOOR_TTL + 1),
+                ms.LADDERS["light"][0])
+            probe.assert_called_once()
+        # a cached first-rung id for light keeps 24h
+        self._write("light", ms.LADDERS["light"][0], base)
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="light", now=base + ms._TTL - 1),
+                ms.LADDERS["light"][0])
+
+
+class DowngradeAlertTest(unittest.TestCase):
+    """A fresh probe resolution to a non-first model emits exactly one alert per
+    tier per 24h through the injected notify path (acceptance 2, fake notifier)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cache = self.tmp / "model_pref.json"
+        patcher = mock.patch.object(ms, "_CACHE", self.cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(ms.os.environ, {"WORKER_MODEL": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.sent: list[str] = []
+
+    def _notify(self, message):
+        self.sent.append(message)
+
+    def test_fresh_fallback_resolution_alerts_once_and_names_the_tier(self):
+        base = 1_000_000.0
+        # standard's first rung is exhausted; the next fallback wins
+        first = ms.LADDERS["standard"][0]
+        with mock.patch.object(ms, "_probe", side_effect=lambda m, e="max": m != first):
+            model = ms.resolve_model(tier="standard", now=base,
+                                     use_cache=False, notify=self._notify)
+        self.assertEqual(model, ms.LADDERS["standard"][1])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("standard", self.sent[0])
+
+    def test_throttled_to_once_per_tier_per_24h(self):
+        base = 1_000_000.0
+        first = ms.LADDERS["standard"][0]
+        with mock.patch.object(ms, "_probe", side_effect=lambda m, e="max": m != first):
+            ms.resolve_model(tier="standard", now=base,
+                             use_cache=False, notify=self._notify)
+            # a second fresh resolution <24h later: floor re-probed (1h TTL) but
+            # the alert is throttled by the cached alerted_ts
+            ms.resolve_model(tier="standard", now=base + ms._FLOOR_TTL + 1,
+                             use_cache=True, notify=self._notify)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_alert_fires_again_after_24h(self):
+        base = 1_000_000.0
+        first = ms.LADDERS["standard"][0]
+        with mock.patch.object(ms, "_probe", side_effect=lambda m, e="max": m != first):
+            ms.resolve_model(tier="standard", now=base,
+                             use_cache=False, notify=self._notify)
+            ms.resolve_model(tier="standard", now=base + ms._TTL + 1,
+                             use_cache=True, notify=self._notify)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_resolving_to_first_rung_never_alerts(self):
+        with mock.patch.object(ms, "_probe", return_value=True):
+            ms.resolve_model(tier="standard", now=1_000_000.0,
+                             use_cache=False, notify=self._notify)
+        self.assertEqual(self.sent, [])
+
+    def test_cache_hit_never_alerts(self):
+        base = 1_000_000.0
+        floor = ms.LADDERS["standard"][-1]
+        self.cache.write_text(json.dumps({"tiers": {"standard": {"model": floor, "ts": base}}}))
+        with mock.patch.object(ms, "_probe", side_effect=AssertionError("must not probe")):
+            self.assertEqual(
+                ms.resolve_model(tier="standard", now=base + 1,
+                                 use_cache=True, notify=self._notify), floor)
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()
