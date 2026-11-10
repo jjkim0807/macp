@@ -866,3 +866,70 @@ def test_aapt2_picks_one_build_tools_version():
     # aapt2 paths and the second was read as a subcommand.
     from todo_system.orchestrator import beta_smoke as bs
     assert "tail -1" in bs._AAPT2 and "sort -V" in bs._AAPT2
+
+
+# ---------------------------------------------------------------------------
+# swipe step + scrolled expectation (2026-11-10: the scenario DSL had no way to
+# drag a list, so "does the chooser scroll" could not be checked on the node)
+# ---------------------------------------------------------------------------
+
+def _list_dump(first: int, n: int = 4) -> str:
+    rows = "".join(
+        f'    <node index="{i}" class="android.view.View" text="행동 {first + i}" '
+        f'content-desc="" bounds="[0,{600 + i * 200}][1080,{780 + i * 200}]"/>\n'
+        for i in range(n))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">\n'
+        '  <node index="0" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">\n'
+        '    <node index="0" class="android.view.View" text="고르기" content-desc="" bounds="[0,300][1080,420]"/>\n'
+        f'{rows}  </node>\n</hierarchy>\n')
+
+
+LIST_REGION = {"region": [0, 500, 1080, 1500]}
+
+
+def test_resolve_swipe_region_up_drags_finger_upward():
+    x1, y1, x2, y2, ms = bs.resolve_swipe([], {**LIST_REGION, "dir": "up", "frac": 0.6})
+    assert (x1, x2) == (540, 540) and y1 > y2 and ms == 300
+    assert (y1, y2) == (1000 + 300, 1000 - 300)
+
+
+def test_resolve_swipe_explicit_from_to_and_bad_spec():
+    assert bs.resolve_swipe([], {"from": [1, 2], "to": [3, 4], "ms": 50}) == (1, 2, 3, 4, 50)
+    assert bs.resolve_swipe([], {"dir": "up"}) is None            # no region / on
+    assert bs.resolve_swipe([], {**LIST_REGION, "dir": "sideways"}) is None
+    nodes = bs.parse_ui_dump(_list_dump(1))
+    assert bs.resolve_swipe(nodes, {"on": {"text": "행동 1"}, "dir": "down"}) is not None
+
+
+def test_scrolled_detects_moved_and_unmoved_lists():
+    before = bs.parse_ui_dump(_list_dump(1))
+    ok, detail = bs.evaluate_scrolled(before, bs.parse_ui_dump(_list_dump(3)), LIST_REGION)
+    assert ok, detail
+    ok, detail = bs.evaluate_scrolled(before, bs.parse_ui_dump(_list_dump(1)), LIST_REGION)
+    assert not ok and "스크롤 안 됨" in detail
+    # the header outside the region does not count as list content
+    assert "고르기" not in bs.visible_texts(before, (0, 500, 1080, 1500))
+
+
+SWIPE_CFG = {**SMOKE_CFG, "scenario": [
+    {"name": "drag up", "swipe": {**LIST_REGION, "dir": "up"}, "wait_s": 0,
+     "expect": {"kind": "scrolled"}},
+]}
+
+
+def test_run_smoke_swipe_step_scrolls_and_passes(tmp_path):
+    fake = FakeNode(dumps=[_list_dump(1), _list_dump(3)])
+    res = _run_smoke(tmp_path, fake, cfg=SWIPE_CFG)
+    assert res["ok"] is True, res
+    swipes = [c["argv"][3] for c in fake.calls
+              if fake._token(c["argv"]) == "ssh" and "input swipe" in c["argv"][3]]
+    assert swipes and swipes[0].endswith("540 1300 540 700 300")
+    assert fake.stops()
+
+
+def test_run_smoke_swipe_that_does_not_move_fails_scenario(tmp_path):
+    fake = FakeNode(dumps=[_list_dump(1)])              # list never moves
+    res = _run_smoke(tmp_path, fake, cfg=SWIPE_CFG)
+    assert res["ok"] is False and res["kind"] == "scenario"
+    assert fake.stops()

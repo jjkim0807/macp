@@ -12,7 +12,7 @@ What the gate does on the shared on-demand emulator node ``macp-app-test`` (via
 ``scripts/app-test-node``): start the node (one preemption retry) → ship a
 ``git archive`` tarball of the merged sha → build the debug APK ON THE NODE →
 boot the AVD → install → (optional) seed a prebuilt DB (adb push → force-stop →
-WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a tap/wait/expect scenario parsed from the
+WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a tap/swipe/wait/expect scenario parsed from the
 repo's ``smoke`` config → scan logcat for ``FATAL EXCEPTION`` / ``ANR`` → pull
 screenshots → **always stop the node**. A non-PASS withholds ``distribute`` and
 the watermark bump (the merge still stands); the one exception is a monthly-budget
@@ -225,6 +225,97 @@ def resolve_tap(nodes: list[UiNode], target: dict | None) -> tuple[int, int] | N
             return None
     n = _match_node(nodes, target)
     return n.center if n is not None else None
+
+
+def _region(nodes: list[UiNode], spec: dict) -> tuple[int, int, int, int] | None:
+    """The rectangle a swipe acts on: an explicit ``region: [x1, y1, x2, y2]``
+    wins, else the bounds of the node matched by ``on`` (a tap-style selector),
+    else ``None``."""
+    reg = spec.get("region")
+    if reg:
+        try:
+            x1, y1, x2, y2 = (int(v) for v in reg)
+        except (TypeError, ValueError):
+            return None
+        return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+    n = _match_node(nodes, spec.get("on"))
+    if n is None:
+        return None
+    x1, y1, x2, y2 = n.bounds
+    return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+
+def resolve_swipe(nodes: list[UiNode], spec: dict | None) -> tuple[int, int, int, int, int] | None:
+    """``(x1, y1, x2, y2, ms)`` for an ``adb shell input swipe``, or ``None``.
+
+    ``from: [x, y]`` + ``to: [x, y]`` are used as given. Otherwise the swipe runs
+    through the middle of the region (``region`` or the ``on`` node's bounds)
+    covering ``frac`` (default 0.6) of its height/width: ``dir`` ``up`` drags the
+    finger upward — the list scrolls toward its END — and ``down`` the reverse;
+    ``left``/``right`` likewise. ``ms`` defaults to 300."""
+    if not isinstance(spec, dict):
+        return None
+    try:
+        ms = int(spec.get("ms", 300))
+    except (TypeError, ValueError):
+        ms = 300
+    if spec.get("from") and spec.get("to"):
+        try:
+            (x1, y1), (x2, y2) = spec["from"], spec["to"]
+            return (int(x1), int(y1), int(x2), int(y2), ms)
+        except (TypeError, ValueError):
+            return None
+    rect = _region(nodes, spec)
+    if rect is None:
+        return None
+    try:
+        frac = min(max(float(spec.get("frac", 0.6)), 0.1), 0.9)
+    except (TypeError, ValueError):
+        frac = 0.6
+    rx1, ry1, rx2, ry2 = rect
+    cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+    half_h, half_w = int((ry2 - ry1) * frac / 2), int((rx2 - rx1) * frac / 2)
+    d = str(spec.get("dir", "up"))
+    if d == "up":
+        return (cx, cy + half_h, cx, cy - half_h, ms)
+    if d == "down":
+        return (cx, cy - half_h, cx, cy + half_h, ms)
+    if d == "left":
+        return (cx + half_w, cy, cx - half_w, cy, ms)
+    if d == "right":
+        return (cx - half_w, cy, cx + half_w, cy, ms)
+    return None
+
+
+def visible_texts(nodes: list[UiNode], rect: tuple[int, int, int, int] | None) -> list[str]:
+    """Non-empty texts / content-descs of the nodes whose centre lies inside
+    ``rect`` (all nodes when ``rect`` is None), in tree order — the "what the list
+    shows" fingerprint the ``scrolled`` expectation compares."""
+    out: list[str] = []
+    for n in nodes:
+        label = n.text or n.content_desc
+        if not label:
+            continue
+        if rect is not None:
+            x, y = n.center
+            if not (rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]):
+                continue
+        out.append(label)
+    return out
+
+
+def evaluate_scrolled(before: list[UiNode], after: list[UiNode],
+                      spec: dict | None) -> tuple[bool, str]:
+    """``scrolled`` — the visible content of the swipe's region differs after the
+    swipe. Fails closed when the region cannot be resolved or shows nothing."""
+    spec = spec or {}
+    rect = _region(before, spec) if (spec.get("region") or spec.get("on")) else None
+    b, a = visible_texts(before, rect), visible_texts(after, rect)
+    if not b and not a:
+        return False, "영역에 보이는 항목 없음"
+    if a == b:
+        return False, f"스크롤 안 됨 (보이는 첫 항목 '{b[0] if b else ''}' 그대로)"
+    return True, f"'{b[0] if b else ''}' → '{a[0] if a else ''}'"
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +829,7 @@ def _seed_db(run: Runner, node_script: Path | str, pkg: str, smoke_cfg: dict,
 
 def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: dict,
                   deadline: float, steps_out: list) -> tuple[bool, str | None, str]:
-    """Run the tap/wait/expect scenario. Returns ``(ok, kind, detail)``; a failed
+    """Run the tap/swipe/wait/expect scenario. Returns ``(ok, kind, detail)``; a failed
     expectation or an untappable target → ``(False, "scenario", …)``. Each step's
     per-step result (name/ok/duration/detail) is appended to ``steps_out``."""
     fields = smoke_cfg.get("fields") or {}
@@ -756,6 +847,18 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
                 return False, "scenario", f"{name}: 탭 대상 못 찾음"
             _ssh(run, node_script, f"{_ADB} shell input tap {xy[0]} {xy[1]}",
                  env=env, timeout=_remaining(deadline))
+        swipe = step.get("swipe")
+        before: list[UiNode] = []
+        if swipe is not None:
+            before = _node_dump(run, node_script, env, deadline)
+            sw = resolve_swipe(before, swipe)
+            if sw is None:
+                steps_out.append(_step(name, False, time.monotonic() - t0,
+                                       f"스와이프 대상 못 찾음: {swipe!r}"))
+                return False, "scenario", f"{name}: 스와이프 대상 못 찾음"
+            _ssh(run, node_script,
+                 f"{_ADB} shell input swipe {sw[0]} {sw[1]} {sw[2]} {sw[3]} {sw[4]}",
+                 env=env, timeout=_remaining(deadline))
         wait_s = step.get("wait_s")
         if wait_s:
             try:
@@ -764,7 +867,21 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
                 pass
         expect = step.get("expect")
         if not expect:
-            steps_out.append(_step(name, True, time.monotonic() - t0, "탭 완료"))
+            steps_out.append(_step(name, True, time.monotonic() - t0,
+                                   "스와이프 완료" if swipe is not None else "탭 완료"))
+            continue
+        if str(expect.get("kind")) == "scrolled":
+            # Compared against the dump taken BEFORE the swipe — a post-swipe
+            # series alone cannot tell whether the list moved.
+            if swipe is None:
+                steps_out.append(_step(name, False, time.monotonic() - t0,
+                                       "scrolled 는 swipe 단계에서만 쓸 수 있음"))
+                return False, "scenario", f"{name}: scrolled 는 swipe 단계에서만"
+            after = _node_dump(run, node_script, env, deadline)
+            ok, detail = evaluate_scrolled(before, after, swipe)
+            steps_out.append(_step(name, ok, time.monotonic() - t0, detail))
+            if not ok:
+                return False, "scenario", f"{name}: {detail}"
             continue
         within = expect.get("within_s", _DEFAULT_WITHIN_S)
         try:
