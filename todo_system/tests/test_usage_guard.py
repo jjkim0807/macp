@@ -549,7 +549,9 @@ def test_hermetic_against_host_usage_guard_env():
          "todo_system/tests/test_usage_guard.py::"
          "test_hermetic_against_host_usage_guard_env"],
         env=env, cwd=str(Path(__file__).resolve().parents[2]),
-        capture_output=True, text=True, timeout=60,
+        # Nested pytest run takes ~54s on an idle host, so 60s leaves almost no
+        # headroom and flakes the outer full-gate run on a busy host.
+        capture_output=True, text=True, timeout=180,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
 
