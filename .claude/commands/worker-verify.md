@@ -168,6 +168,11 @@ tests, iOS targets on a Linux host, external services, a real device — and set
 - tests pass but a packaging/signing/device path the outcome depends on is unexercised → `medium` at most
 - only part of the list could run → `low`, and see the Rules for whether that is a FAIL
 
+`confidence: high` is **not allowed** when the change touches an app UI (e.g. Android
+`app/**`, a web frontend) and no on-device/emulator run happened in this run. Write
+`medium` at most and name the unexercised device path. The report stage treats
+`high` here as a contract breach.
+
 ### Step 6: Map acceptance criteria to evidence
 
 - An executable criterion ("tests pass", "builds", "the migration test covers X") →
@@ -177,6 +182,35 @@ tests, iOS targets on a Linux host, external services, a real device — and set
   the task cannot honestly be called done without it, it decides the verdict (see
   Rules). Otherwise list it under `concerns` — e.g. a "looks right on the phone"
   item that a human checks after the beta ships.
+
+- **`requirements.md` Constraints count like criteria.** Read its Constraints /
+  Must / Do-not lines and check each against the diff the same way. A violated
+  constraint is a FAIL even if no AC names it.
+
+### Step 6b: Wiring — is the new code actually reachable?
+
+Green unit tests of new components prove nothing if the real entry point never calls
+them (a real case: five merged memory tasks, every part unit-tested, and the
+chat endpoint never called any of it). For every new or changed **production**
+function/class/config value in the diff:
+
+```bash
+git diff <default-branch>...worker/<slug> --name-only
+git grep -n '<NewSymbol>' worker/<slug> -- ':!*test*' ':!*Test*' ':!docs/**'
+```
+
+- **Declared but never read** (a BuildConfig field, env var, setting, constructor
+  parameter that only tests pass) → FAIL, unless the task explicitly scopes the
+  wiring to a later task.
+- **New component with zero production call sites** → FAIL under the same exception.
+- Record the call site (file:line) of each new production entry point in verify.md
+  under `## Wiring`.
+
+### Step 6c: Changing user-facing behaviour to satisfy a check is a FAIL
+
+If the diff changes user-visible text or behaviour **so that a grep/lint/test passes**
+(run.log or commit messages saying so, or a reworded string whose only effect is to
+dodge a forbidden-word check) → FAIL. Fix the check or ask; never bend the product.
 
 ### Step 7: Check branch state
 
@@ -209,8 +243,16 @@ Judge, from the diff vs. the task `outcome`/`next_action`:
 - Diff plausibly addresses the outcome → pass (checks permitting).
 
 Record a `confidence` (high/medium/low) and any `concerns` in verify.md. This is a
-plausibility judgment from the diff, not a re-review — don't nitpick style. When
-unsure but the checks are green and the diff is on-topic, pass with a note.
+plausibility judgment from the diff, not a re-review — don't nitpick style. But do
+not pass on "green and on-topic" alone: Steps 6, 6b and 6c must all hold. If one of
+them is unresolved, the verdict is FAIL with `blocked_on`, not a PASS with a note.
+
+For an app UI change, also read the diff for the device-only failure classes unit
+tests cannot see, and FAIL on any you find: hardcoded emulator/localhost URLs in
+runtime defaults, missing system-bar / navigation-bar / IME inset handling on
+screens with top bars or bottom inputs (edge-to-edge is forced from targetSdk 35),
+raw error codes in user-facing strings, `remember` where rotation would lose user
+input.
 
 ### Step 8b: Safety-critical ACs need a REPRODUCED failure, not a green suite
 
@@ -347,6 +389,9 @@ Omit this section only when no acceptance criterion is a safety/finance path (St
 | 2 | "unfilled orders are reported as failed" | tests/test_x.py:115 | run.log L220 (pre-fix FAIL) | caller passes a closing-auction time, test passes an instant fill — MISMATCH |
 
 - unreached safety ACs: <none | list them; never round these up to PASS>
+
+## Wiring
+<new production entry point → call site file:line, one per line; or "no new production code">
 
 ## Outcome Plausibility
 

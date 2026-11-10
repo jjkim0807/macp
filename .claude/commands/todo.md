@@ -58,6 +58,16 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
    - <today>: created via /todo — <one-line origin>
    ```
 
+   For an `auto` task that builds a feature, add `acceptance_criteria:` that require
+   the **wiring**, not just the parts: a route/screen-level test through the real
+   entry point, and "every new production function is called from the real path;
+   list the call sites in verify.md". Unit tests of components alone let every task
+   go green while the feature is never connected. For an Android `app/**` change also
+   require: build-config values (server URL, client ids) read at runtime, not just
+   declared; edge-to-edge — top bar, bottom input and buttons clear the status bar,
+   navigation bar and keyboard; and set `emulator: true` + `screen_check: true` when
+   user-visible behaviour changes. Follow the vault CLAUDE.md §3 if it says more.
+
 4. Leave `Todo/NOW.md` / `Todo/FOCUS.md` / `todo.db` alone — the todo-sync
    daemon derives them from this markdown automatically within seconds.
 
