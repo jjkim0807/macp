@@ -31,9 +31,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from todo_system.orchestrator import screen_check, stages
+from todo_system.orchestrator import merge_hold, screen_check, stages
+from todo_system.orchestrator.assignment import AWAITING_HUMAN, DONE, FAILED
 
 NOW = dt.datetime(2026, 11, 11, 3, 0, 0, tzinfo=dt.timezone.utc)
+HELD_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +140,139 @@ class DowngradeVerifyConfidenceTest(unittest.TestCase):
     def test_missing_file_is_false(self):
         self.assertFalse(
             stages.downgrade_verify_confidence(self.run_dir / "gone", "n"))
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — the hold record module
+# ---------------------------------------------------------------------------
+
+class MergeHoldScheduleTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_round_trips_the_documented_schema(self):
+        path = merge_hold.schedule(
+            self.root, "task-x", held_sha=HELD_SHA, branch="worker/task-x",
+            repo="git@github.com:o/r.git", pr_url="https://pr/1",
+            note="UI 미확인 보류", now=NOW)
+        self.assertEqual(path, merge_hold.record_path(self.root, "task-x"))
+        self.assertEqual(path.parent,
+                         self.root / "Worker" / "_state" / "pending_merge_holds")
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(rec["slug"], "task-x")
+        self.assertEqual(rec["held_sha"], HELD_SHA)
+        self.assertEqual(rec["branch"], "worker/task-x")
+        self.assertEqual(rec["repo"], "git@github.com:o/r.git")
+        self.assertEqual(rec["pr_url"], "https://pr/1")
+        self.assertEqual(rec["created_ts"], NOW.isoformat())
+        self.assertEqual(rec["expires_ts"],
+                         (NOW + dt.timedelta(hours=48)).isoformat())
+
+    def test_empty_held_sha_is_refused(self):
+        with self.assertRaises(merge_hold.MergeHoldError):
+            merge_hold.schedule(self.root, "task-x", held_sha="  ",
+                                branch="worker/task-x", repo=None, now=NOW)
+
+    def test_empty_slug_is_refused(self):
+        with self.assertRaises(merge_hold.MergeHoldError):
+            merge_hold.schedule(self.root, "  ", held_sha=HELD_SHA,
+                                branch="b", repo=None, now=NOW)
+
+
+class MergeHoldEvaluateTest(unittest.TestCase):
+    """`evaluate` is pure — no vault, no git, no ledger."""
+
+    def record(self, *, hours_left=1.0):
+        return {"slug": "s", "held_sha": HELD_SHA,
+                "created_ts": NOW.isoformat(),
+                "expires_ts": (NOW + dt.timedelta(hours=hours_left)).isoformat()}
+
+    def verdict(self, *, device_pass=True, device_pass_sha=HELD_SHA,
+                state=AWAITING_HUMAN, hours_left=1.0):
+        return merge_hold.evaluate(
+            self.record(hours_left=hours_left), device_pass=device_pass,
+            device_pass_sha=device_pass_sha, state=state, now=NOW)
+
+    def test_pass_for_held_sha_releases(self):
+        self.assertEqual(self.verdict(), merge_hold.RELEASE)
+
+    def test_failed_state_also_releases(self):
+        self.assertEqual(self.verdict(state=FAILED), merge_hold.RELEASE)
+
+    def test_no_device_pass_waits(self):
+        self.assertEqual(self.verdict(device_pass=False), merge_hold.WAIT)
+
+    def test_different_sha_waits(self):
+        self.assertEqual(self.verdict(device_pass_sha="deadbeef"), merge_hold.WAIT)
+
+    def test_missing_sha_waits(self):
+        self.assertEqual(self.verdict(device_pass_sha=None), merge_hold.WAIT)
+
+    def test_resolved_state_is_stale(self):
+        self.assertEqual(self.verdict(state=DONE), merge_hold.STALE)
+
+    def test_expired_is_discarded_even_with_a_pass(self):
+        self.assertEqual(self.verdict(hours_left=-1.0), merge_hold.EXPIRED)
+
+
+class ScanDeviceEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.runs = self.root / "Worker" / "runs"
+        self.runs.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _run(self, name: str, *, head_sha: str | None, device_note: str | None):
+        d = self.runs / name
+        d.mkdir()
+        (d / "verify.md").write_text(
+            "---\noverall_status: pass\n---\n", encoding="utf-8")
+        if device_note is not None:
+            screen_check.append_note(d, device_note)
+        if head_sha is not None:
+            (d / "head_sha.txt").write_text(head_sha + "\n", encoding="utf-8")
+        return d
+
+    def test_newest_app_run_with_a_pass(self):
+        self._run("20261111T020000-task-x", head_sha="old",
+                  device_note="화면 확인 불가(노드 오류)")
+        self._run("20261111T030000-task-x", head_sha=HELD_SHA,
+                  device_note=f"{screen_check.OK_NOTE_PREFIX} — screens/a.png")
+        ok, sha = merge_hold.scan_device_evidence(self.root, "task-x")
+        self.assertTrue(ok)
+        self.assertEqual(sha, HELD_SHA)
+
+    def test_failed_check_run_is_reported_but_not_a_pass(self):
+        self._run("20261111T030000-task-x", head_sha=HELD_SHA,
+                  device_note="화면 확인 불가(앱 리포 아님)")
+        ok, sha = merge_hold.scan_device_evidence(self.root, "task-x")
+        self.assertFalse(ok)
+        self.assertEqual(sha, HELD_SHA)
+
+    def test_run_without_head_sha_is_skipped(self):
+        self._run("20261111T030000-task-x", head_sha=None,
+                  device_note=f"{screen_check.OK_NOTE_PREFIX} — a.png")
+        ok, sha = merge_hold.scan_device_evidence(self.root, "task-x")
+        self.assertFalse(ok)
+        self.assertIsNone(sha)
+
+    def test_no_run_at_all(self):
+        self.assertEqual(
+            merge_hold.scan_device_evidence(self.root, "ghost"), (False, None))
+
+    def test_after_ts_drops_older_runs(self):
+        self._run("20261111T020000-task-x", head_sha=HELD_SHA,
+                  device_note=f"{screen_check.OK_NOTE_PREFIX} — a.png")
+        # cutoff after the only run → nothing qualifies.
+        after = (NOW + dt.timedelta(hours=1)).isoformat()
+        self.assertEqual(
+            merge_hold.scan_device_evidence(self.root, "task-x", after_ts=after),
+            (False, None))
 
 
 if __name__ == "__main__":
