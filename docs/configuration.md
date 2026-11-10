@@ -256,6 +256,59 @@ claude mcp add --scope user macp-browser \
 
 That registration does not reach worker stages, which run with `--strict-mcp-config`.
 
+## App screen check and launch extras
+
+After the verify stage of a task on an **app repo**, the runner can build the debug
+APK, launch it on the shared emulator node and pull its first screen into the run
+dir. This is **on by default** when the run's diff touches the app module, so an app
+change cannot merge with nobody having seen a screen. Turn it off for one task with
+`screen_check: false` (see [Task fields](tasks.md)). A non-app repo, an opted-out
+task, or a diff that misses the app module is a complete no-op — no emulator node is
+started and nothing is appended to `verify.md`.
+
+A bare launcher launch stops a **sign-in-gated** app on its login screen, so every
+screenshot shows the gate instead of the change. A repo can therefore declare launch
+intent extras, which both this check and the beta smoke gate pass to `am start`.
+Both read the repo's entry in the vault's `.macp/beta_publish_config.json`, under a
+`screen_check` or a `smoke` block (`screen_check` wins when both carry the key):
+
+```json
+{
+  "repos": {
+    "demo-app": {
+      "screen_check": {
+        "app_paths": ["app/"],
+        "activity": ".MainActivity",
+        "launch_extras": [
+          {"type": "string", "key": "session_token",
+           "value_from_secret": ".secrets/demo-app.json#session_token"},
+          {"type": "bool", "key": "skip_onboarding", "value": true},
+          {"type": "int", "key": "start_tab", "value": 2}
+        ]
+      }
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `app_paths` | path prefixes that count as "the app module". Default `["app/"]` — set it for a repo whose app lives elsewhere (e.g. `["composeApp/"]`) |
+| `activity` | the component `am start -n <pkg>/<activity>` launches. **Required for extras**: without it the launch stays on the launcher intent |
+| `launch_extras` | a list of `{type, key, value \| value_from_secret}`. `type` is `string` (`--es`), `bool` (`--ez`) or `int` (`--ei`); it defaults to `string` |
+
+**Secret values never go in this file.** As with `build_props`, the config names the
+file and the field and the value is read at launch time:
+`value_from_secret: "<vault-relative json path>#<field>"`, pointing at a gitignored
+JSON object in the vault. A path that escapes the vault is refused.
+
+A declaration that cannot be honoured — missing secret file, absent/blank field,
+unreadable JSON, a bad type, no `activity` — is a **clean skip**, never a crash: the
+app launches with the original launcher intent and one line naming the *file and
+field* (never a value) is appended to the run's `verify.md` note. Resolved secret
+values are also redacted out of `install.log`, since a remote shell can echo its own
+command line; they appear in no run log, no note, no result JSON and no exception.
+
 ## Notifications and other integrations
 
 KakaoTalk/Slack notifications, an app-beta publishing sweep and an `advote` bridge

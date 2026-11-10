@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import paths
+from . import launch_extras
 from . import lease
 from . import remote_gate
 
@@ -701,14 +702,21 @@ def _archive_and_push(run: Runner, node_script: Path | str, repo_dir: Path | str
     return remote_tar
 
 
-def _save_build_log(env: dict, cp, keep: int = 80, name: str = "build.log") -> None:
+def _save_build_log(env: dict, cp, keep: int = 80, name: str = "build.log",
+                    secrets: list[str] | None = None) -> None:
     """Keep the last ``keep`` lines of a failed node build in ``<result_dir>/build.log``
     (beside screens/, never in the result JSON) so a red build can be diagnosed
-    without another paid node round-trip. Best-effort."""
+    without another paid node round-trip. Best-effort.
+
+    ``secrets`` (the values a :mod:`launch_extras` declaration resolved to) are
+    replaced with ``***`` first: a remote shell under ``set -e`` can echo the very
+    command line that carried them, and this file is the one place a failed launch
+    persists that output."""
     try:
         out = Path(env.get("APP_TEST_OUT", ".")).parent / name
         out.parent.mkdir(parents=True, exist_ok=True)
         text = ((getattr(cp, "stdout", "") or "") + "\n" + (getattr(cp, "stderr", "") or ""))
+        text = launch_extras.redact(text, secrets)
         out.write_text("\n".join(text.splitlines()[-keep:]) + "\n", encoding="utf-8")
     except OSError:
         pass
@@ -740,22 +748,58 @@ def _build_debug_apk(run: Runner, node_script: Path | str, sha: str, remote_tar:
     return apk
 
 
+def _launch_line(smoke_cfg: dict,
+                 progress: Callable[[str], None] | None = None) -> tuple[str, list[str]]:
+    """``(launch command, secret values)`` for the install script.
+
+    Default — and for every repo that declares no :mod:`launch_extras` — this is
+    the ``monkey -c LAUNCHER`` line that was inline in :func:`_install_and_launch`
+    before, CHARACTER FOR CHARACTER. A repo that declares ``launch_extras`` plus
+    an ``activity`` gets ``am start -n "$pkg"/<activity> --es/--ez/--ei …``
+    instead, so a sign-in-gated app can be handed a debug session token and reach
+    its real first screen instead of screenshotting its login gate.
+
+    A declaration that cannot be honoured (secret file/key missing, bad type, no
+    activity) logs ONE value-free line and falls back to ``monkey`` — never a
+    raise: a smoke run must be able to report on the app, not die on its config.
+    ``"$pkg"`` is the variable the script has already assigned, so this works
+    whether the package came from config or from aapt2."""
+    res = launch_extras.resolve(smoke_cfg, vault_root=_VAULT_DATA_ROOT)
+    cmd = launch_extras.am_start_command(
+        launch_extras.PKG_SHELL_VAR, launch_extras.activity(smoke_cfg), res.args)
+    if cmd is None:
+        note = res.note or ("launch_extras 선언됐으나 유효한 activity 설정이 없어 "
+                            "extras 없이 실행" if res.args else None)
+        if note and progress:
+            progress(f"beta-smoke: {note}")        # file/key names only, no value
+        return (f'{_ADB} shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 '
+                ">/dev/null 2>&1"), []
+    return f"{_ADB} shell {cmd} >/dev/null 2>&1", list(res.secrets)
+
+
 def _install_and_launch(run: Runner, node_script: Path | str, apk: str,
-                        smoke_cfg: dict, env: dict, deadline: float) -> str:
+                        smoke_cfg: dict, env: dict, deadline: float,
+                        progress: Callable[[str], None] | None = None) -> str:
     """Install the APK, launch it, and return the resolved package name. The
     package is ``smoke.package`` when given, else detected with aapt2. An install
-    failure → ``SmokeError("node")``."""
+    failure → ``SmokeError("node")``.
+
+    The launch intent comes from :func:`_launch_line`, which may carry secret
+    extras; a failure therefore redacts them out of ``install.log`` before saving
+    it, since the remote shell can echo its own command line. The ``SmokeError``
+    detail keeps naming only the rc and the log file."""
     pkg = str(smoke_cfg.get("package") or "").strip()
     pkg_expr = f'"{pkg}"' if pkg else f'$({_AAPT2} dump packagename "{apk}" | head -1)'
+    launch, secrets = _launch_line(smoke_cfg, progress)
     script = (
         "set -e; "
         f'pkg={pkg_expr}; '
         f'{_ADB} install -r "{apk}" >/dev/null; '
-        f'{_ADB} shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; '
+        f'{launch}; '
         'echo "$pkg"')
     r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
     if getattr(r, "returncode", 1) != 0:
-        _save_build_log(env, r, name="install.log")
+        _save_build_log(env, r, name="install.log", secrets=secrets)
         raise SmokeError("node", f"설치/실행 실패 (rc={getattr(r, 'returncode', None)}) — install.log")
     return _last_line(r) or pkg
 
@@ -977,7 +1021,8 @@ def _run_locked(repo_name: str, repo_dir: Path | str, sha: str, smoke_cfg: dict,
             remote_tar = _archive_and_push(run, node_script, repo_dir, sha, result_dir, env, deadline)
             apk = _build_debug_apk(run, node_script, sha, remote_tar, smoke_cfg, env, deadline)
             _boot(run, node_script, smoke_cfg, env, deadline)
-            pkg = _install_and_launch(run, node_script, apk, smoke_cfg, env, deadline)
+            pkg = _install_and_launch(run, node_script, apk, smoke_cfg, env, deadline,
+                                      progress)
             _seed_db(run, node_script, pkg, smoke_cfg, result_dir, env, deadline)
             sc_ok, sc_kind, sc_detail = _run_scenario(run, node_script, smoke_cfg, env, deadline, steps)
             lc_ok, lc_detail, lc_agg = _scan_node_logcat(run, node_script, env, deadline)

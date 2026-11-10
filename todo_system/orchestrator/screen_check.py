@@ -1,15 +1,31 @@
-"""Opt-in post-verify app screen check on a dedicated emulator node.
+"""Post-verify app screen check on a dedicated emulator node — ON by default for
+an app diff, opted out with ``screen_check: false``.
 
 Runs in the orchestrator RUNTIME (the runner, OUTSIDE the ``claude -p`` verify
-stage), mirroring :mod:`beta_publish`'s split: an app-repo task that asks for it
-(``screen_check: true``) has its debug APK built, installed on the separate
-on-demand emulator node ``macp-app-test`` via ``scripts/app-test-node``, and its
-first screen pulled to ``Worker/runs/<run-id>/screens/*.png``. The node is driven
-start -> shot -> **always stop**, and a one-line note ("화면 확인됨 / 불가(사유)")
-is appended to the run's ``verify.md``. ``runner.StagedExecutor._app_screen_check``
-calls :func:`run_check` the instant the verify stage finishes, gated on the
-opt-in flag; a task with no flag is a no-op so unflagged tasks behave — and take
-exactly as long — as before. That is the regression-safe contract.
+stage), mirroring :mod:`beta_publish`'s split: an eligible app-repo task has its
+debug APK built, installed on the separate on-demand emulator node
+``macp-app-test`` via ``scripts/app-test-node``, and its first screen pulled to
+``Worker/runs/<run-id>/screens/*.png``. The node is driven start -> shot ->
+**always stop**, and a one-line note ("화면 확인됨 / 불가(사유)") is appended to the
+run's ``verify.md``. ``runner.StagedExecutor._app_screen_check`` calls
+:func:`run_check` the instant the verify stage finishes.
+
+Gating (see :func:`requested`): the first cut was opt-in, and because no task
+ever set the flag the check had never run for any app — an app change could merge
+with nobody having seen a screen (vault
+``Notes/macp-worker-quality-root-causes-20261110``, cause 1). So the default is
+now ON when the repo is an app repo AND the run's diff touches the app module
+(``app/`` by default, widened per repo with ``screen_check.app_paths``);
+``screen_check: true`` still forces it on regardless of the diff, and
+``screen_check: false`` forces it off. Everything else keeps the original
+regression-safe contract exactly: a non-app repo, an opted-out task, or a diff
+that misses the app module makes ZERO node calls, writes no note, and leaves
+``verify.md`` byte-identical.
+
+Launch extras: a sign-in-gated app launched with a bare ``monkey -c LAUNCHER``
+screenshots its login screen, so a repo may declare :mod:`launch_extras` and the
+node launches with ``am start -n <pkg>/<activity> --es/--ez/--ei …`` instead.
+With nothing declared the node script's ``monkey`` line is byte-identical.
 
 Why the runner and not the verify stage: the node round-trip needs
 gcloud/ssh/scp, which the verify stage's ``--allowed-tools`` whitelist forbids,
@@ -44,6 +60,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .. import paths
+from . import launch_extras
 from . import lease
 
 # Default per-run node-uptime cap: 20 minutes, in seconds. A task overrides it
@@ -65,6 +83,14 @@ _STOP_TIMEOUT_S = 120
 _DEFAULT_GRADLE_TASK = "assembleDebug"
 # First screen only (install + launch + one screencap); UI-driven scenarios are
 # deliberately out of scope for the first cut.
+# Secret-bearing launch config lives in VAULT data (gitignored JSON named by the
+# repo's beta_publish_config entry), so it follows the redirectable vault root —
+# same resolver split as beta_publish / beta_smoke.
+_VAULT_DATA_ROOT = paths.vault_root(start=paths.vault_search_start())
+# How the launch extras reach `scripts/app-test-node shot`. Set TOGETHER or not at
+# all: the script falls back to its original `monkey` line unless it has both.
+_EXTRAS_ENV = "APP_TEST_LAUNCH_EXTRAS"
+_ACTIVITY_ENV = "APP_TEST_ACTIVITY"
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -91,15 +117,96 @@ def _run(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
 # Opt-in gating + config (pure)
 # ---------------------------------------------------------------------------
 
-def requested(payload: dict) -> bool:
-    """Did this task opt in to the screen check? Default OFF — only a truthy
-    ``screen_check`` frontmatter value turns it on, so an unflagged task is a
-    no-op. Mirrors ``runner._payload_auto_merge``'s string/bool handling (a
+def _flag(payload: dict) -> bool | None:
+    """The task's explicit ``screen_check`` flag, or ``None`` when it set none.
+
+    THREE states, not two: "no key" has to be distinguishable from
+    ``screen_check: false`` now that the default is ON for an app diff. Truthiness
+    itself mirrors ``runner._payload_auto_merge``'s string/bool handling (a
     frontmatter value can arrive as the string ``"true"``)."""
-    v = (payload or {}).get("screen_check", False)
+    v = (payload or {}).get("screen_check")
+    if v is None:
+        return None
     if isinstance(v, str):
-        return v.strip().lower() not in ("", "false", "0", "no", "off")
+        if not v.strip():
+            return None                 # `screen_check:` with no value = unset
+        return v.strip().lower() not in ("false", "0", "no", "off")
     return bool(v)
+
+
+def explicitly_disabled(payload: dict) -> bool:
+    """Did the task opt OUT (``screen_check: false``)? The runner checks this
+    FIRST, before it collects a diff, so an opted-out task costs exactly zero
+    extra work — not one git call, not one note."""
+    return _flag(payload) is False
+
+
+def _norm(path: str) -> str:
+    """A diff path / config prefix in one comparable form: forward slashes, no
+    leading ``./``, no trailing slash. ``git diff --name-only`` always emits
+    repo-relative forward-slash paths, so this only has to absorb a config
+    prefix a human wrote as ``./app/`` or ``app``."""
+    p = path.strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def touches_app_paths(diff_paths, app_paths=("app/",)) -> bool:
+    """Does any changed path live under one of ``app_paths``?
+
+    ``None`` (the diff could not be read) and ``[]`` (nothing changed) are both
+    False: the default-ON rule needs positive evidence that the app module was
+    touched, and guessing ON from an unreadable diff would wake the billed
+    emulator node on every run of every repo."""
+    if not diff_paths:
+        return False
+    prefixes = [_norm(p) for p in app_paths if isinstance(p, str) and p.strip()]
+    for raw in diff_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        path = _norm(raw)
+        for prefix in prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def app_paths(entry: dict | None) -> tuple[str, ...]:
+    """The repo's app-module path prefixes, ``("app/",)`` by default.
+
+    Widened only by the repo's own config (``screen_check.app_paths`` in the
+    vault's ``beta_publish_config.json`` entry) — Flutter's ``lib/`` and KMP's
+    ``composeApp/`` are deliberately NOT defaults, since a wrong default turns
+    the check on for diffs that cannot change a screen."""
+    raw = launch_extras._lookup(entry, "app_paths")
+    if isinstance(raw, list):
+        vals = tuple(p.strip() for p in raw if isinstance(p, str) and p.strip())
+        if vals:
+            return vals
+    return ("app/",)
+
+
+def requested(payload: dict, diff_paths=None, app_paths=("app/",)) -> bool:
+    """Should this task get a screen check?
+
+    Default ON for an app diff: with no ``screen_check`` key, the answer is "yes"
+    iff some changed path is under ``app_paths``. An EXPLICIT value always wins —
+    ``true`` turns it on regardless of the diff (preserving the old opt-in
+    behaviour), ``false`` turns it off regardless. ``diff_paths=None`` means the
+    diff could not be read, which resolves to False (see
+    :func:`touches_app_paths`).
+
+    Why default ON: the opt-in flag was never set by any task, so the check had
+    never run for any app (vault ``Notes/macp-worker-quality-root-causes-20261110``
+    cause 1) and an app change could merge without anyone seeing a screen. The
+    no-op contract for everything else is unchanged — a non-app repo, an
+    opted-out task, or a diff that misses the app module still costs zero node
+    calls and leaves ``verify.md`` byte-identical."""
+    flag = _flag(payload)
+    if flag is not None:
+        return flag
+    return touches_app_paths(diff_paths, app_paths)
 
 
 def is_app_repo(repo: Path | str) -> bool:
@@ -183,6 +290,34 @@ def _node_env(run_dir: Path | str) -> dict:
     env = dict(os.environ)
     env["APP_TEST_OUT"] = str(Path(run_dir) / "screens")
     return env
+
+
+def _launch_env(run_dir: Path | str, config: dict | None,
+                ) -> "tuple[dict, list[str], str | None]":
+    """``(env, secrets, note)`` — the node env plus the launch-extras decision.
+
+    The engine cannot name the package here (the node script resolves it with
+    aapt2 from the APK it just pushed), so the extras ride to the script as
+    ``APP_TEST_LAUNCH_EXTRAS`` + ``APP_TEST_ACTIVITY`` and the script assembles
+    ``am start -n "$pkg"/<activity> <extras>`` itself. BOTH vars are set or
+    NEITHER is, so the script's existing ``monkey`` line stays byte-identical for
+    every repo that declares nothing (or declares extras without an ``activity``).
+
+    ``note`` is a value-free one-liner for ``verify.md`` when extras were declared
+    but could not be used; ``secrets`` are the raw values, for redaction."""
+    env = _node_env(run_dir)
+    res = launch_extras.resolve(config, vault_root=_VAULT_DATA_ROOT)
+    act = launch_extras.activity(config)
+    if res.args and launch_extras.valid_activity(act):
+        env[_EXTRAS_ENV] = " ".join(res.args)
+        env[_ACTIVITY_ENV] = act
+        return env, list(res.secrets), None
+    if res.note:
+        return env, [], res.note
+    if res.args:
+        return env, list(res.secrets), (
+            "launch_extras 선언됐으나 유효한 activity 설정이 없어 extras 없이 실행")
+    return env, [], None
 
 
 def _node(run: Runner, node_script: Path | str, subcmd: str, *args: str,
@@ -270,34 +405,42 @@ def _ok_note(dst: str, run_dir: Path | str) -> str:
 
 def _run_locked(repo: Path | str, run_dir: Path | str, *, cap_s: int, task: str,
                 node_script: Path | str, run: Runner,
-                progress: Callable[[str], None]) -> str:
+                progress: Callable[[str], None], config: dict | None = None) -> str:
     """The node round-trip, assuming the lock is held. Returns a note; NEVER
     raises — every failure is absorbed into a "화면 확인 불가(…)" note.
 
     Structure: the whole body (build + start + shot) is the outer try; the inner
     ``finally`` stops the node UNCONDITIONALLY (AC #2 — even the APK-build-failure
-    path stops, since stopping an un-started/stopped VM is idempotent)."""
+    path stops, since stopping an un-started/stopped VM is idempotent).
+
+    A launch-extras skip reason is appended to whatever note comes out, so a
+    misconfigured secret is visible in ``verify.md`` (by file + key name, never a
+    value) instead of silently screenshotting the login screen."""
     deadline = time.monotonic() + cap_s
-    env = _node_env(run_dir)
+    env, _secrets, extras_note = _launch_env(run_dir, config)
+    if extras_note:
+        progress(f"screen check: {extras_note}")
+    suffix = f" (launch_extras: {extras_note})" if extras_note else ""
     try:
         try:
             apk = _build_debug_apk(repo, task, run, deadline)
             _node(run, node_script, "start", env=env, timeout=_remaining(deadline))
             dst = _shot_with_retry(run, node_script, apk, env, deadline, progress)
-            return _ok_note(dst, run_dir)
+            return _ok_note(dst, run_dir) + suffix
         finally:
             _stop_node(run, node_script, env, progress)
     except SkipCheck as e:
-        return f"화면 확인 불가({e})"
+        return f"화면 확인 불가({e}){suffix}"
     except subprocess.TimeoutExpired:
-        return f"화면 확인 불가(상한 {cap_s // 60}분 초과 — 강제 stop)"
+        return f"화면 확인 불가(상한 {cap_s // 60}분 초과 — 강제 stop){suffix}"
     except Exception as e:      # noqa: BLE001 — a screen check can only ever SKIP
-        return f"화면 확인 불가(노드 오류: {type(e).__name__})"
+        return f"화면 확인 불가(노드 오류: {type(e).__name__}){suffix}"
 
 
 def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
               lock_path: Path | str, node_script: Path | str,
               gradle_task: str = _DEFAULT_GRADLE_TASK, run: Runner = _run,
+              config: dict | None = None,
               progress: Callable[[str], None] | None = None) -> str:
     """Build the debug APK, capture the app's first screen on the shared emulator
     node, and return a one-line note for ``verify.md``. NEVER raises.
@@ -307,13 +450,19 @@ def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
     returns a SKIP note with ZERO node calls (AC #3). On success the node is
     driven start -> shot(-> retry once) and always stopped (AC #2); the screenshot
     lands under ``run_dir/screens/`` (AC #4). The whole node round-trip is bounded
-    by ``cap_s`` and forcibly stopped past it (AC #5)."""
+    by ``cap_s`` and forcibly stopped past it (AC #5).
+
+    ``config`` is the repo's vault config entry; its ``launch_extras`` /
+    ``activity`` let a sign-in-gated app be launched past its login screen
+    (:mod:`launch_extras`). ``None`` or an entry declaring neither keeps the node
+    script's original ``monkey`` launch, byte for byte."""
     progress = progress or (lambda _m: None)
     lock = lease.Lease(str(lock_path), ttl=cap_s + _LOCK_MARGIN)
     if not lock.acquire():
         return "화면 확인 불가(노드 사용 중 — 락 획득 실패)"
     try:
         return _run_locked(repo, run_dir, cap_s=cap_s, task=gradle_task,
-                           node_script=node_script, run=run, progress=progress)
+                           node_script=node_script, run=run, progress=progress,
+                           config=config)
     finally:
         lock.release()
