@@ -120,6 +120,9 @@ A task with no `worker_mode` belongs to you.
 | `model_tier` | `heavy` · `standard` · `light`. Otherwise inferred (see [How it works](concepts.md#choosing-resources)) |
 | `long_job` | a shell command that outlives a stage (data collection, a long benchmark). The runner starts it detached and resumes the task when it ends |
 | `bypass_guard` | `true` lets this one task through a usage-pacing hold |
+| `screen_check` | post-verify first-screen capture on the emulator node. **Runs by default** on an app repo whose diff touches `app/` (or the repo's configured `app_paths`); set `false` to opt out, `true` to force it regardless of the diff. A non-app repo, or a diff that misses the app module, is a no-op. See [Configuration](configuration.md#app-screen-check-and-launch-extras) |
+| `screen_check_cap_min` | node-uptime cap for that check in minutes (default 20) |
+| `screen_check_gradle_task` | the gradle task that builds the debug APK (default `assembleDebug`) |
 
 ## Ordering and gating
 
