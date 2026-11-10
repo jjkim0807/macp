@@ -88,8 +88,11 @@ if args[:2] == ["compute", "ssh"]:
     elif "aapt2 dump packagename" in cmd:
         print("com.example.fake")
         sys.exit(0)
-    elif "adb install" in cmd or "monkey -p" in cmd:
+    elif "install -r" in cmd:
         rc = next_rc("install", "FAKE_INSTALL_RC_SEQUENCE")
+        # Record the install/launch script verbatim so a test can assert WHICH
+        # launch line the script built (monkey vs am start).
+        (home / "launch.cmd").write_text(cmd)
         save()
         if rc == "255":
             sys.exit(255)
@@ -139,6 +142,10 @@ def _run_shot(tmp_path: Path, apk: Path, env_overrides: dict[str, str]) -> subpr
         "APP_TEST_OUT": str(out_dir),
         "FAKE_REMOTE_HOME": str(tmp_path / "remote_home"),
         "FAKE_STATE_FILE": str(tmp_path / "state.json"),
+        # Pinned empty so a stray value in the caller's environment cannot flip a
+        # case between the monkey and the am-start launch.
+        "APP_TEST_LAUNCH_EXTRAS": "",
+        "APP_TEST_ACTIVITY": "",
         **env_overrides,
     }
     return subprocess.run(
@@ -177,6 +184,48 @@ def test_success_survives_transient_rc255(tmp_path):
     assert out_file.exists()
     assert out_file.read_bytes() == b"\x89PNG\r\n\x1a\nFAKE"
     assert "com.example.fake" in out_file.name
+
+
+def _launched_with(tmp_path, env_overrides: dict[str, str]) -> str:
+    """Run `shot` to completion and return the install/launch script the node
+    was actually asked to run."""
+    apk = tmp_path / "under-test.apk"
+    apk.write_bytes(b"fake apk bytes")
+    result = _run_shot(tmp_path, apk, {"FAKE_POLL_RC_SEQUENCE": "1", **env_overrides})
+    assert result.returncode == 0, result.stderr
+    return (tmp_path / "remote_home" / "launch.cmd").read_text()
+
+
+def test_shot_launches_with_monkey_when_no_extras_are_set(tmp_path):
+    """Regression gate for the whole feature: with no launch env the script must
+    still build the ORIGINAL monkey launcher intent, untouched."""
+    cmd = _launched_with(tmp_path, {})
+
+    assert '$A shell monkey -p "com.example.fake" -c android.intent.category.LAUNCHER 1' in cmd
+    assert "am start" not in cmd
+
+
+def test_shot_launches_with_am_start_when_extras_are_set(tmp_path):
+    cmd = _launched_with(tmp_path, {
+        "APP_TEST_LAUNCH_EXTRAS": "--es session_token tok --ez skip_onboarding true",
+        "APP_TEST_ACTIVITY": ".MainActivity",
+    })
+
+    assert '$A shell am start -n "com.example.fake/.MainActivity" ' in cmd
+    assert "--es session_token tok --ez skip_onboarding true" in cmd
+    assert "monkey" not in cmd
+
+
+def test_shot_keeps_monkey_when_only_one_of_the_two_vars_is_set(tmp_path):
+    """The engine sets both or neither; a half-set environment must not produce
+    an `am start` with a missing component."""
+    only_extras = _launched_with(tmp_path, {"APP_TEST_LAUNCH_EXTRAS": "--ez k true"})
+    assert "monkey" in only_extras and "am start" not in only_extras
+
+
+def test_shot_keeps_monkey_when_only_the_activity_is_set(tmp_path):
+    only_activity = _launched_with(tmp_path, {"APP_TEST_ACTIVITY": ".MainActivity"})
+    assert "monkey" in only_activity and "am start" not in only_activity
 
 
 def test_boot_timeout_exits_nonzero(tmp_path):

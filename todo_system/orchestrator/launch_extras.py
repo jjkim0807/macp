@@ -209,9 +209,13 @@ def _one(item: Any, vault_root: Path | str) -> tuple[list[str], list[str], str]:
     rendered, reason = _format(kind, raw)
     if rendered is None:
         return [], [], f"{reason} ({key!r})"
-    # Both the node shell and the device `sh -c` re-parse this line, so the value
-    # is quoted once here; `key` is allow-listed above so quoting it is a no-op.
-    return [flag, key, shlex.quote(rendered)], secrets, ""
+    # TWICE, and that is not a typo. The launch line is parsed by TWO shells: the
+    # node shell runs it (gcloud hands `--command` to a remote shell), and then
+    # `adb shell` joins its own argv back into one string for the DEVICE's `sh`.
+    # One level of quoting is eaten by each, so a value with a space survives only
+    # if it carries two. For a token-shaped value both passes are a no-op, so the
+    # common case stays readable. `key` is allow-listed above, so it needs none.
+    return [flag, key, shlex.quote(shlex.quote(rendered))], secrets, ""
 
 
 def resolve(cfg: Any, *, vault_root: Path | str) -> Resolved:

@@ -933,3 +933,166 @@ def test_run_smoke_swipe_that_does_not_move_fails_scenario(tmp_path):
     res = _run_smoke(tmp_path, fake, cfg=SWIPE_CFG)
     assert res["ok"] is False and res["kind"] == "scenario"
     assert fake.stops()
+
+
+# ---------------------------------------------------------------------------
+# Launch extras on the beta-smoke path — regression guard + secret containment
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402 — grouped with the launch-extras block
+
+from todo_system.orchestrator import emulator_cli  # noqa: E402
+
+_TOKEN = "s3cret-session-token-value"
+# The monkey launch line EXACTLY as it read before launch extras existed. If this
+# string stops appearing verbatim, every repo that declares no extras has had its
+# launch changed — which is the one regression this feature must not cause.
+_MONKEY_LINE = ('~/android/platform-tools/adb shell monkey -p "$pkg" '
+                "-c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+
+
+def _extras_vault(tmp_path, monkeypatch, *, write_secret: bool = True) -> dict:
+    """Point beta_smoke's vault root at tmp, optionally write the secret, and
+    return a smoke cfg declaring one secret-backed extra plus two literals."""
+    vault = tmp_path / "vault"
+    vault.mkdir(exist_ok=True)
+    if write_secret:
+        src = vault / ".secrets" / "demo-app.json"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(json.dumps({"session_token": _TOKEN}), encoding="utf-8")
+    monkeypatch.setattr(bs, "_VAULT_DATA_ROOT", vault)
+    return {**SMOKE_CFG, "activity": ".MainActivity", "launch_extras": [
+        {"type": "string", "key": "session_token",
+         "value_from_secret": ".secrets/demo-app.json#session_token"},
+        {"type": "bool", "key": "skip_onboarding", "value": True},
+        {"type": "int", "key": "start_tab", "value": 2},
+    ]}
+
+
+def _install_script(fake) -> str:
+    scripts = [c["argv"][3] for c in fake.calls
+               if fake._token(c["argv"]) == "ssh" and fake._ssh_kind(c["argv"][3]) == "install"]
+    assert len(scripts) == 1, scripts
+    return scripts[0]
+
+
+def _passing_node(**kw):
+    return FakeNode(dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"),
+                           _dump("독서하기", "0:30")], **kw)
+
+
+def test_install_keeps_the_monkey_line_verbatim_without_extras(tmp_path):
+    """No launch_extras declared → the install script is the one it always was."""
+    fake = _passing_node()
+    res = _run_smoke(tmp_path, fake)
+    assert res["ok"] is True
+    script = _install_script(fake)
+    assert _MONKEY_LINE in script
+    assert "am start" not in script
+
+
+def test_install_uses_am_start_with_extras_in_order(tmp_path, monkeypatch):
+    cfg = _extras_vault(tmp_path, monkeypatch)
+    fake = _passing_node()
+    res = _run_smoke(tmp_path, fake, cfg=cfg)
+
+    assert res["ok"] is True
+    script = _install_script(fake)
+    assert ('~/android/platform-tools/adb shell am start -n "$pkg"/.MainActivity '
+            f"--es session_token {_TOKEN} --ez skip_onboarding true "
+            "--ei start_tab 2 >/dev/null 2>&1") in script
+    assert "monkey" not in script
+    # the package still comes from the script's own aapt2 assignment
+    assert "pkg=$(" in script
+
+
+def test_install_falls_back_to_monkey_when_the_secret_is_missing(tmp_path, monkeypatch):
+    """A declared-but-unreadable secret must not crash the smoke gate: the launch
+    degrades to monkey and the run still reports on the app."""
+    cfg = _extras_vault(tmp_path, monkeypatch, write_secret=False)
+    fake = _passing_node()
+    msgs: list[str] = []
+
+    res = bs.run_smoke(
+        "demo-app", tmp_path / "clone", "b" * 40, cfg,
+        run=fake, node_script=tmp_path / "app-test-node",
+        lock_path=tmp_path / "node.lock", result_root=tmp_path / "results",
+        remote_cfg=REMOTE_CFG, budget_path=tmp_path / "budget.json",
+        progress=msgs.append)
+
+    assert res["ok"] is True
+    script = _install_script(fake)
+    assert _MONKEY_LINE in script
+    assert "am start" not in script
+    # the skip is reported by file + key name only
+    joined = "\n".join(msgs)
+    assert ".secrets/demo-app.json" in joined and "session_token" in joined
+    assert _TOKEN not in joined
+
+
+def test_install_failure_redacts_the_secret_from_log_detail_and_result(tmp_path, monkeypatch):
+    """The node shell can echo its own command line, so the one place a failed
+    launch persists output — install.log — must not carry the token, and neither
+    may the SmokeError detail or the result JSON."""
+    cfg = _extras_vault(tmp_path, monkeypatch)
+    # install fails, and the fake's stdout echoes the command it was given
+    fake = _passing_node(install_rc=1)
+    fake.pkg = f"+ adb shell am start -n com.example.app/.MainActivity --es session_token {_TOKEN}"
+    msgs: list[str] = []
+
+    res = bs.run_smoke(
+        "demo-app", tmp_path / "clone", "b" * 40, cfg,
+        run=fake, node_script=tmp_path / "app-test-node",
+        lock_path=tmp_path / "node.lock", result_root=tmp_path / "results",
+        remote_cfg=REMOTE_CFG, budget_path=tmp_path / "budget.json",
+        progress=msgs.append)
+
+    assert res["ok"] is False and res["kind"] == "node"
+    install_log = Path(res["result_dir"]) / "install.log"
+    assert install_log.is_file()
+    assert _TOKEN not in install_log.read_text(encoding="utf-8")
+    assert "***" in install_log.read_text(encoding="utf-8")
+    assert _TOKEN not in res["detail"]
+    assert _TOKEN not in json.dumps(res, ensure_ascii=False)
+    assert _TOKEN not in (Path(res["result_dir"]) / "result.json").read_text(encoding="utf-8")
+    assert _TOKEN not in "\n".join(msgs)
+
+
+def test_emulator_cli_stdout_json_never_carries_the_secret(tmp_path, monkeypatch, capsys):
+    """emulator_cli prints the result dict as pure stdout JSON, so that is the
+    last place a secret could escape a stage."""
+    cfg = _extras_vault(tmp_path, monkeypatch)
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir(exist_ok=True)
+    fake = _passing_node(install_rc=1)
+    fake.pkg = f"+ am start --es session_token {_TOKEN}"
+    args = types.SimpleNamespace(repo_dir=str(repo_dir), owner="run-1",
+                                 scenario=str(scenario), seed="none", sha="b" * 40)
+
+    rc = emulator_cli._cmd_run(
+        args, run=fake, node_script=tmp_path / "app-test-node",
+        lock_path=tmp_path / "node.lock", result_root=tmp_path / "results",
+        budget_path=tmp_path / "budget.json", remote_cfg=REMOTE_CFG,
+        notify=lambda _m: None, now=None)
+
+    out = capsys.readouterr()
+    assert rc == emulator_cli.EXIT_FAILURE
+    assert json.loads(out.out)["kind"] == "node"     # stdout is pure JSON
+    assert _TOKEN not in out.out
+    assert _TOKEN not in out.err                     # progress goes here
+
+
+def test_launch_line_is_pure_and_pinned(tmp_path, monkeypatch):
+    """_launch_line is pure, so both shapes can be pinned without a fake node."""
+    monkeypatch.setattr(bs, "_VAULT_DATA_ROOT", tmp_path)
+    assert bs._launch_line({})[0] == _MONKEY_LINE
+    assert bs._launch_line({"launch_extras": [{"type": "bool", "key": "k", "value": True}]})[0] == (
+        _MONKEY_LINE)                                 # extras but no activity → monkey
+    cmd, secrets = bs._launch_line(
+        {"activity": ".MainActivity",
+         "launch_extras": [{"type": "bool", "key": "k", "value": True}]})
+    assert cmd == ('~/android/platform-tools/adb shell am start -n "$pkg"/.MainActivity '
+                   "--ez k true >/dev/null 2>&1")
+    assert secrets == []                              # a literal value is not a secret

@@ -19,6 +19,7 @@ Only generic identifiers appear here (``com.example.app``, ``.MainActivity``,
 from __future__ import annotations
 
 import json
+import shlex
 
 from todo_system.orchestrator import launch_extras
 
@@ -131,12 +132,42 @@ def test_unknown_type_is_a_skip_not_a_guess(tmp_path):
     assert res.note and "float" in res.note
 
 
-def test_a_value_with_shell_metacharacters_is_quoted(tmp_path):
-    rel = _write_secret(tmp_path, {"session_token": "a b; rm -rf /"})
+def _through_two_shells(extras: str) -> list[str]:
+    """What ``am start`` actually receives on the device.
+
+    Models the two parsing layers the launch line really crosses: the NODE shell
+    parses the ssh command (pass 1), ``adb shell`` joins its argv back into one
+    string, and the DEVICE's ``sh`` parses that (pass 2). ``shlex.split`` is the
+    POSIX parse, so this is the honest round trip rather than an eyeballed
+    expectation about quote counts."""
+    node_argv = shlex.split(extras)                 # node shell parses
+    return shlex.split(" ".join(node_argv))         # adb re-joins; device sh parses
+
+
+def test_a_token_value_survives_both_shell_layers(tmp_path):
+    rel = _write_secret(tmp_path)
     res = launch_extras.resolve({"launch_extras": _string_extra(rel)}, vault_root=tmp_path)
-    # quoted exactly once, so the node shell and the device `sh -c` see one token
-    assert res.args[:2] == ["--es", "session_token"]
-    assert res.args[2] == "'a b; rm -rf /'"
+    assert _through_two_shells(" ".join(res.args)) == ["--es", "session_token", _SECRET]
+
+
+def test_a_value_with_shell_metacharacters_survives_both_shell_layers(tmp_path):
+    """The real regression risk: one level of quoting is eaten by the node shell
+    and a second by the device's `sh`, so a value with a space arrives split in
+    two (and `;` would arrive as a command separator) unless it is quoted twice."""
+    nasty = "a b; rm -rf / $(id) 'q'"
+    rel = _write_secret(tmp_path, {"session_token": nasty})
+    res = launch_extras.resolve({"launch_extras": _string_extra(rel)}, vault_root=tmp_path)
+
+    assert _through_two_shells(" ".join(res.args)) == ["--es", "session_token", nasty]
+
+
+def test_bool_and_int_render_unquoted_in_practice(tmp_path):
+    """Quoting a closed-set value is a no-op, so the command line stays readable."""
+    res = launch_extras.resolve(
+        {"launch_extras": [{"type": "bool", "key": "k", "value": True},
+                           {"type": "int", "key": "n", "value": 7}]},
+        vault_root=tmp_path)
+    assert res.args == ["--ez", "k", "true", "--ei", "n", "7"]
 
 
 def test_one_bad_item_drops_the_whole_set(tmp_path):

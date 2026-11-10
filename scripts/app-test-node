@@ -21,6 +21,12 @@ ZONE=${APP_TEST_ZONE:-us-central1-a}
 OUT=${APP_TEST_OUT:-./app-test-shots}
 BOOT_TIMEOUT=${APP_TEST_BOOT_TIMEOUT:-400}
 POLL_INTERVAL=${APP_TEST_POLL_INTERVAL:-3}
+# Launch-intent extras for `shot` (screen_check._launch_env sets BOTH or NEITHER):
+# EXTRAS = the already-quoted `--es/--ez/--ei …` tokens, ACTIVITY = the component
+# to start. With either empty, `shot` launches with the original monkey intent.
+# A sign-in-gated app needs these to get past its login screen.
+EXTRAS=${APP_TEST_LAUNCH_EXTRAS:-}
+ACTIVITY=${APP_TEST_ACTIVITY:-}
 
 _ssh() { "$G" compute ssh "$NODE" --zone "$ZONE" --internal-ip --quiet --command "$1"; }
 _scp() { "$G" compute scp "$@" --zone "$ZONE" --internal-ip --quiet; }
@@ -68,9 +74,19 @@ case "$cmd" in
     fi
 
     pkg=$(_ssh_retry '~/android/build-tools/*/aapt2 dump packagename ~/under-test.apk | head -1')
+    # The launch line, built here and spliced in below with the same '"$var"'
+    # pattern the rest of this script uses. With no extras it is CHARACTER-FOR-
+    # CHARACTER the monkey line that was inline here before, so every repo that
+    # declares nothing runs exactly as it did. `$A` stays literal (the remote
+    # shell assigns it); EXTRAS arrives pre-quoted for the node + device shells.
+    if [ -n "$EXTRAS" ] && [ -n "$ACTIVITY" ]; then
+      launch='$A shell am start -n "'"$pkg"'/'"$ACTIVITY"'" '"$EXTRAS"' >/dev/null 2>&1'
+    else
+      launch='$A shell monkey -p "'"$pkg"'" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1'
+    fi
     _ssh_retry 'set -eo pipefail; export ANDROID_SDK_ROOT=~/android; A=~/android/platform-tools/adb
       $A install -r ~/under-test.apk | tail -1
-      $A shell monkey -p "'"$pkg"'" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+      '"$launch"'
       sleep '"$wait_s"'
       $A exec-out screencap -p > ~/shot.png
       echo "'"$pkg"'" > ~/shot.pkg'
