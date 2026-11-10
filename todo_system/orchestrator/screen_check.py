@@ -92,6 +92,14 @@ _VAULT_DATA_ROOT = paths.vault_root(start=paths.vault_search_start())
 _EXTRAS_ENV = "APP_TEST_LAUNCH_EXTRAS"
 _ACTIVITY_ENV = "APP_TEST_ACTIVITY"
 
+# The success-note prefix — the one deterministic "a human/emulator saw this run's
+# screen" token in verify.md. `_ok_note` STAMPS it and `has_device_pass` READS it,
+# both off this one constant so the writer and the reader can never drift (a
+# duplicated literal is exactly how a guard that reads the wrong string passes
+# vacuously). The negative note ("화면 확인 불가(…)") deliberately does NOT start
+# with it, so a failed/absent check is never mistaken for device evidence.
+OK_NOTE_PREFIX = "화면 확인됨"
+
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -271,6 +279,31 @@ def append_note(run_dir: Path | str, note: str,
         progress(f"screen check: {note}")
 
 
+def has_device_pass(run_dir: Path | str) -> bool:
+    """Did THIS run leave positive device evidence in ``verify.md``?
+
+    True iff the run's ``verify.md`` contains the success note
+    :data:`OK_NOTE_PREFIX` (``화면 확인됨``) — the only deterministic token that a
+    screen was actually captured on the emulator node this run. The negative note
+    (``화면 확인 불가(…)``) is NOT evidence, and a missing / unreadable file is
+    NOT evidence: both resolve to False.
+
+    Fail-SAFE to False on purpose. This reader gates a merge-hold: "no proof we
+    saw a screen" must withhold, so every uncertainty (file absent, read error,
+    an app diff whose check never ran) counts as "no evidence". That is the
+    opposite default from a would-be-helpful reader that assumes success — the
+    whole point of the guard is to stop a high-confidence UI change from merging
+    with nobody having seen it run. Reads only the success PREFIX, so a note that
+    merely quotes the phrase inside a longer failure reason can't be constructed
+    here (``_ok_note`` is the sole writer and always leads with the prefix)."""
+    path = Path(run_dir) / "verify.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return False
+    return OK_NOTE_PREFIX in text
+
+
 # ---------------------------------------------------------------------------
 # Node round-trip (always-stop, lock, cap) — every effect via injected run
 # ---------------------------------------------------------------------------
@@ -400,7 +433,7 @@ def _ok_note(dst: str, run_dir: Path | str) -> str:
         shown = str(Path(dst).resolve().relative_to(Path(run_dir).resolve()))
     except (ValueError, OSError):
         shown = Path(dst).name
-    return f"화면 확인됨 — {shown}"
+    return f"{OK_NOTE_PREFIX} — {shown}"
 
 
 def _run_locked(repo: Path | str, run_dir: Path | str, *, cap_s: int, task: str,
