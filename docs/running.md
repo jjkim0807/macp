@@ -82,12 +82,16 @@ stay silent while there is enough free space.
 Below the trigger, the prune runs one pass, at most once every 30 minutes:
 
 1. `uv cache prune` (uv's own command, which takes uv's own lock).
-2. If Gradle is idle, `<gradle home>/caches/<version>/` directories for a Gradle
-   version that no `~/Worker` wrapper (`gradle/wrapper/gradle-wrapper.properties`,
-   linked worktrees included) uses, or that nothing below has touched for N days. If
-   any wrapper file can't be parsed, every version directory is kept.
-3. If Gradle is idle, regular hex-named files directly in
-   `<gradle home>/caches/build-cache-1/` that haven't changed for N days, oldest first.
+2. `<gradle home>/caches/<version>/` directories for a Gradle version that is in
+   use by neither a `~/Worker` wrapper (`gradle/wrapper/gradle-wrapper.properties`,
+   linked worktrees included) nor a live Gradle daemon, or that is but nothing below
+   has touched for N days. Active runs no longer block this — only the version set
+   actually in use is protected. If the protected set can't be read (an unparseable
+   wrapper, a Gradle daemon whose version can't be parsed, or no `/proc`), every
+   version directory is kept.
+3. Regular hex-named files directly in `<gradle home>/caches/build-cache-1/` that
+   haven't changed for N days, oldest first. These prune even while runs are active:
+   each is deleted as one atomic file.
 
 It stops once free space reaches the target. Every deletion goes through one function
 that checks the real path against this allowlist and refuses symlinks. These are never
@@ -95,11 +99,18 @@ touched: `caches/modules-2`, every distribution under `<gradle home>/wrapper`, o
 `caches/*` entries, the `~/Worker` clones and worktrees, the vault, `~/.config`, and
 the browser caches under `~/.cache`.
 
-**Gradle is busy** when a ledger row holding a repo is dispatched, accepted or
-in progress, when a long_job is running or has a state file (the run-start guard's
-rule), or when a Gradle daemon, wrapper or worker process is alive. An unreadable
-ledger or a host without `/proc` also counts as busy. While Gradle is busy, only uv is
-pruned, and the line says why the Gradle part was skipped.
+**Protected versions.** The versions kept are the ones the `~/Worker` wrappers name
+unioned with the versions live Gradle daemons are running (parsed from each daemon's
+distribution/launcher path in `/proc`). The set is recomputed before every deletion,
+so a daemon that starts mid-pass protects its version from that point on; the line then
+says `<version>=now protected`. It is fail-closed: an unparseable wrapper, a daemon
+whose version can't be read, or no `/proc` keeps every version directory (the line says
+`versions=protected set unknown (…)`) — build-cache entries still prune. An active
+ledger run by itself no longer protects anything.
+
+When `uv cache prune` times out or exits non-zero, the skip reason names the live
+processes holding uv's cache lock (any process whose `argv[0]` is `uv` — `uv run`,
+`uv sync`, `uv cache`), e.g. `uv=timed out (90s); lock held by: uv run python trading_loop.py`.
 
 A pass prints exactly one `disk-prune:` line to the maintenance log, for example:
 
