@@ -14,6 +14,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
+from todo_system import cli
+from todo_system import ops_alerts as oa
 from todo_system.kakao_format import KAKAO_TEXT_LIMIT
 
 VAULT = Path(__file__).resolve().parents[2]
@@ -113,6 +117,80 @@ def test_plan_change_check_skips_without_a_login_stamp(monkeypatch, tmp_path):
     problems, notes = [], []
     A.check_plan_change("hq", tmp_path, problems, notes)
     assert not problems and notes[0].startswith("[hq] plan-vs-login check n/a")
+
+
+# --- ops human task wiring (ops-claude-auth-<account>) -------------------------
+
+def _creds(exp_ms):
+    return {"claudeAiOauth": {"accessToken": "a", "refreshToken": "r",
+                              "refreshTokenExpiresAt": exp_ms}}
+
+
+def _ms_from_now(days):
+    return dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + days * 86_400_000
+
+
+@pytest.fixture
+def auth_ops_task(tmp_path, monkeypatch):
+    """ops_alerts at a readable tmp vault + frozen day; account machinery stubbed
+    so the test is only about the expiry→ops path. Returns the acct-a task path."""
+    root = tmp_path / "ops-vault"
+    monkeypatch.setattr(oa, "VAULT_ROOT", root)
+    monkeypatch.setattr(oa, "_today", lambda: "2049-01-10")
+    monkeypatch.setattr(A, "_mark_auth", lambda *a, **k: None)
+    monkeypatch.setattr(A, "_check_automation_token", lambda *a, **k: None)
+    return root / "Todo" / "items" / "ops-claude-auth-acct-a.md"
+
+
+def test_expired_refresh_token_opens_the_account_auth_task(auth_ops_task, monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(-2)))
+    A.check_credential("acct-a", tmp_path, [], [])
+    assert auth_ops_task.is_file()
+    fm, _ = cli.parse_frontmatter(auth_ops_task.read_text(encoding="utf-8"))
+    assert fm["status"] == "open"
+    assert fm["worker_mode"] == "manual"
+    assert fm["due"] == "2049-01-10"
+    assert "ops" in fm["tags"]
+
+
+def test_expiring_soon_refresh_token_opens_the_account_auth_task(auth_ops_task, monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(3)))   # < WARN_DAYS
+    A.check_credential("acct-a", tmp_path, [], [])
+    assert cli.parse_frontmatter(auth_ops_task.read_text(encoding="utf-8"))[0]["status"] == "open"
+
+
+def test_healthy_runway_resolves_the_account_auth_task(auth_ops_task, monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(-2)))
+    A.check_credential("acct-a", tmp_path, [], [])                                   # open it
+    assert cli.parse_frontmatter(auth_ops_task.read_text(encoding="utf-8"))[0]["status"] == "open"
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(30)))  # > WARN_DAYS
+    A.check_credential("acct-a", tmp_path, [], [])                                   # resolve it
+    assert cli.parse_frontmatter(auth_ops_task.read_text(encoding="utf-8"))[0]["status"] == "done"
+
+
+def test_healthy_runway_with_no_task_is_a_silent_noop(auth_ops_task, monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(30)))
+    A.check_credential("acct-a", tmp_path, [], [])
+    assert not auth_ops_task.exists()
+
+
+def test_ops_import_is_stdlib_and_paths_only():
+    # The Mac auth-watch imports this under bare /usr/bin/python3 (3.9): ops_alerts
+    # must drag in nothing beyond stdlib + `from . import paths`.
+    import ast
+    src = Path(oa.__file__).read_text(encoding="utf-8")
+    abs_mods, rel_mods = set(), set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:                       # relative: `from . import paths`
+                rel_mods.update(n.name for n in node.names)
+            else:
+                abs_mods.add((node.module or "").split(".")[0])
+        elif isinstance(node, ast.Import):
+            for n in node.names:
+                abs_mods.add(n.name.split(".")[0])
+    assert rel_mods == {"paths"}, rel_mods
+    assert abs_mods <= {"__future__", "datetime", "os", "re", "pathlib"}, abs_mods
 
 
 def test_last_startup_error_sees_the_prefixless_bridge_404(monkeypatch, tmp_path):

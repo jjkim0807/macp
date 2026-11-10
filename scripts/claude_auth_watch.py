@@ -58,6 +58,7 @@ IS_DARWIN = sys.platform == "darwin"
 _INSTALL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_INSTALL_DIR))          # bootstrap — raw install location
 from todo_system import daemonctl  # noqa: E402
+from todo_system import ops_alerts  # noqa: E402
 from todo_system import paths  # noqa: E402
 # Single source of the length budget + self-limiting composer. Leaf module,
 # stdlib-only, so it stays safe under launchd's bare /usr/bin/python3 (no venv).
@@ -282,13 +283,23 @@ def check_credential(name, config_dir, problems: list[str], notes: list[str]) ->
                 label + f"refresh token expired {abs(days):.1f}d ago ({when:%Y-%m-%d %H:%MZ})"
             )
             logged_out = True
+            ops_alerts.open_alert(
+                ops_alerts.account_key(name), "Claude 리프레시 토큰 만료",
+                ["터미널에서 claude 실행 후 /login", f"만료 {when:%Y-%m-%d %H:%MZ}"],
+                level="critical")
         elif days <= WARN_DAYS:
             problems.append(
                 label + f"refresh token expires in {days:.1f}d ({when:%Y-%m-%d %H:%MZ}) — "
                 "re-login before it does"
             )
+            ops_alerts.open_alert(
+                ops_alerts.account_key(name), "Claude 리프레시 토큰 만료 임박",
+                ["터미널에서 claude 실행 후 /login", f"만료 {when:%Y-%m-%d %H:%MZ}"],
+                level="warn")
         else:
             notes.append(label + f"refresh token good for {days:.0f}d (until {when:%Y-%m-%d})")
+            # healthy runway → close any open auth task for this account (no-op if none)
+            ops_alerts.resolve_alert(ops_alerts.account_key(name), "토큰 갱신 확인")
     else:
         notes.append(label + "refresh token carries no expiry field")
 
