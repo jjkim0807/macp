@@ -212,13 +212,82 @@ def test_lock_is_released_after_a_run(tmp_path):
 # AC #1 / #5 — opt-in gating + cap parsing (pure)
 # ---------------------------------------------------------------------------
 
-def test_requested_defaults_off():
+_APP_DIFF = ["app/src/main/java/Main.kt", "README.md"]
+_NON_APP_DIFF = ["docs/x.md", "todo_system/orchestrator/runner.py"]
+
+
+def test_requested_defaults_on_for_an_app_diff():
+    """The new contract: no flag + a diff under app/ → ON (the opt-in flag was
+    never set by any task, so the check had never run — root cause 1)."""
+    assert screen_check.requested({}, _APP_DIFF) is True
+    assert screen_check.requested(None, _APP_DIFF) is True
+
+
+def test_requested_defaults_off_without_an_app_diff():
+    assert screen_check.requested({}, _NON_APP_DIFF) is False
+    assert screen_check.requested({}, []) is False
+
+
+def test_requested_is_off_when_the_diff_could_not_be_read():
+    """``diff_paths=None`` = "no diff available". That resolves OFF: guessing ON
+    would wake the billed node on every run of every repo. A bare one-argument
+    call (the old signature) therefore behaves exactly as it used to."""
+    assert screen_check.requested({}, None) is False
     assert screen_check.requested({}) is False
     assert screen_check.requested(None) is False
-    assert screen_check.requested({"screen_check": True}) is True
-    assert screen_check.requested({"screen_check": "true"}) is True
-    assert screen_check.requested({"screen_check": "false"}) is False
-    assert screen_check.requested({"screen_check": "off"}) is False
+
+
+def test_an_explicit_flag_always_beats_the_diff():
+    # true forces it on even with a diff that never touches the app module
+    assert screen_check.requested({"screen_check": True}, _NON_APP_DIFF) is True
+    assert screen_check.requested({"screen_check": "true"}, None) is True
+    # false forces it off even with an app diff
+    assert screen_check.requested({"screen_check": False}, _APP_DIFF) is False
+    assert screen_check.requested({"screen_check": "false"}, _APP_DIFF) is False
+    assert screen_check.requested({"screen_check": "off"}, _APP_DIFF) is False
+    # an empty frontmatter value is "unset", not "false"
+    assert screen_check.requested({"screen_check": "  "}, _APP_DIFF) is True
+
+
+def test_explicitly_disabled_distinguishes_unset_from_false():
+    assert screen_check.explicitly_disabled({"screen_check": False}) is True
+    assert screen_check.explicitly_disabled({"screen_check": "false"}) is True
+    assert screen_check.explicitly_disabled({}) is False          # unset ≠ opted out
+    assert screen_check.explicitly_disabled(None) is False
+    assert screen_check.explicitly_disabled({"screen_check": True}) is False
+
+
+def test_touches_app_paths_prefix_matching():
+    t = screen_check.touches_app_paths
+    assert t(["app/src/Main.kt"]) is True
+    assert t(["app/build.gradle.kts"]) is True
+    # a sibling directory that merely starts with the same letters is NOT a match
+    assert t(["application-notes/x.md"]) is False
+    assert t(["appcompat.md"]) is False
+    assert t([], ("app/",)) is False
+    assert t(None) is False
+    # a config prefix a human wrote loosely still matches
+    assert t(["composeApp/src/Main.kt"], ("./composeApp",)) is True
+    assert t(["x"], ("",)) is False
+    assert t([None, 7, "", "app/a.kt"]) is True       # junk entries are skipped
+
+
+def test_app_paths_default_and_repo_override():
+    assert screen_check.app_paths(None) == ("app/",)
+    assert screen_check.app_paths({}) == ("app/",)
+    assert screen_check.app_paths({"screen_check": {"app_paths": ["composeApp/"]}}) == ("composeApp/",)
+    assert screen_check.app_paths({"smoke": {"app_paths": ["lib/", "app/"]}}) == ("lib/", "app/")
+    # junk falls back to the default rather than matching nothing
+    assert screen_check.app_paths({"screen_check": {"app_paths": []}}) == ("app/",)
+    assert screen_check.app_paths({"screen_check": {"app_paths": "app/"}}) == ("app/",)
+    assert screen_check.app_paths({"screen_check": {"app_paths": [None, "  "]}}) == ("app/",)
+
+
+def test_requested_honors_a_repos_configured_app_paths():
+    paths = screen_check.app_paths({"screen_check": {"app_paths": ["composeApp/"]}})
+    assert screen_check.requested({}, ["composeApp/src/Main.kt"], paths) is True
+    # …and the default set no longer matches that repo's app module
+    assert screen_check.requested({}, ["composeApp/src/Main.kt"]) is False
 
 
 def test_is_app_repo(tmp_path):

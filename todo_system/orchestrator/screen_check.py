@@ -1,15 +1,31 @@
-"""Opt-in post-verify app screen check on a dedicated emulator node.
+"""Post-verify app screen check on a dedicated emulator node — ON by default for
+an app diff, opted out with ``screen_check: false``.
 
 Runs in the orchestrator RUNTIME (the runner, OUTSIDE the ``claude -p`` verify
-stage), mirroring :mod:`beta_publish`'s split: an app-repo task that asks for it
-(``screen_check: true``) has its debug APK built, installed on the separate
-on-demand emulator node ``macp-app-test`` via ``scripts/app-test-node``, and its
-first screen pulled to ``Worker/runs/<run-id>/screens/*.png``. The node is driven
-start -> shot -> **always stop**, and a one-line note ("화면 확인됨 / 불가(사유)")
-is appended to the run's ``verify.md``. ``runner.StagedExecutor._app_screen_check``
-calls :func:`run_check` the instant the verify stage finishes, gated on the
-opt-in flag; a task with no flag is a no-op so unflagged tasks behave — and take
-exactly as long — as before. That is the regression-safe contract.
+stage), mirroring :mod:`beta_publish`'s split: an eligible app-repo task has its
+debug APK built, installed on the separate on-demand emulator node
+``macp-app-test`` via ``scripts/app-test-node``, and its first screen pulled to
+``Worker/runs/<run-id>/screens/*.png``. The node is driven start -> shot ->
+**always stop**, and a one-line note ("화면 확인됨 / 불가(사유)") is appended to the
+run's ``verify.md``. ``runner.StagedExecutor._app_screen_check`` calls
+:func:`run_check` the instant the verify stage finishes.
+
+Gating (see :func:`requested`): the first cut was opt-in, and because no task
+ever set the flag the check had never run for any app — an app change could merge
+with nobody having seen a screen (vault
+``Notes/macp-worker-quality-root-causes-20261110``, cause 1). So the default is
+now ON when the repo is an app repo AND the run's diff touches the app module
+(``app/`` by default, widened per repo with ``screen_check.app_paths``);
+``screen_check: true`` still forces it on regardless of the diff, and
+``screen_check: false`` forces it off. Everything else keeps the original
+regression-safe contract exactly: a non-app repo, an opted-out task, or a diff
+that misses the app module makes ZERO node calls, writes no note, and leaves
+``verify.md`` byte-identical.
+
+Launch extras: a sign-in-gated app launched with a bare ``monkey -c LAUNCHER``
+screenshots its login screen, so a repo may declare :mod:`launch_extras` and the
+node launches with ``am start -n <pkg>/<activity> --es/--ez/--ei …`` instead.
+With nothing declared the node script's ``monkey`` line is byte-identical.
 
 Why the runner and not the verify stage: the node round-trip needs
 gcloud/ssh/scp, which the verify stage's ``--allowed-tools`` whitelist forbids,
@@ -44,6 +60,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from . import launch_extras
 from . import lease
 
 # Default per-run node-uptime cap: 20 minutes, in seconds. A task overrides it
@@ -91,15 +108,96 @@ def _run(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
 # Opt-in gating + config (pure)
 # ---------------------------------------------------------------------------
 
-def requested(payload: dict) -> bool:
-    """Did this task opt in to the screen check? Default OFF — only a truthy
-    ``screen_check`` frontmatter value turns it on, so an unflagged task is a
-    no-op. Mirrors ``runner._payload_auto_merge``'s string/bool handling (a
+def _flag(payload: dict) -> bool | None:
+    """The task's explicit ``screen_check`` flag, or ``None`` when it set none.
+
+    THREE states, not two: "no key" has to be distinguishable from
+    ``screen_check: false`` now that the default is ON for an app diff. Truthiness
+    itself mirrors ``runner._payload_auto_merge``'s string/bool handling (a
     frontmatter value can arrive as the string ``"true"``)."""
-    v = (payload or {}).get("screen_check", False)
+    v = (payload or {}).get("screen_check")
+    if v is None:
+        return None
     if isinstance(v, str):
-        return v.strip().lower() not in ("", "false", "0", "no", "off")
+        if not v.strip():
+            return None                 # `screen_check:` with no value = unset
+        return v.strip().lower() not in ("false", "0", "no", "off")
     return bool(v)
+
+
+def explicitly_disabled(payload: dict) -> bool:
+    """Did the task opt OUT (``screen_check: false``)? The runner checks this
+    FIRST, before it collects a diff, so an opted-out task costs exactly zero
+    extra work — not one git call, not one note."""
+    return _flag(payload) is False
+
+
+def _norm(path: str) -> str:
+    """A diff path / config prefix in one comparable form: forward slashes, no
+    leading ``./``, no trailing slash. ``git diff --name-only`` always emits
+    repo-relative forward-slash paths, so this only has to absorb a config
+    prefix a human wrote as ``./app/`` or ``app``."""
+    p = path.strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def touches_app_paths(diff_paths, app_paths=("app/",)) -> bool:
+    """Does any changed path live under one of ``app_paths``?
+
+    ``None`` (the diff could not be read) and ``[]`` (nothing changed) are both
+    False: the default-ON rule needs positive evidence that the app module was
+    touched, and guessing ON from an unreadable diff would wake the billed
+    emulator node on every run of every repo."""
+    if not diff_paths:
+        return False
+    prefixes = [_norm(p) for p in app_paths if isinstance(p, str) and p.strip()]
+    for raw in diff_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        path = _norm(raw)
+        for prefix in prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def app_paths(entry: dict | None) -> tuple[str, ...]:
+    """The repo's app-module path prefixes, ``("app/",)`` by default.
+
+    Widened only by the repo's own config (``screen_check.app_paths`` in the
+    vault's ``beta_publish_config.json`` entry) — Flutter's ``lib/`` and KMP's
+    ``composeApp/`` are deliberately NOT defaults, since a wrong default turns
+    the check on for diffs that cannot change a screen."""
+    raw = launch_extras._lookup(entry, "app_paths")
+    if isinstance(raw, list):
+        vals = tuple(p.strip() for p in raw if isinstance(p, str) and p.strip())
+        if vals:
+            return vals
+    return ("app/",)
+
+
+def requested(payload: dict, diff_paths=None, app_paths=("app/",)) -> bool:
+    """Should this task get a screen check?
+
+    Default ON for an app diff: with no ``screen_check`` key, the answer is "yes"
+    iff some changed path is under ``app_paths``. An EXPLICIT value always wins —
+    ``true`` turns it on regardless of the diff (preserving the old opt-in
+    behaviour), ``false`` turns it off regardless. ``diff_paths=None`` means the
+    diff could not be read, which resolves to False (see
+    :func:`touches_app_paths`).
+
+    Why default ON: the opt-in flag was never set by any task, so the check had
+    never run for any app (vault ``Notes/macp-worker-quality-root-causes-20261110``
+    cause 1) and an app change could merge without anyone seeing a screen. The
+    no-op contract for everything else is unchanged — a non-app repo, an
+    opted-out task, or a diff that misses the app module still costs zero node
+    calls and leaves ``verify.md`` byte-identical."""
+    flag = _flag(payload)
+    if flag is not None:
+        return flag
+    return touches_app_paths(diff_paths, app_paths)
 
 
 def is_app_repo(repo: Path | str) -> bool:
