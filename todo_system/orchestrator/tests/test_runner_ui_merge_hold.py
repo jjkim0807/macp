@@ -31,8 +31,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from todo_system.orchestrator import merge_hold, screen_check, stages
+from todo_system.orchestrator import agent_backend, merge_hold, repos
+from todo_system.orchestrator import runner as runner_mod
+from todo_system.orchestrator import screen_check, stages
+from todo_system.orchestrator import message as m
 from todo_system.orchestrator.assignment import AWAITING_HUMAN, DONE, FAILED
+from todo_system.orchestrator.registry import Agent
+from todo_system.orchestrator.runner import StagedExecutor
 
 NOW = dt.datetime(2026, 11, 11, 3, 0, 0, tzinfo=dt.timezone.utc)
 HELD_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
@@ -273,6 +278,215 @@ class ScanDeviceEvidenceTest(unittest.TestCase):
         self.assertEqual(
             merge_hold.scan_device_evidence(self.root, "task-x", after_ts=after),
             (False, None))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — the runner guard (decision unit + full _execute wiring)
+# ---------------------------------------------------------------------------
+
+class UiMergeHoldFiresTest(unittest.TestCase):
+    """The pure-ish decision: all four conditions must hold. git/config are mocked
+    so only the AND is under test."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.repo = self.tmp / "clone"
+        self.repo.mkdir()
+        (self.repo / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")  # app repo
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+        (self.run_dir / "verify.md").write_text(
+            "---\noverall_status: pass\nconfidence: high\n---\n", encoding="utf-8")
+        self.ex = StagedExecutor()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @contextlib.contextmanager
+    def _patched(self, *, changed=("app/src/Main.kt",)):
+        with mock.patch.object(StagedExecutor, "_changed_paths", return_value=list(changed)), \
+             mock.patch.object(StagedExecutor, "_screen_check_config", return_value=None):
+            yield
+
+    def _fires(self, verify_text=None):
+        if verify_text is not None:
+            (self.run_dir / "verify.md").write_text(verify_text, encoding="utf-8")
+        text = (self.run_dir / "verify.md").read_text(encoding="utf-8")
+        return self.ex._ui_merge_hold_fires(
+            self.repo, "git@github.com:o/r.git", {}, self.run_dir, "worker/x",
+            text, lambda _m: None)
+
+    def test_all_four_conditions_fire(self):
+        with self._patched():
+            self.assertTrue(self._fires())
+
+    def test_confidence_not_high_does_not_fire(self):
+        with self._patched():
+            self.assertFalse(self._fires(
+                "---\noverall_status: pass\nconfidence: medium\n---\n"))
+
+    def test_non_app_repo_does_not_fire(self):
+        (self.repo / "gradlew").unlink()
+        with self._patched():
+            self.assertFalse(self._fires())
+
+    def test_diff_misses_app_module_does_not_fire(self):
+        with self._patched(changed=("docs/readme.md",)):
+            self.assertFalse(self._fires())
+
+    def test_device_pass_present_does_not_fire(self):
+        screen_check.append_note(
+            self.run_dir, f"{screen_check.OK_NOTE_PREFIX} — screens/a.png")
+        with self._patched():
+            self.assertFalse(self._fires())
+
+    def test_no_repo_url_does_not_fire(self):
+        with self._patched():
+            text = (self.run_dir / "verify.md").read_text(encoding="utf-8")
+            self.assertFalse(self.ex._ui_merge_hold_fires(
+                self.repo, None, {}, self.run_dir, "worker/x", text, lambda _m: None))
+
+
+def _agent(**kw) -> Agent:
+    base = dict(id="w", kind="ai-local", capabilities=["git"], repo="~/Worker/x")
+    base.update(kw)
+    return Agent(**base)
+
+
+def _prepared(rc_code: int = 0) -> subprocess.CompletedProcess:
+    cp = subprocess.CompletedProcess(args=["git", "checkout", "-B"], returncode=rc_code,
+                                     stdout="", stderr="")
+    cp.orphaned_commits = None
+    return cp
+
+
+class ExecuteWiringTest(unittest.TestCase):
+    """AC#1/#2/#3 at the real `_execute` seam: the guard is WIRED into the verify
+    block and the merge-hold path, not merely a helper that nothing calls
+    (the 'parts green, wiring missing' failure this guards against)."""
+
+    VERIFY_HIGH = "---\noverall_status: pass\nconfidence: high\n---\n\n# verify\n"
+    REPORT_OK = ("---\noverall_status: pass\nmerged: no\n"
+                 "pr_url: https://github.com/o/r/pull/1\n---\n")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.repo = self.tmp / "clone"
+        self.repo.mkdir()
+        self.runs = self.tmp / "runs"
+        self.runs.mkdir()
+        self.vault = self.tmp / "vault"
+        (self.vault / "Worker").mkdir(parents=True)
+        self.captured_auto_merge: dict[str, object] = {}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_run_stage(this_test):
+        def run_stage(self, stage, **kw):
+            this_test.captured_auto_merge[stage] = kw.get("auto_merge")
+            art = Path(kw["run_dir"]) / stages.STAGE_ARTIFACT[stage]
+            if stage == "verify":
+                art.write_text(this_test.VERIFY_HIGH, encoding="utf-8")
+            elif stage == "report":
+                art.write_text(this_test.REPORT_OK, encoding="utf-8")
+            else:
+                art.write_text("ok\n", encoding="utf-8")
+            return subprocess.CompletedProcess(args=["claude"], returncode=0,
+                                               stdout="", stderr="")
+        return run_stage
+
+    @contextlib.contextmanager
+    def _sandbox(self, *, app_repo=True, device_pass=False):
+        if app_repo:
+            (self.repo / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+
+        def fake_screen_check(self, repo, payload, run_dir, progress, branch=None):
+            note = (f"{screen_check.OK_NOTE_PREFIX} — screens/a.png" if device_pass
+                    else "화면 확인 불가(노드 오류)")
+            screen_check.append_note(run_dir, note)
+
+        patches = [
+            mock.patch.object(repos, "ensure_worktree", return_value=self.repo),
+            mock.patch.object(stages, "restore_main"),
+            mock.patch.object(stages, "install_push_guard"),
+            mock.patch.object(stages, "default_branch", return_value="main"),
+            mock.patch.object(stages, "prepare_external_branch", return_value=_prepared()),
+            mock.patch.object(stages, "remove_worktree"),
+            mock.patch.object(stages, "RUNS_DIR", self.runs),
+            mock.patch.object(stages, "_VAULT_DATA_ROOT", self.vault),
+            mock.patch.object(stages, "merge_landed", return_value=True),
+            mock.patch.object(runner_mod, "_stop_build_daemons"),
+            mock.patch.object(StagedExecutor, "_publish_beta", return_value=""),
+            mock.patch.object(StagedExecutor, "_head_sha", return_value=HELD_SHA),
+            mock.patch.object(StagedExecutor, "_changed_paths",
+                              return_value=["app/src/Main.kt"]),
+            mock.patch.object(StagedExecutor, "_screen_check_config", return_value=None),
+            mock.patch.object(StagedExecutor, "_app_screen_check", fake_screen_check),
+            mock.patch.object(StagedExecutor, "_account_env", return_value=(None, "")),
+            mock.patch.object(StagedExecutor, "_live_sibling_hold", return_value=None),
+            mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("verify", "report")),
+            mock.patch.object(agent_backend.ClaudeAgentBackend, "run_stage",
+                              self._fake_run_stage()),
+            mock.patch.object(agent_backend.ClaudeAgentBackend, "report_usage", return_value=None),
+            mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            yield
+
+    def _run(self, **sandbox_kw):
+        payload = {"repo": "git@github.com:o/r.git", "summary": "an app UI change"}
+        msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="task-x", payload=payload)
+        lines: list[str] = []
+        with self._sandbox(**sandbox_kw):
+            out = StagedExecutor().execute(msg, _agent(), progress=lines.append)
+        return out
+
+    def _run_dir(self) -> Path:
+        dirs = [d for d in self.runs.iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 1, f"expected one run dir, got {dirs}")
+        return dirs[0]
+
+    def test_ac1_guard_downgrades_confidence(self):
+        out = self._run()
+        self.assertTrue(out.ok, out.summary)
+        verify = (self._run_dir() / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("confidence: medium", verify)
+        self.assertNotIn("confidence: high", verify)
+        self.assertIn(stages._CONFIDENCE_GUARD_HEADER, verify)
+
+    def test_ac2_report_gets_auto_merge_false_and_a_hold_is_scheduled(self):
+        out = self._run()
+        self.assertFalse(self.captured_auto_merge["report"],
+                         "report stage must be told NOT to auto-merge")
+        rec_path = merge_hold.record_path(self.vault, "task-x")
+        self.assertTrue(rec_path.is_file(), "a hold record must be written")
+        rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        self.assertEqual(rec["held_sha"], HELD_SHA)
+        self.assertEqual(rec["pr_url"], "https://github.com/o/r/pull/1")
+        self.assertTrue(out.payload.get("ui_merge_hold"))
+        self.assertTrue(out.payload.get("review_required"))
+
+    def test_ac3_regression_app_run_with_device_pass_is_untouched(self):
+        out = self._run(device_pass=True)
+        self.assertTrue(out.ok, out.summary)
+        verify = (self._run_dir() / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("confidence: high", verify, "confidence left as the stage wrote it")
+        self.assertNotIn(stages._CONFIDENCE_GUARD_HEADER, verify)
+        self.assertFalse(merge_hold.record_path(self.vault, "task-x").exists())
+        self.assertNotIn("ui_merge_hold", out.payload)
+        self.assertNotEqual(self.captured_auto_merge["report"], False,
+                            "a device-passing app run auto-merges as before")
+
+    def test_ac3_regression_non_app_repo_is_untouched(self):
+        out = self._run(app_repo=False)
+        self.assertTrue(out.ok, out.summary)
+        verify = (self._run_dir() / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("confidence: high", verify)
+        self.assertFalse(merge_hold.record_path(self.vault, "task-x").exists())
+        self.assertNotIn("ui_merge_hold", out.payload)
 
 
 if __name__ == "__main__":
