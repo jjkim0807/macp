@@ -1987,6 +1987,71 @@ def checkpoint_push(repo_dir: Path, branch: str,
     return out
 
 
+def rescue_uncommitted(repo_dir: Path, branch: str, slug: str,
+                       progress: Callable[[str], None] | None = None) -> dict:
+    """Commit an Implement stage's leftover WIP onto `branch` so checkpoint_push
+    can SAVE it — a never-raising, default-branch-refusing helper beside
+    checkpoint_push.
+
+    A stage that goes green but hits its turn limit before it commits leaves the
+    work uncommitted in the worktree; checkpoint_push pushes COMMITS only, so the
+    next dispatch's branch prep hard-resets that work away (the macp#131 loss).
+    This makes ONE WIP commit of whatever is uncommitted — tracked edits plus new
+    files, via `git add -A` so `.gitignore` is honoured — on the worker branch,
+    right before checkpoint_push runs; Verify then judges the resulting tree.
+
+    Returns `{"committed": bool, "sha": str|None, "note": str}`. NEVER raises:
+    losing a rescue must not sink the run that produced the work. It commits ONLY
+    when HEAD is already on `branch` and `branch` is not the repo's default branch
+    — a detached HEAD, a different branch, the default branch, or a clean tree all
+    leave the repo untouched with committed=False. `git -C <repo_dir> add -A`
+    stages only paths under the worktree, so it can never reach outside it; no
+    `--no-verify`."""
+    out: dict = {"committed": False, "sha": None, "note": ""}
+    try:
+        default = default_branch(repo_dir)
+        if branch == default:
+            out["note"] = f"refusing to rescue on default branch {branch}"
+            return out
+        cur = current_branch(repo_dir)
+        if cur != branch:
+            out["note"] = (f"HEAD is on {cur or 'a detached commit'}, "
+                           f"not {branch} — skip rescue")
+            return out
+        st = _git(repo_dir, "status", "--porcelain")
+        if st.returncode != 0:
+            out["note"] = ("git status failed: "
+                           + (st.stderr or st.stdout or "").strip()[:200])
+            return out
+        if not st.stdout.strip():
+            out["note"] = "nothing to rescue"
+            return out
+        add = _git(repo_dir, "add", "-A")
+        if add.returncode != 0:
+            out["note"] = ("git add -A failed: "
+                           + (add.stderr or add.stdout or "").strip()[:200])
+            return out
+        msg = f"chore(worker): {slug} WIP rescue after implement"
+        cm = _git(repo_dir, "commit", "-m", msg)
+        if cm.returncode != 0:
+            out["note"] = ("commit failed: "
+                           + (cm.stderr or cm.stdout or "").strip()[:200])
+            return out
+        sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+        out["committed"] = True
+        out["sha"] = sha or None
+        out["note"] = (f"rescued uncommitted work on {branch} ({sha[:8]})"
+                       if sha else f"rescued uncommitted work on {branch}")
+        if progress is not None:
+            progress(out["note"])
+        return out
+    except Exception as e:      # noqa: BLE001 — a rescue failure must never sink the run
+        out["committed"] = False
+        out["sha"] = None
+        out["note"] = f"rescue skipped ({type(e).__name__})"
+        return out
+
+
 _CAPACITY_MARKERS = ("out of usage credits", "usage limit", "weekly limit",
                      "hit your limit", "rate limit", "overloaded", "please run /login",
                      "not logged in",

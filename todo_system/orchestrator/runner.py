@@ -40,6 +40,7 @@ from . import followups
 from . import lease as lease_mod
 from . import message as m
 from . import repos
+from . import rescope
 from . import screen_check
 from . import agent_backend
 from . import stages
@@ -1225,6 +1226,18 @@ class StagedExecutor(ClaudeCodeExecutor):
                         # a duplicate-PR shape (defect B, 2026-09-20). Skip it — implement
                         # (:844) and quick still checkpoint, plan/research/verify are no-ops.
                         if repo_url and repo is not None and stage != "report":
+                            if stage == "implement":
+                                # Same WIP rescue as the green path: a timed-out
+                                # implement may have left green-but-uncommitted work
+                                # (or a half-edit the retry continues). Commit it so
+                                # the checkpoint below carries it to origin; the
+                                # helper never raises and the tree may be partial —
+                                # Verify judges it on the retry.
+                                rsc = stages.rescue_uncommitted(repo, branch, msg.task_id)
+                                if rsc.get("committed"):
+                                    with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                                        f.write(f"\n=== implement WIP rescue (timeout) ===\n{rsc['note']}\n")
+                                    progress(f"implement rescue (timeout): {rsc['note']}")
                             cp = stages.checkpoint_push(repo, branch)
                             if cp.get("note"):
                                 progress(f"timeout checkpoint: {cp['note']}")
@@ -1299,6 +1312,16 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # path does (:791): post-squash-merge it would re-push the merged
                     # branch as a duplicate-PR shape (defect B).
                     if repo_url and repo is not None and stage != "report":
+                        if stage == "implement":
+                            # Same WIP rescue as the green/timeout paths: a capacity
+                            # deferral can land on a green-but-uncommitted implement,
+                            # so commit the leftovers before the checkpoint carries
+                            # them to origin (never-raises; Verify judges on resume).
+                            rsc = stages.rescue_uncommitted(repo, branch, msg.task_id)
+                            if rsc.get("committed"):
+                                with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                                    f.write(f"\n=== implement WIP rescue (capacity) ===\n{rsc['note']}\n")
+                                progress(f"implement rescue (capacity): {rsc['note']}")
                         cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"capacity checkpoint: {cp['note']}")
@@ -1337,11 +1360,42 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # Inherited implements never reach here — they `continue` at
                     # :734 — so a resumed run does not re-push.
                     try:
+                        # WIP rescue BEFORE the checkpoint: a stage that went green
+                        # but hit its turn limit before committing leaves the work
+                        # uncommitted, and checkpoint_push pushes COMMITS only, so
+                        # the next dispatch's branch prep would hard-reset it away
+                        # (macp#131). Commit the leftovers onto worker/<branch>
+                        # first — never-raising, default-branch/vault refused in the
+                        # helper, gated here by the same repo_url block — then the
+                        # checkpoint pushes them and Verify judges the tree.
+                        rescued = stages.rescue_uncommitted(repo, branch, msg.task_id)
+                        if rescued.get("committed"):
+                            with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                                f.write(f"\n=== implement WIP rescue ===\n{rescued['note']}\n")
+                            progress(f"implement rescue: {rescued['note']}")
                         cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"implement checkpoint: {cp['note']}")
                     except Exception as e:      # noqa: BLE001 — best-effort, fail open
                         progress(f"implement checkpoint skipped ({type(e).__name__})")
+                if stage == "plan" and rescope.plan_declares_oversize(
+                        artifact.read_text(encoding="utf-8")):
+                    # The plan DECLARES the task too big for one Implement stage
+                    # (rescope.plan_declares_oversize — the strong phrases only, not
+                    # the template's `## Parallelizable subtasks` heading). Don't run
+                    # Implement: return a benign FAIL+blocked_on in the verify-FAIL
+                    # shape (:1368) so collect() parks it as AWAITING_HUMAN without a
+                    # refail, and — because the note carries "re-scop"/"exceeds a
+                    # single implement stage" — is_oversize_rescope_park recognises
+                    # it, so a later rescope.json auto-splits it (hand-split compat).
+                    blocked = ("task exceeds a single Implement stage — needs "
+                               "re-scoping (plan stage)")
+                    progress(f"plan declares oversize — skipping implement: {blocked}")
+                    return ExecOutcome(
+                        False, f"blocked on {blocked} — not a defect",
+                        {"branch": branch, "run_dir": str(run_dir),
+                         "verify": "FAIL", "stages": completed,
+                         "blocked_on": blocked, "repo": repo_url})
                 if stage == "verify" and repo_url and repo is not None:
                     # Opt-in app screen check (external app repos only): the verify
                     # stage has just written verify.md — capture the app's first

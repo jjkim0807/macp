@@ -1316,6 +1316,13 @@ class CleanupHookTest(unittest.TestCase):
                 mock.patch.object(stages, "remote_branch_exists", return_value=True),
                 mock.patch.object(stages, "RUNS_DIR", self.runs),
                 mock.patch.object(stages, "build_stage_argv", return_value=["true"]),
+                # Rescue is a no-op here: this class pins daemon-cleanup ORDER, and
+                # the real rescue would issue its own `subprocess.run` git calls into
+                # the mocked seam (clobbering the stage-env capture below), the same
+                # reason checkpoint_push is mocked. Its own wiring lives in
+                # test_runner_implement_rescue.py.
+                mock.patch.object(stages, "rescue_uncommitted",
+                                  return_value={"committed": False, "sha": None, "note": ""}),
                 mock.patch.object(stages, "checkpoint_push", self.checkpoint),
                 mock.patch.object(stages, "cleanup_build_daemons", cleanup),
                 mock.patch.object(stages, "remove_worktree", self.remove_wt),

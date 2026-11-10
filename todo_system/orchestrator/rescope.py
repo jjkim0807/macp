@@ -264,6 +264,55 @@ def is_oversize_rescope_park(blocked_on: str, last_note: str = "") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Signal from a PLAN document that the task is too big for one Implement stage
+# ---------------------------------------------------------------------------
+
+# Strong phrases a plan uses to DECLARE that the task cannot be done in one
+# Implement stage. Deliberately a strict SUBSET of _RESCOPE_PARK_KEYWORDS: it
+# does NOT include "subtask"/"sub-task", because the plan template always carries
+# a `## Parallelizable subtasks` heading — matching that bare word would skip
+# Implement on EVERY task.
+_PLAN_OVERSIZE_KEYWORDS = (
+    "exceeds a single implement stage", "re-scop", "rescop",
+)
+# A line that holds a strong keyword but ALSO carries negation is saying the
+# opposite ("this does not exceed a single implement stage", "no re-scoping
+# needed", "재조정 불필요") and must not trip the signal. Matched as whole words
+# (so "cannot" / "rescoped" are NOT read as negators) plus the Korean negation
+# markers. Being generous here only ever SUPPRESSES a skip — the fail-closed
+# direction — so it never wrongly skips Implement.
+_PLAN_NEGATION_RE = re.compile(
+    r"\bnot\b|\bno\b|\bnever\b|n['’]t|없|불필요|않")
+
+
+def plan_declares_oversize(text: str) -> bool:
+    """Does an implementation plan DECLARE that the task is too big for one
+    Implement stage — a pure function (no I/O).
+
+    Reads `text` line by line (lowercased). A line trips the signal when it holds
+    a strong oversize keyword AND no negation on the SAME line, so the judgment is
+    sentence-local: a line reading "this does not exceed a single implement stage"
+    never counts. Returns True as soon as one line trips, else False.
+
+    Deliberately conservative / fail-closed. The template's `## Parallelizable
+    subtasks` heading is NOT matched (only the strong phrases are); an empty or
+    None text is False; any uncertainty resolves to False — wrongly skipping
+    Implement is worse than running it on a plan that merely discusses
+    re-scoping. A plan that only QUOTES these phrases descriptively stays safe as
+    long as each such line also carries negation or splits the quote so no single
+    line holds a bare strong phrase."""
+    if not text:
+        return False
+    for raw in text.splitlines():
+        line = raw.lower()
+        if _PLAN_NEGATION_RE.search(line):
+            continue
+        if any(kw in line for kw in _PLAN_OVERSIZE_KEYWORDS):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Idempotent state file — prevent duplicate execution per park (AC4)
 # ---------------------------------------------------------------------------
 
