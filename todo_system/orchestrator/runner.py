@@ -1568,8 +1568,13 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # ready PR without merging (it reads this var at :1253), and the
                     # post-loop landed gate naturally skips. The hold record is
                     # scheduled after the loop, where branch/pr_url are resolved.
-                    if stage == "verify" and not ui_merge_hold and self._ui_merge_hold_fires(
-                            repo, repo_url, payload, run_dir, branch, text, progress):
+                    # `auto_merge` gates the guard: a task the user already set to
+                    # NOT auto-merge (auto_merge:false / review) follows its own
+                    # review path untouched — holding it here would later auto-merge
+                    # a PR the user explicitly chose to gate (reconcile_merge_holds).
+                    if stage == "verify" and auto_merge and not ui_merge_hold \
+                            and self._ui_merge_hold_fires(
+                                repo, repo_url, payload, run_dir, branch, text, progress):
                         ui_merge_hold = True
                         ui_merge_hold_reason = (
                             "확신도 high→medium 하향 — 앱 UI 변경인데 이 런에 "

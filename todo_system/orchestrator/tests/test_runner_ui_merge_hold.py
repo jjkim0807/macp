@@ -436,8 +436,9 @@ class ExecuteWiringTest(unittest.TestCase):
                 stack.enter_context(p)
             yield
 
-    def _run(self, **sandbox_kw):
+    def _run(self, *, payload_extra=None, **sandbox_kw):
         payload = {"repo": "git@github.com:o/r.git", "summary": "an app UI change"}
+        payload.update(payload_extra or {})
         msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="task-x", payload=payload)
         lines: list[str] = []
         with self._sandbox(**sandbox_kw):
@@ -485,6 +486,18 @@ class ExecuteWiringTest(unittest.TestCase):
         self.assertTrue(out.ok, out.summary)
         verify = (self._run_dir() / "verify.md").read_text(encoding="utf-8")
         self.assertIn("confidence: high", verify)
+        self.assertFalse(merge_hold.record_path(self.vault, "task-x").exists())
+        self.assertNotIn("ui_merge_hold", out.payload)
+
+    def test_ac3_regression_auto_merge_false_task_is_not_held(self):
+        # A task the user set auto_merge:false already follows the review path;
+        # the guard must not hold it (or reconcile_merge_holds would later merge a
+        # PR the user explicitly gated).
+        out = self._run(payload_extra={"auto_merge": False})
+        self.assertTrue(out.ok, out.summary)
+        verify = (self._run_dir() / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("confidence: high", verify)
+        self.assertNotIn(stages._CONFIDENCE_GUARD_HEADER, verify)
         self.assertFalse(merge_hold.record_path(self.vault, "task-x").exists())
         self.assertNotIn("ui_merge_hold", out.payload)
 
