@@ -38,6 +38,7 @@ from . import claims as claims_mod
 from . import disk_guard
 from . import followups
 from . import lease as lease_mod
+from . import merge_hold
 from . import message as m
 from . import repos
 from . import rescope
@@ -828,6 +829,51 @@ class StagedExecutor(ClaudeCodeExecutor):
         except Exception as e:      # noqa: BLE001 — a screen check never flips verify
             progress(f"screen check skipped ({type(e).__name__})")
 
+    @staticmethod
+    def _head_sha(repo) -> str:
+        """The worker branch's current HEAD sha in the checkout, or "" on any
+        failure. Pins the merge hold to the exact tree the verify stage judged, so
+        a later device-check PASS releases only when it is for THIS sha."""
+        try:
+            r = stages._git(repo, "rev-parse", "HEAD")
+            if getattr(r, "returncode", 1) == 0:
+                return (r.stdout or "").strip()
+        except Exception:           # noqa: BLE001 — a missing sha only skips the hold
+            pass
+        return ""
+
+    def _ui_merge_hold_fires(self, repo, repo_url, payload: dict, run_dir: Path,
+                             branch: str | None, verify_text: str,
+                             progress: ProgressFn) -> bool:
+        """macp#131 turned from a PROMPT rule into an ENGINE gate: a verify stage
+        that declared ``confidence: high`` for an app-UI change this run never saw
+        on a device must not auto-merge. True iff ALL four hold:
+
+        * the stage self-assessed ``confidence: high`` (``parse_verify_confidence``);
+        * the repo is an app repo (``is_app_repo`` — a gradlew at root);
+        * this run's diff touches the app module (``touches_app_paths`` over the
+          repo's configured ``app_paths``);
+        * NO device-pass note (``화면 확인됨``) is in ``verify.md`` — i.e. the
+          ``_app_screen_check`` that ran just above did not capture a screen.
+
+        Any other shape — a non-app repo, a diff that misses the app module,
+        confidence != high, or a device pass present — returns False, leaving the
+        merge path byte-identical. Cheapest checks first so the common case
+        (non-high, or non-app) costs no git/file work. Reuses screen_check's own
+        path predicates (no duplicate app-path logic)."""
+        if stages.parse_verify_confidence(verify_text) != "high":
+            return False
+        if not (repo_url and repo is not None and screen_check.is_app_repo(repo)):
+            return False
+        config = self._screen_check_config(payload)
+        if not screen_check.touches_app_paths(
+                self._changed_paths(repo, branch, progress),
+                screen_check.app_paths(config)):
+            return False
+        if screen_check.has_device_pass(run_dir):
+            return False
+        return True
+
     def _execute(self, msg: m.Envelope, agent: Agent, progress: ProgressFn,
                  on_run_start: RunStartFn | None = None,
                  sink: dict | None = None) -> ExecOutcome:
@@ -1164,6 +1210,13 @@ class StagedExecutor(ClaudeCodeExecutor):
         # timeout/park. Declared before the `try` so the `finally` never sees it
         # unbound on an exception that escapes mid-pipeline.
         run_ok = False
+        # Confidence guard / UI-unseen merge hold (macp#131, engine-enforced). Set
+        # by the verify-stage block below when a high-confidence app-UI change has
+        # no device evidence; read after the loop to schedule the hold + withhold
+        # the merge. Declared here so the post-loop block always sees a value.
+        ui_merge_hold = False
+        ui_merge_hold_sha = ""
+        ui_merge_hold_reason = ""
         try:
             for stage in self._pipeline_for(payload):
                 if stage in inherited:
@@ -1473,6 +1526,19 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # first-match-only read can't be flipped by it.
                     self._app_screen_check(repo, payload, run_dir, progress,
                                            branch=branch)
+                    # Pin the sha this verify judged, for every app run (hold or
+                    # not): merge_hold.scan_device_evidence reads head_sha.txt to
+                    # tie a LATER device-check PASS back to the exact tree. run_dir
+                    # is gitignored, so this is host-local like the rest of the run.
+                    # Best-effort — a write failure never fails the pipeline.
+                    if screen_check.is_app_repo(repo):
+                        sha = self._head_sha(repo)
+                        if sha:
+                            try:
+                                (run_dir / "head_sha.txt").write_text(
+                                    sha + "\n", encoding="utf-8")
+                            except OSError as e:
+                                progress(f"head_sha.txt skipped ({type(e).__name__})")
                 if stage in ("verify", "quick", "discover"):
                     # all declare overall_status in frontmatter; the quick stage
                     # self-verifies + self-merges, so honor its verdict too, and
@@ -1494,6 +1560,30 @@ class StagedExecutor(ClaudeCodeExecutor):
                         return ExecOutcome(False, f"{stage} FAIL — not merged",
                                            {"branch": branch, "run_dir": str(run_dir),
                                             "verify": "FAIL", "stages": completed})
+                    # Confidence guard (verify only; gated after _app_screen_check
+                    # appended its note so has_device_pass reads it): a high-
+                    # confidence app-UI change with no device evidence is recorded
+                    # medium and its auto-merge WITHHELD. auto_merge is reassigned
+                    # False here so the report stage (next loop iteration) opens a
+                    # ready PR without merging (it reads this var at :1253), and the
+                    # post-loop landed gate naturally skips. The hold record is
+                    # scheduled after the loop, where branch/pr_url are resolved.
+                    # `auto_merge` gates the guard: a task the user already set to
+                    # NOT auto-merge (auto_merge:false / review) follows its own
+                    # review path untouched — holding it here would later auto-merge
+                    # a PR the user explicitly chose to gate (reconcile_merge_holds).
+                    if stage == "verify" and auto_merge and not ui_merge_hold \
+                            and self._ui_merge_hold_fires(
+                                repo, repo_url, payload, run_dir, branch, text, progress):
+                        ui_merge_hold = True
+                        ui_merge_hold_reason = (
+                            "확신도 high→medium 하향 — 앱 UI 변경인데 이 런에 "
+                            "기기 확인 증거(화면 확인됨)가 없어 자동 머지를 보류함")
+                        stages.downgrade_verify_confidence(run_dir, ui_merge_hold_reason)
+                        ui_merge_hold_sha = self._head_sha(repo)
+                        auto_merge = False
+                        progress("confidence guard: 앱 UI 변경 + 기기 증거 없음 — "
+                                 "confidence→medium, 자동 머지 보류")
             merge_note = ""
             # A proven no-op closes instead of parking; this flag rides the RESULT
             # payload (extra["no_op"]) so the orchestrator writes the close note.
@@ -1581,8 +1671,36 @@ class StagedExecutor(ClaudeCodeExecutor):
                 except Exception:
                     pass
             pr_url = stages.parse_report_pr_url(report_txt)
+            # UI-unseen merge hold (macp#131): the confidence guard fired above, so
+            # the report stage opened a READY PR (auto_merge was forced False, the
+            # landed gate skipped). Park the task for review and schedule a
+            # host-local hold pinned to the verified sha — a later same-sha device
+            # PASS releases it (orchestrator.reconcile_merge_holds). The reason
+            # string is the engine's, not the agent's (same discipline as the
+            # rebase-conflict / review-hold notes). Best-effort schedule: a write
+            # failure still parks the task (review=True), it just won't auto-release.
+            if ui_merge_hold:
+                review = True
+                merge_note = (" — UI 미확인 자동 머지 보류 (기기 확인 PASS 대기; "
+                              "PR은 ready)")
+                try:
+                    merge_hold.schedule(
+                        stages._VAULT_DATA_ROOT, msg.task_id,
+                        held_sha=ui_merge_hold_sha, branch=branch, repo=repo_url,
+                        pr_url=pr_url, note=ui_merge_hold_reason)
+                except Exception as e:      # noqa: BLE001 — hold is best-effort
+                    progress(f"merge hold not scheduled ({type(e).__name__}) — "
+                             "parked for review anyway")
             extra = {"branch": branch, "run_dir": str(run_dir), "stages": completed,
                      "review_required": review, "repo": repo_url}
+            if ui_merge_hold:
+                # The orchestrator RESULT path reads these to route a SINGLE
+                # dedicated alert (not the generic review ping). Deliberately NOT
+                # setting blocked_on: this is not an external blocker, and setting
+                # it would make reconcile_merged mis-park a hold that a human later
+                # merges by hand as "merged but still blocked" instead of closing.
+                extra["ui_merge_hold"] = True
+                extra["ui_merge_hold_reason"] = ui_merge_hold_reason
             if no_op_close:
                 # review_required is already False for a no-op; this tells the
                 # orchestrator's RESULT close path to stamp the Progress-Log note.

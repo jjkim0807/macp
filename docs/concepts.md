@@ -67,7 +67,12 @@ routed to you are parked in your inbox, not executed.
 3. The **runner** receives the `TASK_ASSIGN`, prepares a git worktree, and runs the
    pipeline. Each stage writes its artifact into `Worker/runs/<run_id>/`.
 4. The **report** stage pushes the branch and opens a PR. With `auto_merge: true` it
-   also squash-merges the PR once verify has passed.
+   also squash-merges the PR once verify has passed. One engine-enforced exception:
+   if verify declared `confidence: high` for an app-UI change that no on-device
+   screen check saw this run, the runner records the confidence as `medium` and
+   **withholds the merge** — the PR stays open and ready, and a later run that
+   captures the app's screen on the *same* branch sha releases it automatically
+   (`reconcile_merge_holds`, host-local record under `Worker/_state/pending_merge_holds/`).
 5. The next tick **collects** the result. On success the ledger goes to `done` and the
    task file is closed. On failure the orchestrator decides whether to retry, park the
    task, or give up. Stale runs are reaped.

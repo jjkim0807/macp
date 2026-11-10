@@ -711,6 +711,55 @@ def parse_verify_verdict(verify_md_text: str) -> str | None:
     return m.group(1).upper() if m else None
 
 
+def parse_verify_confidence(verify_md_text: str) -> str | None:
+    """verify.md declares `confidence: high | medium | low` in frontmatter — the
+    verify stage's self-assessed certainty that the change is correct
+    (worker-verify.md). Returns the lower-cased value, or None when unstated.
+
+    Same first-match-only contract as :func:`parse_verify_verdict`: the top
+    frontmatter line is authoritative, and a later mention in the prose body is
+    ignored. The merge-hold guard reads only this field, so a change the stage
+    itself is not `high`-confident in never trips the guard."""
+    m = re.search(r"confidence:\s*(high|medium|low)", verify_md_text or "", re.I)
+    return m.group(1).lower() if m else None
+
+
+# The confidence-guard block header + the code-owned downgrade note. Owned HERE,
+# not left to the verify agent's prose: the runner — not the LLM — decides a UI
+# change with no device evidence is not `high`-confident, so the reason string is
+# the engine's (the same `rebase_conflict_park` / `review_hold` discipline).
+_CONFIDENCE_GUARD_HEADER = "## 확신도 가드"
+
+
+def downgrade_verify_confidence(run_dir: Path | str, note: str) -> bool:
+    """Rewrite verify.md's first ``confidence: high`` to ``confidence: medium`` and
+    append a code-owned ``## 확신도 가드`` note. Returns True iff the file changed.
+
+    The runner calls this when its own guard fires: the verify stage declared
+    ``high`` for a UI change this run never saw on a device, so the recorded
+    confidence is lowered to ``medium`` with the reason. Mirrors
+    :func:`screen_check.append_note`'s append-only discipline for the note, but the
+    confidence line is an in-place ``re.sub(count=1)`` on the FIRST frontmatter
+    match only — the same first-match contract :func:`parse_verify_confidence`
+    reads, so a stray ``confidence: high`` in the prose body is left untouched.
+    Never writes ``overall_status:``, so the verdict is unchanged. Best-effort: a
+    missing/unreadable file returns False without raising (the guard's other
+    effects — hold record, auto_merge=False — still stand)."""
+    path = Path(run_dir) / "verify.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return False
+    new_text, _n = re.subn(r"(confidence:\s*)high", r"\1medium", text,
+                           count=1, flags=re.I)
+    block = f"\n{_CONFIDENCE_GUARD_HEADER}\n\n- {note}\n"
+    try:
+        path.write_text(new_text + block, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def parse_report_merged(report_md_text: str) -> bool | None:
     """report.md declares `merged: yes | no | n/a` — did the auto_merge actually
     land? None if unstated (treat as unknown → surface for review)."""
