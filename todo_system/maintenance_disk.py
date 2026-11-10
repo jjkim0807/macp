@@ -14,9 +14,11 @@ stale `~/.gradle/caches/build-cache-1/` entries, and uv's own cache.
   state write, no output (정상이면 무음 — and no mailbox churn).
 * below it, at most once per PASS_INTERVAL_S, one prune pass:
   1. `uv cache prune` (uv's own command, under uv's own lock), then
-  2. unless Gradle is busy, old Gradle version caches and then old build-cache
-     entries, oldest first, until free ≥ TARGET (MIN_FREE + 2 GiB) or the
-     pass budget runs out.
+  2. old Gradle version caches whose version nothing currently uses, then old
+     build-cache entries, oldest first, until free ≥ TARGET (MIN_FREE + 2 GiB)
+     or the pass budget runs out. Active runs no longer block this: only the
+     version set in use is protected (see below), while build-cache entries,
+     each an atomic single-file delete, always prune.
   Exactly one `disk-prune:` line then names the usage before → after, what was
   removed, what was skipped and why, and whether free space is STILL below.
 * still below after the pass: one page through the caller's notifier, at most
@@ -28,9 +30,11 @@ of every target, and the only two deleting calls in this module sit behind it
 in `_delete`:
 
 * `<gradle home>/caches/<version>/` (a directory whose name is a Gradle
-  version) when that version is not used by any ~/Worker wrapper, or nothing
-  at depth ≤ 2 below it changed for MAX_AGE_DAYS (default 30). When the set of
-  wrapper versions cannot be read, no version directory is a candidate.
+  version) when that version is in neither the ~/Worker wrappers nor any live
+  Gradle daemon, or when it is but nothing at depth ≤ 2 below it changed for
+  MAX_AGE_DAYS (default 30). When the protected version set cannot be read (an
+  unparseable wrapper, a version-less or unreadable Gradle daemon, or no /proc),
+  no version directory is a candidate — build-cache still prunes.
 * `<gradle home>/caches/build-cache-1/<hash>` (a regular file with a hex name)
   unchanged for MAX_AGE_DAYS.
 
@@ -40,12 +44,20 @@ the vault, ~/.config, the browser caches under ~/.cache and the other
 protected home directories listed in `_protected_roots`. Symlinks are refused,
 not followed.
 
-Busy (Gradle part only; uv still runs): a ledger row that is dispatched,
-accepted or in_progress with a repo, a running long_job or a long_job state
-file (disk_guard's `_holders`, reused read-only — an unreadable ledger counts
-as busy), or a live Gradle daemon/wrapper/worker process in /proc (no /proc
-counts as busy). It is re-read before every version directory and every
-BUSY_RECHECK_EVERY build-cache entries.
+Protected versions (version caches only; build-cache and uv are unaffected):
+the Gradle versions the ~/Worker wrappers name, unioned with the versions live
+Gradle daemons in /proc are running (parsed from their dist/launcher path). A
+`caches/<version>` dir is kept iff its name is in that set. The set is
+recomputed before each deletion, so a daemon that starts mid-pass protects its
+version from that point on. It is fail-closed: an unparseable wrapper, a Gradle
+daemon whose version cannot be read, or no /proc makes the set unknown and keeps
+every version dir. The ledger (`_holders`) no longer gates any deletion — an
+active run by itself protects nothing.
+
+uv lock holders: when `uv cache prune` times out or exits non-zero, the skip
+reason names the live processes whose argv[0] is `uv` (uv run/sync/cache all
+take uv's cache lock), e.g. `uv=timed out (90s); lock held by: uv run python
+trading_loop.py`.
 
 Fail-open by contract: the step never raises into the tick. A timeout, a
 missing `uv` or an odd exit code becomes a skip reason.
@@ -94,8 +106,9 @@ ALERT_COOLDOWN_S = 24 * 3600   # check_work_starvation's cadence
 UV_TIMEOUT_S = 90
 BUDGET_S = 120                 # one pass, uv included
 MAX_DELETIONS = 5000           # one pass, version dirs and entries together
-BUSY_RECHECK_EVERY = 200       # build-cache entries between busy re-reads
 TEXT_LIMIT = 400               # chars of the skip list in the summary line
+UV_HOLDER_MAX = 5              # how many uv lock-holder cmdlines to name
+UV_HOLDER_CHARS = 120          # per-holder cmdline cap
 VERSION_DEPTH = 2              # how deep "last used" looks below caches/<version>
 UV_ARGS = ("cache", "prune")
 
@@ -108,10 +121,19 @@ UV_BIN_ENV = "MACP_UV_BIN"
 
 VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?(-[0-9A-Za-z.]+)?$")
 HASH_RE = re.compile(r"^[0-9a-f]{32,}$")
-_DIST_RE = re.compile(r"gradle-(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?)-(?:bin|all)\.zip")
+_VER = r"\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?"
+_DIST_RE = re.compile(r"gradle-(" + _VER + r")-(?:bin|all)\.zip")
 WRAPPER_GLOBS = ("*/gradle/wrapper/gradle-wrapper.properties",
                  "*.wt/*/gradle/wrapper/gradle-wrapper.properties")
 GRADLE_MARKERS = (b"GradleDaemon", b"GradleWrapperMain", b"GradleWorkerMain")
+# A live Gradle JVM names its version in its cmdline — the distribution dir
+# (`gradle-8.7-bin`), the launcher jar (`gradle-launcher-8.7.jar`), or the
+# exploded dist (`gradle-8.7/lib`). Tried in that order on the raw cmdline bytes.
+_DAEMON_VERSION_RES = (
+    re.compile((r"gradle-(" + _VER + r")-(?:bin|all)").encode()),
+    re.compile((r"gradle-launcher-(" + _VER + r")\.jar").encode()),
+    re.compile((r"gradle-(" + _VER + r")/lib").encode()),
+)
 
 # Seams, all read at CALL time — never frozen into a default argument — so the
 # suite-wide fixture in todo_system/conftest.py can point every one at a tmp dir.
@@ -218,7 +240,7 @@ def measure(gh: Path) -> tuple[int, int] | None:
     return disk_guard.measure(gh, disk_usage=_disk_usage)
 
 
-# -- what is current, what is busy -------------------------------------------
+# -- which versions are in use (protected) -----------------------------------
 
 def wrapper_versions(worker_root: str | Path) -> tuple[set[str] | None, str]:
     """Gradle versions the ~/Worker clones' wrappers name — ({…}, "") — or
@@ -247,13 +269,26 @@ def wrapper_versions(worker_root: str | Path) -> tuple[set[str] | None, str]:
     return found, ""
 
 
-def _gradle_process() -> str | None:
-    """`<marker> pid <n>` for a live Gradle JVM, "no /proc", or None."""
+def _daemon_version(cmdline: bytes) -> str | None:
+    """The Gradle version named in a JVM `cmdline`, or None if none parses."""
+    for rx in _DAEMON_VERSION_RES:
+        m = rx.search(cmdline)
+        if m:
+            return m.group(1).decode()
+    return None
+
+
+def gradle_daemon_versions() -> tuple[set[str] | None, str]:
+    """Versions the live Gradle JVMs in /proc run — ({…}, "") — or (None, why)
+    when /proc is unreadable or a Gradle JVM names no parseable version. None is
+    fail-closed: an unknown version means we cannot tell which caches/<version>
+    dir it protects, so every version dir is then kept."""
     try:
         names = os.listdir(PROC_DIR)
     except OSError:
-        return "no /proc"
+        return None, "no /proc"
     me = os.getpid()
+    versions: set[str] = set()
     for name in sorted((n for n in names if n.isdigit()), key=int):
         if int(name) == me:
             continue
@@ -262,21 +297,26 @@ def _gradle_process() -> str | None:
                 data = fh.read()
         except OSError:
             continue
-        for marker in GRADLE_MARKERS:
-            if marker in data:
-                return f"{marker.decode()} pid {name}"
-    return None
+        if not any(marker in data for marker in GRADLE_MARKERS):
+            continue
+        version = _daemon_version(data)
+        if version is None:
+            return None, f"gradle JVM pid {name} version unknown"
+        versions.add(version)
+    return versions, ""
 
 
-def gradle_busy() -> str | None:
-    """Why Gradle caches must not be touched now, or None when idle."""
-    held, problem = disk_guard._holders(disk_guard.WORKER_ROOT, disk_guard.ASSIGNMENTS_DIR,
-                                        disk_guard.JOBS_DIR)
-    if held is None:
-        return f"ledger unreadable ({problem})"
-    if held:
-        return next(iter(held.values()))
-    return _gradle_process()
+def protected_versions() -> tuple[set[str] | None, str]:
+    """Gradle versions a running build may need: the ~/Worker wrapper versions
+    unioned with the live Gradle daemon versions. (None, why) when either source
+    is unknown — fail-closed, every version dir is then kept."""
+    wrapper, why = wrapper_versions(disk_guard.WORKER_ROOT)
+    if wrapper is None:
+        return None, why
+    daemons, why = gradle_daemon_versions()
+    if daemons is None:
+        return None, why
+    return wrapper | daemons, ""
 
 
 # -- candidates ----------------------------------------------------------------
@@ -450,8 +490,42 @@ def _delete(path: str | Path, *, gradle_home: str | Path, home: str | Path,
 
 # -- uv ------------------------------------------------------------------------
 
+def _uv_lock_holders() -> list[str]:
+    """Cmdline prefixes of live processes whose argv[0] basename is `uv` — uv
+    run/sync/cache all take uv's cache lock. Best-effort; fail-open on OSError."""
+    try:
+        names = os.listdir(PROC_DIR)
+    except OSError:
+        return []
+    me = os.getpid()
+    holders: list[str] = []
+    for name in sorted((n for n in names if n.isdigit()), key=int):
+        if int(name) == me:
+            continue
+        try:
+            with open(os.path.join(PROC_DIR, name, "cmdline"), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        parts = [p for p in data.split(b"\0") if p]
+        if not parts or os.path.basename(parts[0].decode("utf-8", "replace")) != "uv":
+            continue
+        cmd = " ".join(p.decode("utf-8", "replace") for p in parts)
+        holders.append(cmd[:UV_HOLDER_CHARS])
+        if len(holders) >= UV_HOLDER_MAX:
+            break
+    return holders
+
+
+def _with_lock_holders(reason: str) -> str:
+    """Append `; lock held by: …` to a uv skip reason when any holder is live."""
+    holders = _uv_lock_holders()
+    return reason + "; lock held by: " + "; ".join(holders) if holders else reason
+
+
 def _uv_prune(budget_left: float) -> str | None:
-    """`uv cache prune`: None on success, else the skip reason."""
+    """`uv cache prune`: None on success, else the skip reason (naming the uv
+    lock holders on a timeout or a non-zero exit)."""
     uv = uv_bin()
     if not uv:
         return "uv=not found"
@@ -460,10 +534,12 @@ def _uv_prune(budget_left: float) -> str | None:
         r = _run([uv, *UV_ARGS], stdin=subprocess.DEVNULL, capture_output=True,
                  text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"uv=timed out ({int(timeout)}s)"
+        return _with_lock_holders(f"uv=timed out ({int(timeout)}s)")
     except OSError as e:
         return f"uv={type(e).__name__}"
-    return None if r.returncode == 0 else f"uv=rc {r.returncode}"
+    if r.returncode == 0:
+        return None
+    return _with_lock_holders(f"uv=rc {r.returncode}")
 
 
 # -- state ---------------------------------------------------------------------
@@ -523,8 +599,9 @@ def _clip(items: list[str], limit: int = TEXT_LIMIT) -> str:
 
 def prune_pass(*, gh: Path, home: Path, vault: Path, free: int, total: int,
                lo: int, target: int, now: float) -> dict:
-    """uv first, then Gradle (when idle) until free ≥ target. Never raises
-    for one bad target; the caller catches anything else."""
+    """uv first, then non-protected Gradle version caches and stale build-cache
+    entries until free ≥ target. Never raises for one bad target; the caller
+    catches anything else."""
     res: dict = {"free_before": free, "free_after": free, "total": total,
                  "threshold": lo, "target": target, "uv_ok": False,
                  "versions": [], "entries": 0, "skipped": [], "stopped": None, "notes": []}
@@ -546,14 +623,10 @@ def prune_pass(*, gh: Path, home: Path, vault: Path, free: int, total: int,
     remeasure()
     if res["free_after"] >= target:
         return res
-    busy = gradle_busy()
-    if busy:
-        res["skipped"].append(f"gradle={busy}")
-        return res
     max_age_s = max_age_days() * 86400
-    current, why = wrapper_versions(disk_guard.WORKER_ROOT)
+    current, why = protected_versions()
     if current is None:
-        res["skipped"].append(f"versions=wrapper set unknown ({why})")
+        res["skipped"].append(f"versions=protected set unknown ({why})")
     deletions = 0
     kw = {"gradle_home": gh, "home": home, "vault_root": vault}
 
@@ -571,10 +644,10 @@ def prune_pass(*, gh: Path, home: Path, vault: Path, free: int, total: int,
     for v in version_candidates(gh, current, max_age_s, now):
         if not can_go_on():
             break
-        busy = gradle_busy()            # a run can start while the previous dir goes
-        if busy:
-            res["skipped"].append(f"gradle={busy}")
-            return res
+        live, _ = protected_versions()  # a daemon for v can start mid-pass
+        if live is None or v.name in live:
+            res["skipped"].append(f"{v.name}=now protected")
+            continue
         try:
             _delete(v, **kw)
         except (Refused, OSError) as e:
@@ -587,14 +660,9 @@ def prune_pass(*, gh: Path, home: Path, vault: Path, free: int, total: int,
     if res["stopped"] or res["free_after"] >= target:
         return res
     errors: dict[str, int] = {}
-    for i, entry in enumerate(build_cache_candidates(gh, max_age_s, now)):
+    for entry in build_cache_candidates(gh, max_age_s, now):
         if not can_go_on():
             break
-        if i and i % BUSY_RECHECK_EVERY == 0:
-            busy = gradle_busy()
-            if busy:
-                res["skipped"].append(f"gradle={busy}")
-                break
         try:
             _delete(entry, **kw)
         except (Refused, OSError) as e:
@@ -733,11 +801,9 @@ def main(argv: list[str] | None = None) -> int:
           + ("off (prune enabled)" if enabled() else "ON — the prune is disabled"))
     uv = uv_bin()
     print(f"uv: {uv} — a pass runs `uv cache prune`" if uv else "uv: not found — skipped")
-    current, why = wrapper_versions(disk_guard.WORKER_ROOT)
-    print("wrapper versions: " + (", ".join(sorted(current)) if current is not None
-                                  else f"UNKNOWN ({why}) — every version dir is kept"))
-    busy = gradle_busy()
-    print(f"gradle: busy — {busy} (gradle caches would be skipped)" if busy else "gradle: idle")
+    current, why = protected_versions()
+    print("protected versions: " + (", ".join(sorted(current)) if current is not None
+                                     else f"UNKNOWN ({why}) — every version dir is kept"))
     days = max_age_days()
     now = _now()
     try:

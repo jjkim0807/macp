@@ -375,7 +375,7 @@ class CandidateTest(_Case):
         self.assertIn("app/gradle/wrapper/gradle-wrapper.properties: no distributionUrl version", why)
         self.assertEqual(md.version_candidates(self.gh, None, 30 * DAY, self.now), [])
         line = self.prune()
-        self.assertIn("skipped versions=wrapper set unknown (app/gradle/wrapper", line)
+        self.assertIn("skipped versions=protected set unknown (app/gradle/wrapper", line)
         self.assertTrue((self.caches / "8.7").exists())
         self.assertFalse(self.old1.exists())          # build-cache still pruned
 
@@ -399,45 +399,88 @@ class CandidateTest(_Case):
             self.assertEqual(md.max_age_days(), 30)
 
 
-class BusyTest(_Case):
-    """(e) Busy skips every Gradle deletion with a one-line reason; uv still runs."""
+def _daemon_cmdline(version: str | None) -> bytes:
+    """A live Gradle JVM cmdline naming `version` via its dist/launcher path, or
+    one with the GradleDaemon marker but no parseable version (version=None)."""
+    marker = b"org.gradle.launcher.daemon.bootstrap.GradleDaemon"
+    if version is None:
+        return b"java\0-cp\0/opt/gradle.jar\0" + marker + b"\0"
+    v = version.encode()
+    return (b"java\0-cp\0/home/u/.gradle/wrapper/dists/gradle-" + v
+            + b"-bin/abc123/gradle-" + v + b"/lib/gradle-launcher-" + v
+            + b".jar\0" + marker + b"\0")
 
-    def _assert_gradle_skipped(self, reason):
-        line = self.prune()
-        self.assertIn(f"skipped gradle={reason}", line)
-        self.assertTrue((self.caches / "8.7").exists())
-        self.assertTrue(self.old1.exists())
-        self.assertEqual(len(self.run.calls), 1)          # uv did run
-        self.assertIn("uv cache prune ok", line)
-        self.assertEqual(line.count("\n"), 0)
 
-    def test_an_in_progress_run(self):
+class ActiveRunTest(_Case):
+    """(e) The new model: an active run/daemon no longer blanket-skips Gradle. Only
+    the in-use version set is protected; everything else prunes while runs are live,
+    and build-cache entries always prune (atomic per-entry delete)."""
+
+    def _daemon(self, pid, version):
+        (self.proc / str(pid)).mkdir()
+        (self.proc / str(pid) / "cmdline").write_bytes(_daemon_cmdline(version))
+
+    def test_an_active_ledger_run_no_longer_blocks_gradle(self):
+        # Was BusyTest.test_an_in_progress_run: held → blanket skip. Now the ledger
+        # gates nothing; non-current 8.7 and old build-cache go, current 8.11.1 stays.
         self.row("task-a", "in_progress", repo="app")
-        self._assert_gradle_skipped("held by task-a (in_progress)")
+        line = self.prune()
+        self.assertNotIn("gradle=", line)
+        self.assertFalse((self.caches / "8.7").exists())
+        self.assertTrue((self.caches / "8.11.1").exists())
+        self.assertFalse(self.old1.exists())
+        self.assertFalse(self.old2.exists())
+        self.assertEqual(len(self.run.calls), 1)
+        self.assertIn("uv cache prune ok", line)
 
-    def test_a_running_long_job_row(self):
+    def test_a_running_long_job_no_longer_blocks_gradle(self):
         self.row("task-j", "failed", repo="app", job_running=True)
-        self._assert_gradle_skipped("held by task-j (job_running)")
-
-    def test_a_long_job_state_file(self):
         self.jobs.mkdir()
         (self.jobs / "lj.json").write_text(json.dumps(
             {"slug": "lj", "cwd": str(self.worker / "app")}), encoding="utf-8")
-        self._assert_gradle_skipped("long_job lj cwd")
+        line = self.prune()
+        self.assertNotIn("gradle=", line)
+        self.assertFalse((self.caches / "8.7").exists())
+        self.assertFalse(self.old1.exists())
 
-    def test_an_unreadable_ledger(self):
+    def test_an_unreadable_ledger_no_longer_blocks_gradle(self):
+        # The ledger is irrelevant to the protected set now; versions still prune.
         shutil.rmtree(self.ledger)
-        self._assert_gradle_skipped("ledger unreadable (no ledger dir")
+        line = self.prune()
+        self.assertNotIn("ledger", line)
+        self.assertFalse((self.caches / "8.7").exists())
+        self.assertFalse(self.old1.exists())
 
-    def test_a_gradle_daemon_process(self):
-        (self.proc / "4242").mkdir()
-        (self.proc / "4242" / "cmdline").write_bytes(
-            b"java\0-cp\0gradle.jar\0org.gradle.launcher.daemon.bootstrap.GradleDaemon\0")
-        self._assert_gradle_skipped("GradleDaemon pid 4242")
+    def test_a_live_daemon_protects_only_its_version(self):
+        # A daemon for 8.7 protects 8.7; a third non-current version 8.5 still goes.
+        _write(self.caches / "8.5" / "f", 1024)
+        _age(self.caches / "8.5", self.now - 5 * DAY)
+        self._daemon(4242, "8.7")
+        line = self.prune()
+        self.assertTrue((self.caches / "8.7").exists())     # protected by the daemon
+        self.assertFalse((self.caches / "8.5").exists())    # non-current, deleted
+        self.assertTrue((self.caches / "8.11.1").exists())  # current wrapper version
+        self.assertFalse(self.old1.exists())                # build-cache still pruned
+        self.assertIn("removed versions 8.5", line)
 
-    def test_no_proc(self):
+    def test_an_unparseable_daemon_keeps_versions_but_prunes_build_cache(self):
+        # Fail-closed on versions: a Gradle JVM with no readable version keeps every
+        # version dir, but entry-atomic build-cache pruning still proceeds.
+        self._daemon(4242, None)
+        line = self.prune()
+        self.assertIn("versions=protected set unknown", line)
+        self.assertIn("4242", line)
+        self.assertTrue((self.caches / "8.7").exists())
+        self.assertTrue((self.caches / "8.11.1").exists())
+        self.assertFalse(self.old1.exists())
+        self.assertFalse(self.old2.exists())
+
+    def test_no_proc_keeps_versions_but_prunes_build_cache(self):
         with mock.patch.object(md, "PROC_DIR", str(self.tmp / "nowhere")):
-            self._assert_gradle_skipped("no /proc")
+            line = self.prune()
+        self.assertIn("versions=protected set unknown", line)
+        self.assertTrue((self.caches / "8.7").exists())
+        self.assertFalse(self.old1.exists())
 
     def test_idle_deletes(self):
         # the positive half: a finished row, a vault task and an unrelated pid hold nothing
@@ -453,22 +496,135 @@ class BusyTest(_Case):
         self.assertTrue(self.recent.exists())
         self.assertTrue((self.caches / "8.11.1").exists())
 
-    def test_busy_is_re_read_before_each_version_dir(self):
+    def test_a_daemon_appearing_mid_pass_protects_only_that_version(self):
+        # Per-dir recompute: 8.5 is deleted, then a daemon for 8.7 starts; 8.7 is now
+        # protected and skipped by name, and build-cache still prunes afterwards.
         _write(self.caches / "8.5" / "f", 1024)
         _age(self.caches / "8.5", self.now - 5 * DAY)
         real_delete = md._delete
 
-        def delete_then_dispatch(path, **kw):
+        def delete_then_daemon(path, **kw):
             freed = real_delete(path, **kw)
-            self.row("late", "dispatched", repo="app")
+            d = self.proc / "9999"
+            if not d.exists():
+                d.mkdir()
+                (d / "cmdline").write_bytes(_daemon_cmdline("8.7"))
             return freed
 
-        with mock.patch.object(md, "_delete", side_effect=delete_then_dispatch):
+        with mock.patch.object(md, "_delete", side_effect=delete_then_daemon):
             line = self.prune()
-        self.assertFalse((self.caches / "8.5").exists())   # oldest non-current first
-        self.assertTrue((self.caches / "8.7").exists())
-        self.assertIn("skipped gradle=held by late (dispatched)", line)
-        self.assertTrue(self.old1.exists())
+        self.assertFalse((self.caches / "8.5").exists())    # oldest non-current first
+        self.assertTrue((self.caches / "8.7").exists())     # now protected mid-pass
+        self.assertIn("8.7", line)                          # named as a protected skip
+        self.assertFalse(self.old1.exists())                # build-cache still runs
+
+
+class DaemonVersionTest(_Case):
+    """gradle_daemon_versions() over the fake /proc."""
+
+    def _proc(self, pid, cmdline: bytes):
+        (self.proc / str(pid)).mkdir()
+        (self.proc / str(pid) / "cmdline").write_bytes(cmdline)
+
+    def test_dist_path_form(self):
+        self._proc(1, b"java\0-cp\0/h/.gradle/wrapper/dists/gradle-8.7-bin/x/l.jar\0"
+                      b"org.gradle.launcher.daemon.bootstrap.GradleDaemon\0")
+        self.assertEqual(md.gradle_daemon_versions(), ({"8.7"}, ""))
+
+    def test_launcher_jar_form(self):
+        self._proc(2, b"java\0-cp\0/opt/gradle/lib/gradle-launcher-8.11.1.jar\0"
+                      b"org.gradle.wrapper.GradleWrapperMain\0")
+        self.assertEqual(md.gradle_daemon_versions(), ({"8.11.1"}, ""))
+
+    def test_gradle_version_lib_form(self):
+        self._proc(3, b"java\0/usr/share/gradle-8.7/lib/plugins/x.jar\0"
+                      b"org.gradle.launcher.daemon.bootstrap.GradleDaemon\0")
+        self.assertEqual(md.gradle_daemon_versions(), ({"8.7"}, ""))
+
+    def test_several_daemons_union_their_versions(self):
+        self._proc(1, _daemon_cmdline("8.7"))
+        self._proc(2, _daemon_cmdline("8.11.1"))
+        versions, why = md.gradle_daemon_versions()
+        self.assertEqual((versions, why), ({"8.7", "8.11.1"}, ""))
+
+    def test_a_marker_process_with_no_version_fails_closed(self):
+        self._proc(4, b"java\0-cp\0/opt/gradle.jar\0"
+                      b"org.gradle.launcher.daemon.bootstrap.GradleDaemon\0")
+        versions, why = md.gradle_daemon_versions()
+        self.assertIsNone(versions)
+        self.assertIn("4", why)
+
+    def test_no_gradle_process_is_the_empty_set(self):
+        self._proc(5, b"python3\0-m\0http.server\0")
+        self.assertEqual(md.gradle_daemon_versions(), (set(), ""))
+
+    def test_no_proc_fails_closed(self):
+        with mock.patch.object(md, "PROC_DIR", str(self.tmp / "nowhere")):
+            versions, why = md.gradle_daemon_versions()
+        self.assertIsNone(versions)
+        self.assertIn("/proc", why)
+
+
+class ProtectedVersionsTest(_Case):
+    def test_union_of_wrapper_and_daemon_versions(self):
+        (self.proc / "1").mkdir()
+        (self.proc / "1" / "cmdline").write_bytes(_daemon_cmdline("8.7"))
+        current, why = md.protected_versions()
+        self.assertEqual((current, why), ({"8.7", "8.11.1"}, ""))
+
+    def test_unparseable_wrapper_makes_the_whole_set_unknown(self):
+        (self.worker / "app" / "gradle" / "wrapper" / "gradle-wrapper.properties").write_text(
+            "distributionUrl=https\\://example.invalid/custom.zip\n", encoding="utf-8")
+        current, why = md.protected_versions()
+        self.assertIsNone(current)
+        self.assertIn("no distributionUrl version", why)
+
+    def test_unparseable_daemon_makes_the_whole_set_unknown(self):
+        (self.proc / "1").mkdir()
+        (self.proc / "1" / "cmdline").write_bytes(_daemon_cmdline(None))
+        current, why = md.protected_versions()
+        self.assertIsNone(current)
+        self.assertIn("1", why)
+
+
+class UvLockHolderTest(_Case):
+    """(f') uv prune failures name the processes holding uv's lock."""
+
+    def _proc(self, pid, cmdline: bytes):
+        (self.proc / str(pid)).mkdir()
+        (self.proc / str(pid) / "cmdline").write_bytes(cmdline)
+
+    def test_timeout_names_lock_holders(self):
+        self.run.raise_ = subprocess.TimeoutExpired(["uv"], md.UV_TIMEOUT_S)
+        self._proc(100, b"uv\0run\0python\0trading_loop.py\0")
+        self._proc(101, b"/home/u/.local/bin/uv\0run\0--\0worldgraph\0serve-play\0")
+        line = self.prune()
+        self.assertIn("uv=timed out", line)
+        self.assertIn("lock held by:", line)
+        self.assertIn("trading_loop.py", line)
+        self.assertIn("worldgraph", line)
+
+    def test_nonzero_exit_names_lock_holders(self):
+        self.run.rc = 2
+        self._proc(100, b"uv\0run\0python\0trading_loop.py\0")
+        line = self.prune()
+        self.assertIn("uv=rc 2", line)
+        self.assertIn("lock held by:", line)
+        self.assertIn("trading_loop.py", line)
+
+    def test_clean_success_names_no_holders(self):
+        self._proc(100, b"uv\0run\0python\0trading_loop.py\0")
+        line = self.prune()
+        self.assertIn("uv cache prune ok", line)
+        self.assertNotIn("lock held by:", line)
+
+    def test_holders_unit_finds_only_uv_argv0(self):
+        self._proc(100, b"uv\0sync\0")
+        self._proc(101, b"/bin/python3\0-m\0uv\0")        # uv not argv[0] → not a holder
+        self._proc(102, b"bash\0-c\0uvx ruff\0")
+        holders = md._uv_lock_holders()
+        self.assertEqual(len(holders), 1)
+        self.assertIn("uv sync", holders[0])
 
 
 class UvTest(_Case):
@@ -737,8 +893,8 @@ class DryRunTest(_Case):
         rc, out, _ = self._main(["--dry-run"])
         self.assertEqual(rc, 0)
         self.assertIn("below the trigger", out)
-        self.assertIn("wrapper versions: 8.11.1", out)
-        self.assertIn("gradle: idle", out)
+        self.assertIn("protected versions: 8.11.1", out)
+        self.assertNotIn("gradle: busy", out)
         self.assertIn("  caches/8.7: would remove", out)
         self.assertIn("  caches/8.11.1: keep: current wrapper version", out)
         self.assertIn("caches/build-cache-1: 2 entries unchanged for >30d", out)
