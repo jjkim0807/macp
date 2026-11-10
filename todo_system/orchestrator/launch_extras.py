@@ -270,13 +270,6 @@ def am_start_command(pkg: str, activity_name: str, args: list[str]) -> str | Non
     return f"am start -n {pkg}/{activity_name} " + " ".join(args)
 
 
-def extras_args(cfg: Any, *, vault_root: Path | str) -> str:
-    """``resolve(...).args`` joined into one shell-ready string (``""`` when
-    nothing resolved) — the form the node script reads from
-    ``APP_TEST_LAUNCH_EXTRAS``."""
-    return " ".join(resolve(cfg, vault_root=vault_root).args)
-
-
 def redact(text: str, secrets: list[str] | None) -> str:
     """Replace every secret value in ``text`` with ``***``.
 

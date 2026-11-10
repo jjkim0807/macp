@@ -286,13 +286,6 @@ def test_am_start_command_is_none_whenever_anything_is_off():
         assert launch_extras.am_start_command(bad, _ACT, args) is None, bad
 
 
-def test_extras_args_joins_resolved_tokens(tmp_path):
-    rel = _write_secret(tmp_path)
-    s = launch_extras.extras_args({"launch_extras": _string_extra(rel)}, vault_root=tmp_path)
-    assert s == f"--es session_token {_SECRET}"
-    assert launch_extras.extras_args({}, vault_root=tmp_path) == ""
-
-
 # ---------------------------------------------------------------------------
 # redact()
 # ---------------------------------------------------------------------------
