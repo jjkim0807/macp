@@ -154,7 +154,7 @@ from typing import NamedTuple
 
 import pytest
 
-from todo_system import cli, maintenance_disk, maintenance_embed, paths, usage_guard, worker
+from todo_system import cli, maintenance_disk, maintenance_embed, ops_alerts, paths, usage_guard, worker
 from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
 from todo_system.orchestrator import orchestrator as _orch_mod
 
@@ -485,6 +485,18 @@ def _disk_prune_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(maintenance_disk, "STATE_DIR", base / "state")
     monkeypatch.setattr(maintenance_disk, "VAULT_ROOT", base / "vault")
     monkeypatch.setattr(maintenance_disk, "PROC_DIR", str(base / "no-proc"))
+
+
+@pytest.fixture(autouse=True)
+def _ops_alerts_isolated(tmp_path_factory, monkeypatch):
+    # ops_alerts.open_alert writes Todo/items/ops-*.md under the vault root, and
+    # the _TRIPWIRE does NOT guard Todo/items/ — so without this any test that
+    # drives a watcher to its alert transition (e.g. the end-to-end cmd_maintenance
+    # tests) would leak a real task file into the vault / vault-template. Point the
+    # call-time seam at a tmp dir that is never created, so a forgotten isolation
+    # finds an empty vault rather than the live one (the _disk_prune_isolated rule).
+    base = tmp_path_factory.mktemp("ops-alerts")
+    monkeypatch.setattr(ops_alerts, "VAULT_ROOT", base / "vault")
 
 
 @pytest.fixture(autouse=True)

@@ -81,7 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import paths
+from . import ops_alerts, paths
 from .kakao_format import compose_alert
 from .orchestrator import disk_guard
 
@@ -664,7 +664,11 @@ def check_and_prune(*, notify: Callable[[str], object] | None = None,
             return f"disk-prune: free space unreadable under {gh} — skipped"
         free, total = m
         if free >= lo:
-            return None                  # healthy: silent, no subprocess, no state
+            # healthy: silent — no subprocess, no state write. resolve_alert is a
+            # one-stat no-op unless a disk ops task is still open, in which case
+            # closing it IS the recovery (the only write this path ever makes).
+            ops_alerts.resolve_alert("hq-disk", "여유 회복")
+            return None
         t = _now() if now is None else now
         state = _read_state()
         if _cooling(t, state["last_pass_ts"], PASS_INTERVAL_S):
@@ -687,6 +691,13 @@ def check_and_prune(*, notify: Callable[[str], object] | None = None,
                     res["notes"].append("paged")
                 except Exception as e:   # noqa: BLE001 - paging is best-effort
                     res["notes"].append(f"notify failed ({type(e).__name__})")
+            # Tie the human task to the same 24h alert cadence (idempotent, fail-open).
+            ops_alerts.open_alert(
+                "hq-disk", "본부 루트 디스크 여유 부족",
+                ["df -h / 로 여유 확인",
+                 "du -sh ~/.gradle ~/.cache ~/Worker 로 큰 디렉토리 확인",
+                 "필요 시 수동 정리 — 여유가 회복되면 이 태스크는 자동으로 닫힌다"],
+                level="alert")
         return summarize(res)
     except Exception as e:               # noqa: BLE001 - must never break maintenance
         return f"disk-prune: error ({type(e).__name__}: {e})"[:300] + " — skipped"

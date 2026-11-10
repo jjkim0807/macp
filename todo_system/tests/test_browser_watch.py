@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 from todo_system import browser_watch as bw
+from todo_system import cli
+from todo_system import ops_alerts as oa
 from todo_system import worker
 
 T0 = 1_000_000.0
@@ -284,6 +286,55 @@ def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
                         lambda script, run=None: real(script, run=state_run("logged_out")))
     assert worker.cmd_maintenance() == 0
     assert len(sent) == 1 and "로그인 풀림" in sent[0]
+
+
+# -- ops human task wiring (ops-hq-browser) ----------------------------------
+
+def _ops_task(tmp_path, monkeypatch, day="2049-01-10"):
+    """Point ops_alerts at a readable tmp vault (overriding the autouse isolation)
+    and freeze the day; return the ops-hq-browser.md path."""
+    root = tmp_path / "ops-vault"
+    monkeypatch.setattr(oa, "VAULT_ROOT", root)
+    monkeypatch.setattr(oa, "_today", lambda: day)
+    return root / "Todo" / "items" / "ops-hq-browser.md"
+
+
+def _status(path):
+    return cli.parse_frontmatter(path.read_text(encoding="utf-8"))[0]["status"]
+
+
+def test_logged_out_opens_the_browser_ops_task(probe, tmp_path, monkeypatch):
+    path = _ops_task(tmp_path, monkeypatch)
+    assert check("logged_out", T0, [])
+    assert path.is_file()
+    fm, _ = cli.parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm["status"] == "open"
+    assert fm["worker_mode"] == "manual"
+    assert fm["due"] == "2049-01-10"
+    assert "ops" in fm["tags"]
+
+
+def test_logged_in_first_run_opens_no_ops_task(probe, tmp_path, monkeypatch):
+    path = _ops_task(tmp_path, monkeypatch)
+    assert check("logged_in", T0, []) is None
+    assert not path.exists()
+
+
+def test_recovery_resolves_the_browser_ops_task(probe, tmp_path, monkeypatch):
+    path = _ops_task(tmp_path, monkeypatch)
+    check("logged_out", T0, [])
+    assert _status(path) == "open"
+    check("logged_in", T0 + HOUR + 1, [])
+    assert _status(path) == "done"
+
+
+def test_unknown_third_streak_opens_the_browser_ops_task(probe, tmp_path, monkeypatch):
+    path = _ops_task(tmp_path, monkeypatch)
+    for i in range(2):
+        check("unknown", T0 + i * (HOUR + 1), [])
+    assert not path.exists()                       # 1st/2nd are blips — no task yet
+    assert check("unknown", T0 + 2 * (HOUR + 1), [])
+    assert _status(path) == "open"                 # the 3rd opens it
 
 
 # -- message content ---------------------------------------------------------
