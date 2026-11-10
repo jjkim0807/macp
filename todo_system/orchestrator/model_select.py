@@ -81,6 +81,13 @@ ESTIMATE_HEAVY_MIN_MIN = 240
 _ROOT = paths.vault_root(start=paths.vault_search_start())
 _CACHE = _ROOT / "Worker" / "_state" / "model_pref.json"
 _TTL = 24 * 3600
+# A cached choice equal to the tier's first (most-preferred) rung keeps the full
+# 24h TTL; any *other* choice — a fallback or the floor — expires after at most
+# 1h so the next stage re-probes from the top of the ladder. Before this, one
+# transient probe failure could pin a tier to its floor for a full day until a
+# human cleared the cache (the `model-choice-does-not-self-heal` incident,
+# 2026-11-10: standard·heavy stuck on the floor claude-opus-4-8).
+_FLOOR_TTL = 3600
 
 
 # The CLI reports an exhausted quota on stdout and still exits 0, so the exit
@@ -198,8 +205,16 @@ def _cached_model(tier: str, now: float) -> str | None:
     if not isinstance(entry, dict):
         return None
     try:
-        if now - float(entry.get("ts", 0)) < _TTL and entry.get("model"):
-            return str(entry["model"])
+        model = entry.get("model")
+        if not model:
+            return None
+        # A first-rung choice keys off the tier actually being read, so the
+        # legacy flat entry (only read as heavy) compares against
+        # LADDERS["heavy"][0] = PREFERRED and a hand-written floor there also
+        # expires in 1h. Any other choice gets the short floor TTL.
+        ttl = _TTL if str(model) == LADDERS[tier][0] else _FLOOR_TTL
+        if now - float(entry.get("ts", 0)) < ttl:
+            return str(model)
     except (TypeError, ValueError):
         pass
     return None
