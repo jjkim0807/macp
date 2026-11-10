@@ -70,6 +70,12 @@ _FLAGS = {"string": "--es", "bool": "--ez", "int": "--ei"}
 _BLOCKS = ("screen_check", "smoke")
 # A 1-char secret would turn every occurrence of that character into `***`.
 _MIN_REDACT_LEN = 2
+# The ONE non-identifier package `am_start_command` accepts: the node-side shell
+# variable `beta_smoke._install_and_launch` already assigns (`pkg=$(aapt2 dump
+# packagename …)`) when the repo declares no package. Spelled out as a single
+# allowed literal rather than loosening _PKG_RE, so nothing else shell-shaped can
+# reach the command line through the package position.
+PKG_SHELL_VAR = '"$pkg"'
 
 
 class Resolved(NamedTuple):
@@ -233,6 +239,14 @@ def resolve(cfg: Any, *, vault_root: Path | str) -> Resolved:
     return Resolved(args, secrets, None)
 
 
+def valid_activity(activity_name: str) -> bool:
+    """Does ``activity_name`` pass the allow-list? Callers that assemble the
+    ``am start`` line somewhere else — ``screen_check`` hands the activity to the
+    node script, which splices it next to the package IT resolved with aapt2 —
+    validate it here so the one regex stays the single source of truth."""
+    return bool(_ACTIVITY_RE.match((activity_name or "").strip()))
+
+
 def am_start_command(pkg: str, activity_name: str, args: list[str]) -> str | None:
     """``am start -n <pkg>/<activity> <args…>``, or ``None``.
 
@@ -245,7 +259,9 @@ def am_start_command(pkg: str, activity_name: str, args: list[str]) -> str | Non
     if not args:
         return None
     pkg, activity_name = (pkg or "").strip(), (activity_name or "").strip()
-    if not _PKG_RE.match(pkg) or not _ACTIVITY_RE.match(activity_name):
+    if not valid_activity(activity_name):
+        return None
+    if pkg != PKG_SHELL_VAR and not _PKG_RE.match(pkg):
         return None
     return f"am start -n {pkg}/{activity_name} " + " ".join(args)
 

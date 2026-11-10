@@ -60,6 +60,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .. import paths
 from . import launch_extras
 from . import lease
 
@@ -82,6 +83,14 @@ _STOP_TIMEOUT_S = 120
 _DEFAULT_GRADLE_TASK = "assembleDebug"
 # First screen only (install + launch + one screencap); UI-driven scenarios are
 # deliberately out of scope for the first cut.
+# Secret-bearing launch config lives in VAULT data (gitignored JSON named by the
+# repo's beta_publish_config entry), so it follows the redirectable vault root —
+# same resolver split as beta_publish / beta_smoke.
+_VAULT_DATA_ROOT = paths.vault_root(start=paths.vault_search_start())
+# How the launch extras reach `scripts/app-test-node shot`. Set TOGETHER or not at
+# all: the script falls back to its original `monkey` line unless it has both.
+_EXTRAS_ENV = "APP_TEST_LAUNCH_EXTRAS"
+_ACTIVITY_ENV = "APP_TEST_ACTIVITY"
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -283,6 +292,34 @@ def _node_env(run_dir: Path | str) -> dict:
     return env
 
 
+def _launch_env(run_dir: Path | str, config: dict | None,
+                ) -> "tuple[dict, list[str], str | None]":
+    """``(env, secrets, note)`` — the node env plus the launch-extras decision.
+
+    The engine cannot name the package here (the node script resolves it with
+    aapt2 from the APK it just pushed), so the extras ride to the script as
+    ``APP_TEST_LAUNCH_EXTRAS`` + ``APP_TEST_ACTIVITY`` and the script assembles
+    ``am start -n "$pkg"/<activity> <extras>`` itself. BOTH vars are set or
+    NEITHER is, so the script's existing ``monkey`` line stays byte-identical for
+    every repo that declares nothing (or declares extras without an ``activity``).
+
+    ``note`` is a value-free one-liner for ``verify.md`` when extras were declared
+    but could not be used; ``secrets`` are the raw values, for redaction."""
+    env = _node_env(run_dir)
+    res = launch_extras.resolve(config, vault_root=_VAULT_DATA_ROOT)
+    act = launch_extras.activity(config)
+    if res.args and launch_extras.valid_activity(act):
+        env[_EXTRAS_ENV] = " ".join(res.args)
+        env[_ACTIVITY_ENV] = act
+        return env, list(res.secrets), None
+    if res.note:
+        return env, [], res.note
+    if res.args:
+        return env, list(res.secrets), (
+            "launch_extras 선언됐으나 유효한 activity 설정이 없어 extras 없이 실행")
+    return env, [], None
+
+
 def _node(run: Runner, node_script: Path | str, subcmd: str, *args: str,
           env: dict, timeout: float) -> "subprocess.CompletedProcess[str]":
     """One ``scripts/app-test-node <subcmd> [args…]`` invocation via the seam."""
@@ -368,34 +405,42 @@ def _ok_note(dst: str, run_dir: Path | str) -> str:
 
 def _run_locked(repo: Path | str, run_dir: Path | str, *, cap_s: int, task: str,
                 node_script: Path | str, run: Runner,
-                progress: Callable[[str], None]) -> str:
+                progress: Callable[[str], None], config: dict | None = None) -> str:
     """The node round-trip, assuming the lock is held. Returns a note; NEVER
     raises — every failure is absorbed into a "화면 확인 불가(…)" note.
 
     Structure: the whole body (build + start + shot) is the outer try; the inner
     ``finally`` stops the node UNCONDITIONALLY (AC #2 — even the APK-build-failure
-    path stops, since stopping an un-started/stopped VM is idempotent)."""
+    path stops, since stopping an un-started/stopped VM is idempotent).
+
+    A launch-extras skip reason is appended to whatever note comes out, so a
+    misconfigured secret is visible in ``verify.md`` (by file + key name, never a
+    value) instead of silently screenshotting the login screen."""
     deadline = time.monotonic() + cap_s
-    env = _node_env(run_dir)
+    env, _secrets, extras_note = _launch_env(run_dir, config)
+    if extras_note:
+        progress(f"screen check: {extras_note}")
+    suffix = f" (launch_extras: {extras_note})" if extras_note else ""
     try:
         try:
             apk = _build_debug_apk(repo, task, run, deadline)
             _node(run, node_script, "start", env=env, timeout=_remaining(deadline))
             dst = _shot_with_retry(run, node_script, apk, env, deadline, progress)
-            return _ok_note(dst, run_dir)
+            return _ok_note(dst, run_dir) + suffix
         finally:
             _stop_node(run, node_script, env, progress)
     except SkipCheck as e:
-        return f"화면 확인 불가({e})"
+        return f"화면 확인 불가({e}){suffix}"
     except subprocess.TimeoutExpired:
-        return f"화면 확인 불가(상한 {cap_s // 60}분 초과 — 강제 stop)"
+        return f"화면 확인 불가(상한 {cap_s // 60}분 초과 — 강제 stop){suffix}"
     except Exception as e:      # noqa: BLE001 — a screen check can only ever SKIP
-        return f"화면 확인 불가(노드 오류: {type(e).__name__})"
+        return f"화면 확인 불가(노드 오류: {type(e).__name__}){suffix}"
 
 
 def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
               lock_path: Path | str, node_script: Path | str,
               gradle_task: str = _DEFAULT_GRADLE_TASK, run: Runner = _run,
+              config: dict | None = None,
               progress: Callable[[str], None] | None = None) -> str:
     """Build the debug APK, capture the app's first screen on the shared emulator
     node, and return a one-line note for ``verify.md``. NEVER raises.
@@ -405,13 +450,19 @@ def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
     returns a SKIP note with ZERO node calls (AC #3). On success the node is
     driven start -> shot(-> retry once) and always stopped (AC #2); the screenshot
     lands under ``run_dir/screens/`` (AC #4). The whole node round-trip is bounded
-    by ``cap_s`` and forcibly stopped past it (AC #5)."""
+    by ``cap_s`` and forcibly stopped past it (AC #5).
+
+    ``config`` is the repo's vault config entry; its ``launch_extras`` /
+    ``activity`` let a sign-in-gated app be launched past its login screen
+    (:mod:`launch_extras`). ``None`` or an entry declaring neither keeps the node
+    script's original ``monkey`` launch, byte for byte."""
     progress = progress or (lambda _m: None)
     lock = lease.Lease(str(lock_path), ttl=cap_s + _LOCK_MARGIN)
     if not lock.acquire():
         return "화면 확인 불가(노드 사용 중 — 락 획득 실패)"
     try:
         return _run_locked(repo, run_dir, cap_s=cap_s, task=gradle_task,
-                           node_script=node_script, run=run, progress=progress)
+                           node_script=node_script, run=run, progress=progress,
+                           config=config)
     finally:
         lock.release()

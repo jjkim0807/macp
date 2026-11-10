@@ -732,32 +732,97 @@ class StagedExecutor(ClaudeCodeExecutor):
                 pass
             return ""
 
+    def _changed_paths(self, repo, branch,
+                       progress: ProgressFn | None = None) -> list[str] | None:
+        """The paths this run's branch changed, or ``None`` when unknowable.
+
+        ``git diff --name-only origin/<default>...<branch>`` — THREE dots on
+        purpose: that diffs the merge base against the branch, so it reports what
+        this run changed and not the reverse of whatever else landed on the
+        default branch meanwhile (``prepare_external_branch`` cut the branch from
+        ``origin/<default>``, so the merge base is exactly that cut point).
+
+        ``None`` on anything unreadable — no branch, a bad rc (shallow clone,
+        missing ref), or any exception. :func:`screen_check.requested` treats
+        ``None`` as "do not run", so a repo whose history we cannot read keeps
+        today's behaviour instead of waking the billed node speculatively."""
+        if not branch:
+            return None
+        try:
+            base = stages.default_branch(repo)
+            r = stages._git(repo, "diff", "--name-only", f"origin/{base}...{branch}")
+            if getattr(r, "returncode", 1) != 0:
+                if progress:
+                    progress("screen check: could not read the run diff "
+                             f"(rc={getattr(r, 'returncode', None)}) — not running")
+                return None
+            paths_changed = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+            if progress:
+                # COUNT only: a path list in the run log is noise, and the count is
+                # what explains the gate's decision.
+                progress(f"screen check: {len(paths_changed)} changed path(s) in this run")
+            return paths_changed
+        except Exception:           # noqa: BLE001 — an unreadable diff is just "unknown"
+            return None
+
+    def _screen_check_config(self, payload: dict) -> dict | None:
+        """This repo's vault config entry (``beta_publish_config.json``), or
+        ``None``. Carries ``app_paths`` / ``activity`` / ``launch_extras``; a repo
+        with no entry simply has no extras and no widened app paths."""
+        try:
+            repo_url = (payload or {}).get("repo")
+            if not repo_url:
+                return None
+            return beta_publish.repo_config(repos.repo_name(repo_url))
+        except Exception:           # noqa: BLE001 — config is optional, never fatal
+            return None
+
     def _app_screen_check(self, repo, payload: dict, run_dir: Path,
-                          progress: ProgressFn) -> None:
-        """Opt-in app screen check for a just-verified app-repo task.
+                          progress: ProgressFn, branch: str | None = None) -> None:
+        """Post-verify app screen check, ON by default for an app diff.
 
         The peer of :meth:`_publish_beta`, run the instant the verify stage wrote
         ``verify.md``. Builds the debug APK, captures the app's first screen on the
         shared emulator node (``scripts/app-test-node``), always stops the node,
-        and appends a one-line note to ``verify.md``. Completely fail-open: a task
-        with no ``screen_check`` flag is a no-op (unflagged tasks behave exactly as
-        before), and NOTHING here — a flag-off, a non-app repo, a node failure, or
-        an exception — ever raises or changes the verify verdict (the note is
-        appended below the frontmatter ``parse_verify_verdict`` reads).
+        and appends a one-line note to ``verify.md``.
+
+        Gate order is deliberate, cheapest first, so the no-op cases stay free:
+        an explicit ``screen_check: false`` leaves immediately; a non-app repo
+        leaves without even a git call (and silently, unless the task explicitly
+        asked for the check); only then is the run's diff collected and the repo
+        config read. So a task that is not eligible costs zero node calls, zero
+        git calls beyond the gates it needed, and leaves ``verify.md`` byte-identical.
+
+        Completely fail-open: NOTHING here — an opt-out, a non-app repo, an
+        unreadable diff, a node failure, or an exception — ever raises or changes
+        the verify verdict (the note is appended below the frontmatter
+        ``parse_verify_verdict`` reads).
         """
         try:
-            if not screen_check.requested(payload):
-                return                               # not opted in → no-op, no note
+            if screen_check.explicitly_disabled(payload):
+                return                               # opted out → no-op, no note
+            flagged_on = screen_check.requested(payload, None)
             if not screen_check.is_app_repo(repo):
-                screen_check.append_note(
-                    run_dir, "화면 확인 불가(앱 리포 아님 — gradlew 없음)", progress)
+                if flagged_on:
+                    # Only a task that explicitly asked for it gets told why not;
+                    # for everything else a non-app repo is a silent no-op.
+                    screen_check.append_note(
+                        run_dir, "화면 확인 불가(앱 리포 아님 — gradlew 없음)", progress)
                 return
+            config = self._screen_check_config(payload)
+            # An explicit `true` wins over the diff, so don't pay for the diff then.
+            diff_paths = (None if flagged_on
+                          else self._changed_paths(repo, branch, progress))
+            if not screen_check.requested(payload, diff_paths,
+                                          screen_check.app_paths(config)):
+                return                               # app repo, but not this diff
             note = screen_check.run_check(
                 repo, run_dir,
                 cap_s=screen_check.cap_seconds(payload),
                 lock_path=stages._VAULT_DATA_ROOT / "Worker" / "screen-test-node.lock",
                 node_script=stages._ENGINE_ROOT / "scripts" / "app-test-node",
                 gradle_task=screen_check.gradle_task(payload),
+                config=config,
                 progress=progress)
             screen_check.append_note(run_dir, note, progress)
         except Exception as e:      # noqa: BLE001 — a screen check never flips verify
@@ -1397,14 +1462,17 @@ class StagedExecutor(ClaudeCodeExecutor):
                          "verify": "FAIL", "stages": completed,
                          "blocked_on": blocked, "repo": repo_url})
                 if stage == "verify" and repo_url and repo is not None:
-                    # Opt-in app screen check (external app repos only): the verify
-                    # stage has just written verify.md — capture the app's first
-                    # screen on the emulator node and append a note. The repo_url
-                    # gate skips vault tasks entirely. Fail-open and placed BEFORE
-                    # the verdict read below: the note lands beneath the frontmatter
-                    # and never contains overall_status:, so parse_verify_verdict's
+                    # App screen check (external app repos only): the verify stage
+                    # has just written verify.md — capture the app's first screen on
+                    # the emulator node and append a note. The repo_url gate skips
+                    # vault tasks entirely; `branch` lets the check read this run's
+                    # own diff, which is what makes it default-ON for an app change
+                    # rather than opt-in. Fail-open and placed BEFORE the verdict
+                    # read below: the note lands beneath the frontmatter and never
+                    # contains overall_status:, so parse_verify_verdict's
                     # first-match-only read can't be flipped by it.
-                    self._app_screen_check(repo, payload, run_dir, progress)
+                    self._app_screen_check(repo, payload, run_dir, progress,
+                                           branch=branch)
                 if stage in ("verify", "quick", "discover"):
                     # all declare overall_status in frontmatter; the quick stage
                     # self-verifies + self-merges, so honor its verdict too, and
