@@ -2021,6 +2021,52 @@ class HumanWhyDecisionVsTodo(unittest.TestCase):
             self.assertTrue(M._needs_decision("h_fm"))
         self.assertEqual(pf.call_count, 1)
 
+
+class OpsTaskSurfacesAsManualDevRow(unittest.TestCase):
+    """An ops_alerts task (`worker_mode: manual`, `due: 오늘`, tags `ops`) reaches the
+    person's list as '직접 할 일' (why=manual), is urgent (due today), and classifies
+    as dev — all with NO change to macp_dashboard.py (`manual`∉AUTO_MODES, `ops`∈DEV_TAGS).
+    The frozen 12-key row set is unchanged."""
+
+    TODAY = dt.date(2049, 1, 10)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        items = self.tmp / "items"
+        items.mkdir()
+        db = self.tmp / "todo.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (slug TEXT, title TEXT, status TEXT, due TEXT, "
+                    "not_before TEXT, next_action TEXT, tags TEXT, parent_slug TEXT, "
+                    "is_parent INTEGER, worker_mode TEXT)")
+        con.execute("INSERT INTO tasks VALUES "
+                    "('ops-hq-disk','본부 루트 디스크 여유 부족','open',?,NULL,"
+                    "'df -h /','todo,ops',NULL,0,'manual')", (self.TODAY.isoformat(),))
+        con.commit()
+        con.close()
+        reg = types.SimpleNamespace(
+            agents=[types.SimpleNamespace(id="me", kind="human")],
+            for_project=lambda slug: None)          # no registry owner → tag-driven category
+        M._DECISION_CACHE.clear()
+        self.addCleanup(M._DECISION_CACHE.clear)
+        for p in (mock.patch.object(M, "TODO_DB", db),
+                  mock.patch.object(M, "ITEMS", items),
+                  mock.patch.object(M, "_repo_in_chain", return_value=False),
+                  mock.patch("todo_system.orchestrator.registry.load_registry",
+                             return_value=reg)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_ops_task_is_manual_urgent_dev_with_frozen_keys(self):
+        rows = {r["slug"]: r for r in M.collect_human([], today=self.TODAY)}
+        self.assertIn("ops-hq-disk", rows)
+        row = rows["ops-hq-disk"]
+        self.assertEqual(row["why"], "manual")      # '직접 할 일'
+        self.assertTrue(row["urgent"])              # due today
+        self.assertEqual(row["category"], "dev")    # ops ∈ DEV_TAGS
+        self.assertEqual(set(row), HumanWhyDecisionVsTodo.KEYS)
+
     def test_needs_decision_truthy_values(self):
         items = M.ITEMS
         for i, (val, want) in enumerate([("true", True), ("yes", True), ("1", True),
