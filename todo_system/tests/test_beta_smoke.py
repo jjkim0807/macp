@@ -1096,3 +1096,128 @@ def test_launch_line_is_pure_and_pinned(tmp_path, monkeypatch):
     assert cmd == ('~/android/platform-tools/adb shell am start -n "$pkg"/.MainActivity '
                    "--ez k true >/dev/null 2>&1")
     assert secrets == []                              # a literal value is not a secret
+
+
+# ---------------------------------------------------------------------------
+# clock / timezone step — pure parser + node script builders
+# ---------------------------------------------------------------------------
+
+import zoneinfo  # noqa: E402 — grouped with the clock-step block
+
+
+def _has_tz(name: str) -> bool:
+    try:
+        zoneinfo.ZoneInfo(name)
+        return True
+    except Exception:       # noqa: BLE001 — no tzdata on this host
+        return False
+
+
+needs_seoul = pytest.mark.skipif(not _has_tz("Asia/Seoul"), reason="no tzdata for Asia/Seoul")
+_ADB = "~/android/platform-tools/adb"
+
+
+def test_parse_clock_step_epoch_int_and_digit_string():
+    want = dt.datetime.fromtimestamp(1762941000, dt.timezone.utc).strftime("%m%d%H%M%Y.%S")
+    for raw in (1762941000, "1762941000", " 1762941000 "):
+        spec = bs.parse_clock_step({"set_time": raw})
+        assert spec == bs.ClockSpec(epoch=1762941000, timezone=None, restart_app=False)
+        assert spec.utc_stamp == want
+
+
+@needs_seoul
+def test_parse_clock_step_naive_time_is_read_in_the_step_timezone():
+    spec = bs.parse_clock_step({"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul"})
+    assert spec.timezone == "Asia/Seoul"
+    assert spec.utc_stamp == "111209502026.00"           # 18:50 KST = 09:50 UTC
+
+
+def test_parse_clock_step_naive_time_without_timezone_is_utc():
+    assert bs.parse_clock_step({"set_time": "2026-11-12 18:50"}).utc_stamp == "111218502026.00"
+    assert bs.parse_clock_step({"set_time": "2026-11-12T18:50:30"}).utc_stamp == "111218502026.30"
+
+
+def test_parse_clock_step_explicit_offset_wins():
+    assert bs.parse_clock_step({"set_time": "2026-11-12T18:50+09:00"}).utc_stamp == "111209502026.00"
+
+
+@needs_seoul
+def test_parse_clock_step_timezone_only_and_restart():
+    spec = bs.parse_clock_step({"timezone": "Asia/Seoul", "restart_app": True})
+    assert spec == bs.ClockSpec(epoch=None, timezone="Asia/Seoul", restart_app=True)
+    assert spec.utc_stamp is None
+
+
+def test_parse_clock_step_without_clock_keys_is_none():
+    assert bs.parse_clock_step({"tap": "x"}) is None
+    assert bs.parse_clock_step({"name": "n", "expect": {"kind": "text_matches"}}) is None
+
+
+@pytest.mark.parametrize("step", [
+    {"set_time": "tomorrow"},
+    {"set_time": ""},
+    {"set_time": True},
+    {"set_time": 1.5},
+    {"set_time": [1]},
+    {"set_time": None},
+    {"set_time": 5},                                  # out of range (1970)
+    {"set_time": 1762941000000},                      # milliseconds, not seconds
+    {"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul; reboot"},
+    {"timezone": "../etc"},
+    {"timezone": "Not/AZone"},
+    {"timezone": 123},
+    {"timezone": ""},
+    {"set_time": 1762941000, "restart_app": "yes"},
+    {"restart_app": True},                            # restart alone is not a clock step
+])
+def test_parse_clock_step_rejects_bad_values_with_a_message(step):
+    with pytest.raises(ValueError) as ei:
+        bs.parse_clock_step(step)
+    assert str(ei.value).strip()
+
+
+@needs_seoul
+def test_clock_script_order_and_arguments():
+    spec = bs.parse_clock_step({"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul",
+                                "restart_app": True})
+    s = bs.clock_script(spec, "com.example")
+    assert s.startswith("set -e; ")
+    assert f"{_ADB} root >/dev/null 2>&1 || true" in s
+    assert f"{_ADB} shell settings put global auto_time 0" in s
+    assert f"{_ADB} shell settings put global auto_time_zone 0" in s
+    assert f"{_ADB} shell setprop persist.sys.timezone Asia/Seoul" in s
+    assert f"{_ADB} shell date -u 111209502026.00 >/dev/null" in s
+    assert s.endswith('echo "$prev"')
+    order = [s.index(k) for k in (f"{_ADB} root", "wait-for-device", "getprop persist.sys.timezone",
+                                  "auto_time 0", "setprop persist.sys.timezone",
+                                  "date -u", "am force-stop com.example",
+                                  "monkey -p com.example")]
+    assert order == sorted(order)
+    assert "'~" not in s and '"~' not in s           # ~ stays unquoted → node expands it
+
+
+def test_clock_script_time_only_leaves_the_zone_alone():
+    s = bs.clock_script(bs.parse_clock_step({"set_time": "2026-11-12T18:50+09:00"}))
+    assert "auto_time 0" in s and "date -u 111209502026.00" in s
+    assert "auto_time_zone" not in s
+    assert "setprop" not in s
+    assert "force-stop" not in s and "monkey" not in s
+
+
+@pytest.mark.parametrize("pkg", [None, "", "com.x; reboot", "com/x"])
+def test_clock_script_restart_needs_a_valid_pkg(pkg):
+    spec = bs.ClockSpec(epoch=1762941000, timezone=None, restart_app=True)
+    with pytest.raises(ValueError):
+        bs.clock_script(spec, pkg)
+
+
+def test_clock_restore_script():
+    s = bs.clock_restore_script("Europe/London")
+    assert "set -e" not in s                          # best-effort: every line runs
+    assert f"{_ADB} shell settings put global auto_time 1" in s
+    assert f"{_ADB} shell settings put global auto_time_zone 1" in s
+    assert s.endswith(f"{_ADB} shell setprop persist.sys.timezone Europe/London")
+    for bad in ("", None, "x;y", "a b"):
+        r = bs.clock_restore_script(bad)
+        assert "auto_time 1" in r
+        assert "setprop" not in r
