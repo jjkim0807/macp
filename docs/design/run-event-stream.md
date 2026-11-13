@@ -441,7 +441,7 @@ ingest 해도 **같은 것**이 흐른다. ② **기본은 가장 보수적**: �
 | `Agent`(서브에이전트) | 타입 · 프롬프트 길이 · `parent_tool_use_id` | 프롬프트 본문, 결과 본문 | 서브에이전트의 도구 호출은 `parent_tool_use_id` 로 매달린다(§2.4 ⑫) |
 | 프롬프트(`-p` 본문) · `thinking` 블록 · transcript `queue-operation.content`·`lastPrompt` | 프롬프트 sha256 + bytes / thinking **블록 수** | **원문 전부** | 프롬프트엔 태스크 본문·related.md·프로젝트 메모리가 들어 있다 |
 | `agent.message` · `agent.question` · `progress.note` · `run.finished.summary` · `approval.*.summary/note` | 전역 마스킹 + ≤ 2 KiB 절단 | 전역 패턴에 걸린 값 | 에이전트가 본문에 비밀을 인용할 수 있다 |
-| `stage.started` 의 작업 디렉토리 · `system/init.cwd` | `cwd_kind: vault 또는 checkout` | 절대 경로 | 공개 리포 식별자 규율과 같은 이유(`/home/<user>`·`/Users/<user>`) |
+| `stage.started` 의 작업 디렉토리 · `system/init.cwd` | `cwd_kind: vault 또는 checkout` | 절대 경로 | 공개 리포 식별자 규율과 같은 이유(리눅스·맥 홈 디렉토리 접두가 사용자 이름을 드러낸다) |
 | `stage.usage` · `stage.finished` · `state.transition` · `checkpoint.pushed` · `artifact.written` | 숫자·sha·상대 경로 | — | 메타만 — 마스킹 대상 아님 |
 
 ### 4.2 전역 마스킹 패턴 (코드가 쓸 정규식의 **종류** — 정확한 정규식은 S2 가 테스트와 함께 확정)
@@ -452,7 +452,7 @@ ingest 해도 **같은 것**이 흐른다. ② **기본은 가장 보수적**: �
 | 키=값 비밀 | `token=`·`password=`·`passwd=`·`secret=`·`api_key=` 뒤의 값, `Authorization:`·`Bearer ` 뒤의 값, `MACP_*_TOKEN=` 류 env 대입 | `<token>` |
 | 인증번호 | `인증`·`승인`·`확인`·`code`·`OTP`·`verification`·`PIN` 이 앞뒤 40자 안에 있는 **4~8자리 숫자** | `<otp>` — **해시 없음** |
 | 이메일 · 전화 · 주민번호 형태 | `local@domain`, `01x-xxxx-xxxx`·`+82…`, `6자리-7자리` | `<email>` · `<phone>` · `<id>` |
-| 홈 경로 | `/home/<user>`·`/Users/<user>` 접두, `CLAUDE_CONFIG_DIR` 하위 경로 | `~` · `<config-dir>` |
+| 홈 경로 | `/home/<user>` 접두와 맥의 사용자 홈 접두, `CLAUDE_CONFIG_DIR` 하위 경로 | `~` · `<config-dir>` |
 | 긴 base64 blob | 데이터 URI·이미지·바이너리 덤프(`data:…;base64,`) | `<blob N bytes>` |
 
 마스킹기는 **보수적**이다 — 오탐(git sha 가 `<token>` 으로 가려지는 일)은 감수하고, 누락을 피한다. 패턴은
@@ -470,3 +470,189 @@ S2 의 테스트는 **같은 픽스처에서** ① `tool.called{tool:"Bash", inp
 (`capture.py:28-33` "private context and never leave the local config dir").
 
 ---
+
+## §5 그래프 메모리 연결 — 이벤트에서 에피소드·provenance 로 넘기는 경로 (graph-memory.md 와 맞춤)
+
+### 5.1 이벤트 → 에피소드 = **요약·메타만** (R5)
+
+에피소드 본문은 임베딩된다(`graph-memory.md` §3.4 — 요약·메타만 벡터화; R5 `:168-178` "임베딩 입력에도 동일
+경계"). 그래서 이벤트에서 에피소드로 넘어가는 것은 **엔진이 `events.ndjson` 에서 기계적으로 만든 런 통계
+블록**이고, 발췌·텍스트는 **어떤 형태로도** 넘어가지 않는다.
+
+| 런 통계 블록(`run_stats`) 필드 | 출처 이벤트 | 비고 |
+|---|---|---|
+| 스테이지별 `rc` · `outcome` · `duration_ms` | `stage.finished` | |
+| 스테이지별 `num_turns` · 토큰 4종 · `total_cost_usd` | `stage.usage` | ③ stages.json `usage.<stage>` 와 **같은 수치**(같은 `report_usage` 결과를 이벤트로도 낸다) |
+| 도구별 호출 수 · 오류 수(예: `Bash 37 (err 2) · Read 20 · Edit 9 · Write 3`) | `tool.called` · `tool.result{is_error}` 집계 | 도구 **이름과 숫자**만 |
+| `sensitive` 호출 수(SMS·메일·브라우저·비밀 경로) | `tool.called{sensitive:true}` 집계 | "이 런이 민감 채널을 N 번 썼다" — 내용 없음 |
+| 건드린 경로 **수**(Write/Edit 대상 상대 경로 집합 크기) | `tool.called{category:file_write}` | 경로 **목록**은 넣지 않는다(run dir 의 이벤트에만) |
+| `blocked_on` · verdict · `review_required` · `pr_url` · `merged` · `no_op` | `run.finished` | |
+| `capacity.limited` 횟수 · `api.retry` 횟수 · `stream.truncated` 여부 · `tool_events` | 해당 kind · `stream.meta` | "이 기록이 불완전한가"를 에피소드가 스스로 밝힌다 |
+| `head_sha` · `merge_sha` | `checkpoint.pushed` · `run.finished{merged}` | §5.2 provenance 의 `commit_sha` |
+| **제외** | 모든 `*_excerpt` · `agent.message`/`agent.question` 텍스트 · 프롬프트 sha256(해시도 불필요) · `approval.*` summary/note · URL host | 한 줄도 에피소드에 들어가지 않는다 |
+
+**넣는 자리.** report 스테이지가 쓰는 에피소드(`.claude/commands/worker-report.md:123-154`)에 `## 런 통계`
+섹션을 두되, **에이전트가 쓰는 것이 아니라 엔진이 생성한 블록을 그대로 붙인다** — related.md(④)처럼 러너가
+report 스테이지 **시작 전** run dir 에 `run_stats.md`(사람·에이전트용 md)와 `run_stats.json`(기계용)을 쓰고,
+report 프롬프트는 "이 파일을 `## 런 통계` 아래 그대로 붙여라"만 지시한다. 프롬프트 변경은 `.claude/commands/**`
+하드 가드 때문에 `Worker/proposals/` 경유다(§6 S5·§6.3). report 스테이지가 없는 quick/delegate 런은 에피소드가
+없으므로 `run_stats.json` 만 남고, 그래프 메모리 색인기가 그것을 직접 읽는 것은 후속(비범위)이다.
+
+### 5.2 provenance = `run_id` + `commit_sha` — 열은 이미 있다, 스트림은 **값의 출처**를 준다
+
+- graph_memory edges 는 nullable `run_id`·`commit_sha` provenance 열을 **이미 가진다**(G1 landing —
+  `graph_memory.py:7-13` 독스트링, `_PROVENANCE_COLUMNS` `:157`, 스키마 `:176-177`, 질의 반환 `:1378-1379`).
+  에피소드 frontmatter 에도 `run_id` 가 **이미 있다**(`worker-report.md:135`). R2(`graph-memory.md:137-144`)
+  "출처는 식별자가 아닌 run/commit 참조로만" 과 정합.
+- 지금 **없는 것은 `commit_sha` 의 값**이다 — 에피소드 템플릿에 커밋 sha 칸이 없고, 에이전트가 적는 sha 는
+  `_author_run_id` 처럼 약한 증거다. 스트림이 그 값을 **기계적으로** 준다: `checkpoint.pushed{sha}`(implement
+  완료 시 origin 에 올린 tip), `run.finished{merged, pr_url}`, `artifact.written{sha256}`. §5.1 블록의
+  `head_sha`/`merge_sha` 가 에피소드 frontmatter `commit_sha:` 로 들어가고(템플릿 1줄 추가 → proposals),
+  색인기 `edges_from_file`(`graph_memory.py:261-290`)이 frontmatter 의 `run_id`·`commit_sha` 를 그 파일에서
+  나온 모든 edge 의 provenance 열로 옮긴다.
+- 효용(R1×R2): 같은 태스크의 뒤 run 이 다른 결론을 내면 새 에피소드의 `run_id` 가 더 늦고 `commit_sha` 가
+  다르다 — "무엇이 언제 어느 run 에서 뒤집혔나"의 tombstone 판정(`valid_until`)에 **어느 run 이 최신인가**를
+  `run_id` 타임스탬프로 결정할 수 있다.
+
+### 5.3 bi-temporal 대응 — `ts` 는 valid time 의 재료, `seq` 는 시간축이 아니다
+
+| graph-memory 축 | 이 스트림에서 오는 값 | 규칙 |
+|---|---|---|
+| `event_date`(valid time, `graph-memory.md:128`) | 이벤트 `ts` 의 **날짜** — 런 단위 사실은 `run.finished.ts` 의 날짜(자정을 넘긴 런은 끝난 날) | 에피소드 frontmatter `event_date`(`worker-report.md:133`)와 같은 값. 밀리초 `ts` 는 그래프엔 과하다 — R1 의 "사건 시각"은 결정이 내려진 날·실패가 난 run 의 날짜 수준(`:128-131`)이라 **날짜로 내린다** |
+| `recorded_at`(transaction time, `:129`) | **색인 시각** — 색인기가 그 에피소드/통계를 DB 에 쓴 `datetime.now()`(`graph_memory.py:272`, `:373`) | 이벤트의 `ts` 가 아니다. 런이 어제 끝났어도 오늘 색인됐으면 `recorded_at` 은 오늘 |
+| `valid_until`(`:130-131`) | 같은 태스크의 **뒤 run** 이 사실을 뒤집을 때 그 run 의 `run.finished.ts` | tombstone — 삭제가 아니다 |
+| (없음) | `seq` | **저장하지 않는다.** `seq` 는 런 **내부** 순서·tie-break·커서(§2.1)이고 그래프에는 "런 안에서 몇 번째"가 의미 없다. 런 내부 재생은 `events.ndjson` 의 영역 |
+
+### 5.4 trace.py 와의 관계 — `artifact.written` 이 가장 강한 authorship 증거가 된다
+
+지금 `artifact_origin`(`trace.py:66-80`)은 두 증거를 순서대로 본다: `inherited_from` 스탬프(강, `stages.py:2535`,
+`read_provenance` `:2605`) → frontmatter `run_id`(약, `_author_run_id` `trace.py:49-54` — "에이전트가 틀린 id 를
+적을 수 있고 run.log 엔 아예 없다"). `artifact.written{path, sha256, bytes, by, stage}` 는 **세 번째이자 가장
+강한** 증거다 — 에이전트가 적는 것이 아니라 **러너가 스테이지 끝에 그 바이트의 파일을 보고 해시**했다. 그래서
+S5 뒤의 판정 순서는: (1) 그 run 의 `artifact.written` 에 같은 상대 경로·같은 sha256 이 있으면 `own`(결정적),
+(2) 없고 `inherited_from` 스탬프가 있으면 `inherited`(그리고 사본의 sha 는 원 run 의 `artifact.written` 과
+일치하므로 "어느 run 에서 왔나"를 sha 로 **역추적**할 수 있다), (3) 둘 다 없으면 `unknown`(frontmatter `run_id`
+는 설명용). `trace` 는 읽기 전용·순수 함수라는 설계(`trace.py:16-20`)는 그대로다 — `events.ndjson` 을 읽는 것도
+읽기다.
+
+### 5.5 재생·감사 뷰 — 같은 파일, 두 입구
+
+- **대시보드 이벤트 탭이 곧 재생 뷰**다 — §3.4 의 cursor GET 을 `since=0` 부터 페이지하면 지난 런의 재생이고,
+  `live` 면 실시간이다. 별도 재생 엔드포인트는 없다.
+- **`trace` CLI** 에 `--events` 를 더한다(S5): kind·도구 필터(`--kind tool.called --tool Bash`), 집계(`--stats`
+  = §5.1 블록과 같은 함수). 감사 질문의 전형 — "이 런이 `macp-sms` 를 불렀나" — 는 `tool.called{tool:"Bash",
+  input_excerpt: "macp-sms …"}` 의 존재로 답한다. **호출 사실은 있고 stdout 은 없다** — §4 의 의도된 비대칭이다.
+
+---
+
+## §6 단계별 구현 분할안
+
+> **분할 원칙**: expand → migrate → contract(parallel-change) 로 **각 leaf 가 단독으로 컴파일·테스트 green**.
+> 첫 leaf 는 소비자 없는 **additive 기록**(가장 안전·독립). 완료 조건은 전부 **로컬 명령** — "CI green" 금지
+> (Actions 미사용, [[Decisions/2026-09-11-no-github-actions-local-release-lane]]). 각 leaf 는 부모와 동일하게
+> `repo: jjkim0807/macp`, `touches` 는 아래 열거.
+
+### 6.1 leaf 목록 · depends_on 체인 · 로컬 검증
+
+| leaf | 단계 | 범위(touches) | depends_on | 로컬 검증 명령 |
+|---|---|---|---|---|
+| **S1** 이벤트 writer + 러너 라이프사이클 층 | expand | `todo_system/orchestrator/run_events.py`(신규 — 봉투·kind 상수·`RunEventWriter`(append·단조 `seq`·줄/런 캡·마스킹 훅 자리·`events.in/` 드롭박스 접기)·kill switch `MACP_RUN_EVENTS`(기본 on, `0` 끔)·위치 리졸버 `MACP_RUN_EVENTS_DIR`) + `todo_system/orchestrator/runner.py`(스테이지 루프에 `run.started`·`stage.started`·`stage.finished`·`stage.usage`·`artifact.written`·`checkpoint.pushed`·`capacity.limited`·`progress.note`·`run.finished` emit — **기록만, 소비자 없음**) + `docs/configuration.md`(env 2개) + `todo_system/orchestrator/tests/test_run_events.py`(신규) | **없음**(additive — 안전한 첫 leaf) | `uv run pytest todo_system/orchestrator/tests/test_run_events.py todo_system/orchestrator/tests/test_runner.py` · `uvx ruff check .` · `bash scripts/check_engine_isolation.sh`(stdlib only) |
+| **S2** claude 도구 이벤트 어댑터 + 마스킹기 + `event_stream` capability | expand | `todo_system/orchestrator/run_events_claude.py`(신규 — transcript tail 스레드, `ClaudeAgentBackend.run_stage` 안에서 `transcript_path` 글롭 재시도·종료 후 최종 sweep) + `todo_system/orchestrator/run_events_redact.py`(신규 — §4.1·4.2 → 코드, `redaction_profile=1`) + `todo_system/orchestrator/agent_backend.py`(`CAPABILITIES` 에 `event_stream`, claude `_CAPS`; `stages.required_capabilities` 에는 **넣지 않음**) + 픽스처 `tests/fixtures/claude_output/tool_use.json`(`capture.py` 레시피 확장: 합성 프롬프트로 Bash·Read 1회씩 — `macp-sms` 는 부르지 않고 `echo MACP-FIXTURE-CODE-000000` 류 **합성 명령**으로 마스킹 경로를 밟게) + 테스트 2개(신규) | **S1** | `uv run pytest todo_system/orchestrator/tests/test_run_events_claude.py todo_system/orchestrator/tests/test_run_events_redact.py` + **골든 무수정 green** `uv run pytest todo_system/tests/test_agent_backend_golden.py todo_system/tests/test_agent_backend.py` |
+| **S3** 대시보드 `GET /api/run/events` + `/api/run` 필드 + 웹 이벤트 탭 | expand→migrate | `scripts/macp_dashboard.py`(라우트·오프셋 캐시·`wait` long-poll 상한·`/api/run` 필드 3개·셸 "이벤트" 탭·escape) + `todo_system/tests/test_macp_dashboard.py`(**라우트 테스트** — 바인딩된 서버에 실제 GET, 픽스처 events 파일; 셸 계약 테스트) — parity 초안(§3.4)은 PR 본문에, 볼트 문서 반영은 S7 | **S1** | `uv run pytest todo_system/tests/test_macp_dashboard.py -k "RunEvents"` · `uvx ruff check .` |
+| **S4** 본부 ingest + 원격 업로더 | migrate | `todo_system/orchestrator/state_store_remote.py`(`POST /api/runs/<run_id>/events`, bearer 재사용, `(run_id, src_host, seq)` 멱등, `redaction_profile` 최소치 거부) + `run_events.py`(flush 훅 → 업로더, outbox 재사용) + `todo_system/orchestrator/tests/test_state_api_events.py`(신규) — 볼트 `.gitignore` 의 `Worker/remote/*/runs/*/events.ndjson` 한 줄은 **볼트 몫**(PR 본문에 명시, S7) | **S1** + state-store leaf ⑦(상태 API 서버, human_gate) 존재 | `uv run pytest todo_system/orchestrator/tests/test_state_api_events.py` |
+| **S5** 그래프 메모리 연결 + trace | migrate | `todo_system/orchestrator/run_stats.py`(신규 — §5.1 블록 → `run_stats.md`/`run_stats.json`, report 스테이지 시작 전 러너가 생성) + `Worker/proposals/<slug>/.claude/commands/worker-report.md`(`## 런 통계` 섹션 + frontmatter `commit_sha` — **헤드리스가 `.claude/**` 못 씀 → proposals, 사람 `cp`**) + `todo_system/graph_memory.py`(`edges_from_file` 이 frontmatter `commit_sha` 를 provenance 열로) + `todo_system/orchestrator/trace.py`(`artifact_origin` 1순위 = `artifact.written` sha; `--events`/`--stats`) + 테스트 | **S1, S2** | `uv run pytest todo_system/orchestrator/tests/test_run_events_stats.py todo_system/orchestrator/tests/test_trace.py todo_system/tests/test_graph_memory_bitemporal.py` |
+| **S6** stream-json 경로 + Gemini 어댑터 + PROGRESS contract | contract (**human_gate**) | `stages.py`/`agent_backend.py`(`MACP_RUN_EVENTS_SOURCE=stream-json`: `--output-format stream-json` + reader 스레드 + **stdout 재구성 어댑터** — `result.result` 를 기존 소비자가 읽는 텍스트 stdout 으로, stderr 경고 소실에 대한 모델캐시 훅 대응; transcript tail 은 fallback) + `todo_system/tests/test_agent_backend_golden.py`(**의식적 갱신**) + Gemini stream-json 어댑터(필드 **실측 캡처** 뒤) + PROGRESS 봉투→`progress.note` 파생 여부(contract — 봉투는 두되 `last_note` 를 이벤트에서 만들지)는 **사람 결정** | **S2, S3** | 전체 `uv run pytest -q` + 골든(갱신본) + `bash scripts/check_engine_isolation.sh` |
+| **S7** 사람 게이트 묶음 | human_gate | §3.2 보존·크기 숫자 승인 · §4.1 브라우저 host 마스킹 전환 여부 · 볼트 `docs/dashboard-parity.md` 에 §3.4 초안 반영 · 볼트 `.gitignore` 한 줄(S4) · Android 앱 짝 태스크 생성(`macp-dashboard-android`, **이 리포 밖**) · 자매 `docs/design/event-triggers.md:10,20-21,191` 의 "run-event-stream.md 미존재" 표기 갱신(후속 doc leaf, 이 리포) | **S3**(앱 짝·parity), **S4**(gitignore) | (사람 결정 — 로컬 명령 없음; doc leaf 는 `uvx ruff check .` + 식별자 스캔) |
+
+**depends_on 체인**: `S1 → {S2, S3, S4} → S5(S1, S2) → S6(S2, S3) → S7(S3, S4)`. 오케스트레이터 자동 분할이면
+**첫 서브태스크는 S1**(writer + 라이프사이클 emit — 소비자가 없는 순수 추가라 어떤 화면·판정도 바꾸지 않고,
+`MACP_RUN_EVENTS=0` 으로 바이트 동일 복귀)이고 나머지는 위 체인대로 `blocked` + `on_unblock: auto` + `depends_on`
+으로 직렬화한다. S2·S3·S4 는 S1 의 파일만 읽는 **서로 독립**한 소비자/생산자라 병렬 가능하다.
+
+### 6.2 라우트 수준 완료 조건 (§6 AC 의 teeth)
+
+부품(writer·마스킹기·파서)이 아니라 **배선**(러너가 쓰고 → 라우트가 돌려주고 → 화면이 그린다)을 완료 조건으로
+삼는다. 기억 부품 5개가 다 머지됐는데 `/v1/chat` 이 한 번도 부르지 않은 선례
+([[Notes/macp-worker-quality-root-causes-20261110]])를 피하는 규율이다. 각 배선 leaf 는 **새 프로덕션 호출
+위치**를 verify.md `## Wiring` 에 적는다.
+
+- **S1**: "**실제 스테이지 루프 1회**(테스트 하니스의 가짜 백엔드 — `test_runner.py` 가 쓰는 agent seam)가
+  `Worker/runs/<run-id>/events.ndjson` 에 `stream.meta` → `run.started` → `stage.started` → `stage.finished` →
+  `stage.usage` → `run.finished` 를 **그 순서·단조 `seq`** 로 남긴다 — `RunEventWriter` 단위 테스트만으로는 PASS
+  아님. `MACP_RUN_EVENTS=0` 이면 파일이 생기지 않는다(양성 대조군: 기본값에선 생긴다). Wiring = `runner.py` 의
+  emit 지점 줄."
+- **S2**: "픽스처 transcript 를 tail 해 `tool.called`/`tool.result` 가 **마스킹된 채** 나온다 — §4.3 의 세 단언
+  (합성 `macp-sms` 류 호출 행 **있음** · 그 결과의 `output_excerpt: null`·`sensitive: true` · 합성 코드 문자열
+  파일 전체 **0회**)이 한 테스트에. 골든 테스트 **무수정** green. Wiring = `ClaudeAgentBackend.run_stage` 안의
+  tail 스레드 시작·종료 줄."
+- **S3**: "**실제 HTTP GET** `/api/run/events?id=<run>&since=0` 이 픽스처 이벤트를 `events[]` 로 돌려주고
+  `next_since`·`live`·`truncated`·`tool_events` 가 **서버 판정**으로 채워진다; `since=<next_since>` 재요청은 빈
+  배열 + 같은 `next_since`; `/api/run?id=` 에 `events_count`·`events_live`·`events_available` 이 있고 기존 키는
+  그대로다; 웹 run 상세 셸에 이벤트 탭이 그려진다(셸 계약 테스트). Wiring = `do_GET` 분기 줄 + 셸 JS 의 fetch."
+- **S4**: "**실제 POST**(바인딩된 상태 API 서버, bearer)가 본부 `Worker/runs/<run-id>/events.ndjson` 에 append 되고,
+  **같은 배치의 재전송**이 중복을 만들지 않으며(`(run_id, src_host, seq)`), `redaction_profile` 이 최소치 미만인
+  배치는 4xx 로 거부된다(양성 대조군: 최소치 이상은 200). Wiring = 서버 라우트 줄 + 러너 flush 훅 줄."
+- **S5**: "실제 events 픽스처에서 만든 `run_stats.md` 에 `*_excerpt`·프롬프트 해시·URL host 가 **0회**이고(양성:
+  도구별 호출 수 행은 있다); `artifact_origin` 이 sha 일치로 `own` 을, 사본은 `inherited` 를 판정한다; 에피소드
+  frontmatter `commit_sha` 가 edges 의 `commit_sha` 열로 들어간다. Wiring = 러너의 `run_stats` 생성 호출 줄 +
+  proposals 의 프롬프트 변경분(사람 `cp` 뒤에 verify)."
+- **S6**: "`stream-json` 모드 **실측 캡처** 픽스처에서 run.log tail·`is_capacity_limit` 판정·모델캐시 훅 입력이
+  transcript 모드와 **동일**하고, 전체 pytest + 갱신된 골든이 green."
+- S7 은 사람 결정이라 라우트 조건이 없다. S1~S6 의 "단위 테스트만 녹색" 은 어느 leaf 에서도 PASS 가 아니다.
+
+### 6.3 규약 · 범위 가드
+
+- **`.claude/commands/**` 변경**(S5 의 report 프롬프트)은 헤드리스 워커가 쓸 수 없다(하드 가드). 완성본을
+  `Worker/proposals/<slug>/` 에 두고 사람이 `cp` 한다 — 그 leaf 가 실제로 돌 때의 규약. 직접 편집하지 않는다.
+- **범위 가드**: 이 §6 은 **문서 내부 서술만**이다. 실제 `Todo/items/<slug>.md` leaf 파일은 **생성하지 않는다** —
+  설계 머지 뒤 **사람이 권장안을 보고 게이트를 풀 때** 생성한다(태스크 Spec·CLAUDE.md §3 "leaf 태스크 파일 생성
+  금지"). 이 run 은 macp 체크아웃에서 돌아 볼트 `Todo/` 를 쓰지도 못한다.
+- **볼트 측 변경**(`.gitignore` 한 줄 · `docs/dashboard-parity.md` 반영)은 이 리포의 PR 이 할 수 없다 — 해당 leaf
+  의 PR 본문에 명시하고 S7 이 맡는다. 자매 `event-triggers.md` 의 "미존재" 표기 갱신도 이 PR 에서 하지 않는다
+  (`touches` 는 이 파일 하나).
+- **"CI green" 금지** — 모든 완료 조건은 위 표의 로컬 명령이다.
+
+---
+
+## 부록: 이 노트가 확정한 설계 결정 요약
+
+1. **공백**: 런 기록은 열세 가지 파일·형식이 각자의 시점에 남고(§1.1), 런 중 갱신되는 것은 미독 transcript 와
+   한 줄 PROGRESS 봉투 둘뿐이다. 도구 호출 단위 기록은 transcript 에만 있고 아무도 읽지 않는다. 대시보드엔
+   스트리밍 엔드포인트가 없다(§1.2, §1.3).
+2. **소스 = 두 층**: 러너 라이프사이클 층은 **항상·모든 백엔드**(CLI 변경 0·원문 노출 0); 도구 단위 층은 백엔드
+   어댑터 — **claude 1차 transcript tail**(argv·stdout 의미 바이트 동일), **2차 stream-json**(kill switch
+   `MACP_RUN_EVENTS_SOURCE`, 골든 갱신 + stdout 재구성 어댑터 뒤), **Solar 직접**, **Gemini 후속 leaf**(공식
+   JSONL 스트림 확인·필드 미확인). **hooks 는 소스가 아니다** — 관측/통제 경계, 승인 카드 자매 소유(§2.3).
+3. **봉투**: `{v, run_id, seq, ts, stage, kind, src, payload[, src_host]}`; `v` 는 추가 호환·제거/의미변경 시 +1;
+   `seq` 는 런 내 순서(시간축 아님); 첫 줄 `stream.meta`; **파일당 writer 는 그 런의 러너 하나**, 다른 프로세스는
+   `events.in/` 드롭박스(§2.1). kind 22종, 승인 두 kind 는 자매가 생산 — 이름·필드만 예약(§2.2).
+4. **매핑**: 공식 문서 6개(최종 URL, 조회 2026-11-13) + 실측 픽스처로 15행; `tool_use`/`tool_result` 블록 필드와
+   Gemini 이벤트 필드는 **미확인** → S2/후속 leaf 의 실측 캡처로 확정. `stream_event`(토큰 델타)·hook 이벤트·
+   thinking·프롬프트 원문은 비채택(§2.4).
+5. **위치 정본 = `Worker/runs/<run-id>/events.ndjson`**(아티팩트와 한 폴더·같은 수명), XDG 디렉토리는
+   `MACP_RUN_EVENTS_DIR` override. 둘 다 **git 밖** — 크기·개인정보·`chore: sync vault state` 쓸림. M5 git 추적
+   전송·상태 SQLite 원본·mailbox 봉투는 기각(§3.1).
+6. **숫자(사람 게이트)**: 발췌 ≤ 2 KiB(+bytes+sha256) · 줄 8 KiB · 런 20 MiB(초과 시 `stream.truncated` 후 도구
+   payload 생략) · 보존 30일 또는 500 런, run dir 와 같은 수명 · 인증번호는 해시도 없음(§3.2).
+7. **원격 → 본부 = 본부 HTTP 상태 API 확장** `POST /api/runs/<run_id>/events`(bearer 재사용·NDJSON 배치·
+   `(run_id, src_host, seq)` 멱등·HQ-down 시 outbox·재마스킹 없음·`redaction_profile` 최소치 거부). 본부는 같은
+   run dir 파일에 append → 대시보드 경로 동일. 노출·토큰은 사람 게이트(§3.3).
+8. **대시보드 = cursor 증분 GET** `/api/run/events?id&since[&limit&wait≤25]` → `{events, next_since, live,
+   truncated, tool_events}`; **SSE 기각**(연결당 스레드 × 탭 수명 = 2026-10-22 사고 재현 경로, 터널 뒤 장수연결
+   미확인); 재생·감사·실시간이 한 엔드포인트; `/api/run` 은 필드 추가만; 판정은 서버·웹·앱 동일(parity 초안 포함)(§3.4).
+9. **개인정보 = 쓰는 순간 writer 1곳 마스킹** + 도구별 제외표: SMS·메일 stdout 전부 제외(해시 없음), 브라우저
+   본문·스크린샷·path/query 제외(host 만), 에뮬레이터 aggregates only, 파일 도구는 경로·bytes·sha 만, 프롬프트·
+   thinking 비수록; 전역 패턴(토큰·키=값·OTP·이메일·전화·홈경로·blob); `redaction_profile` 버전; 네거티브 단언은
+   양성 대조군과 함께(§4).
+10. **그래프 메모리 = 요약·메타만**: 엔진 생성 `run_stats`(스테이지 rc·usage·도구별 수·민감 호출 수·경로 수·
+    verdict·sha) → report 에피소드 `## 런 통계`(proposals 경유); provenance `run_id`+`commit_sha`(열 이미 존재,
+    값은 `checkpoint.pushed`·`run.finished` 에서); `event_date` ← `ts` 날짜, `recorded_at` ← 색인 시각, `seq` 는
+    저장 안 함; `artifact.written{sha256}` 이 trace 의 1순위 authorship 증거(§5).
+11. **분할 = `S1 → {S2, S3, S4} → S5 → S6 → S7`**(expand→migrate→contract). **S1(writer + 러너 라이프사이클
+    emit, 소비자 없음)이 additive 라 안전한 첫 leaf**. S6(stream-json·골든 갱신·PROGRESS contract)·S7(숫자·parity·
+    앱 짝·gitignore)은 human_gate(§6.1).
+12. **라우트 수준 완료 조건**: S1 "실제 스테이지 루프가 파일을 남긴다", S3 "실제 GET 이 이벤트를 돌려주고 탭이
+    그려진다", S4 "실제 POST 가 append 되고 재전송이 중복을 안 만든다" — 단위 테스트만으로는 어느 leaf 도 PASS
+    아님; 새 호출 위치를 verify.md `## Wiring` 에(§6.2).
+13. **범위**: 이 노트는 설계만 — leaf 태스크 생성·`.claude/commands` 적용·볼트 문서 반영은 **머지 뒤 사람 게이트**.
+    이 run 은 macp 체크아웃이라 볼트 `Todo/` 를 쓰지 못한다(§6.3).
