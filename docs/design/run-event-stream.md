@@ -305,3 +305,168 @@ transcript 에 없는 줄인데, 그 값어치는 어댑터·골든 갱신 비�
   읽는 env, 명시적 0 만 끔" 규칙).
 
 ---
+
+## §3 기록·전달 — 위치 · 크기·보존 · 원격 러너 → 본부 · 대시보드 구독
+
+### 3.1 파일 위치 — 정본 `Worker/runs/<run-id>/events.ndjson`, 둘 다 "git 밖"
+
+| 후보 | git 추적? | 대시보드 읽기 경로 | 스테이지 `--add-dir` 가시성 | 클라우드 인수 상속 | 개인정보 노출면 | 판정 · 근거 |
+|---|---|---|---|---|---|---|
+| **★ `Worker/runs/<run-id>/events.ndjson`** | **✗** — 볼트 `.gitignore:75` 가 `Worker/runs/` 디렉토리 전체를 비추적 | `RUNS / run_id` 바로(`macp_dashboard.py:83`, `collect_run_detail` `:426`) — 경로 추가 없이 **같은 폴더** | ✓ 에이전트가 자기 런의 이벤트를 **읽을** 수 있다(쓰기는 writer 만, §2.1) | ✗ 호스트 로컬 — ③ stages.json·② run.log 와 **같은 수명** | run dir 에 이미 있는 run.log·screens 와 동일 면 | **정본.** 아티팩트·stages.json·run.log 와 한 폴더라 trace(`trace.py`)·재생·대시보드가 **한 경로**를 읽고, 재시도 체인(`inherit_artifacts` `stages.py:2626`)·디스크 가드 sweep 이 디렉토리 단위로 함께 다룬다 |
+| XDG `~/.local/share/macp/events/<run-id>.ndjson` | ✗ 볼트 밖 | 경로 하나 더 읽어야(`MACP_RUN_EVENTS_DIR` 해석) | ✗ add-dir 밖 — 에이전트가 **못 읽는다**(그걸 원하는 호스트가 있다) | ✗ | run dir 와 **분리** — SMS 스토어 선례 0700/0600(`sms.py:88`, `:119-123`) | **선택 가능 override.** `MACP_RUN_EVENTS_DIR` env → `.macp/config.toml` 키 `run_events_dir` → 기본값 "run dir" 의 세 단계 리졸버(`docs/configuration.md:16-42` 패턴; XDG 기본값 선례 `MACP_STATE_SQLITE_PATH` `:57`). external 모드의 `state.sqlite` 와 같은 디렉토리에 두는 대칭이 성립한다 |
+| `Worker/remote/<host>/runs/<run-id>/events.ndjson` **git 추적**(M5 전송 트리) | ✓ 추적되어 버린다(`.gitignore:142-145` — `runs/` 는 전송, `*.log` 만 제외; `worker.py:79-81`) | 본부 볼트에 pull 되면 보임 | — | ✓(그래서 위험) | **영구 히스토리**에 도구 I/O 발췌가 남는다 | **기각.** 셋 다 치명: 크기(런당 MiB 급 × 하루 수십 런 → 볼트 리포 비대), 개인정보(마스킹 뒤에도 발췌가 영구 git 히스토리로), `chore: sync vault state` 커밋에 쓸린다(`worker.py:2584-2590` — remote/ 는 git 이 "백업이 아니라 전송"인 곳) + push 주기만큼 지연. §6 S4 가 볼트 `.gitignore` 에 `Worker/remote/*/runs/*/events.ndjson` 한 줄을 요구한다(볼트 몫·사람) |
+| 외부 상태 SQLite(`state.sqlite`)의 events 테이블 | ✗ | 상태 API 경유 | ✗ | ✓(external 모드) | DB 안 | **기각(원본으로는).** 행 단위 append 로그는 **파일**이 맞다 — tail·바이트 커서·sha 가 자연스럽고 writer 가 하나다. `state-store.md:260-262` 는 `runs/` 를 "호스트 로컬 런타임 — 이관 대상 아님" 으로 두고, external 모드에서도 `Worker/runs/` 는 호스트 로컬로 남는다 → 동거가 자연스럽다. 색인·질의가 필요한 것은 §5 의 **요약 블록**이고 그것이 SQLite 로 간다(이벤트 원본은 아님) |
+| PROGRESS 봉투로 mailbox 전송 | ✓(git mailbox 면) | ledger | — | ✓ | 봉투 | **기각.** 봉투는 ledger 상태기계의 **입력**(`apply_reply` `assignment.py:207`)이고 소비 후 삭제된다(`worker.py:2584`); 도구 이벤트 수백 건을 봉투로 보내면 git 전송 시 커밋 폭주, `last_note` 200자 설계와 충돌 |
+
+두 후보가 **모두 "git 밖"인 이유**를 적어 둔다 — 셋이다: **크기**(§3.2 숫자), **개인정보**(마스킹해도 도구
+I/O 발췌·URL host·경로 basename 이 남는다 — 공개 리포도, 사람의 영구 히스토리도 아닌 **호스트 로컬 보존**이
+맞다), **`chore: sync vault state` 커밋에 쓸리지 않음**(todo-sync 데몬이 볼트 추적 파일을 자동 커밋·push 한다).
+로컬(본부) 러너는 파일에 **직접** 쓰고, 원격 러너는 자기 호스트의 같은 경로에 쓴 뒤 §3.3 으로 올린다.
+
+### 3.2 크기·보존 — 숫자와 근거 (**사람 게이트**: 숫자는 제안이고 머지 뒤 사람이 확정한다)
+
+| 항목 | 제안 | 근거 |
+|---|---|---|
+| 이벤트당 발췌(`*_excerpt`) | **≤ 2 KiB** = head 1 KiB + `…[N bytes omitted]…` + tail 1 KiB; 원문 전체의 `*_bytes` 와 `*_sha256` 은 항상 | 길이·동일성(같은 명령을 두 번 돌렸나)은 해시로 답하고, 내용은 "무슨 명령이었나" 를 알아볼 발췌만. 1 KiB 는 git·pytest 출력의 첫·마지막 화면 한 장 |
+| 이벤트 1줄 하드캡 | **8 KiB**(payload 직렬화 기준). 초과 시 발췌를 더 줄이고 `truncated: true` | tail·cursor 구현이 "한 줄 = 한 read" 로 단순해지는 상한. `MAX_BODY=4000` 자(`sms.py:53`)의 2배 |
+| 런당 상한 | **20 MiB**. 초과 시 `stream.truncated{reason: run_cap}` 1건 뒤 **도구 payload 생략**(라이프사이클 kind 는 계속) | 형제 런 implement = 46턴(stages.json 실측); 턴당 도구 호출 3~5 → 이벤트 ~2×(3~5)×46 ≈ 300~450건 × 평균 1~2 KiB ≈ **0.5~1 MiB/스테이지**, 5 스테이지 ≈ 3~5 MiB. 최악은 `STAGE_MAX_TURNS` implement 200(`stages.py:405`) × 10 이벤트 × 2 KiB ≈ 4 MiB/스테이지 → 20 MiB 는 평균의 4~6배, 최악의 1배 여유 |
+| 보존 | **30일 또는 최근 500 런 중 먼저 도달** — run dir 와 **같은 수명**(events 만 먼저 지우지 않는다) | SMS 7일(`sms.py:52`)보다 긴 이유: 실패 진단은 "최신 run 부터"이지만 재시도 체인·`inherit_artifacts` 가 **며칠 전 run** 을 되읽고, 재발 비교(같은 태스크의 지난 런)는 주 단위다. 7일로 줄여도 설계는 바뀌지 않는다 — **사람 결정**. events 만 먼저 지우면 "아티팩트는 있는데 이벤트만 없는 run" 이 생겨 trace 가 두 종류의 부재를 구분해야 하므로 비권장 |
+| 집행 주체 | 러너 **run-start sweep**(디스크 가드가 run dir 를 다루는 자리 — `record_disk_guard` `stages.py:2243` 가 기록하는 그 가드) | 틱마다가 아니라 런 시작 시 1회 — 비용이 런 수에 비례 |
+| 짧은 비밀 | 인증번호(4~8자리)·PIN 은 **해시도 남기지 않는다** — `<otp>` 치환만 | sha256 이라도 10^8 공간은 브루트포스로 복원된다(§4) |
+
+### 3.3 원격 러너 → 본부 — 본부 HTTP 상태 API 확장 (1차), 기각안 둘
+
+**1차 권장 = `state_store_remote serve`(본부 HTTP 상태 API, `docs/configuration.md:118-144`)에 엔드포인트
+하나 추가**: `POST /api/runs/<run_id>/events`.
+
+- **인증**: 기존 bearer 재사용 — `MACP_STATE_REMOTE_TOKEN`/`_TOKEN_FILE`, env-only·config 키 없음·로그 금지
+  (`configuration.md:59`, `:137-139`). 토큰 값·host 는 이 문서에도 코드에도 적지 않는다.
+- **본문**: NDJSON 배치 — 원격 파일의 줄을 **그대로**(이미 마스킹된 상태, `redaction_profile` 포함). 요청마다
+  `X-Macp-Host: <host_label>`(합성 라벨) — 본부가 `src_host` 로 붙인다.
+- **멱등**: `(run_id, src_host, seq)` 가 키. 본부는 호스트별 마지막 `seq` 를 기억하고 중복은 버린다 → 재전송이
+  중복을 만들지 않는다(§6.2 S4 의 라우트 AC). 응답 `{accepted, next_seq}`.
+- **본부 측 저장**: `Worker/runs/<run-id>/events.ndjson` 에 append(디렉토리 없으면 생성 + `remote_host` 마커
+  파일) → **대시보드 경로가 로컬 런과 동일**(§3.4 가 그냥 읽는다). 아티팩트(①)는 지금처럼 M5 git 전송
+  (`Worker/remote/<host>/runs/`)으로 오고, 이벤트만 HTTP 로 온다 — 둘의 `run_id` 가 같아 trace 가 묶는다.
+- **HQ 다운**: 러너는 기존 **host-local append-only outbox**(`configuration.md:143-144`) 에 배치를 append 하고
+  계속 돈다(이벤트는 관측이라 상태 API 와 달리 **러너를 멈추지 않는다**); 복구 시 순서대로 flush. 원격 파일이
+  정본 사본이라 outbox 가 유실돼도 재업로드(`since=<본부 next_seq>`) 가 가능하다.
+- **업로더**: 러너의 writer 가 N초(제안 5 s) 또는 N KiB(제안 64 KiB) 마다 flush 하는 훅 — "원격 런도 본부 화면에
+  근실시간" 이 목적. 스테이지 종료 시 강제 flush.
+- **재마스킹 없음**: 본부는 받은 줄을 다시 마스킹하지 않는다(원격 writer 가 끝냈다). `redaction_profile` 이 본부
+  최소치보다 낮으면 **거부(4xx)** — 옛 엔진의 원격 러너가 덜 마스킹된 줄을 올리는 사고를 막는다. 거부 시 러너는
+  라이프사이클 kind 만 올린다(degrade).
+
+**기각안.** (ⅰ) **git 추적 전송**(§3.1 셋째 행) — 크기·개인정보·영구 히스토리·지연. (ⅱ) **git mailbox 봉투**로
+이벤트 전송 — 봉투 1통 = 커밋 1개 모양이라 수백 건이 커밋 폭주를 만들고, ledger 상태기계 입력과 섞인다.
+(ⅲ) **본부가 원격 파일을 pull**(ssh/scp) — 스테이지 금지 도구이고 원격 호스트의 인바운드 노출을 요구한다.
+
+**사람 게이트.** 네트워크 노출면(테일넷 안에서만 리슨 등)·토큰 프로비저닝·`redaction_profile` 최소치는
+`state-store.md` leaf ⑦(`:369-373`, human_gate)과 같은 게이트에서 사람이 정한다. §6 S4 는 그 leaf ⑦ 이
+존재해야 돈다(상태 API 서버가 있어야 엔드포인트를 더할 수 있다).
+
+### 3.4 대시보드 구독 — SSE 기각, cursor 증분 GET 권장, 웹·앱 동일 계약
+
+**운영 전제(확인된 것).** 서버는 stdlib `ThreadingHTTPServer`(`macp_dashboard.py:50`, `:2775`) — **연결당
+스레드 1개**, 연결이 살아 있는 동안 스레드가 산다. `/api/status` 는 2026-10-22 에 요청 적체로 **110 스레드**가
+futex 에 걸려 앱이 본부에 닿지 못했고, 수정은 `_StatusCache` 단일 비행(`:2460-2474`)이었다. 프로덕션 모양은
+loopback + `tailscale serve`(TLS 종단 뒤 plain http, `:19-28`, `:2641-2643`). **장수 연결이 그 프록시 뒤에서
+어떻게 끊기는지(idle timeout)는 이 체크아웃만으로 확정할 수 없다 → 미확인.**
+
+| 방식 | 스레드 모델 비용 | 프록시·터널 장수연결 리스크 | 재생·감사 재사용 | 웹·앱 동일성 | 2026-10-22 사고 대비 |
+|---|---|---|---|---|---|
+| **SSE** `GET /api/run/stream?id=` | 열린 run 상세 탭마다 **무기한 스레드 1개** — 클라이언트 수 × 런 수 | **미확인**(tailscale serve·devtunnel 의 idle timeout) — 끊기면 클라이언트 재접속 폭주 | ✗ 과거 런 재생엔 **별도** 엔드포인트 필요 | 웹은 `EventSource` 내장, 앱은 별도 SSE 클라이언트 코드 | **재현 경로**: 스레드가 요청 수가 아니라 **탭 수명**에 비례 → 단일 비행으로도 못 막는다 |
+| WebSocket | 같음 + 핸드셰이크 | 같음 | ✗ | 앱 별 코드 | stdlib 서버에 없음 — 새 의존성 |
+| **★ cursor 증분 GET** `GET /api/run/events?id=&since=` | `wait=0`(기본): 스레드 수명 = 응답 시간(ms) — 기존 3초 폴링과 **같은 모양**. `wait>0`(선택 long-poll): 최대 25 s, 동시 long-poll 상한(제안 8) 초과 시 **즉시 응답으로 degrade** | `wait≤25 s` 는 보수적 프록시 idle 30 s 미만; 연결은 매 응답마다 닫힌다 | **✓ 한 엔드포인트** — `since=0` 부터 `limit` 씩 페이지하면 재생이고, `since=next_since` 를 3초마다 치면 실시간이다 | **✓** 앱은 이미 `/api/status` 를 폴링한다(`docs/dashboard-parity.md`) — 같은 패턴, 새 프로토콜 없음 | 요청당 비용이 bounded(파일 오프셋부터 ≤ `limit` 줄) + 단일 비행 오프셋 캐시 → 적체 조건이 없다 |
+| plain poll(`/api/run` 전체 재전송) | 같음 | 없음 | ✗ 전체 재전송 | ✓ | 런당 20 MiB 를 3초마다 — 대역 폭주 |
+
+**권장 = cursor 증분 GET.** 계약:
+
+```
+GET /api/run/events?id=<run-id>&since=<seq>[&limit=<n, 기본 200, 최대 500>][&wait=<s, 기본 0, 최대 25>]
+→ 200 {"run_id": "...", "schema_version": 1, "events": [ {...}, ... ],
+       "next_since": <int>, "live": <bool>, "truncated": <bool>, "tool_events": <bool>}
+→ 404 {"error": "no events"}   (옛 런 — 파일 없음; 기존 /api/run 은 그대로 200)
+```
+
+- **판정 필드는 서버가 만든다**(parity 규칙): `live` = ledger 가 `dispatched`/`in_progress` **그리고** 파일 mtime 이
+  최근 N초(제안 120) 안 — 클라이언트는 bool 만 읽는다. `truncated` = `stream.truncated` 를 봤거나 `limit` 에
+  걸렸다. `tool_events` = `stream.meta.tool_events`.
+- **핸들러 비용**: `since` 이후만 읽는다 — run_id → `(last_seq, byte_offset)` 오프셋 캐시(`_StatusCache` 와 같은
+  per-server 단일 비행 `:2773`), 응답은 `limit` 줄 상한, 한 줄 ≤ 8 KiB(§3.2) 이므로 응답 ≤ 4 MiB.
+- **`/api/run?id=` 에는 필드 추가만**: `events_count` · `events_live` · `events_available`(bool). 기존 키(`stages`·
+  `artifacts`·`log_tail`·`ledger` …)는 불변 — 구 앱이 깨지지 않는다.
+- **렌더(웹)**: run 상세에 "이벤트" 탭. 시간순 목록, `kind` 배지, `stage` 구분선; 도구 이벤트는 `tool` · 발췌 ·
+  `bytes` · `sensitive` 배지 · `is_error` 색. `live` 면 3초마다 `since=next_since` 증분 append(전체 재렌더 아님),
+  `truncated` 면 "일부 생략" 표시, `tool_events:false` 면 "이 런은 도구 단위 기록 없음". **payload 는 데이터로
+  escape** 한다 — 이벤트 본문은 지시가 아니고, 발췌에 HTML/JS 가 섞여 있어도 텍스트다(event-triggers.md §4.4 와
+  동형; XSS 방어).
+
+**Parity 계약 초안**(머지 뒤 볼트 `docs/dashboard-parity.md` 에 사람이 옮긴다 — 이 리포는 볼트 문서를 고칠 수 없다;
+앱 짝 태스크는 `macp-dashboard-android` 별도 리포, 사람 게이트):
+
+> **Dashboard parity contract — 런 이벤트 탭** (웹 먼저, 앱이 따른다. 판정은 전부 서버, 클라이언트는 렌더만.)
+> **1. 데이터 계약(서버, 추가만)** — 새 라우트 `GET /api/run/events`(위 계약 그대로). `/api/run` 응답에
+> `events_count`·`events_live`·`events_available` 추가, 기존 키 불변. `live`·`truncated`·`tool_events` 는 서버 판정.
+> **2. 렌더(클라이언트)** — run 상세의 "이벤트" 탭(기본 접힘, 헤더에 `events_count`). `live` 면 3초 증분, 아니면 1회.
+> 도구 행 = `tool` 칩 + 발췌 1줄 말줄임 + `bytes` + `sensitive`/`is_error` 배지; 탭하면 발췌 전체(≤ 2 KiB). 모르는
+> `kind` 는 회색 배지에 값 그대로(구 클라이언트 안전). **3. 상태** — 탭 접힘 키 웹 `mdash.sec.run-events`, 앱 FoldStore
+> 같은 이름. **4. 제약** — 외부 네트워크 의존 없음, payload 는 escape 된 텍스트, 390px 가로 스크롤 0. **5. 테스트** —
+> `todo_system/tests/test_macp_dashboard.py` 의 `RunEventsRoute`(바인딩된 서버에 실제 GET) · `RunEventsShell`(셸 계약).
+
+---
+
+## §4 개인정보 경계 — 쓰는 순간 한 곳에서 마스킹, 도구별 제외표
+
+**원칙.** ① 마스킹은 **writer 한 곳**에서, **쓰는 순간**에 집행한다(`related_context.py:28-32` 가 R5 를 "렌더
+한 모듈에서 집행" `:245` 하는 것과 같은 모양; §6 S2 의 `run_events_redact.py`). 파일에는 마스킹된 것만 있으므로,
+스테이지 에이전트가 `--add-dir` 로 자기 run dir 의 `events.ndjson` 을 Read 해도, 대시보드가 보내도, 본부가
+ingest 해도 **같은 것**이 흐른다. ② **기본은 가장 보수적**: 규칙표에 없는 도구는 "이름 + rc + bytes + sha256" 만
+기록하고 발췌는 없다. 과잉 마스킹은 감사 가치만 줄이지만 누락은 유출이다. ③ CLAUDE.md §11(SMS)·§11b(메일)·§12
+(브라우저)의 "본문·코드·스크린샷·덤프를 볼트나 외부로 옮겨 적지 않는다"가 그대로 이 표의 상위 규칙이다.
+④ 규칙표가 바뀌면 `redaction_profile` +1(§2.1) — 옛 파일은 재마스킹하지 않고 그 프로필로 쓰였다고 표시한다.
+
+### 4.1 도구별 규칙표
+
+| 도구 / 패턴 | 기록하는 것 | **절대 기록하지 않는 것** | 비고 |
+|---|---|---|---|
+| `Bash(macp-sms:*)` · `Bash(macp-mail:*)` | 호출됨 · 서브커맨드(`list`·`wait-code`·`list-recent`) · rc · duration · `sensitive: true` | **stdout 전부 — 해시도 없다.** 인자 중 `--from`/`--grep`/`--since` 값은 `<redacted>` | 인증번호(4~8자리)는 sha256 으로도 10^8 브루트포스로 복원된다. 은행·카드 OTP 포함 전 메시지가 들어오는 채널(CLAUDE.md §11) |
+| `Bash(macp-browser:*)` `probe`·`steps`·`text` · `mcp__macp-browser__browser_navigate`·`browser_snapshot`·`browser_text`·`browser_take_screenshot`·`browser_tabs` | 서브커맨드/도구명 · URL 의 **scheme + host 만** · rc · 출력 bytes · `sensitive: true` | snapshot/text **본문**, 스크린샷 **경로와 바이트**(`last.png`), `steps` JSON 의 `fill` 값, URL 의 path·query·fragment(쿼리에 토큰·세션 id) | CLAUDE.md §12 "스크린샷·덤프 텍스트에는 개인정보가 들기 쉽다". host 도 로그인 콘솔 종류를 드러내지만 "어느 서비스를 다뤘나"는 감사 가치가 있어 **host 만** 남긴다(사람 게이트: host 마스킹 전환 가능) |
+| `mcp__macp-browser__browser_type` · `browser_click` · `browser_wait_for` | 도구명 · 요소 ref id · 입력 **길이** | 입력 텍스트(비밀번호·검색어·개인정보), 대기 조건 문구 | |
+| `Bash(macp-emulator:*)` | 서브커맨드 · rc · **aggregates JSON**(rc · per-step durations · ANR/FATAL counts · skipped frames) 그대로 | 시드 DB, 스크린샷 경로, 덤프 | `stages.py:656-657` "Aggregates only: never copy the seed DB, screenshots, or dumps" — 이미 enforced 규율 |
+| `Bash(macp-remote-gate:*)` | 서브커맨드 · handle · rc | 출력 본문 | |
+| 일반 `Bash` | 명령줄(전역 마스킹 뒤 ≤ 2 KiB) · 출력 발췌 head/tail 1 KiB · bytes · sha256 · rc · duration | 전역 패턴에 걸린 값(§4.2). 명령줄이 `.secrets/`·`.env`·`~/.ssh`·`*.pem`·`credentials`·`token` 을 포함하면 `sensitive: true` + **출력 발췌 생략** | `git`·`uv run pytest`·`./gradlew` 가 대부분 — 첫·마지막 화면 한 장이 진단 가치의 대부분 |
+| `Read` · `Write` · `Edit` · `NotebookEdit` · `Glob` · `Grep` | 경로(홈 접두 → `~`, 체크아웃 상대) · bytes · sha256(Write/Edit 결과 **내용의** 해시) · Grep 의 매치 **건수** | 파일 **내용**(Read 결과, Write 본문, Edit 의 old/new string), Grep 패턴·매치 줄 | `.secrets/`·`.env`·`~/.ssh`·`*.pem`·`*credentials*` 경로는 `sensitive: true` 이고 경로도 **basename 만** |
+| `WebFetch` · `WebSearch` | host + path(쿼리 제외) · status · bytes / 검색어 **길이**만 | 응답 본문, 검색어 원문, 쿼리 문자열 | |
+| `Agent`(서브에이전트) | 타입 · 프롬프트 길이 · `parent_tool_use_id` | 프롬프트 본문, 결과 본문 | 서브에이전트의 도구 호출은 `parent_tool_use_id` 로 매달린다(§2.4 ⑫) |
+| 프롬프트(`-p` 본문) · `thinking` 블록 · transcript `queue-operation.content`·`lastPrompt` | 프롬프트 sha256 + bytes / thinking **블록 수** | **원문 전부** | 프롬프트엔 태스크 본문·related.md·프로젝트 메모리가 들어 있다 |
+| `agent.message` · `agent.question` · `progress.note` · `run.finished.summary` · `approval.*.summary/note` | 전역 마스킹 + ≤ 2 KiB 절단 | 전역 패턴에 걸린 값 | 에이전트가 본문에 비밀을 인용할 수 있다 |
+| `stage.started` 의 작업 디렉토리 · `system/init.cwd` | `cwd_kind: vault 또는 checkout` | 절대 경로 | 공개 리포 식별자 규율과 같은 이유(`/home/<user>`·`/Users/<user>`) |
+| `stage.usage` · `stage.finished` · `state.transition` · `checkpoint.pushed` · `artifact.written` | 숫자·sha·상대 경로 | — | 메타만 — 마스킹 대상 아님 |
+
+### 4.2 전역 마스킹 패턴 (코드가 쓸 정규식의 **종류** — 정확한 정규식은 S2 가 테스트와 함께 확정)
+
+| 종류 | 패턴 서술 | 치환 |
+|---|---|---|
+| API 키·토큰 형태 | `sk-…`, `ghp_…`/`github_pat_…`, `AIza…`, `xox[abp]-…`, JWT 3분절(`eyJ….….…`), 32자 이상의 연속 hex/base64 뭉치 | `<token>` |
+| 키=값 비밀 | `token=`·`password=`·`passwd=`·`secret=`·`api_key=` 뒤의 값, `Authorization:`·`Bearer ` 뒤의 값, `MACP_*_TOKEN=` 류 env 대입 | `<token>` |
+| 인증번호 | `인증`·`승인`·`확인`·`code`·`OTP`·`verification`·`PIN` 이 앞뒤 40자 안에 있는 **4~8자리 숫자** | `<otp>` — **해시 없음** |
+| 이메일 · 전화 · 주민번호 형태 | `local@domain`, `01x-xxxx-xxxx`·`+82…`, `6자리-7자리` | `<email>` · `<phone>` · `<id>` |
+| 홈 경로 | `/home/<user>`·`/Users/<user>` 접두, `CLAUDE_CONFIG_DIR` 하위 경로 | `~` · `<config-dir>` |
+| 긴 base64 blob | 데이터 URI·이미지·바이너리 덤프(`data:…;base64,`) | `<blob N bytes>` |
+
+마스킹기는 **보수적**이다 — 오탐(git sha 가 `<token>` 으로 가려지는 일)은 감수하고, 누락을 피한다. 패턴은
+`redaction_profile` 과 함께 버전된다.
+
+### 4.3 검증 규율 — 네거티브 단언은 양성 대조군과 함께
+
+"`macp-sms` 의 stdout 이 어디에도 없다"를 **`! grep -q` 하나로** 단언하면 파일이 비어도 통과한다(공허 단언).
+S2 의 테스트는 **같은 픽스처에서** ① `tool.called{tool:"Bash", input_excerpt:"macp-sms wait-code --from <redacted> …"}`
+가 **있고** ② `tool.result{tool_use_id:…, output_excerpt: null, sensitive: true}` 가 있고 ③ 픽스처가 심은
+합성 코드 문자열(예: `MACP-FIXTURE-CODE-000000`)이 **파일 전체에 0회**임을 한 테스트에서 함께 단언한다.
+브라우저 픽스처도 같은 모양 — snapshot 본문의 합성 마커가 0회이고 `host` 는 `example.invalid` 로 있다.
+공개 리포의 픽스처는 전부 **합성**(`example.invalid`, `<redacted>`, `00000000-0000-4000-8000-000000000000`)이고,
+실 캡처(`capture.py`)로 만든 transcript 픽스처는 지금처럼 usage 가 읽는 줄만 남기고 attachment 줄은 제외한다
+(`capture.py:28-33` "private context and never leave the local config dir").
+
+---
