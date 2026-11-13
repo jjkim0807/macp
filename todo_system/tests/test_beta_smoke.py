@@ -1217,10 +1217,32 @@ def test_clock_restore_script():
     assert f"{_ADB} shell settings put global auto_time 1" in s
     assert f"{_ADB} shell settings put global auto_time_zone 1" in s
     assert s.endswith(f"{_ADB} shell setprop persist.sys.timezone Europe/London")
-    for bad in ("", None, "x;y", "a b"):
-        r = bs.clock_restore_script(bad)
-        assert "auto_time 1" in r
-        assert "setprop" not in r
+    # Unknown (None) or invalid values never produce a setprop, whatever the flag.
+    for bad in (None, "x;y", "a b"):
+        for clear in (False, True):
+            r = bs.clock_restore_script(bad, clear_if_empty=clear)
+            assert "auto_time 1" in r
+            assert "setprop" not in r
+    # Intended contract change: "" alone (untrusted, or no zone override sent) still
+    # leaves setprop alone; only clear_if_empty=True clears it (see the exact-string test).
+    r = bs.clock_restore_script("")
+    assert "auto_time 1" in r
+    assert "setprop" not in r
+
+
+def test_clock_restore_script_exact_strings():
+    a = f"{_ADB} shell settings put global"
+    seoul = (f"{a} auto_time 1; {a} auto_time_zone 1; "
+             f"{_ADB} shell setprop persist.sys.timezone Asia/Seoul")
+    cleared = (f"{a} auto_time 1; {a} auto_time_zone 1; "
+               f"{_ADB} shell setprop persist.sys.timezone \"''\"")
+    assert bs.clock_restore_script("Asia/Seoul") == seoul
+    assert bs.clock_restore_script("Asia/Seoul", clear_if_empty=True) == seoul  # valid prev wins
+    assert bs.clock_restore_script("", clear_if_empty=True) == cleared
+    assert bs.clock_restore_script("") == f"{a} auto_time 1; {a} auto_time_zone 1"
+    for s in (seoul, cleared):
+        assert "set -e" not in s
+        assert "'~" not in s and '"~' not in s           # ~ stays unquoted for the node
 
 
 # --- clock step wired into the scenario + restored before stop -------------
@@ -1375,3 +1397,57 @@ def test_clock_step_that_raises_is_still_restored_and_the_node_stops(tmp_path):
     assert res["kind"] == "node"
     assert [c for c in _ssh_cmds(fake) if _is_restore(c)], "attempted clock step → restore tried"
     assert fake.tokens()[-1] == "stop"
+
+
+# --- empty prev_tz: clear the zone override only when it is safe ------------
+
+@needs_seoul
+def test_run_scenario_tz_step_on_empty_zone_device_records_tz_set_and_prev_tz_ok():
+    run = _ClockRun(prev_tz="")
+    state: dict = {}
+    assert _scenario(run, [{"set_time": 1762941000, "timezone": "Asia/Seoul"}],
+                     clock_state=state)[0] is True
+    assert state == {"touched": True, "prev_tz": "", "tz_set": True, "prev_tz_ok": True}
+
+
+@needs_seoul
+def test_run_scenario_failed_tz_step_records_tz_set_but_not_prev_tz_ok():
+    run = _ClockRun(clock_rc=1, prev_tz="")
+    state: dict = {}
+    assert _scenario(run, [{"set_time": 1762941000, "timezone": "Asia/Seoul"}],
+                     clock_state=state)[0] is False
+    assert state["tz_set"] is True
+    assert "prev_tz_ok" not in state
+
+
+def test_run_scenario_time_only_step_has_no_tz_set():
+    run = _ClockRun(prev_tz="")
+    state: dict = {}
+    assert _scenario(run, [{"set_time": 1762941000}], clock_state=state)[0] is True
+    assert "tz_set" not in state
+    assert state["prev_tz_ok"] is True
+
+
+def _restore_cmd(state: dict) -> str:
+    run = _ClockRun()
+    bs._restore_clock(run, "node-script", {}, state, lambda m: None)
+    assert len(run.calls) == 1
+    assert run.calls[0][:3] == ["bash", "node-script", "ssh"]
+    return run.calls[0][3]
+
+
+def test_restore_clock_clears_zone_when_set_and_prev_was_trustworthy_empty():
+    cmd = _restore_cmd({"touched": True, "prev_tz": "", "tz_set": True, "prev_tz_ok": True})
+    assert _is_restore(cmd)
+    assert cmd.endswith(f"{_ADB} shell setprop persist.sys.timezone \"''\"")
+
+
+@pytest.mark.parametrize("state", [
+    {"touched": True, "prev_tz": "", "tz_set": True},          # first step did not finish
+    {"touched": True, "prev_tz": "", "prev_tz_ok": True},      # no zone override sent
+    {"touched": True, "prev_tz": None, "tz_set": True},        # previous zone unknown
+])
+def test_restore_clock_leaves_zone_alone_when_clearing_is_not_safe(state):
+    cmd = _restore_cmd(state)
+    assert _is_restore(cmd)
+    assert "setprop" not in cmd

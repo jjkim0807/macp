@@ -647,7 +647,9 @@ def _restore_clock(run: Runner, node_script: Path | str, env: dict, clock_state:
     if not (clock_state or {}).get("touched"):
         return
     try:
-        r = _ssh(run, node_script, clock_restore_script(clock_state.get("prev_tz")),
+        clear = bool(clock_state.get("tz_set") and clock_state.get("prev_tz_ok"))
+        r = _ssh(run, node_script,
+                 clock_restore_script(clock_state.get("prev_tz"), clear_if_empty=clear),
                  env=env, timeout=_CLOCK_RESTORE_TIMEOUT_S)
         progress(f"beta-smoke: clock restore rc={getattr(r, 'returncode', None)}")
     except Exception as e:      # noqa: BLE001 — restore must not mask the real outcome
@@ -1026,14 +1028,34 @@ def clock_script(spec: ClockSpec, pkg: str | None = None) -> str:
     return "; ".join(parts)
 
 
-def clock_restore_script(prev_tz: str | None) -> str:
+# Fixed literal that empties the zone override. The node shell strips the double
+# quotes, so adb receives ``''`` and the device shell sets an EMPTY value (a bare
+# ``''`` would reach the device as a missing argument). Not yet confirmed on a
+# real AVD — that check is the follow-up 2c06f5d27747.
+_TZ_CLEAR = f"{_ADB} shell setprop persist.sys.timezone \"''\""
+
+
+def clock_restore_script(prev_tz: str | None, *, clear_if_empty: bool = False) -> str:
     """The end-of-run restore for a run that ran a clock step: automatic time and
-    zone back on, and the zone the device had before the first clock step (only
-    when it passes :data:`_TZ_RE`). No ``set -e`` — best-effort, every line runs."""
+    zone back on, then the zone override, by what is known about ``prev_tz``:
+
+    - a zone that passes :data:`_TZ_RE` → restored with ``setprop``;
+    - ``""`` with ``clear_if_empty`` (the run set a zone AND the first clock step
+      finished, so the empty reading is trustworthy) → cleared with
+      :data:`_TZ_CLEAR`, because an AVD with no network/telephony zone source never
+      re-derives a zone from ``auto_time_zone=1`` and the override would leak;
+    - ``None`` (unknown — ssh raised/timed out), an invalid value, or ``""`` that
+      may only mean "the step aborted before its echo" → ``setprop`` untouched: a
+      value we do not know is never overwritten, and only ``_TZ_RE`` values or
+      the fixed literal ever reach the shell.
+
+    No ``set -e`` — best-effort, every line runs."""
     parts = [f"{_ADB} shell settings put global auto_time 1",
              f"{_ADB} shell settings put global auto_time_zone 1"]
     if prev_tz and _TZ_RE.match(prev_tz):
         parts.append(f"{_ADB} shell setprop persist.sys.timezone {prev_tz}")
+    elif prev_tz == "" and clear_if_empty:
+        parts.append(_TZ_CLEAR)
     return "; ".join(parts)
 
 
@@ -1050,8 +1072,11 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
     with ZERO adb calls; a clock script that exits non-zero (e.g. no root, so
     ``date`` is refused) fails it too. ``pkg`` is needed only by
     ``restart_app``. ``clock_state`` (owned by :func:`_run_locked`) records that a
-    clock step touched the device (``touched``) and the zone it had before the
-    first one (``prev_tz``), so the run restores both before the node stops."""
+    clock step touched the device (``touched``), the zone it had before the
+    first one (``prev_tz``), whether any step overrode the zone (``tz_set``) and
+    whether the first step finished with rc 0 so ``prev_tz`` is trustworthy
+    (``prev_tz_ok``) — the latter two keys appear only when true — so the run
+    restores both before the node stops."""
     fields = smoke_cfg.get("fields") or {}
     scenario = smoke_cfg.get("scenario") or []
     interval = _poll_interval(smoke_cfg)
@@ -1070,10 +1095,16 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
             first = clock_state is not None and not clock_state.get("touched")
             if clock_state is not None:
                 clock_state["touched"] = True
+                if clock.timezone is not None:
+                    clock_state["tz_set"] = True
             r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
             if first:
                 clock_state["prev_tz"] = _last_line(r)
             rc = getattr(r, "returncode", 1)
+            if first and rc == 0:
+                # rc 0 means the script reached its final ``echo "$prev"``, so an
+                # empty prev_tz really is "the device had no zone".
+                clock_state["prev_tz_ok"] = True
             if rc != 0:
                 steps_out.append(_step(name, False, time.monotonic() - t0,
                                        f"시계 설정 실패 (rc={rc})"))
