@@ -531,6 +531,15 @@ class ReconcileMergeHoldsTest(unittest.TestCase):
             notify=lambda text, link=None: None,
             alert_route=route,
         )
+        # Freeze the clock both merge_hold.schedule() and the orchestrator tick
+        # read (merge_hold._now). The fixture run is stamped 20261111T040000;
+        # with a live clock the hold's created_ts drifts past it after
+        # 2026-11-11 and scan_device_evidence drops the run as "started before
+        # the hold", so the release test sees WAIT ([] != ['task-x']). Pinning
+        # to NOW (03:00Z) keeps the run after the hold and the 48h expiry ahead.
+        clock = mock.patch.object(merge_hold, "_now", return_value=NOW)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -576,8 +585,14 @@ class ReconcileMergeHoldsTest(unittest.TestCase):
 
     def test_different_sha_waits_without_merging(self):
         self._seed()
-        self._hold()
+        rec = json.loads(self._hold().read_text(encoding="utf-8"))
         self._run(sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        # The run counts as evidence; the WAIT below comes from the sha mismatch,
+        # not from the run being filtered out as older than the hold.
+        self.assertEqual(
+            merge_hold.scan_device_evidence(self.root, "task-x",
+                                            after_ts=rec["created_ts"]),
+            (True, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
         with mock.patch.object(stages, "merge_pr") as mp:
             released = self.orch.reconcile_merge_holds()
         self.assertEqual(released, [])
@@ -599,8 +614,9 @@ class ReconcileMergeHoldsTest(unittest.TestCase):
         self._hold()
         self._run()
         with mock.patch.object(stages, "merge_pr",
-                               return_value={"merged": False, "note": "no perm"}):
+                               return_value={"merged": False, "note": "no perm"}) as mp:
             self.assertEqual(self.orch.reconcile_merge_holds(), [])
+        mp.assert_called_once()  # the release branch was reached; merge unconfirmed
         self.assertTrue(merge_hold.record_path(self.root, "task-x").exists(),
                         "an unconfirmed merge never closes on an open PR")
         self.assertEqual(self.ledger.load("task-x").state, AWAITING_HUMAN)
