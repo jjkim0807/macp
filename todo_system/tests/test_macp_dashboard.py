@@ -2671,8 +2671,11 @@ class StatusSingleFlightTests(unittest.TestCase):
 # 2026-11-09: +298 bytes = the `⛓ N` open-depends_on chip in `humanRow` and its
 # two comment lines (macp-human-action-ready-alerts). A symbol + a count, so no
 # new i18n key and no WHY/badge change; the rest of the page is byte-identical.
-_KO_HTML_SHA256 = "859c9758e2d1fc31232775b51ab163907401eb7b84b4ccbf837b5dbdf3a1e059"
-_KO_HTML_LEN = 44468
+# 2026-11-13: +104 bytes = the header's `<a id="graph-link" class="pill" href="graph">`
+# link to the new /graph page (one new i18n key) and its `a.pill` reset rule; the
+# rest of the page is byte-identical to the previous golden.
+_KO_HTML_SHA256 = "738fe574ae915d52ba6f93ff5d2312e0e98d12cf5185c52dea32b737841380aa"
+_KO_HTML_LEN = 44572
 _HANGUL = re.compile("[가-힣]")
 
 
@@ -2826,11 +2829,13 @@ class RenderHtmlByLanguage(unittest.TestCase):
         from todo_system import i18n
         used = set(M._MARKER_RE.findall(M._HTML_TEMPLATE))
         self.assertTrue(used)
+        graph_used = set(M._MARKER_RE.findall(M._GRAPH_TEMPLATE))
         for lang in ("ko", "en"):
             self.assertNotIn("@@", M.render_html(lang), lang)
-            self.assertEqual(used - set(i18n.DASHBOARD[lang]), set(), lang)
-        # and no table entry is dead weight
-        self.assertEqual(set(i18n.DASHBOARD["ko"]) - used, set())
+            self.assertNotIn("@@", M.render_graph_html(lang), lang)
+            self.assertEqual((used | graph_used) - set(i18n.DASHBOARD[lang]), set(), lang)
+        # and no table entry is dead weight (the /graph page shares the table)
+        self.assertEqual(set(i18n.DASHBOARD["ko"]) - used - graph_used, set())
 
     def test_render_html_en_sets_lang_and_locale(self):
         en = M.render_html("en")
