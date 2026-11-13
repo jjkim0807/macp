@@ -90,3 +90,129 @@ source — 의존은 명시하되 **블로커로 두지 않는다**.
 단 5 게이트는 그대로 통과). 기존 primitive 를 **대체가 아니라 확장**한다: `not_before` →(스케줄
 트리거), `inbox.jsonl` 멱등 적재 →(이벤트 저장소), `resume.py` pending_resumes 틱 재검 →(본부-다운
 드레인), `/api/sms` 인증 수신 →(웹훅 ingress).
+
+---
+
+## §2 트리거 선언
+
+### 2.1 선언이 사는 곳 — 별도 레지스트리 `Worker/triggers/<id>.md` (근거 포함)
+
+열림질문(태스크 frontmatter vs 별도 파일)을 **별도 레지스트리**로 결정한다. `Worker/triggers/<id>.md`
+가 트리거 선언의 정본이고, `Worker/assignments/`(ledger)·`Todo/items/`(태스크 md)와 나란히
+**git 추적**된다(편집 소스 = SoT). 근거 셋:
+
+1. **팬아웃**: 한 이벤트(웹훅 하나, 한 종류의 SMS)가 **여러 태스크**를 깨울 수 있어야 한다. 태스크
+   frontmatter 는 트리거를 한 태스크에 1:1 로 묶어 이걸 못 한다. 레지스트리의 `targets:` 는 목록이다.
+2. **트리거는 태스크보다 오래 산다**: 태스크는 done 되면 닫히지만(§1 life of a task), 그 트리거는
+   다음 인스턴스를 위해 계속 떠 있어야 한다(반복 스케줄, 상시 웹훅). 트리거는 자기 상태
+   (`last_fired`·`fire_count`)를 가진 **상시 제어면 객체**라 어느 한 태스크의 수명에 묶이면 안 된다.
+3. **틱이 싸게 열거한다**: 틱이 매번 모든 태스크 md 본문을 스캔해 트리거를 찾는 건 비싸다. ledger 가
+   `Worker/assignments/` 한 곳인 것처럼, 트리거도 틱이 **열거할 한 디렉토리**여야 한다.
+
+frontmatter 단축형(태스크에 `trigger:` 한 줄)은 **단일 태스크용 설탕**으로 남기되, todo-sync 가 그걸
+레지스트리 항목으로 **투영**한다 — `not_before` 가 태스크 필드이지만 중앙 `is_deferred()`
+(`not_before.py:63`)가 평가하는 분리와 똑같다. **정본은 레지스트리**다. 선언(`Worker/triggers/`)은
+git 추적, **발화 상태**(`last_fired`·`fire_count`·in-flight 표식)는 host-local 런타임
+`Worker/_state/triggers/<id>.json`(gitignored — `resume.py` pending_resumes 와 동형 `resume.py:15-19`)로
+갈라 둔다. 두 호스트가 같은 볼트를 push 해도 "이 호스트가 몇 번 발화했나"는 섞이지 않는다.
+
+### 2.2 선언 스키마 (합성 예시 — 실명·실 토큰·실 host 없음)
+
+```yaml
+# Worker/triggers/<id>.md frontmatter  (예시는 전부 합성 placeholder)
+id: <kebab-id>
+kind: schedule | webhook | internal | condition
+enabled: true
+# --- 매치 조건 (kind 별로 하나) ---
+schedule: "0 9 * * 1-5"          # kind: schedule — cron, 또는 {once: <ISO>} / {every: 30m}
+match:                           # kind: webhook — source + 선택적 필드 조건자
+  source: <webhook-source>       #   POST /api/event/<source> 의 source
+  when: "<predicate over event fields>"   # 순수 조건식 — 이벤트는 데이터, 지시 아님(§4)
+on_event: <internal-event-name>  # kind: internal — run-event-stream 의 이벤트명(§3.2)
+condition: "<predicate over vault/ledger state>"  # kind: condition — 상태 변화 폴링
+# --- 깨울 대상 (팬아웃: 목록) ---
+targets:
+  - task: <existing-slug>        # 기존 태스크 재개, 또는
+  - routine: <routine-id>        # 루틴(파라미터화 템플릿)에서 새 런 생성
+# --- 실행 규율 ---
+once: false                      # true = 1회 발화 후 enabled:false (not_before 1회 시각과 동형)
+overlap: skip                    # skip(기본) | queue | replace — §2.3
+max_fires: 100                   # 누적 발화 상한; 도달 시 비활성 + 경보 1회
+rate_limit: {max: 5, per: 6h}    # 창당 발화 상한 — §4
+```
+
+- **본문**(md body)에는 사람이 읽을 트리거의 의도·소유자·되돌리기 규칙을 적는다(태스크 md 와 같은
+  관례). 민감 매칭값(발신번호 등)은 본문·frontmatter 에 **적지 않고**(공개 리포·R5 §5), 조건자는
+  호스트 로컬에서 평가되는 참조로만 쓴다.
+
+### 2.3 1회 vs 반복 · 겹침 건너뜀 · 횟수 상한
+
+- **1회 vs 반복**: `once: true` → 한 번 발화하고 스스로 `enabled: false`(= `not_before` 의 1회 시각과
+  동형, 반복 없음). `schedule` 의 cron/`every` → 반복. `once`(딱 한 번)와 `max_fires`(최대 N 번)는
+  **다른 축**이다.
+- **겹침 건너뜀**: `overlap: skip`(기본) — 이 트리거가 깨운 런이 아직 in-flight 면 새 발화를 **버린다**
+  (큐에 쌓지 않는다). 디스패치의 `touches`/repo 동시성 게이트(`concepts.md:142-145`)와 겹치지만, 트리거
+  레벨에서 **먼저** 거른다 — 폭주하는 웹훅이 애초에 큐를 채우지 못하게. 대안 `queue`(쌓기)·`replace`
+  (최신으로 교체)는 **명시해야만** 켜진다(기본은 가장 보수적인 skip).
+- **횟수 상한**: `max_fires` 는 트리거의 **누적** 발화 상한. 도달하면 트리거를 비활성화하고 경보를
+  **한 번** 낸다(SMS 수신 거부 경보가 종류당 6h 1회인 것과 같은 쓰로틀 규율 `sms.py:128,175-195`).
+  창당(window) 상한은 `rate_limit` 로 분리(§4) — "총 몇 번"과 "분당 몇 번"은 별개다.
+
+### 2.4 `not_before` 를 일반화한다 (대체가 아니라 확장)
+
+§1 에서 본 `not_before`(`not_before.py:1`)는 "이 시각까지 지연"을 **한 번** 푸는 시각 게이트다 — 반복도,
+겹침 정책도, 횟수 상한도 없다. 스케줄 트리거는 이 primitive 를 **반복 + 겹침 건너뜀 + 횟수 상한**으로
+일반화한 것이고, 구현 시 `is_deferred()` 의 시각 파싱(`not_before.py:31-60`)을 재사용한다(§6 E3). 기존
+`not_before` 필드는 그대로 유효하다 — 1회 지연은 여전히 가장 단순한 특수 케이스다.
+
+---
+
+## §3 수신 경로
+
+### 3.1 웹훅 수신 — 새 프로세스가 아니라 본부 대시보드를 확장한다
+
+`POST /api/sms` 가 이미 **인증된 쓰기 수신의 전체 모양**을 보여 준다:
+- 자기 비밀값 Bearer 토큰 + 상수시간 비교 — `MACP_SMS_TOKEN`, `hmac.compare_digest` `macp_dashboard.py:2703,2712`
+- 크기 상한 — `SMS_MAX_BYTES = 256KiB`, 초과 413 `macp_dashboard.py:2697,2733-2737`
+- 클라이언트별 속도 제한 — 슬라이딩 윈도우 `_is_throttled()`/`_note_auth_failure()` `macp_dashboard.py:2571-2596`, 임계 초과 429
+- 수신 거부 경보 — 종류(auth/bad_payload/too_large)당 6h 1회 `sms.py:128,175-195`
+
+그래서 웹훅은 **별 수신기가 아니라 이 대시보드를 확장**한다: `POST /api/event/<source>`. 각 `source`
+는 **자기 비밀값**(SMS 토큰과 같은 패턴 — env 로 호스트에, **git 밖** `sms.py:15-17`)을 Bearer 로
+받고 hmac 비교한다. 이 토큰은 볼트를 읽는 **대시보드 토큰과 분리**된다 — 웹훅 발신자는 `/api/sms`
+발신자가 그렇듯 "쓰기 전용·자기 비밀값만" 쥔다(`macp_dashboard.py:2695-2696`). 프로덕션 shape 는
+loopback + `tailscale serve`(tailnet HTTPS), 토큰 게이트는 다른 노출 경로의 안전망이고 비-loopback
+바인드는 토큰 없이는 거부된다(`macp_dashboard.py:19-28,2755-2764`). **새 상시 SaaS/DB 는 만들지 않는다**
+(범위 밖·[[Decisions/2026-09-25-backend-unify-gcp-no-supabase]]).
+
+### 3.2 내부 이벤트 버스 — 런 이벤트 스트림 위에 올라탄다
+
+내부 이벤트(PR 머지·verify 실패·베타 피드백)는 자매 설계
+[[docs/design/run-event-stream|run-event-stream.md]](NDJSON 런 이벤트 스트림, **아직 미존재·설계
+단계**, 태스크 `macp-run-event-stream-design`)가 **쓰는** 이벤트를 **구독**해 트리거 매치한다. 권장
+분리:
+
+- **외부 ingress**(웹훅·SMS·메일)는 독립 경로 — 런 이벤트 스트림이 없어도 먼저 간다.
+- **내부 이벤트**는 스트림이 landing 하면 그 위에서 source — 두 번 만들지 않는다.
+
+이 의존은 **명시하되 블로커가 아니다**: §2 스케줄과 §3.1 웹훅은 스트림 없이 구현 가능하고(§6 E3·E4),
+오직 내부 이벤트 브리지(§6 E6)만 스트림에 의존한다. 베타 피드백→태스크는 이미
+`macp-advote-feedback-bridge` 가 외부 피드백 브리지의 선례를 보였으니, 내부 이벤트도 같은
+"이벤트 → 트리거 매치 → 런" 모양으로 통일한다.
+
+### 3.3 본부가 꺼져 있던 동안의 이벤트
+
+본부가 다운된 사이 도착한 이벤트가 유실되면 안 된다. 세 규칙:
+
+1. **수신 즉시 지속(persist-on-receipt)**: 웹훅 핸들러는 트리거를 **직접 실행하지 않는다**. 이벤트를
+   git 밖 저장소에 **append 만** 한다(`inbox.jsonl` 이 선례 — 멱등 append, id 로 중복 제거
+   `sms.py:229-245`). 핸들러가 가벼워야 본부 재시작·크래시에도 안전하다. 저장소는
+   `Worker/_state/events/`(host-local, gitignored — SMS 스토어처럼 git 밖).
+2. **다음 틱에 드레인(drain-on-tick)**: 틱이 이벤트 저장소를 읽어 트리거를 매치하고 `dispatch()` 를
+   호출한다. 본부가 2시간 꺼져 있었어도, 올라오면 그 2시간치 미처리 이벤트를 드레인한다.
+3. **재검은 `resume.py` pending_resumes 처럼**: 발화 판정을 매 틱 다시 하고, 불확실하면 WAIT 로
+   남긴다(순수 판정 `evaluate():122`, 틱 재검 `consume():307`, host-local 예약 `resume.py:15-19`).
+   id 멱등이라 발신자가 2xx 받을 때까지 재시도해도 **한 번만** 발화한다.
+
+핸들러 = "저장만", 틱 = "드레인·발화"로 가른 것이 본부-다운 내성의 핵심이다 — 수신과 실행을 한
+요청 안에서 묶으면 본부가 꺼진 창에서 온 이벤트는 그대로 사라진다.
