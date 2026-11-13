@@ -293,3 +293,90 @@ SMS·메일 본문은 **트리거 조건 판정에만** 쓰고, 태스크·기�
   절대 홈경로·개인 데이터**를 넣지 않는다. (식별자 게이트 `check_public_identifiers.sh` 는
   `todo_system/`·`scripts/`·`.claude/commands/` 만 스캔해 `docs/` 의 이 문서는 범위 밖이지만, 규율은
   문서에도 적용한다 — 위 예시들이 전부 합성 placeholder 인 이유다.)
+
+---
+
+## §6 단계별 구현 분할안
+
+> **분할 원칙**: expand → migrate → contract(parallel-change) 로 **각 leaf 가 단독으로 컴파일·테스트
+> green**. 첫 leaf 는 디스패치 배선 없는 **additive** 단계(가장 안전·독립). 완료 조건은 전부 **로컬
+> 명령** — "CI green" 금지(Actions 미사용, [[Decisions/2026-09-11-no-github-actions-local-release-lane]]).
+> 각 leaf 는 부모와 동일하게 `repo: jjkim0807/macp`, `touches` 는 아래 열거.
+
+### 6.1 leaf 목록 · depends_on 체인 · 로컬 검증
+
+| leaf | 단계 | 범위(touches) | depends_on | 로컬 검증 명령 |
+|---|---|---|---|---|
+| **E1** 트리거 선언 스키마 + 파서 + 레지스트리 로더 | expand | `todo_system/triggers.py`(신규 — `Worker/triggers/<id>.md` 파싱·검증, 디스패치 배선 **없음**) + `todo_system/tests/test_triggers.py`(신규) | **없음**(순수 파싱/검증, additive — 안전한 첫 leaf) | `uv run pytest todo_system/tests/test_triggers.py` · `uvx ruff check .` |
+| **E2** 이벤트 저장소 + id 멱등 + 드레인 큐 | expand | `todo_system/events.py`(신규 — host-local `Worker/_state/events/`, 멱등 append, SMS `inbox.jsonl` 과 독립) + 테스트(신규) | **없음**(SMS 스토어와 독립, additive) | `uv run pytest todo_system/tests/test_events.py` |
+| **E3** 스케줄 트리거 평가(not_before 일반화) | migrate(병존) | `todo_system/triggers.py`(반복 + `overlap:skip` + `max_fires`; `not_before.py:31-60` 시각 파싱 재사용) + 틱 훅 `todo_system/orchestrator/orchestrator.py` + 테스트 | **E1** | `uv run pytest todo_system/tests/test_triggers_schedule.py` |
+| **E4** 웹훅 수신기 | migrate | `scripts/macp_dashboard.py`(`POST /api/event/<source>` — `/api/sms` 핸들러 패턴 재사용: 자기 비밀값·hmac·크기 상한·속도 제한·거부 경보) + 테스트 | **E1, E2** | `uv run pytest todo_system/tests/test_dashboard_event_ingest.py` · `uvx ruff check .` |
+| **E5** 디스패치 배선 (트리거 매치 → 런 시작) | migrate→contract | `todo_system/orchestrator/orchestrator.py`(틱 드레인 → 트리거 매치 → `dispatch()`, 5 게이트 통과, 트리거별 `rate_limit`·`overlap`) + 발화 상태 `Worker/_state/triggers/<id>.json` + 테스트 | **E2, E3, E4** | `uv run pytest …` **+ 라우트 테스트(§6.2)** |
+| **E6** 내부 이벤트 브리지 | human_gate | `todo_system/orchestrator/…`(run-event-stream 구독 → 트리거 매치) + 테스트 | **E5** + sibling `macp-run-event-stream-design`(**미존재**) | `uv run pytest …`(스트림 landing 후) |
+
+**depends_on 체인**: `{E1, E2}` 먼저(둘 다 additive·서로 독립) → **E3**(E1) · **E4**(E1,E2) → **E5**
+(E2,E3,E4) → **E6**(E5 + run-event-stream). 오케스트레이터 자동 분할이면 **첫 서브태스크는 E1**(스키마·
+파서 — 가장 안전·독립, 디스패치를 건드리지 않음)이고 나머지는 위 체인대로 `blocked` + `on_unblock: auto`
++ `depends_on` 으로 직렬화한다. E1·E2 는 런을 시작시키는 코드가 **아직 없는** 순수 추가라 각자 green.
+
+### 6.2 라우트 수준 완료 조건 (§6 AC 의 teeth)
+
+배선 leaf(E3·E4·E5)의 acceptance 는 **"실제 수신 경로 이벤트가 런을 시작시킨다"**를 **라우트 수준**에서
+요구한다 — 부품(파서)이 아니라 **배선**(이벤트 in → 런 시작)을 완료 조건으로 삼는다:
+
+- **E4**: **실제 POST** `/api/event/<source>`(올바른 비밀값·Bearer)가 이벤트를 저장소에 남긴다 — 핸들러
+  함수 단위 테스트가 아니라 실제 HTTP 요청 → `Worker/_state/events/` 확인.
+- **E3**: **실제 wall-clock 스케줄 발화**(또는 고정 시계로 시각 경과)가 틱에서 트리거를 매치해 발화한다.
+- **E5 (핵심)**: **엔드투엔드** — 저장소의 이벤트(E4 의 실제 POST, 또는 `inbox.jsonl` 에 실제로 있는 SMS)가
+  **틱 드레인 → 트리거 매치 → `dispatch()` 호출 → `Worker/assignments/<slug>.json` 에 assignment 가
+  쓰인다**를 라우트 테스트로 못박는다. 그리고 **새 프로덕션 호출 위치(트리거→`dispatch()` 배선 지점)를
+  verify.md 에 적는다**(배선을 완료 조건으로 규율 — [[Notes/macp-worker-quality-root-causes-20261110]]).
+
+왜 이 조건이 필요한가: 트리거 스키마가 **파싱된다**는 단위 테스트만으로는 배선이 빠진 채 전부 녹색일 수
+있다(기억 부품 5개가 다 머지됐는데 `/v1/chat` 이 한 번도 안 부른 선례 — 같은 노트). 그래서 E5 는
+"실제 이벤트가 `dispatch()` 를 부른다"를 **라우트 테스트**로 요구한다. E1·E2(순수 파서·저장소)에는 이
+조건을 걸지 않는다 — 그건 배선 leaf 가 아니다.
+
+### 6.3 `.claude/commands/**` 규약 · 범위 가드
+
+- **`.claude/commands/**` 변경**(예: 트리거가 깨운 런의 스테이지 프롬프트에 이벤트 데이터블록 넣는 법)은
+  헤드리스 워커가 쓸 수 없다(하드 가드). 완성본을 `Worker/proposals/<slug>/` 에 두고 사람이 `cp` 한다 —
+  해당 leaf 가 실제로 돌 때의 규약. 직접 편집하지 않는다.
+- **범위 가드**: 이 §6 은 **문서 내부 서술만**이다. 실제 `Todo/items/<slug>.md` leaf 파일은 **생성하지
+  않는다** — 설계 머지 뒤 **사람이 권장안을 보고 게이트를 풀 때** 생성한다(태스크 Spec·CLAUDE.md §3
+  "leaf 태스크 파일 생성 금지"). 이 run 은 macp 체크아웃에서 돌아 볼트 `Todo/` 를 쓰지도 못한다.
+
+---
+
+## 부록: 이 노트가 확정한 설계 결정 요약
+
+1. **공백**: 지금 런을 시작시키는 건 전부 주기 타이머(틱 ~5분·플래너·discovery·stall)·내부 런 종료
+   (follow-ups)·사람(resume)뿐이고, **외부 이벤트가 런을 깨우는 경로가 없다**. SMS·메일은 본부로 들어와
+   `inbox.jsonl` 에 쌓이지만 **pull 전용**이라 어떤 런도 시작시키지 않는다(§1).
+2. **트리거의 집 = 별도 레지스트리** `Worker/triggers/<id>.md`(git 추적, SoT). 근거: 팬아웃(한 이벤트
+   → 여러 태스크)·트리거는 태스크보다 오래 삼·틱이 싸게 열거. frontmatter `trigger:` 는 단일 태스크용
+   설탕(todo-sync 투영). 발화 상태는 host-local `Worker/_state/triggers/`(§2.1).
+3. **선언 스키마**: `kind`(schedule·webhook·internal·condition) · `targets`(팬아웃 목록) · `once` ·
+   `overlap`(기본 skip) · `max_fires`(누적) · `rate_limit`(창당). 스케줄은 `not_before` 를 **반복 +
+   겹침 건너뜀 + 횟수 상한**으로 일반화(§2).
+4. **웹훅 수신 = 본부 대시보드 확장** `POST /api/event/<source>`, source 별 **자기 비밀값**(SMS 토큰
+   패턴, **git 밖**, 대시보드 토큰과 분리), 프로덕션은 loopback + `tailscale serve`. **새 상시 SaaS/DB
+   없음**(§3.1).
+5. **내부 이벤트 = 런 이벤트 스트림 구독**([[docs/design/run-event-stream|run-event-stream.md]], 미존재·
+   설계 단계). 외부 ingress 는 독립, 내부는 스트림에서 source — **의존하되 블로커 아님**(§3.2, §6 E6).
+6. **본부-다운 내성 = 수신 즉시 지속 + 틱 드레인**: 핸들러는 **저장만**, 틱이 드레인·발화. id 멱등
+   (`sms.append` 선례), 재검은 `resume.py` pending_resumes 처럼(§3.3).
+7. **폭주·비용 방지**: ① id 멱등 중복 제거(저장 계층) ② 트리거별 `rate_limit`(슬롯 먼저 찍기,
+   `should_alert` 선례) + `overlap:skip` ③ 트리거가 깨운 런도 **5 게이트(usage guard·일일 예산) 통과**
+   — 트리거는 **자동 `bypass_guard` 없음**, 페이싱을 뛰어넘지 않는다 ④ 이벤트 본문은 **데이터, 지시
+   아님**(매칭은 기계, 모델엔 인용 데이터블록)(§4).
+8. **개인정보 경계**: SMS·메일 본문은 host-local 에서 **조건 판정에만**, 불리언/추출토큰만 내보내고
+   본문은 태스크·Memory·커밋·PR·Slack·경보 어디로도 옮기지 않는다. 경보=고정 템플릿+코드만
+   (`compose_ingest_alert` 선례), 로그=id만. 건강·OTP 경계 밖(§5).
+9. **분할 = `{E1,E2} → E3·E4 → E5 → E6`**(expand→migrate→contract). **E1(스키마·파서)·E2(이벤트 저장소)가
+   additive 라 디스패치를 안 건드리는 안전한 첫 leaf**. E6 만 run-event-stream 에 의존(§6.1).
+10. **라우트 수준 완료 조건**: 배선 leaf(E3·E4·E5)는 "**실제 수신 경로 이벤트가 `dispatch()` 를 부른다**"를
+    라우트 테스트로 요구하고 새 호출 위치를 verify.md 에 적는다 — 파서 단위 테스트만으로 배선 누락이 전부
+    녹색이 되는 사고를 막는다(§6.2).
+11. **범위**: 이 노트는 설계만 — 실제 leaf 태스크 생성·`.claude/commands` 적용은 **머지 뒤 사람 게이트**.
+    이 run 은 macp 체크아웃이라 볼트 `Todo/` 를 쓰지 못한다(§6.3).
