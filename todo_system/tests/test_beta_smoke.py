@@ -1096,3 +1096,282 @@ def test_launch_line_is_pure_and_pinned(tmp_path, monkeypatch):
     assert cmd == ('~/android/platform-tools/adb shell am start -n "$pkg"/.MainActivity '
                    "--ez k true >/dev/null 2>&1")
     assert secrets == []                              # a literal value is not a secret
+
+
+# ---------------------------------------------------------------------------
+# clock / timezone step — pure parser + node script builders
+# ---------------------------------------------------------------------------
+
+import zoneinfo  # noqa: E402 — grouped with the clock-step block
+
+
+def _has_tz(name: str) -> bool:
+    try:
+        zoneinfo.ZoneInfo(name)
+        return True
+    except Exception:       # noqa: BLE001 — no tzdata on this host
+        return False
+
+
+needs_seoul = pytest.mark.skipif(not _has_tz("Asia/Seoul"), reason="no tzdata for Asia/Seoul")
+_ADB = "~/android/platform-tools/adb"
+
+
+def test_parse_clock_step_epoch_int_and_digit_string():
+    want = dt.datetime.fromtimestamp(1762941000, dt.timezone.utc).strftime("%m%d%H%M%Y.%S")
+    for raw in (1762941000, "1762941000", " 1762941000 "):
+        spec = bs.parse_clock_step({"set_time": raw})
+        assert spec == bs.ClockSpec(epoch=1762941000, timezone=None, restart_app=False)
+        assert spec.utc_stamp == want
+
+
+@needs_seoul
+def test_parse_clock_step_naive_time_is_read_in_the_step_timezone():
+    spec = bs.parse_clock_step({"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul"})
+    assert spec.timezone == "Asia/Seoul"
+    assert spec.utc_stamp == "111209502026.00"           # 18:50 KST = 09:50 UTC
+
+
+def test_parse_clock_step_naive_time_without_timezone_is_utc():
+    assert bs.parse_clock_step({"set_time": "2026-11-12 18:50"}).utc_stamp == "111218502026.00"
+    assert bs.parse_clock_step({"set_time": "2026-11-12T18:50:30"}).utc_stamp == "111218502026.30"
+
+
+def test_parse_clock_step_explicit_offset_wins():
+    assert bs.parse_clock_step({"set_time": "2026-11-12T18:50+09:00"}).utc_stamp == "111209502026.00"
+
+
+@needs_seoul
+def test_parse_clock_step_timezone_only_and_restart():
+    spec = bs.parse_clock_step({"timezone": "Asia/Seoul", "restart_app": True})
+    assert spec == bs.ClockSpec(epoch=None, timezone="Asia/Seoul", restart_app=True)
+    assert spec.utc_stamp is None
+
+
+def test_parse_clock_step_without_clock_keys_is_none():
+    assert bs.parse_clock_step({"tap": "x"}) is None
+    assert bs.parse_clock_step({"name": "n", "expect": {"kind": "text_matches"}}) is None
+
+
+@pytest.mark.parametrize("step", [
+    {"set_time": "tomorrow"},
+    {"set_time": ""},
+    {"set_time": True},
+    {"set_time": 1.5},
+    {"set_time": [1]},
+    {"set_time": None},
+    {"set_time": 5},                                  # out of range (1970)
+    {"set_time": 1762941000000},                      # milliseconds, not seconds
+    {"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul; reboot"},
+    {"timezone": "../etc"},
+    {"timezone": "Not/AZone"},
+    {"timezone": 123},
+    {"timezone": ""},
+    {"set_time": 1762941000, "restart_app": "yes"},
+    {"restart_app": True},                            # restart alone is not a clock step
+])
+def test_parse_clock_step_rejects_bad_values_with_a_message(step):
+    with pytest.raises(ValueError) as ei:
+        bs.parse_clock_step(step)
+    assert str(ei.value).strip()
+
+
+@needs_seoul
+def test_clock_script_order_and_arguments():
+    spec = bs.parse_clock_step({"set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul",
+                                "restart_app": True})
+    s = bs.clock_script(spec, "com.example")
+    assert s.startswith("set -e; ")
+    assert f"{_ADB} root >/dev/null 2>&1 || true" in s
+    assert f"{_ADB} shell settings put global auto_time 0" in s
+    assert f"{_ADB} shell settings put global auto_time_zone 0" in s
+    assert f"{_ADB} shell setprop persist.sys.timezone Asia/Seoul" in s
+    assert f"{_ADB} shell date -u 111209502026.00 >/dev/null" in s
+    assert s.endswith('echo "$prev"')
+    order = [s.index(k) for k in (f"{_ADB} root", "wait-for-device", "getprop persist.sys.timezone",
+                                  "auto_time 0", "setprop persist.sys.timezone",
+                                  "date -u", "am force-stop com.example",
+                                  "monkey -p com.example")]
+    assert order == sorted(order)
+    assert "'~" not in s and '"~' not in s           # ~ stays unquoted → node expands it
+
+
+def test_clock_script_time_only_leaves_the_zone_alone():
+    s = bs.clock_script(bs.parse_clock_step({"set_time": "2026-11-12T18:50+09:00"}))
+    assert "auto_time 0" in s and "date -u 111209502026.00" in s
+    assert "auto_time_zone" not in s
+    assert "setprop" not in s
+    assert "force-stop" not in s and "monkey" not in s
+
+
+@pytest.mark.parametrize("pkg", [None, "", "com.x; reboot", "com/x"])
+def test_clock_script_restart_needs_a_valid_pkg(pkg):
+    spec = bs.ClockSpec(epoch=1762941000, timezone=None, restart_app=True)
+    with pytest.raises(ValueError):
+        bs.clock_script(spec, pkg)
+
+
+def test_clock_restore_script():
+    s = bs.clock_restore_script("Europe/London")
+    assert "set -e" not in s                          # best-effort: every line runs
+    assert f"{_ADB} shell settings put global auto_time 1" in s
+    assert f"{_ADB} shell settings put global auto_time_zone 1" in s
+    assert s.endswith(f"{_ADB} shell setprop persist.sys.timezone Europe/London")
+    for bad in ("", None, "x;y", "a b"):
+        r = bs.clock_restore_script(bad)
+        assert "auto_time 1" in r
+        assert "setprop" not in r
+
+
+# --- clock step wired into the scenario + restored before stop -------------
+
+def _is_clock(cmd: str) -> bool:
+    return "date -u" in cmd or "setprop" in cmd or "adb root" in cmd
+
+
+def _is_restore(cmd: str) -> bool:
+    return "auto_time 1" in cmd
+
+
+def _ssh_cmds(fake) -> list[str]:
+    return [c["argv"][3] for c in fake.calls
+            if fake._token(c["argv"]) == "ssh" and len(c["argv"]) > 3]
+
+
+CLOCK_CFG = {**SMOKE_CFG, "scenario": [
+    {"name": "evening", "set_time": "2026-11-12 18:50", "timezone": "Asia/Seoul"},
+    *SMOKE_CFG["scenario"],
+]}
+
+
+@needs_seoul
+def test_run_smoke_clock_step_runs_before_the_scenario_and_is_restored_before_stop(tmp_path):
+    fake = FakeNode(dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"),
+                           _dump("독서하기", "0:30")])
+    res = _run_smoke(tmp_path, fake, cfg=CLOCK_CFG)
+    assert res["ok"] is True, res
+    assert res["steps"][0]["name"] == "evening"
+    assert res["steps"][0]["ok"] is True
+    assert res["steps"][0]["detail"] == "시계 설정 완료"
+    assert res["steps"][1]["ok"] is True                # the existing step still runs
+    cmds = _ssh_cmds(fake)
+    clock = [i for i, c in enumerate(cmds) if _is_clock(c) and not _is_restore(c)]
+    assert len(clock) == 1
+    assert "setprop persist.sys.timezone Asia/Seoul" in cmds[clock[0]]
+    assert "date -u 111209502026.00" in cmds[clock[0]]
+    first_dump = next(i for i, c in enumerate(cmds) if "uiautomator dump" in c)
+    assert clock[0] < first_dump                        # clock before the first dump/tap
+    # the restore is the last node call, right before stop
+    assert fake.tokens()[-1] == "stop"
+    last_ssh = fake.calls[-2]
+    assert fake._token(last_ssh["argv"]) == "ssh" and _is_restore(last_ssh["argv"][3])
+    assert last_ssh["timeout"] == bs._CLOCK_RESTORE_TIMEOUT_S
+
+
+def test_run_smoke_bad_clock_value_fails_with_zero_clock_calls_and_still_stops(tmp_path):
+    cfg = {**SMOKE_CFG, "scenario": [{"name": "bad", "set_time": "nope"}]}
+    fake = FakeNode()
+    res = _run_smoke(tmp_path, fake, cfg=cfg)
+    assert res["ok"] is False
+    assert res["kind"] == "scenario"
+    assert "시계 스텝 오류" in res["detail"]
+    assert "시계 스텝 오류" in res["steps"][0]["detail"]
+    assert not [c for c in _ssh_cmds(fake) if _is_clock(c) or _is_restore(c)]
+    assert fake.stops()
+
+
+def test_run_smoke_without_clock_steps_has_no_restore_call(tmp_path):
+    fake = FakeNode(dumps=[_dump("운동하기", "0:30"), _dump("운동하기", "0:30"),
+                           _dump("독서하기", "0:30")])
+    res = _run_smoke(tmp_path, fake)
+    assert res["ok"] is True
+    assert not [c for c in _ssh_cmds(fake) if _is_clock(c) or _is_restore(c)]
+    assert fake.ssh_kinds() == ["build", "install", "dump", "tap", "dump", "dump",
+                                "logcat", "screencap"]
+
+
+class _ClockRun:
+    """Minimal ``run`` for direct :func:`bs._run_scenario` calls: the clock script
+    answers ``clock_rc`` and echoes ``prev_tz``; everything else rc 0."""
+
+    def __init__(self, clock_rc=0, prev_tz="Europe/London"):
+        self.calls: list[list[str]] = []
+        self.clock_rc = clock_rc
+        self.prev_tz = prev_tz
+
+    def __call__(self, argv, *, cwd=None, env=None, timeout=None):
+        argv = list(argv)
+        self.calls.append(argv)
+        cmd = argv[3] if len(argv) > 3 else ""
+        if "uiautomator dump" in cmd:
+            return subprocess.CompletedProcess(argv, 0, _dump("운동하기", "0:30"), "")
+        if "date -u" in cmd or "setprop" in cmd:
+            return subprocess.CompletedProcess(argv, self.clock_rc, self.prev_tz + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _scenario(run, steps, *, pkg=None, clock_state=None, steps_out=None):
+    cfg = {"scenario": steps, "poll_interval_s": 0}
+    out = steps_out if steps_out is not None else []
+    return bs._run_scenario(run, "node-script", cfg, {}, time.monotonic() + 60, out,
+                            pkg=pkg, clock_state=clock_state)
+
+
+def test_run_scenario_clock_failure_rc_fails_and_still_marks_touched():
+    run = _ClockRun(clock_rc=1)
+    state: dict = {}
+    out: list = []
+    res = _scenario(run, [{"name": "evening", "set_time": 1762941000}],
+                    clock_state=state, steps_out=out)
+    assert res == (False, "scenario", "evening: 시계 설정 실패 (rc=1)")
+    assert state == {"touched": True, "prev_tz": "Europe/London"}
+    assert out[0]["ok"] is False
+    assert out[0]["detail"] == "시계 설정 실패 (rc=1)"
+
+
+def test_run_scenario_keeps_prev_tz_from_the_first_clock_step_only():
+    run = _ClockRun(prev_tz="Europe/London")
+    state: dict = {}
+    assert _scenario(run, [{"set_time": 1762941000}], clock_state=state)[0] is True
+    run.prev_tz = "Asia/Tokyo"
+    assert _scenario(run, [{"set_time": 1762941000}], clock_state=state)[0] is True
+    assert state["prev_tz"] == "Europe/London"
+
+
+def test_run_scenario_restart_app_needs_pkg_and_makes_zero_calls_without_it():
+    run = _ClockRun()
+    ok, kind, detail = _scenario(run, [{"name": "s", "set_time": 1762941000,
+                                        "restart_app": True}])
+    assert (ok, kind) == (False, "scenario")
+    assert "시계 스텝 오류" in detail
+    assert run.calls == []
+    run = _ClockRun()
+    assert _scenario(run, [{"set_time": 1762941000, "restart_app": True}],
+                     pkg="com.example")[0] is True
+    assert len(run.calls) == 1
+    assert "am force-stop com.example" in run.calls[0][3]
+    assert "monkey -p com.example" in run.calls[0][3]
+
+
+def test_run_scenario_clock_with_tap_keeps_the_tap_detail():
+    run = _ClockRun()
+    out: list = []
+    res = _scenario(run, [{"name": "s", "set_time": 1762941000, "tap": {"id": "skip_button"}}],
+                    steps_out=out)
+    assert res[0] is True
+    assert out[0]["detail"] == "탭 완료"
+    cmds = [c[3] for c in run.calls]
+    assert "date -u" in cmds[0]                       # clock runs before the tap's dump
+    assert any("input tap" in c for c in cmds[1:])
+
+
+def test_clock_step_that_raises_is_still_restored_and_the_node_stops(tmp_path):
+    # the clock ssh is classified "ssh-other" by FakeNode; raising there models a
+    # timeout/fault mid-step. The restore (also ssh-other) raises too → never blocks stop.
+    fake = FakeNode(raise_on="ssh-other", raise_exc=RuntimeError("boom"))
+    cfg = {**SMOKE_CFG, "scenario": [{"name": "t", "set_time": 1762941000}]}
+    res = _run_smoke(tmp_path, fake, cfg=cfg)
+    assert res["ok"] is False
+    assert res["kind"] == "node"
+    assert [c for c in _ssh_cmds(fake) if _is_restore(c)], "attempted clock step → restore tried"
+    assert fake.tokens()[-1] == "stop"

@@ -17,7 +17,8 @@ Subcommands (see the wrapper header):
   AGGREGATES-ONLY result JSON to stdout, and map the result to an exit code:
   ``0`` PASS · ``75`` node lease held by another owner · ``76`` over the shared
   monthly budget · ``1`` any real failure (build/scenario/crash/node/config).
-  Progress lines go to stderr so stdout stays pure JSON.
+  Progress lines go to stderr so stdout stays pure JSON. Scenario steps
+  (clock/tap/swipe/wait_s/expect) are listed in the ``scripts/macp-emulator`` header.
 * ``status`` — read-only: the node lease state, month spend, cap, over-budget.
 * ``stop`` — operator-only node teardown; refuses (``64``) when invoked INSIDE a
   stage (the orchestrator injects :data:`stages.EMULATOR_OWNER_ENV`), since a

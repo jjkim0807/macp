@@ -19,6 +19,22 @@
 #   macp-emulator status    one JSON line: node lease state · month spend · cap · over_budget (READ-ONLY)
 #   macp-emulator stop      operator-only node teardown; refuses (exit 64) when invoked INSIDE a stage
 #
+# Scenario steps (--scenario JSON "scenario": [ {"name": …, …}, … ]; one step may
+# combine keys, which run in this order — beta_smoke._run_scenario):
+#   set_time / timezone / restart_app
+#            set the device clock: set_time = epoch seconds or ISO 8601
+#            ("2026-11-12 18:50", "2026-11-12T18:50+09:00"); a time without an
+#            offset is read in `timezone` (IANA, e.g. "Asia/Seoul"), else UTC.
+#            Needs adb root (google_apis AVD). restart_app: true relaunches the
+#            app so an already-drawn screen picks up the new clock. A bad value
+#            fails the step before any adb call. Automatic time/zone and the
+#            previous zone are restored before the node stops.
+#   tap      a field name from "fields" or an inline selector ({"id"|"text"|"desc"|"xy"})
+#   swipe    {"region"|"on": …, "dir": up|down|left|right} or {"from": [x,y], "to": [x,y]}
+#   wait_s   seconds to sleep
+#   expect   {"kind": text_changes|text_matches|timer_reset|scrolled, "field": …, "within_s": …}
+#            (scrolled only in a swipe step)
+#
 # Install (once per host): copy to a dir on PATH, e.g.
 #   cp scripts/macp-emulator ~/.local/bin/macp-emulator && chmod +x ~/.local/bin/macp-emulator
 # The maintenance tick's sync_wrappers() keeps ~/.local/bin/macp-{sms,browser,remote-gate,emulator}

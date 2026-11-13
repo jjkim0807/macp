@@ -12,9 +12,12 @@ What the gate does on the shared on-demand emulator node ``macp-app-test`` (via
 ``scripts/app-test-node``): start the node (one preemption retry) → ship a
 ``git archive`` tarball of the merged sha → build the debug APK ON THE NODE →
 boot the AVD → install → (optional) seed a prebuilt DB (adb push → force-stop →
-WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a tap/swipe/wait/expect scenario parsed from the
-repo's ``smoke`` config → scan logcat for ``FATAL EXCEPTION`` / ``ANR`` → pull
-screenshots → **always stop the node**. A non-PASS withholds ``distribute`` and
+WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a
+clock/tap/swipe/wait/expect scenario parsed from the repo's ``smoke`` config (a
+clock step — ``set_time``/``timezone``/``restart_app`` — sets the device clock
+via ``adb root`` + ``date -u``, see :func:`parse_clock_step`) → scan logcat for
+``FATAL EXCEPTION`` / ``ANR`` → pull screenshots → (only if a clock step ran)
+restore automatic time/zone → **always stop the node**. A non-PASS withholds ``distribute`` and
 the watermark bump (the merge still stands); the one exception is a monthly-budget
 trip, which skips the gate and still distributes (blocking a month of betas on a
 cost ceiling is the worse failure — see ``maybe_publish``).
@@ -44,6 +47,7 @@ import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+import zoneinfo
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -564,6 +568,18 @@ _SEED_DEVICE_PATH = "/data/local/tmp/mk-smoke-seed.db"
 # are allow-listed: no quotes, spaces, `/` or a leading `.` (no `..` escape).
 _PKG_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+# A clock step's timezone is interpolated into a node shell AND a device
+# `setprop`, so it is allow-listed like pkg/db_name (IANA-shaped segments only:
+# no quotes, spaces, `;`, and no `.` so `..` cannot appear) and must ALSO load
+# as a zoneinfo key — an unknown zone fails before any adb call.
+_TZ_RE = re.compile(r"^[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*$")
+# Accepted set_time range: 2000-01-01 ≤ t < 2100-01-01 UTC. Catches an epoch in
+# milliseconds or a typo long before the device clock jumps to it.
+_CLOCK_MIN_EPOCH = 946684800
+_CLOCK_MAX_EPOCH = 4102444800
+# The end-of-run clock restore gets its own fixed timeout (like _STOP_TIMEOUT_S):
+# the cap deadline may already be spent when the inner finally reaches it.
+_CLOCK_RESTORE_TIMEOUT_S = 60
 
 
 def _remaining(deadline: float) -> float:
@@ -618,6 +634,24 @@ def _stop_node(run: Runner, node_script: Path | str, env: dict,
         progress(f"beta-smoke: node stop rc={getattr(r, 'returncode', None)}")
     except Exception as e:      # noqa: BLE001 — stop must not mask the real outcome
         progress(f"beta-smoke: node stop skipped ({type(e).__name__})")
+
+
+def _restore_clock(run: Runner, node_script: Path | str, env: dict, clock_state: dict | None,
+                   progress: Callable[[str], None]) -> None:
+    """Put the device's automatic time/zone (and the zone it had before the first
+    clock step) back before the node stops, so a clock step never leaks into a
+    later run — ``/data`` survives between runs. Only when a clock step touched
+    the device: a run without one makes ZERO extra node calls. Never raises (the
+    twin of :func:`_stop_node`) and uses its own fixed timeout, since the cap
+    deadline may already be spent."""
+    if not (clock_state or {}).get("touched"):
+        return
+    try:
+        r = _ssh(run, node_script, clock_restore_script(clock_state.get("prev_tz")),
+                 env=env, timeout=_CLOCK_RESTORE_TIMEOUT_S)
+        progress(f"beta-smoke: clock restore rc={getattr(r, 'returncode', None)}")
+    except Exception as e:      # noqa: BLE001 — restore must not mask the real outcome
+        progress(f"beta-smoke: clock restore skipped ({type(e).__name__})")
 
 
 def _default_notify(message: str) -> None:
@@ -871,17 +905,179 @@ def _seed_db(run: Runner, node_script: Path | str, pkg: str, smoke_cfg: dict,
         raise SmokeError("node", f"시드 DB 주입 실패 (rc={getattr(r, 'returncode', None)})")
 
 
+@dataclass(frozen=True)
+class ClockSpec:
+    """A validated clock/timezone scenario step (see :func:`parse_clock_step`).
+    ``epoch`` is the absolute instant to set (``None`` = leave the clock alone),
+    ``timezone`` an allow-listed, zoneinfo-loadable IANA name (``None`` = leave
+    the device zone alone), ``restart_app`` relaunches the app afterwards so a
+    screen already drawn under the old clock is redrawn."""
+
+    epoch: int | None
+    timezone: str | None
+    restart_app: bool = False
+
+    @property
+    def utc_stamp(self) -> str | None:
+        """``MMDDhhmmYYYY.ss`` in UTC — the toybox ``date -u`` set format. Setting
+        the clock in UTC makes it independent of the device zone (and of whether
+        the zone is changed before or after it)."""
+        if self.epoch is None:
+            return None
+        return dt.datetime.fromtimestamp(self.epoch, dt.timezone.utc).strftime("%m%d%H%M%Y.%S")
+
+
+def _load_zone(tz) -> "zoneinfo.ZoneInfo":
+    if not isinstance(tz, str) or not _TZ_RE.match(tz):
+        raise ValueError(f"알 수 없는 타임존: {tz!r}")
+    try:
+        return zoneinfo.ZoneInfo(tz)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        raise ValueError(f"알 수 없는 타임존: {tz!r}") from None
+
+
+def parse_clock_step(step: dict) -> ClockSpec | None:
+    """Parse a scenario step's clock keys into a :class:`ClockSpec`. Pure.
+
+    Keys (all optional; a step with neither ``set_time`` nor ``timezone`` is not
+    a clock step → ``None``):
+
+    - ``set_time`` — an epoch int (seconds; ``bool``/``float`` rejected), a
+      digits-only string (epoch), or an ISO 8601 string (``"2026-11-12 18:50"``,
+      ``"2026-11-12T18:50:30"``, ``"2026-11-12T18:50+09:00"``). A string without
+      an offset is read in ``timezone`` when given, else in UTC. Must fall in
+      2000-01-01 ≤ t < 2100-01-01 UTC.
+    - ``timezone`` — an IANA name (``"Asia/Seoul"``), allow-listed by
+      :data:`_TZ_RE` AND loadable by :mod:`zoneinfo`.
+    - ``restart_app`` — ``bool``; only together with ``set_time``/``timezone``.
+
+    Any invalid value raises ``ValueError`` with a Korean message, so the
+    scenario fails with ZERO adb calls."""
+    has_time = "set_time" in step
+    has_tz = "timezone" in step
+    if not has_time and not has_tz:
+        if "restart_app" in step:
+            raise ValueError("restart_app 은 set_time/timezone 과 함께 써야 함")
+        return None
+    restart = step.get("restart_app", False)
+    if not isinstance(restart, bool):
+        raise ValueError(f"restart_app 은 true/false 여야 함: {restart!r}")
+    tz = step.get("timezone") if has_tz else None
+    zone = _load_zone(tz) if has_tz else None
+    epoch: int | None = None
+    if has_time:
+        raw = step.get("set_time")
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            raise ValueError(f"set_time 은 epoch 정수 또는 ISO 시각 문자열이어야 함: {raw!r}")
+        if isinstance(raw, int):
+            epoch = raw
+        elif re.fullmatch(r"[0-9]+", raw.strip()):
+            epoch = int(raw.strip())
+        else:
+            text = raw.strip()
+            try:
+                when = dt.datetime.fromisoformat(text) if text else None
+            except ValueError:
+                when = None
+            if when is None:
+                raise ValueError(f"set_time 을 해석할 수 없음: {raw!r}")
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=zone if zone is not None else dt.timezone.utc)
+            epoch = int(when.timestamp())
+        if not (_CLOCK_MIN_EPOCH <= epoch < _CLOCK_MAX_EPOCH):
+            raise ValueError(f"set_time 범위 밖 (2000~2099년): {raw!r}")
+    return ClockSpec(epoch=epoch, timezone=tz, restart_app=restart)
+
+
+def clock_script(spec: ClockSpec, pkg: str | None = None) -> str:
+    """The node-side shell script for one clock step. Pure, so the command order
+    and arguments can be pinned without a node.
+
+    ``adb root`` (best-effort — setting the clock needs root, which the
+    google_apis AVD grants) → ``wait-for-device`` (root restarts adbd) → read the
+    current ``persist.sys.timezone`` (echoed LAST, so the run can restore it) →
+    automatic time off → [zone] automatic zone off + ``setprop
+    persist.sys.timezone`` → [time] ``date -u MMDDhhmmYYYY.ss`` → [restart]
+    ``am force-stop`` + LAUNCHER relaunch (launch extras are NOT re-sent).
+
+    Only the numeric stamp, an allow-listed zone and an allow-listed pkg reach
+    the shell. ``restart_app`` with a missing/invalid ``pkg`` → ``ValueError``."""
+    if spec.restart_app and not _PKG_RE.match(pkg or ""):
+        raise ValueError("restart_app 에 필요한 패키지 이름이 없거나 형식이 잘못됨")
+    if spec.timezone is not None and not _TZ_RE.match(spec.timezone):
+        raise ValueError(f"알 수 없는 타임존: {spec.timezone!r}")
+    parts = [
+        "set -e",
+        f"{_ADB} root >/dev/null 2>&1 || true",
+        f"{_ADB} wait-for-device",
+        f"prev=$({_ADB} shell getprop persist.sys.timezone | tr -d '\\r')",
+        f"{_ADB} shell settings put global auto_time 0",
+    ]
+    if spec.timezone is not None:
+        parts += [f"{_ADB} shell settings put global auto_time_zone 0",
+                  f"{_ADB} shell setprop persist.sys.timezone {spec.timezone}"]
+    if spec.utc_stamp is not None:
+        parts.append(f"{_ADB} shell date -u {spec.utc_stamp} >/dev/null")
+    if spec.restart_app:
+        parts += [f"{_ADB} shell am force-stop {pkg}",
+                  f"{_ADB} shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1 "
+                  ">/dev/null 2>&1"]
+    parts.append('echo "$prev"')
+    return "; ".join(parts)
+
+
+def clock_restore_script(prev_tz: str | None) -> str:
+    """The end-of-run restore for a run that ran a clock step: automatic time and
+    zone back on, and the zone the device had before the first clock step (only
+    when it passes :data:`_TZ_RE`). No ``set -e`` — best-effort, every line runs."""
+    parts = [f"{_ADB} shell settings put global auto_time 1",
+             f"{_ADB} shell settings put global auto_time_zone 1"]
+    if prev_tz and _TZ_RE.match(prev_tz):
+        parts.append(f"{_ADB} shell setprop persist.sys.timezone {prev_tz}")
+    return "; ".join(parts)
+
+
 def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: dict,
-                  deadline: float, steps_out: list) -> tuple[bool, str | None, str]:
-    """Run the tap/swipe/wait/expect scenario. Returns ``(ok, kind, detail)``; a failed
-    expectation or an untappable target → ``(False, "scenario", …)``. Each step's
-    per-step result (name/ok/duration/detail) is appended to ``steps_out``."""
+                  deadline: float, steps_out: list, *, pkg: str | None = None,
+                  clock_state: dict | None = None) -> tuple[bool, str | None, str]:
+    """Run the clock/tap/swipe/wait/expect scenario. Returns ``(ok, kind, detail)``; a
+    failed expectation or an untappable target → ``(False, "scenario", …)``. Each
+    step's per-step result (name/ok/duration/detail) is appended to ``steps_out``.
+
+    Within one step the keys run in this order: clock (``set_time``/``timezone``/
+    ``restart_app``, see :func:`parse_clock_step`) → ``tap`` → ``swipe`` →
+    ``wait_s`` → ``expect``. A clock value that does not validate fails the step
+    with ZERO adb calls; a clock script that exits non-zero (e.g. no root, so
+    ``date`` is refused) fails it too. ``pkg`` is needed only by
+    ``restart_app``. ``clock_state`` (owned by :func:`_run_locked`) records that a
+    clock step touched the device (``touched``) and the zone it had before the
+    first one (``prev_tz``), so the run restores both before the node stops."""
     fields = smoke_cfg.get("fields") or {}
     scenario = smoke_cfg.get("scenario") or []
     interval = _poll_interval(smoke_cfg)
     for idx, step in enumerate(scenario):
         name = str(step.get("name") or f"step {idx + 1}")
         t0 = time.monotonic()
+        try:
+            clock = parse_clock_step(step)
+            script = clock_script(clock, pkg) if clock is not None else None
+        except ValueError as e:
+            steps_out.append(_step(name, False, time.monotonic() - t0, f"시계 스텝 오류: {e}"))
+            return False, "scenario", f"{name}: 시계 스텝 오류 — {e}"
+        if clock is not None:
+            # Marked BEFORE the call so a half-applied step (rc≠0, timeout, raise)
+            # is still restored; prev_tz comes from the FIRST step's output only.
+            first = clock_state is not None and not clock_state.get("touched")
+            if clock_state is not None:
+                clock_state["touched"] = True
+            r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
+            if first:
+                clock_state["prev_tz"] = _last_line(r)
+            rc = getattr(r, "returncode", 1)
+            if rc != 0:
+                steps_out.append(_step(name, False, time.monotonic() - t0,
+                                       f"시계 설정 실패 (rc={rc})"))
+                return False, "scenario", f"{name}: 시계 설정 실패 (rc={rc})"
         tap_target = _resolve_selector(step.get("tap"), fields)
         if tap_target is not None:
             xy = resolve_tap(_node_dump(run, node_script, env, deadline), tap_target)
@@ -911,8 +1107,11 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
                 pass
         expect = step.get("expect")
         if not expect:
-            steps_out.append(_step(name, True, time.monotonic() - t0,
-                                   "스와이프 완료" if swipe is not None else "탭 완료"))
+            if clock is not None and tap_target is None and swipe is None:
+                done = "시계 설정 완료"
+            else:
+                done = "스와이프 완료" if swipe is not None else "탭 완료"
+            steps_out.append(_step(name, True, time.monotonic() - t0, done))
             continue
         if str(expect.get("kind")) == "scrolled":
             # Compared against the dump taken BEFORE the swipe — a post-swipe
@@ -1015,6 +1214,7 @@ def _run_locked(repo_name: str, repo_dir: Path | str, sha: str, smoke_cfg: dict,
     env = _node_env(result_dir, remote_cfg)
     steps: list = []
     screenshots: list[str] = []
+    clock_state: dict = {}
     try:
         try:
             _start_node(run, node_script, env, deadline)
@@ -1024,11 +1224,17 @@ def _run_locked(repo_name: str, repo_dir: Path | str, sha: str, smoke_cfg: dict,
             pkg = _install_and_launch(run, node_script, apk, smoke_cfg, env, deadline,
                                       progress)
             _seed_db(run, node_script, pkg, smoke_cfg, result_dir, env, deadline)
-            sc_ok, sc_kind, sc_detail = _run_scenario(run, node_script, smoke_cfg, env, deadline, steps)
+            sc_ok, sc_kind, sc_detail = _run_scenario(run, node_script, smoke_cfg, env, deadline,
+                                                      steps, pkg=pkg, clock_state=clock_state)
             lc_ok, lc_detail, lc_agg = _scan_node_logcat(run, node_script, env, deadline)
             screenshots = _pull_screens(run, node_script, result_dir, env, deadline)
         finally:
-            _stop_node(run, node_script, env, progress)
+            # Restore the device clock/zone (only if a clock step ran) AFTER the
+            # screenshot, then stop — nested so the stop runs even if it raises.
+            try:
+                _restore_clock(run, node_script, env, clock_state, progress)
+            finally:
+                _stop_node(run, node_script, env, progress)
     except SmokeError as e:
         return _result(False, e.kind, e.detail, result_dir=result_dir, steps=steps, screenshots=screenshots)
     except subprocess.TimeoutExpired:
