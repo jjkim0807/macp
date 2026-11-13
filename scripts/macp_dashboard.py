@@ -10,6 +10,8 @@ Stdlib-only HTTP server. `/` serves the HTML shell; `/api/status` serves fresh
 JSON that the page polls every few seconds; `/api/run?id=<run dir>` serves one
 run's detail (stage rcs, artifact markdown, run.log tail) and `/api/task?slug=`
 one task's (todo fields, ledger, task body, its runs) for the tap-through view.
+`/graph` is an interactive view of graph_memory's typed edges, fed by
+`/api/graph?as_of=<YYYY-MM-DD>` (read-only on `Memory/relations.sqlite`).
 `POST /api/sms` is the phone's write-only SMS ingest (own `MACP_SMS_TOKEN`,
 stored by `todo_system.sms`, never in the vault); a rejected ingest
 (401/429/400/413) raises one notifier alert per kind per 6h
@@ -86,6 +88,8 @@ TODO_DB = VAULT / "Todo" / "todo.db"
 ITEMS = VAULT / "Todo" / "items"
 SESSIONS = VAULT / "Memory" / "sessions"
 REGISTRY = VAULT / "Worker" / "agents" / "registry.yaml"
+# graph_memory's derived index (`python -m todo_system.graph_memory scan`). Read-only here.
+RELATIONS_DB = VAULT / "Memory" / "relations.sqlite"
 
 ACTIVE = ("dispatched", "in_progress")
 # The default runner identity (systemd unit runs `--agent worker-default`). The
@@ -1354,6 +1358,89 @@ def collect_todo() -> dict:
     return out
 
 
+# ---- graph memory view (/graph, /api/graph) ---------------------------------
+# A read-only picture of graph_memory's bi-temporal `edges` table: which tasks,
+# decisions, entities and notes point at which. `as_of` rewinds it to the edges
+# that were live at that instant (recorded by then, not yet tombstoned), so the
+# page can show how the graph looked on an earlier day.
+
+GRAPH_MAX_NODES = 600   # keep the client-side layout responsive; most-connected first
+_AS_OF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$")
+# source_file prefix -> node kind (the edge's from_slug lives in that file)
+_GRAPH_KINDS = (("Todo/items/", "task"), ("Decisions/", "decision"),
+                ("Memory/entities/", "entity"), ("Memory/episodes/", "episode"),
+                ("Notes/", "note"))
+
+
+def _graph_as_of(raw: str | None) -> str | None:
+    """Normalise ?as_of= to a comparable ISO string; a bare date means end of day.
+    Anything else is ignored (None = now) rather than raising."""
+    raw = (raw or "").strip()
+    if not _AS_OF_RE.match(raw):
+        return None
+    if "T" not in raw:
+        return raw + "T23:59:59"
+    return raw if raw.count(":") == 2 else raw + ":00"
+
+
+def _graph_kind(source_file: str) -> str:
+    sf = (source_file or "").replace("\\", "/")
+    for prefix, kind in _GRAPH_KINDS:
+        if sf.startswith(prefix):
+            return kind
+    return "ref"
+
+
+def collect_graph(as_of: str | None = None, max_nodes: int = GRAPH_MAX_NODES) -> dict:
+    """Nodes + typed edges from ``Memory/relations.sqlite`` for the /graph page.
+
+    Fail-soft like every collector: a missing or unreadable index comes back as
+    ``available: False`` with empty lists, never an exception."""
+    out = {"available": False, "as_of": as_of, "nodes": [], "edges": [],
+           "truncated": 0, "first_recorded": None}
+    try:
+        with _ro_conn(RELATIONS_DB) as con:
+            if con is None:
+                return out
+            if as_of:
+                rows = con.execute(
+                    "SELECT from_slug, to_slug, edge_type, source_file FROM edges "
+                    "WHERE recorded_at <= ? AND (valid_until IS NULL OR valid_until > ?)",
+                    (as_of, as_of)).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT from_slug, to_slug, edge_type, source_file FROM edges "
+                    "WHERE valid_until IS NULL").fetchall()
+            out["first_recorded"] = con.execute("SELECT MIN(recorded_at) FROM edges").fetchone()[0]
+    except Exception:
+        return out
+    out["available"] = True
+
+    degree: dict[str, int] = {}
+    kind: dict[str, str] = {}
+    for frm, to, _t, sf in rows:
+        degree[frm] = degree.get(frm, 0) + 1
+        degree[to] = degree.get(to, 0) + 1
+        kind.setdefault(frm, _graph_kind(sf))
+    keep = set(sorted(degree, key=lambda s: (-degree[s], s))[:max_nodes])
+    out["truncated"] = len(degree) - len(keep)
+
+    titles, statuses = _title_map(), _todo_status_map()
+    # A slug that only ever appears as a target (e.g. a parent task) still counts as a
+    # task when todo.db knows it; "ref" is left for links to nothing indexed.
+    out["nodes"] = [{"id": s, "label": titles.get(s) or s,
+                     "kind": kind.get(s) or ("task" if s in titles else "ref"),
+                     "status": statuses.get(s) or "", "degree": degree[s]}
+                    for s in sorted(keep)]
+    seen = set()
+    for frm, to, etype, _sf in rows:
+        sig = (frm, to, etype)
+        if frm in keep and to in keep and sig not in seen:
+            seen.add(sig)
+            out["edges"].append({"from": frm, "to": to, "type": etype})
+    return out
+
+
 def collect_usage() -> dict | None:
     """Claude subscription usage + guard decision (todo_system/usage_guard.py).
     Reads the guard's state file only — the dashboard poll must never trigger a
@@ -1797,6 +1884,7 @@ border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-i
 overflow:hidden;text-overflow:ellipsis}
 .htitle .mut{font-weight:400;font-size:13px}
 .dot{width:11px;height:11px;border-radius:50%;flex:none;background:var(--mut)}
+a.pill{color:inherit;text-decoration:none}
 .pill{padding:3px 11px;border-radius:20px;font-size:13px;font-weight:600;
 border:1px solid var(--bd);white-space:nowrap}
 #theme{background:transparent;color:var(--fg);font:inherit;cursor:pointer}
@@ -1894,6 +1982,7 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
   <span id="hdot" class="dot"></span>
   <div class="htitle">MaestroACP<span class="mut"> · @@dash.html.subtitle@@</span></div>
   <span id="hstate" class="pill">…</span>
+  <a id="graph-link" class="pill" href="graph">@@dash.html.graph_link@@</a>
   <button id="theme" class="pill" type="button" aria-label="@@dash.html.theme_aria@@">@@dash.js.theme_auto@@</button>
   <span id="clock" class="mut mono"></span>
 </header>
@@ -2388,6 +2477,225 @@ def render_html(lang: str) -> str:
 HTML = render_html("ko")   # the ko page, byte-identical to the pre-i18n constant
 
 
+# The /graph page: graph_memory's edges as an interactive node graph. Same rules as
+# the main page — stdlib server, no external URL / font / script, the same theme
+# tokens and `mdash.theme` choice, every string an i18n marker. The force layout is
+# a small hand-rolled simulation (O(n²) repulsion, capped by GRAPH_MAX_NODES).
+_GRAPH_TEMPLATE = """<!doctype html><html lang="@@dash.html.lang@@"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MaestroACP · @@dash.graph.title@@</title>
+<meta name="color-scheme" content="dark light">
+<link rel="icon" type="image/svg+xml" href="__FAVICON__">
+<script>try{var _t=localStorage.getItem('mdash.theme');if(_t==='light'||_t==='dark')document.documentElement.dataset.theme=_t}catch(_e){}</script>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--bd2:#242b34;--fg:#e6edf3;--mut:#9ba5b0;
+--grn:#3fb950;--red:#f85149;--yel:#d29922;--blu:#58a6ff;--pur:#bc8cff}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+--bg:#f6f8fa;--card:#ffffff;--bd:#d0d7de;--bd2:#eaeef2;--fg:#1f2328;--mut:#59636e;
+--grn:#1a7f37;--red:#cf222e;--yel:#9a6700;--blu:#0969da;--pur:#8250df}}
+:root[data-theme="light"]{--bg:#f6f8fa;--card:#ffffff;--bd:#d0d7de;--bd2:#eaeef2;--fg:#1f2328;
+--mut:#59636e;--grn:#1a7f37;--red:#cf222e;--yel:#9a6700;--blu:#0969da;--pur:#8250df}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;
+font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--bd)}
+.htitle{font-size:15px;font-weight:600;margin-right:auto}
+.mut{color:var(--mut)}
+a{color:var(--blu);text-decoration:none}
+input,button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);
+border-radius:6px;padding:4px 8px}
+button{cursor:pointer}
+#bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--bd2)}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border:1px solid var(--bd);
+border-radius:20px;font-size:12px;cursor:pointer;user-select:none}
+.chip.off{opacity:.4}
+.sw{width:9px;height:9px;border-radius:50%;display:inline-block}
+#stage{position:relative;flex:1;min-height:320px;overflow:hidden}
+svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+svg.drag{cursor:grabbing}
+.e{stroke:var(--bd);stroke-width:1}
+.e.hl{stroke:var(--blu);stroke-width:1.8}
+.n{stroke:var(--bg);stroke-width:1.5;cursor:pointer}
+.n.sel{stroke:var(--fg);stroke-width:2.5}
+.lbl{fill:var(--fg);font-size:11px;pointer-events:none;paint-order:stroke;stroke:var(--bg);stroke-width:3px}
+.dim{opacity:.15}
+#side{position:absolute;top:10px;right:10px;width:min(320px,calc(100% - 20px));max-height:calc(100% - 20px);
+overflow:auto;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+#side h3{margin:0 0 4px;font-size:15px;overflow-wrap:anywhere}
+#side .row{display:flex;gap:6px;padding:4px 0;border-top:1px solid var(--bd2);font-size:13px}
+#side .row a{flex:1;overflow-wrap:anywhere;cursor:pointer}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+padding:24px;text-align:center;color:var(--mut)}
+</style></head><body>
+<header>
+  <div class="htitle">MaestroACP<span class="mut"> · @@dash.graph.title@@</span></div>
+  <a href="./">@@dash.graph.back@@</a>
+</header>
+<div id="bar">
+  <input id="q" type="search" placeholder="@@dash.graph.search_ph@@" aria-label="@@dash.graph.search_ph@@">
+  <label class="mut">@@dash.graph.as_of@@ <input id="asof" type="date"></label>
+  <button id="now" type="button">@@dash.graph.now@@</button>
+  <span id="types"></span>
+  <span id="stats" class="mut"></span>
+</div>
+<div id="stage">
+  <svg id="svg" aria-label="@@dash.graph.title@@"><g id="vp"><g id="eg"></g><g id="ng"></g><g id="lg"></g></g></svg>
+  <div id="side" hidden></div>
+  <div id="msg">@@dash.js.loading@@</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const NS=$('svg').namespaceURI;
+const KIND={task:'--blu',decision:'--pur',entity:'--grn',episode:'--yel',note:'--yel',ref:'--mut'};
+const KNAME={task:'@@dash.graph.kind_task@@',decision:'@@dash.graph.kind_decision@@',entity:'@@dash.graph.kind_entity@@',
+  episode:'@@dash.graph.kind_episode@@',note:'@@dash.graph.kind_note@@',ref:'@@dash.graph.kind_ref@@'};
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let G={nodes:[],edges:[]},idx={},off=new Set(),sel=null,view={x:0,y:0,k:1},alpha=0,raf=0;
+
+function mk(tag,attrs,parent){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);parent.appendChild(e);return e}
+
+async function load(){
+  const a=$('asof').value;
+  $('msg').hidden=false;$('msg').textContent='@@dash.js.loading@@';
+  try{
+    const r=await fetch('api/graph'+(a?'?as_of='+encodeURIComponent(a):''),{credentials:'same-origin'});
+    build(await r.json());
+  }catch(e){$('msg').textContent='@@dash.graph.load_failed@@'}
+}
+
+function build(d){
+  const keep={};for(const n of G.nodes)keep[n.id]=n;   /* keep positions across time-travel reloads */
+  G=d;idx={};
+  const W=$('stage').clientWidth,H=$('stage').clientHeight;
+  d.nodes.forEach((n,i)=>{const o=keep[n.id];const t=i*2.399963;const r=30*Math.sqrt(i+1);
+    Object.assign(n,o?{x:o.x,y:o.y,fx:o.fx,fy:o.fy}:{x:W/2+r*Math.cos(t),y:H/2+r*Math.sin(t)},{vx:0,vy:0,nb:[]});idx[n.id]=n});
+  for(const e of d.edges){const a=idx[e.from],b=idx[e.to];if(a&&b){a.nb.push([b,e.type,'out']);b.nb.push([a,e.type,'in'])}}
+  if(!d.available){$('msg').textContent='@@dash.graph.unavailable@@';draw();return}
+  if(!d.nodes.length){$('msg').textContent='@@dash.graph.empty@@';draw();return}
+  $('msg').hidden=true;
+  const types=[...new Set(d.edges.map(e=>e.type))].sort();
+  $('types').innerHTML=types.map(t=>`<span class="chip${off.has(t)?' off':''}" data-t="${esc(t)}">${esc(t)}</span>`).join(' ');
+  $('types').querySelectorAll('.chip').forEach(c=>c.onclick=()=>{off.has(c.dataset.t)?off.delete(c.dataset.t):off.add(c.dataset.t);c.classList.toggle('off');alpha=Math.max(alpha,.3);tick()});
+  $('stats').textContent=`${d.nodes.length} @@dash.graph.nodes@@ · ${d.edges.length} @@dash.graph.edges@@`+(d.truncated?` (+${d.truncated} @@dash.graph.truncated@@)`:'');
+  const warmStart=!Object.keys(keep).length;
+  draw();alpha=warmStart?1:.5;if(warmStart){warm();fit()}else render();tick();
+  select(sel&&idx[sel.id]);
+}
+
+function draw(){
+  const eg=$('eg'),ng=$('ng'),lg=$('lg');eg.innerHTML=ng.innerHTML=lg.innerHTML='';
+  for(const e of G.edges){e.el=mk('line',{class:'e'},eg)}
+  for(const n of G.nodes){
+    n.r=4+Math.min(10,Math.sqrt(n.degree)*2);
+    n.el=mk('circle',{class:'n',r:n.r,fill:n.status==='done'||n.status==='canceled'||n.status==='cancelled'?css('--mut'):css(KIND[n.kind]||'--mut')},ng);
+    const t=document.createElementNS(NS,'title');t.textContent=n.label;n.el.appendChild(t);
+    n.lb=mk('text',{class:'lbl',dx:n.r+3,dy:4},lg);n.lb.textContent=n.label.length>28?n.label.slice(0,27)+'…':n.label;
+    n.el.addEventListener('pointerdown',ev=>nodeDrag(ev,n));
+  }
+  filter();
+}
+
+function visible(e){return !off.has(e.type)}
+function step(){   /* one simulation step: capped repulsion, springs, weak gravity */
+  const N=G.nodes,W=$('stage').clientWidth,H=$('stage').clientHeight;
+  for(let i=0;i<N.length;i++){const a=N[i];for(let j=i+1;j<N.length;j++){const b=N[j];
+    let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy;if(d2>62500)continue;if(d2<100)d2=100;
+    const f=400*alpha/d2;dx*=f;dy*=f;a.vx+=dx;a.vy+=dy;b.vx-=dx;b.vy-=dy}}
+  for(const e of G.edges){if(!visible(e))continue;const a=idx[e.from],b=idx[e.to];if(!a||!b)continue;
+    const dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-50)*.06*alpha/d;
+    a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f}
+  for(const n of N){n.vx+=(W/2-n.x)*.02*alpha;n.vy+=(H/2-n.y)*.02*alpha;
+    const v=Math.hypot(n.vx,n.vy);if(v>15){n.vx*=15/v;n.vy*=15/v}
+    if(n.fx!=null){n.x=n.fx;n.y=n.fy;n.vx=n.vy=0}else{n.x+=n.vx*=.6;n.y+=n.vy*=.6}}
+  alpha*=.97;
+}
+function warm(){   /* settle before first paint so the page opens on a laid-out graph */
+  const n=G.nodes.length,iters=Math.min(200,Math.floor(2e7/Math.max(1,n*n)));
+  for(let i=0;i<iters&&alpha>.02;i++)step();
+}
+function fit(){
+  if(!G.nodes.length)return;const W=$('stage').clientWidth,H=$('stage').clientHeight;
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for(const n of G.nodes){x0=Math.min(x0,n.x);y0=Math.min(y0,n.y);x1=Math.max(x1,n.x);y1=Math.max(y1,n.y)}
+  const k=Math.min(2,Math.max(.2,Math.min((W-80)/Math.max(1,x1-x0),(H-80)/Math.max(1,y1-y0))));
+  view.k=k;view.x=W/2-(x0+x1)/2*k;view.y=H/2-(y0+y1)/2*k;render();
+}
+function tick(){
+  if(raf)return;
+  const go=()=>{raf=0;step();render();if(alpha>.01)raf=requestAnimationFrame(go)};
+  raf=requestAnimationFrame(go);
+}
+
+function render(){
+  for(const e of G.edges){const a=idx[e.from],b=idx[e.to];if(!a||!b)continue;
+    e.el.setAttribute('x1',a.x);e.el.setAttribute('y1',a.y);e.el.setAttribute('x2',b.x);e.el.setAttribute('y2',b.y)}
+  for(const n of G.nodes){n.el.setAttribute('cx',n.x);n.el.setAttribute('cy',n.y);n.lb.setAttribute('x',n.x);n.lb.setAttribute('y',n.y)}
+  $('vp').setAttribute('transform',`translate(${view.x},${view.y}) scale(${view.k})`);
+}
+
+function filter(){
+  const q=$('q').value.trim().toLowerCase();
+  const near=sel?new Set([sel.id,...sel.nb.filter(([,t])=>!off.has(t)).map(([m])=>m.id)]):null;
+  for(const e of G.edges){const on=visible(e);e.el.style.display=on?'':'none';
+    e.el.classList.toggle('hl',!!sel&&on&&(e.from===sel.id||e.to===sel.id));
+    e.el.classList.toggle('dim',!!near&&!(e.from===sel.id||e.to===sel.id))}
+  for(const n of G.nodes){
+    const hit=q&&(n.label.toLowerCase().includes(q)||n.id.toLowerCase().includes(q));
+    const dim=(near&&!near.has(n.id))||(q&&!hit);
+    n.el.classList.toggle('dim',!!dim);n.el.classList.toggle('sel',sel===n);
+    n.lb.style.display=(hit||sel===n||(near&&near.has(n.id))||(!q&&!near&&(n.degree>=3||G.nodes.length<=40)))?'':'none';
+    n.lb.classList.toggle('dim',!!dim)}
+}
+
+function select(n){
+  sel=n||null;filter();const s=$('side');s.hidden=!sel;if(!sel)return;
+  const rows=n.nb.filter(([,t])=>!off.has(t)).map(([m,t,dir])=>`<div class="row"><span class="mut mono">${dir==='out'?'→':'←'} ${esc(t)}</span><a data-id="${esc(m.id)}">${esc(m.label)}</a></div>`).join('');
+  s.innerHTML=`<h3>${esc(n.label)}</h3><div class="mut mono">${esc(n.id)}</div>
+    <div class="mut">${esc(KNAME[n.kind]||n.kind)}${n.status?' · '+esc(n.status):''} · ${n.degree} @@dash.graph.links@@</div>
+    <div style="margin-top:8px">${rows||'<span class="mut">@@dash.graph.none@@</span>'}</div>`;
+  s.querySelectorAll('a[data-id]').forEach(a=>a.onclick=()=>{const m=idx[a.dataset.id];if(m){select(m);center(m)}});
+}
+function center(n){const W=$('stage').clientWidth,H=$('stage').clientHeight;view.x=W/2-n.x*view.k;view.y=H/2-n.y*view.k;render()}
+
+function pt(ev){const r=$('svg').getBoundingClientRect();return{x:(ev.clientX-r.left-view.x)/view.k,y:(ev.clientY-r.top-view.y)/view.k}}
+function nodeDrag(ev,n){
+  ev.stopPropagation();const svg=$('svg');svg.setPointerCapture(ev.pointerId);let moved=false;
+  const mv=e=>{const p=pt(e);n.fx=p.x;n.fy=p.y;moved=true;alpha=Math.max(alpha,.2);tick()};
+  const up=()=>{svg.removeEventListener('pointermove',mv);svg.removeEventListener('pointerup',up);
+    if(!moved){n.fx=n.fy=null;select(n===sel?null:n)}};
+  svg.addEventListener('pointermove',mv);svg.addEventListener('pointerup',up);
+}
+(function panZoom(){
+  const svg=$('svg');
+  svg.addEventListener('pointerdown',ev=>{const sx=ev.clientX-view.x,sy=ev.clientY-view.y;svg.classList.add('drag');svg.setPointerCapture(ev.pointerId);
+    let moved=false;
+    const mv=e=>{view.x=e.clientX-sx;view.y=e.clientY-sy;moved=true;render()};
+    const up=()=>{svg.classList.remove('drag');svg.removeEventListener('pointermove',mv);svg.removeEventListener('pointerup',up);
+      if(!moved&&sel)select(null)};
+    svg.addEventListener('pointermove',mv);svg.addEventListener('pointerup',up)});
+  svg.addEventListener('wheel',ev=>{ev.preventDefault();const r=svg.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+    const k=Math.min(4,Math.max(.2,view.k*Math.exp(-ev.deltaY*.0015)));
+    view.x=mx-(mx-view.x)*k/view.k;view.y=my-(my-view.y)*k/view.k;view.k=k;render()},{passive:false});
+})();
+$('q').oninput=filter;
+$('asof').onchange=load;
+$('now').onclick=()=>{$('asof').value='';load()};
+load();
+</script></body></html>
+"""
+
+
+def render_graph_html(lang: str) -> str:
+    """The /graph page in ``lang`` (same marker rules as :func:`render_html`)."""
+    ph = i18n.dashboard_phrases(lang)
+    page = _MARKER_RE.sub(lambda m: ph.get(m.group(1), m.group(1)), _GRAPH_TEMPLATE)
+    return page.replace("__FAVICON__", FAVICON_HREF)
+
+
 COOKIE = "macp_dash"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
@@ -2661,6 +2969,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._reply(200, json.dumps(detail).encode("utf-8"),
                             "application/json", extra)
+        elif urlparse(self.path).path == "/api/graph":
+            as_of = _graph_as_of((parse_qs(urlparse(self.path).query).get("as_of") or [""])[0])
+            self._reply(200, json.dumps(collect_graph(as_of)).encode("utf-8"),
+                        "application/json", extra)
+        elif urlparse(self.path).path == "/graph":
+            self._reply(200, render_graph_html(paths.ui_language()).encode("utf-8"),
+                        "text/html; charset=utf-8", extra)
         elif urlparse(self.path).path == "/sms-setup":
             self._reply(200, self._sms_setup_page().encode("utf-8"),
                         "text/html; charset=utf-8", extra)
