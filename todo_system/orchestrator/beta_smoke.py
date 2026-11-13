@@ -12,9 +12,12 @@ What the gate does on the shared on-demand emulator node ``macp-app-test`` (via
 ``scripts/app-test-node``): start the node (one preemption retry) → ship a
 ``git archive`` tarball of the merged sha → build the debug APK ON THE NODE →
 boot the AVD → install → (optional) seed a prebuilt DB (adb push → force-stop →
-WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a tap/swipe/wait/expect scenario parsed from the
-repo's ``smoke`` config → scan logcat for ``FATAL EXCEPTION`` / ``ANR`` → pull
-screenshots → **always stop the node**. A non-PASS withholds ``distribute`` and
+WAL cleared → ``run-as <pkg> cp``, debuggable build required) and relaunch → run a
+clock/tap/swipe/wait/expect scenario parsed from the repo's ``smoke`` config (a
+clock step — ``set_time``/``timezone``/``restart_app`` — sets the device clock
+via ``adb root`` + ``date -u``, see :func:`parse_clock_step`) → scan logcat for
+``FATAL EXCEPTION`` / ``ANR`` → pull screenshots → (only if a clock step ran)
+restore automatic time/zone → **always stop the node**. A non-PASS withholds ``distribute`` and
 the watermark bump (the merge still stands); the one exception is a monthly-budget
 trip, which skips the gate and still distributes (blocking a month of betas on a
 cost ceiling is the worse failure — see ``maybe_publish``).
@@ -633,6 +636,24 @@ def _stop_node(run: Runner, node_script: Path | str, env: dict,
         progress(f"beta-smoke: node stop skipped ({type(e).__name__})")
 
 
+def _restore_clock(run: Runner, node_script: Path | str, env: dict, clock_state: dict | None,
+                   progress: Callable[[str], None]) -> None:
+    """Put the device's automatic time/zone (and the zone it had before the first
+    clock step) back before the node stops, so a clock step never leaks into a
+    later run — ``/data`` survives between runs. Only when a clock step touched
+    the device: a run without one makes ZERO extra node calls. Never raises (the
+    twin of :func:`_stop_node`) and uses its own fixed timeout, since the cap
+    deadline may already be spent."""
+    if not (clock_state or {}).get("touched"):
+        return
+    try:
+        r = _ssh(run, node_script, clock_restore_script(clock_state.get("prev_tz")),
+                 env=env, timeout=_CLOCK_RESTORE_TIMEOUT_S)
+        progress(f"beta-smoke: clock restore rc={getattr(r, 'returncode', None)}")
+    except Exception as e:      # noqa: BLE001 — restore must not mask the real outcome
+        progress(f"beta-smoke: clock restore skipped ({type(e).__name__})")
+
+
 def _default_notify(message: str) -> None:
     """Best-effort kakao alert, imported lazily so this module stays stdlib-only
     AT IMPORT (``check_engine_isolation.sh`` archives and imports the tree)."""
@@ -1017,16 +1038,46 @@ def clock_restore_script(prev_tz: str | None) -> str:
 
 
 def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: dict,
-                  deadline: float, steps_out: list) -> tuple[bool, str | None, str]:
-    """Run the tap/swipe/wait/expect scenario. Returns ``(ok, kind, detail)``; a failed
-    expectation or an untappable target → ``(False, "scenario", …)``. Each step's
-    per-step result (name/ok/duration/detail) is appended to ``steps_out``."""
+                  deadline: float, steps_out: list, *, pkg: str | None = None,
+                  clock_state: dict | None = None) -> tuple[bool, str | None, str]:
+    """Run the clock/tap/swipe/wait/expect scenario. Returns ``(ok, kind, detail)``; a
+    failed expectation or an untappable target → ``(False, "scenario", …)``. Each
+    step's per-step result (name/ok/duration/detail) is appended to ``steps_out``.
+
+    Within one step the keys run in this order: clock (``set_time``/``timezone``/
+    ``restart_app``, see :func:`parse_clock_step`) → ``tap`` → ``swipe`` →
+    ``wait_s`` → ``expect``. A clock value that does not validate fails the step
+    with ZERO adb calls; a clock script that exits non-zero (e.g. no root, so
+    ``date`` is refused) fails it too. ``pkg`` is needed only by
+    ``restart_app``. ``clock_state`` (owned by :func:`_run_locked`) records that a
+    clock step touched the device (``touched``) and the zone it had before the
+    first one (``prev_tz``), so the run restores both before the node stops."""
     fields = smoke_cfg.get("fields") or {}
     scenario = smoke_cfg.get("scenario") or []
     interval = _poll_interval(smoke_cfg)
     for idx, step in enumerate(scenario):
         name = str(step.get("name") or f"step {idx + 1}")
         t0 = time.monotonic()
+        try:
+            clock = parse_clock_step(step)
+            script = clock_script(clock, pkg) if clock is not None else None
+        except ValueError as e:
+            steps_out.append(_step(name, False, time.monotonic() - t0, f"시계 스텝 오류: {e}"))
+            return False, "scenario", f"{name}: 시계 스텝 오류 — {e}"
+        if clock is not None:
+            # Marked BEFORE the call so a half-applied step (rc≠0, timeout, raise)
+            # is still restored; prev_tz comes from the FIRST step's output only.
+            first = clock_state is not None and not clock_state.get("touched")
+            if clock_state is not None:
+                clock_state["touched"] = True
+            r = _ssh(run, node_script, script, env=env, timeout=_remaining(deadline))
+            if first:
+                clock_state["prev_tz"] = _last_line(r)
+            rc = getattr(r, "returncode", 1)
+            if rc != 0:
+                steps_out.append(_step(name, False, time.monotonic() - t0,
+                                       f"시계 설정 실패 (rc={rc})"))
+                return False, "scenario", f"{name}: 시계 설정 실패 (rc={rc})"
         tap_target = _resolve_selector(step.get("tap"), fields)
         if tap_target is not None:
             xy = resolve_tap(_node_dump(run, node_script, env, deadline), tap_target)
@@ -1056,8 +1107,11 @@ def _run_scenario(run: Runner, node_script: Path | str, smoke_cfg: dict, env: di
                 pass
         expect = step.get("expect")
         if not expect:
-            steps_out.append(_step(name, True, time.monotonic() - t0,
-                                   "스와이프 완료" if swipe is not None else "탭 완료"))
+            if clock is not None and tap_target is None and swipe is None:
+                done = "시계 설정 완료"
+            else:
+                done = "스와이프 완료" if swipe is not None else "탭 완료"
+            steps_out.append(_step(name, True, time.monotonic() - t0, done))
             continue
         if str(expect.get("kind")) == "scrolled":
             # Compared against the dump taken BEFORE the swipe — a post-swipe
@@ -1160,6 +1214,7 @@ def _run_locked(repo_name: str, repo_dir: Path | str, sha: str, smoke_cfg: dict,
     env = _node_env(result_dir, remote_cfg)
     steps: list = []
     screenshots: list[str] = []
+    clock_state: dict = {}
     try:
         try:
             _start_node(run, node_script, env, deadline)
@@ -1169,11 +1224,17 @@ def _run_locked(repo_name: str, repo_dir: Path | str, sha: str, smoke_cfg: dict,
             pkg = _install_and_launch(run, node_script, apk, smoke_cfg, env, deadline,
                                       progress)
             _seed_db(run, node_script, pkg, smoke_cfg, result_dir, env, deadline)
-            sc_ok, sc_kind, sc_detail = _run_scenario(run, node_script, smoke_cfg, env, deadline, steps)
+            sc_ok, sc_kind, sc_detail = _run_scenario(run, node_script, smoke_cfg, env, deadline,
+                                                      steps, pkg=pkg, clock_state=clock_state)
             lc_ok, lc_detail, lc_agg = _scan_node_logcat(run, node_script, env, deadline)
             screenshots = _pull_screens(run, node_script, result_dir, env, deadline)
         finally:
-            _stop_node(run, node_script, env, progress)
+            # Restore the device clock/zone (only if a clock step ran) AFTER the
+            # screenshot, then stop — nested so the stop runs even if it raises.
+            try:
+                _restore_clock(run, node_script, env, clock_state, progress)
+            finally:
+                _stop_node(run, node_script, env, progress)
     except SmokeError as e:
         return _result(False, e.kind, e.detail, result_dir=result_dir, steps=steps, screenshots=screenshots)
     except subprocess.TimeoutExpired:
