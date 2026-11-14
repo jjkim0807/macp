@@ -272,10 +272,14 @@ def is_oversize_rescope_park(blocked_on: str, last_note: str = "") -> bool:
 # does NOT include "subtask"/"sub-task", because the plan template always carries
 # a `## Parallelizable subtasks` heading — matching that bare word would skip
 # Implement on EVERY task.
-_PLAN_OVERSIZE_KEYWORDS = (
-    "exceeds a single implement stage", "re-scop", "rescop",
-)
-# A line that holds a strong keyword but ALSO carries negation is saying the
+_PLAN_OVERSIZE_PHRASE = "exceeds a single implement stage"
+# "re-scope"/"rescoped"/"rescoping" as a WORD — not the file `rescope.py`, the
+# key `rescope.json`, or a `\|rescope\|` grep alternation. 2026-11-13: three
+# design-doc plans were skipped as "oversize" only because they cited
+# `todo_system/orchestrator/rescope.py` or grepped for it.
+_PLAN_RESCOPE_WORD_RE = re.compile(
+    r"(?<![\w/.\\|])re-?scop(?:e|ed|es|ing)?(?![\w.\\|/])")
+# A sentence that holds a strong keyword but ALSO carries negation is saying the
 # opposite ("this does not exceed a single implement stage", "no re-scoping
 # needed", "재조정 불필요") and must not trip the signal. Matched as whole words
 # (so "cannot" / "rescoped" are NOT read as negators) plus the Korean negation
@@ -283,31 +287,63 @@ _PLAN_OVERSIZE_KEYWORDS = (
 # direction — so it never wrongly skips Implement.
 _PLAN_NEGATION_RE = re.compile(
     r"\bnot\b|\bno\b|\bnever\b|n['’]t|없|불필요|않")
+# A conditional sentence is not a declaration ("Only if the orchestrator ever has
+# to rescope, the hand-split boundary is …" — 2026-11-13). Same fail-closed side.
+_PLAN_CONDITIONAL_RE = re.compile(
+    r"\bif\b|\bwould\b|\bwhether\b|\bin case\b|\bunless\b|만약|경우|라면|한다면")
+_FENCE_RE = re.compile(r"```.*?```", re.S)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。])\s+")
+
+
+def _plan_sentences(text: str) -> list[str]:
+    """Prose sentences of a plan, lowercased: fenced and inline code removed,
+    indented command lines (4+ spaces or a tab, outside lists) dropped, the lines
+    of each paragraph joined so a sentence wrapped across lines is judged whole,
+    then split at sentence punctuation."""
+    text = _INLINE_CODE_RE.sub(" ", _FENCE_RE.sub(" ", text))
+    paragraphs: list[list[str]] = [[]]
+    for raw in text.splitlines():
+        if not raw.strip():
+            paragraphs.append([])
+            continue
+        stripped = raw.lstrip()
+        indent = len(raw) - len(stripped)
+        if (indent >= 4 or raw.startswith("\t")) and not stripped.startswith(("-", "*", "+")) \
+                and not stripped[:1].isdigit():
+            continue                         # an indented command / code line
+        if stripped.startswith(("#", "-", "*", "+")) or stripped[:1].isdigit():
+            paragraphs.append([])            # a heading / list item starts a new unit
+        paragraphs[-1].append(stripped)
+    out: list[str] = []
+    for para in paragraphs:
+        if para:
+            out.extend(_SENTENCE_SPLIT_RE.split(" ".join(para).lower()))
+    return out
 
 
 def plan_declares_oversize(text: str) -> bool:
     """Does an implementation plan DECLARE that the task is too big for one
     Implement stage — a pure function (no I/O).
 
-    Reads `text` line by line (lowercased). A line trips the signal when it holds
-    a strong oversize keyword AND no negation on the SAME line, so the judgment is
-    sentence-local: a line reading "this does not exceed a single implement stage"
-    never counts. Returns True as soon as one line trips, else False.
+    Judged per prose SENTENCE (see `_plan_sentences`): a sentence trips the
+    signal when it holds the phrase "exceeds a single implement stage" or the
+    word re-scope/rescoped/rescoping (not a file name or identifier), and carries
+    neither negation nor a conditional. Code — fenced, inline, or an indented
+    command line — is never read, so a plan that cites `rescope.py` or greps for
+    it does not count. Returns True as soon as one sentence trips, else False.
 
     Deliberately conservative / fail-closed. The template's `## Parallelizable
     subtasks` heading is NOT matched (only the strong phrases are); an empty or
     None text is False; any uncertainty resolves to False — wrongly skipping
     Implement is worse than running it on a plan that merely discusses
-    re-scoping. A plan that only QUOTES these phrases descriptively stays safe as
-    long as each such line also carries negation or splits the quote so no single
-    line holds a bare strong phrase."""
+    re-scoping."""
     if not text:
         return False
-    for raw in text.splitlines():
-        line = raw.lower()
-        if _PLAN_NEGATION_RE.search(line):
+    for sentence in _plan_sentences(text):
+        if _PLAN_NEGATION_RE.search(sentence) or _PLAN_CONDITIONAL_RE.search(sentence):
             continue
-        if any(kw in line for kw in _PLAN_OVERSIZE_KEYWORDS):
+        if _PLAN_OVERSIZE_PHRASE in sentence or _PLAN_RESCOPE_WORD_RE.search(sentence):
             return True
     return False
 
