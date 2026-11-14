@@ -156,6 +156,20 @@ class CalendarOwnershipTest(unittest.TestCase):
         self.assertEqual(events.inserted, [])
         self.assertEqual(events.deleted, ["ev1"])
 
+    def test_undated_task_loses_its_old_event(self):
+        """A task put on hold (due and scheduled cleared) must not keep the
+        event it got while dated — it used to be skipped but never cleaned."""
+        con = _db([("held", "held task", "-", "", "/nonexistent/held.md", "open", None)])
+        events = _FakeEvents(existing=[
+            {"id": "ev-old", "_slug": "held",
+             "extendedProperties": {"private": {"todo_slug": "held"}}},
+        ])
+        created, skipped = _sync(con, events)
+
+        self.assertEqual((created, skipped), (0, 1))
+        self.assertEqual(events.inserted, [])
+        self.assertEqual(events.deleted, ["ev-old"])
+
     def test_cleanup_ignores_non_todo_events(self):
         con = _db([("mine", "human task", "2026-08-10", "", "x.md", "open", None)])
         events = _FakeEvents(existing=[
