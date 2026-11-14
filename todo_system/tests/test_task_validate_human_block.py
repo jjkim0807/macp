@@ -34,6 +34,8 @@ def test_exempt_worker_owned_undated_parent_and_done():
     assert "scheduled" not in _fields({"status": "open", "worker_mode": "manual", "due": "-"})
     assert "scheduled" not in _fields({**base, "status": "open", "is_parent": "true"})
     assert "scheduled" not in _fields({**base, "status": "done"})
+    assert "scheduled" not in _fields({**base, "status": "open", "tags": ["todo", "decision"]})
+    assert "scheduled" not in _fields({**base, "status": "open", "needs_decision": "true"})
 
 
 def test_oversized_estimate_asks_for_a_split():

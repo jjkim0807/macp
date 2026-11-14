@@ -282,8 +282,9 @@ def _check_human_time_block(fm: dict) -> list[Issue]:
     The calendar shows only timed blocks (`calendar_sync` timed-only default),
     so a human task with just a due date never reaches it. The block should
     be sized from `estimate_p50`; work too big for one block is split into
-    child tasks (`parent:`), each with its own block. Parents (`is_parent`) and
-    undated tasks are exempt.
+    child tasks (`parent:`), each with its own block. Parents (`is_parent`),
+    decision tasks (`decision` tag / `needs_decision`) and undated tasks are
+    exempt.
     """
     if str(fm.get("status", "open")).strip().lower() != "open":
         return []
@@ -291,6 +292,14 @@ def _check_human_time_block(fm: dict) -> list[Issue]:
     if mode not in HUMAN_OVERRIDE_WORKER_MODES:
         return []
     if str(fm.get("is_parent", "")).strip().lower() in ("true", "yes", "1"):
+        return []
+    # A decision is answered when it is asked, not worked in a block, and the
+    # engine writes decision tasks (project_stall) with no view of the calendar.
+    raw_tags = fm.get("tags") or []
+    tags = raw_tags if isinstance(raw_tags, list) else re.split(r"[,\s\[\]]+", str(raw_tags))
+    if "decision" in {str(t).strip().lower() for t in tags} or str(
+        fm.get("needs_decision", "")
+    ).strip().lower() in ("true", "yes", "1"):
         return []
     due = str(fm.get("due") or "").strip().strip('"').strip("'")
     sched = str(fm.get("scheduled") or "").strip().strip('"').strip("'")
