@@ -176,6 +176,7 @@ def _sync(monkeypatch, con, events, routes):
         client_secret_path=Path("/nope"),
         token_path=Path("/nope"),
         calendar_routes=routes,
+        timed_only=False,  # routing is about where, not what; bare due dates suffice
     )
 
 
@@ -327,3 +328,10 @@ def test_calendar_sync_command_passes_routes_through(monkeypatch):
     args = CLI.build_parser().parse_args(["calendar-sync", "--calendar-id", DEFAULT])
     assert args.func(args) == 0
     assert seen["calendar_routes"] is None
+    assert seen["timed_only"] is True
+
+    seen.clear()
+    args = CLI.build_parser().parse_args(
+        ["calendar-sync", "--calendar-id", DEFAULT, "--calendar-all-dated"])
+    assert args.func(args) == 0
+    assert seen["timed_only"] is False

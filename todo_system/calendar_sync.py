@@ -473,8 +473,16 @@ def sync_due_tasks_to_calendar(
     client_secret_path: Path,
     token_path: Path,
     calendar_routes: Sequence[CalendarRoute] | None = None,
+    timed_only: bool = True,
 ) -> tuple[int, int]:
     """Upsert open human-owned tasks as events and delete stale todo events.
+
+    ``timed_only`` (the default) puts only tasks with a timed work block
+    (`scheduled: DATE HH:MM~HH:MM`) on the calendar: the calendar is for work a
+    person sits down to at a set time. A task with just a due date or an
+    all-day `scheduled:` stays on the dashboard only, and an event it got
+    earlier is deleted by the cleanup. ``timed_only=False``
+    (``--calendar-all-dated``) is the old rule: every dated task gets an event.
 
     ``calendar_routes`` (``--calendar-route TAG=CALENDAR_ID``) sends a task to
     the calendar of its first routed tag (see :func:`route_calendar`); an
@@ -524,8 +532,16 @@ def sync_due_tasks_to_calendar(
         due = r["due"]
         return bool(due and due != "-") or _parse_scheduled(str(r["path"]))[0] is not None
 
-    skipped = sum(1 for r in rows if not _is_dated(r))
-    rows = [r for r in rows if _is_dated(r)]
+    # Timed-only (the default): a due date or an all-day `scheduled:` is a
+    # deadline, not a block of focused work, and fills the calendar with small
+    # chores (2026-11-14: a 5-minute re-login showed up as an all-day event).
+    def _is_timed(r: sqlite3.Row) -> bool:
+        _, start, end = _parse_scheduled(str(r["path"]))
+        return bool(start and end)
+
+    keep = _is_timed if timed_only else _is_dated
+    skipped = sum(1 for r in rows if not keep(r))
+    rows = [r for r in rows if keep(r)]
 
     # Each synced slug → the one calendar its event belongs in.
     target_by_slug = {
