@@ -516,6 +516,17 @@ def sync_due_tasks_to_calendar(
                 covered_parents.add(parent)
     rows = [r for r in rows if str(r["slug"]) not in covered_parents]
 
+    # A task with neither `due` nor a scheduled date has no place on the
+    # calendar. Leaving it out of target_by_slug lets the cleanup below delete
+    # the event it got while it was still dated (a task put on hold by
+    # clearing both fields used to keep its old event forever).
+    def _is_dated(r: sqlite3.Row) -> bool:
+        due = r["due"]
+        return bool(due and due != "-") or _parse_scheduled(str(r["path"]))[0] is not None
+
+    skipped = sum(1 for r in rows if not _is_dated(r))
+    rows = [r for r in rows if _is_dated(r)]
+
     # Each synced slug → the one calendar its event belongs in.
     target_by_slug = {
         str(r["slug"]): (
@@ -565,19 +576,12 @@ def sync_due_tasks_to_calendar(
                 break
 
     created_or_updated = 0
-    skipped = 0
     for row in rows:
         due = row["due"]
         source_path = str(row["path"])
         sched_date, scheduled_start, scheduled_end = _parse_scheduled(source_path)
         due_time = _parse_due_time(source_path)
-
-        # Skip if neither due date nor scheduled date
-        has_due = due and due != "-"
-        has_sched = sched_date is not None
-        if not has_due and not has_sched:
-            skipped += 1
-            continue
+        has_due = bool(due and due != "-")
 
         effective_due = due if has_due else sched_date
         result = _upsert_event(
