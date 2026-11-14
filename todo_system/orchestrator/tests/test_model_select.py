@@ -132,7 +132,7 @@ class TierLadderTest(unittest.TestCase):
             self.assertEqual(ms.resolve_model(use_cache=False, tier="standard"), ms.LADDERS["standard"][0])
 
     def test_exhausted_light_rung_walks_down_its_own_ladder(self):
-        with mock.patch.object(ms, "_probe", side_effect=lambda m, e="max": m != "claude-sonnet-5"):
+        with mock.patch.object(ms, "_probe", side_effect=lambda m, e="max": m != ms.LADDERS["light"][0]):
             self.assertEqual(ms.resolve_model(use_cache=False, tier="light"), ms.LADDERS["light"][1])
 
     def test_tier_caches_do_not_leak_into_each_other(self):
@@ -143,7 +143,7 @@ class TierLadderTest(unittest.TestCase):
             self.assertEqual(ms.resolve_model(tier="heavy"), ms.PREFERRED)
             probe.assert_called_once()
         with mock.patch.object(ms, "_probe", side_effect=AssertionError("cached")):
-            self.assertEqual(ms.resolve_model(tier="light"), "claude-sonnet-5")
+            self.assertEqual(ms.resolve_model(tier="light"), ms.LADDERS["light"][0])
             self.assertEqual(ms.resolve_model(tier="heavy"), ms.PREFERRED)
 
     def test_legacy_flat_cache_is_read_as_the_heavy_tier(self):
@@ -153,7 +153,7 @@ class TierLadderTest(unittest.TestCase):
         with mock.patch.object(ms, "_probe", side_effect=AssertionError("cached")):
             self.assertEqual(ms.resolve_model(tier="heavy"), "claude-opus-4-8")
         with mock.patch.object(ms, "_probe", return_value=True) as probe:
-            self.assertEqual(ms.resolve_model(tier="light"), "claude-sonnet-5")
+            self.assertEqual(ms.resolve_model(tier="light"), ms.LADDERS["light"][0])
             probe.assert_called_once()
 
     def test_heavy_write_mirrors_legacy_keys_and_keeps_siblings(self):
@@ -163,7 +163,17 @@ class TierLadderTest(unittest.TestCase):
         c = json.loads(self.cache.read_text())
         self.assertEqual(c["model"], ms.PREFERRED)            # legacy mirror
         self.assertEqual(c["tiers"]["heavy"]["model"], ms.PREFERRED)
-        self.assertEqual(c["tiers"]["light"]["model"], "claude-sonnet-5")
+        self.assertEqual(c["tiers"]["light"]["model"], ms.LADDERS["light"][0])
+
+    def test_every_ladder_starts_with_a_family_alias(self):
+        # New models reach the workers through the CLI's alias resolution, not
+        # through a code change (2026-11-14: Fable 5.2 / Sonnet 5.5 were missed).
+        self.assertEqual(
+            {t: ms.LADDERS[t][0] for t in ms.TIERS},
+            {"heavy": "fable", "standard": "opus", "light": "sonnet"},
+        )
+        for ladder in ms.LADDERS.values():
+            self.assertTrue(ladder[-1].startswith("claude-"), ladder)  # pinned floor
 
     def test_unknown_tier_falls_back_to_heavy(self):
         with mock.patch.object(ms, "_probe", return_value=True):
@@ -469,3 +479,32 @@ class DowngradeAlertTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeIsolationTest(unittest.TestCase):
+    """The probe must not run inside the vault: its CLAUDE.md made a bare "ok"
+    start real work, hit --max-turns 1 and exit 1 on a perfectly good model."""
+
+    def _run(self, rc, out):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(kw, cmd=cmd)
+            return mock.Mock(returncode=rc, stdout=out, stderr="")
+
+        with mock.patch.object(ms.subprocess, "run", side_effect=fake_run):
+            return ms._probe("opus", "high"), seen
+
+    def test_runs_in_an_empty_temp_dir(self):
+        ok, seen = self._run(0, "ok")
+        self.assertTrue(ok)
+        self.assertIn("macp-model-probe-", seen["cwd"])
+        self.assertFalse(Path(seen["cwd"]).exists())  # cleaned up afterwards
+
+    def test_max_turns_exit_means_the_model_ran(self):
+        ok, _ = self._run(1, "Error: Reached max turns (1)")
+        self.assertTrue(ok)
+
+    def test_other_failures_still_fail(self):
+        self.assertFalse(self._run(1, "Error: model not found")[0])
+        self.assertFalse(self._run(0, "You're out of usage credits.")[0])

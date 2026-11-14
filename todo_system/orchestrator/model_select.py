@@ -3,12 +3,20 @@
 Models are chosen per **tier**, and a task's tier comes from how hard / what
 kind of work it is (`classify_tier`):
 
-    heavy    Fable 5.1 → Opus 5.5 → Opus 5 → Opus 4.8   architecture-level,
+    heavy    fable → Fable 5.1 → opus → Opus 4.8   architecture-level,
                                              long, or explicitly hard tasks
-    standard Opus 5.5 → Opus 5 → Opus 4.8   the default for a normal
+    standard opus → Opus 5.5 → Opus 4.8     the default for a normal
                                              research→…→report pipeline
-    light    Sonnet 5 → Opus 5.5 → Opus 4.8 quick/trivial one-liners, short
-                                             estimates, delegate housekeeping
+    light    sonnet → Sonnet 5 → opus → Opus 4.8   quick/trivial one-liners,
+                                             short estimates, delegate housekeeping
+
+Each ladder starts with the CLI's **family alias** (`fable`, `opus`, `sonnet`),
+which the installed Claude Code resolves to the newest model of that family —
+so when a new model ships and the CLI is upgraded (ops/claude_upgrade.py), the
+workers move to it with no code change. Pinned ids follow as fallbacks in case
+the newest model is not usable on this account yet. (2026-11-14: the ladders
+were hard-coded ids and still ran Fable 5.1 / Sonnet 5 after Fable 5.2 and
+Sonnet 5.5 shipped.)
 
 Each ladder is walked top-down and the first model that actually runs wins
 (`resolve_model(tier=...)`). Before 2026-09-10 every stage of every task ran on
@@ -41,10 +49,11 @@ from .. import paths
 from ..claude_auth import claude_env
 import time
 
-PREFERRED = "claude-fable-5-1"
-# Tried in order. Opus 5.5 first (newest Opus tier), Opus 5 behind it in case
-# the 5.5 rollout is not on this account yet; Opus 4.8 as the floor.
-FALLBACKS = ("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8")
+# Family aliases: resolved by the installed CLI to the newest model of the family.
+PREFERRED = "fable"
+# Tried in order: the last pinned Fable (in case the newest one is not on this
+# account yet), the newest Opus, the last pinned Opus, then Opus 4.8 as the floor.
+FALLBACKS = ("claude-fable-5-1", "opus", "claude-opus-5-5", "claude-opus-4-8")
 
 # Per-tier ladders, each walked top-down by resolve_model(tier=...). The heavy
 # ladder IS (PREFERRED, *FALLBACKS) — those two names stay exported because
@@ -53,8 +62,8 @@ FALLBACKS = ("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8")
 TIERS = ("heavy", "standard", "light")
 LADDERS: dict[str, tuple[str, ...]] = {
     "heavy": (PREFERRED, *FALLBACKS),
-    "standard": ("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"),
-    "light": ("claude-sonnet-5", "claude-opus-5-5", "claude-opus-4-8"),
+    "standard": ("opus", "claude-opus-5-5", "claude-opus-4-8"),
+    "light": ("sonnet", "claude-sonnet-5", "opus", "claude-opus-4-8"),
 }
 # `--effort` per tier. Only heavy keeps max. Effort levels are not comparable
 # across generations: Anthropic reports Opus 5.5 at `medium` matching or beating
@@ -120,30 +129,46 @@ def model_unavailable(text: str) -> bool:
     return any(mark in t for mark in _UNAVAILABLE_MARKERS)
 
 
+# The CLI's rc=1 "the model answered but wanted another turn" — proof the model
+# ran, not that it is unavailable.
+_MAX_TURNS_MARKER = "reached max turns"
+
+
 def _probe(model: str, effort: str = "max") -> bool:
     """True if the claude CLI can actually run this model.
 
-    Requires exit 0 *and* output that isn't a quota refusal (see
-    `_UNAVAILABLE_MARKERS`).
+    Requires output that isn't a quota refusal (see `_UNAVAILABLE_MARKERS`) and
+    exit 0 — or exit 1 with "Reached max turns", which means the model ran.
+
+    Runs in an empty temporary directory. Probing from the vault (the caller's
+    cwd) loaded its CLAUDE.md and hooks, so a bare "ok" often made the model
+    start working, hit `--max-turns 1` and exit 1; working models were judged
+    dead and tiers fell to their floor (2026-11-10, 2026-11-13: standard on
+    Opus 4.8 while Opus 5.5 was fine).
     """
+    import tempfile
+
     try:
-        r = subprocess.run(
-            # probe with the effort the tier will actually run at (max unless a
-            # tier says otherwise) so an effort-level rejection also trips the
-            # fallback.
-            ["claude", "-p", "ok", "--model", model, "--effort", effort,
-             "--max-turns", "1"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=90,
-            # 스테이지와 같은 자격증명으로 프로브해야 판정이 일치한다 —
-            # 다른 토큰으로 재면 "모델 됨"이라 해놓고 실제 스테이지가 죽는다.
-            # claude_env()가 활성 계정(macp.config.current_account)의 config dir과
-            # automation-token을 해석하므로 프로브도 스테이지와 같은 계정으로 돈다.
-            env=claude_env(),
-        )
-        if r.returncode != 0:
+        with tempfile.TemporaryDirectory(prefix="macp-model-probe-") as cwd:
+            r = subprocess.run(
+                # probe with the effort the tier will actually run at (max unless
+                # a tier says otherwise) so an effort-level rejection also trips
+                # the fallback.
+                ["claude", "-p", "Reply with just: ok", "--model", model,
+                 "--effort", effort, "--max-turns", "1"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=90, cwd=cwd,
+                # 스테이지와 같은 자격증명으로 프로브해야 판정이 일치한다 —
+                # 다른 토큰으로 재면 "모델 됨"이라 해놓고 실제 스테이지가 죽는다.
+                # claude_env()가 활성 계정(macp.config.current_account)의 config dir과
+                # automation-token을 해석하므로 프로브도 스테이지와 같은 계정으로 돈다.
+                env=claude_env(),
+            )
+        out = f"{r.stdout or ''}\n{r.stderr or ''}"
+        if model_unavailable(out):
             return False
-        return not model_unavailable(f"{r.stdout or ''}\n{r.stderr or ''}")
+        return r.returncode == 0 or (
+            r.returncode == 1 and _MAX_TURNS_MARKER in out.lower())
     except Exception:
         return False
 

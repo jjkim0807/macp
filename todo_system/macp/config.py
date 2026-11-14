@@ -90,7 +90,7 @@ class Profile:
     # same-repo tasks may run together, everything else stays serial. It is a
     # SUB-constraint of the global usage_guard slot pacing, never a raise of it.
     max_parallel_per_repo: int = 2
-    model: str = "auto"                # auto | claude-fable-5-1 | claude-opus-5-5 | claude-opus-4-8
+    model: str = "auto"                # auto | a family alias (fable, opus, sonnet) | a pinned id
     accounts: list[Account] = field(default_factory=list)
     # Name of the account to prefer (empty = none pinned → lowest priority wins).
     # Written only when set, so a profile that never used it is byte-identical.
