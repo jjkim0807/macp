@@ -268,6 +268,69 @@ def _check_bash_patterns(tools: str) -> list[Issue]:
     return issues
 
 
+# Same shapes calendar_sync accepts as a timed block ("DATE HH:MM~HH:MM" or
+# "HH:MM~HH:MM" on the due date). Kept local: calendar_sync pulls in the
+# Google client libraries, which validation must not need.
+_TIMED_SCHEDULED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}~\d{1,2}:\d{2}")
+# One human block longer than this is a sign the task should be split.
+HUMAN_BLOCK_MAX_MIN = 180
+
+
+def _check_human_time_block(fm: dict) -> list[Issue]:
+    """An open, dated, human-owned task should carry a timed work block.
+
+    The calendar shows only timed blocks (`calendar_sync` timed-only default),
+    so a human task with just a due date never reaches it. The block should
+    be sized from `estimate_p50`; work too big for one block is split into
+    child tasks (`parent:`), each with its own block. Parents (`is_parent`),
+    decision tasks (`decision` tag / `needs_decision`) and undated tasks are
+    exempt.
+    """
+    if str(fm.get("status", "open")).strip().lower() != "open":
+        return []
+    mode = str(fm.get("worker_mode") or "").split("#")[0].strip().lower()
+    if mode not in HUMAN_OVERRIDE_WORKER_MODES:
+        return []
+    if str(fm.get("is_parent", "")).strip().lower() in ("true", "yes", "1"):
+        return []
+    # A decision is answered when it is asked, not worked in a block, and the
+    # engine writes decision tasks (project_stall) with no view of the calendar.
+    raw_tags = fm.get("tags") or []
+    tags = raw_tags if isinstance(raw_tags, list) else re.split(r"[,\s\[\]]+", str(raw_tags))
+    if "decision" in {str(t).strip().lower() for t in tags} or str(
+        fm.get("needs_decision", "")
+    ).strip().lower() in ("true", "yes", "1"):
+        return []
+    due = str(fm.get("due") or "").strip().strip('"').strip("'")
+    sched = str(fm.get("scheduled") or "").strip().strip('"').strip("'")
+    if (not due or due == "-") and (not sched or sched == "-"):
+        return []
+    from .orchestrator.model_select import estimate_minutes
+
+    p50 = estimate_minutes(fm.get("estimate_p50"))
+    issues: list[Issue] = []
+    if not _TIMED_SCHEDULED_RE.match(sched):
+        size = f" of about {fm.get('estimate_p50')}" if p50 else ""
+        issues.append(
+            Issue(
+                WARN,
+                "scheduled",
+                f'human task has no timed block; add `scheduled: "YYYY-MM-DD HH:MM~HH:MM"`'
+                f"{size} (estimate_p50) — the calendar shows only timed blocks.",
+            )
+        )
+    if p50 is not None and p50 > HUMAN_BLOCK_MAX_MIN:
+        issues.append(
+            Issue(
+                WARN,
+                "estimate_p50",
+                f"{fm.get('estimate_p50')} is more than one {HUMAN_BLOCK_MAX_MIN // 60}h block; "
+                "split it into child tasks (`parent:`), each with its own timed block.",
+            )
+        )
+    return issues
+
+
 def validate_frontmatter(fm: dict, body: str = "") -> list[Issue]:
     """Check the fields worker.py reads. Order: errors first, then warnings."""
     issues: list[Issue] = []
@@ -449,6 +512,7 @@ def validate_frontmatter(fm: dict, body: str = "") -> list[Issue]:
 
     issues.extend(_check_actions_dependency(fm))
     issues.extend(_check_decision_gate(fm))
+    issues.extend(_check_human_time_block(fm))
 
     for numeric in ("max_turns", "priority"):
         value = fm.get(numeric)

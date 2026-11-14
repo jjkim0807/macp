@@ -45,6 +45,7 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
    estimate_p90: 60m
    review_cycle: weekly     # daily | weekly | "-"
    worker_mode: <auto|delegate|manual>
+   scheduled: "YYYY-MM-DD HH:MM~HH:MM"   # manual tasks: a timed block, see below
    repo: "<git URL>"        # only for external-repo auto tasks; else omit
    touches: ["<repo-relative file the task edits>", ...]   # REQUIRED with repo: — see step 2
    ---
@@ -57,6 +58,14 @@ description into one well-formed task file. Follow `CLAUDE.md` exactly.
    ## Progress Log
    - <today>: created via /todo — <one-line origin>
    ```
+
+   For a `manual` (human) task with a date, give it a **timed block** instead of
+   a bare due date: `scheduled: "YYYY-MM-DD HH:MM~HH:MM"`, as long as
+   `estimate_p50` (rounded up to 15 minutes), on a free slot before `due` and not
+   before `not_before`. The calendar shows only timed blocks, so a task without
+   one stays off it. Work bigger than one ~3h block is split into child tasks
+   (`parent: "[[<parent>]]"`), one deliverable each with its own block — not into
+   many small pieces. `validate` warns about a dated human task with no block.
 
    For an `auto` task that builds a feature, add `acceptance_criteria:` that require
    the **wiring**, not just the parts: a route/screen-level test through the real
