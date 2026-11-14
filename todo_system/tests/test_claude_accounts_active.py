@@ -544,7 +544,7 @@ def test_model_probe_env_follows_active_account(roots, monkeypatch):
 
     monkeypatch.setattr(model_select.subprocess, "run", fake_run)
     assert model_select._probe("claude-x") is True
-    assert seen["argv"][:5] == ["claude", "-p", "ok", "--model", "claude-x"]
+    assert seen["argv"][:5] == ["claude", "-p", "Reply with just: ok", "--model", "claude-x"]
     assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(school)
     assert seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN_SCHOOL
     # switching accounts switches the probe's credentials too (dev has no token → key removed)

@@ -205,6 +205,15 @@ class ChooseModelTest(unittest.TestCase):
         self.assertEqual(decision["model"], ms.FALLBACKS[0])
         self.assertNotIn(ms.PREFERRED, decision["probed"])
 
+    def test_preferred_alias_with_context_suffix_is_not_rewritten(self):
+        # settings.json often says "fable[1m]"; an upgrade to bare "fable" would
+        # silently drop the 1M-context suffix.
+        stale = {"last_upgrade_ts": self.NOW - mod.UPGRADE_TTL - 1}
+        current = f"{ms.PREFERRED}[1m]"
+        decision = self._choose(current, stale, {ms.PREFERRED, current})
+        self.assertEqual(decision["model"], current)
+        self.assertFalse(decision["upgrade_attempted"])
+
 
 if __name__ == "__main__":
     unittest.main()

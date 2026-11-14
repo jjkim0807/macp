@@ -122,6 +122,11 @@ def load_settings(path: Path) -> tuple[dict, str]:
     return data, raw
 
 
+def _is_preferred(model: str) -> bool:
+    """`model` names PREFERRED, with or without a `[…]` suffix such as `[1m]`."""
+    return model == PREFERRED or model.startswith(PREFERRED + "[")
+
+
 def choose_model(current: str | None, state: dict, now: float) -> dict:
     """Pick the model settings.json should name.
 
@@ -140,8 +145,10 @@ def choose_model(current: str | None, state: dict, now: float) -> dict:
         return probed[model]
 
     upgrade_attempted = False
-    # (1) periodically try to climb back up: a fallback is a demotion, not a home
-    if current and current != PREFERRED and now - float(state.get("last_upgrade_ts") or 0) >= UPGRADE_TTL:
+    # (1) periodically try to climb back up: a fallback is a demotion, not a home.
+    # PREFERRED is a family alias, so "fable[1m]" (alias + context suffix) is
+    # already the preferred family and must not be rewritten to bare "fable".
+    if current and not _is_preferred(current) and now - float(state.get("last_upgrade_ts") or 0) >= UPGRADE_TTL:
         upgrade_attempted = True
         if alive(PREFERRED):
             return {"model": PREFERRED, "probed": probed, "upgrade_attempted": True}
