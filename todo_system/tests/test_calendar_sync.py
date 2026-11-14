@@ -100,8 +100,11 @@ def _full_db(rows: list[dict]) -> sqlite3.Connection:
     return con
 
 
-def _sync(con, events):
-    """Run sync_due_tasks_to_calendar against the fakes."""
+def _sync(con, events, **kw):
+    """Run sync_due_tasks_to_calendar against the fakes. These ownership and
+    cleanup tests predate the timed-only default and use bare due dates, so
+    they run the all-dated rule unless a test passes ``timed_only``."""
+    kw.setdefault("timed_only", False)
     orig_load, orig_build = CS.load_credentials, CS.build
     CS.load_credentials = lambda *a, **k: object()
     CS.build = lambda *a, **k: _FakeService(events)
@@ -111,6 +114,7 @@ def _sync(con, events):
             calendar_id="cal",
             client_secret_path=Path("/nope"),
             token_path=Path("/nope"),
+            **kw,
         )
     finally:
         CS.load_credentials, CS.build = orig_load, orig_build
@@ -225,6 +229,59 @@ class CalendarParentWithTimedChildrenTest(unittest.TestCase):
             created, _ = _sync(con, events)
 
         self.assertEqual(created, 2)
+        self.assertEqual(events.deleted, [])
+
+
+class CalendarTimedOnlyTest(unittest.TestCase):
+    """Default rule (2026-11-14): only timed work blocks reach the calendar."""
+
+    def _write(self, d: Path, name: str, fm: str) -> str:
+        path = d / f"{name}.md"
+        path.write_text(f"---\n{fm}\n---\n# {name}\n", encoding="utf-8")
+        return str(path)
+
+    def _run(self, seed_old_event=True, **kw):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            due_only = self._write(d, "relogin", "due: 2026-11-15")
+            all_day = self._write(d, "wait", "due: 2026-11-20\nscheduled: 2026-11-20")
+            deadline = self._write(d, "file", "due: 2026-11-20\ndue_time: 18:00")
+            timed = self._write(
+                d, "interview", 'due: 2026-11-20\nscheduled: "2026-11-20 10:00~12:00"')
+            con = _db([
+                ("relogin", "re-login", "2026-11-15", "", due_only, "open", "manual"),
+                ("wait", "wait for reply", "2026-11-20", "", all_day, "open", None),
+                ("file", "submit form", "2026-11-20", "", deadline, "open", None),
+                ("interview", "interview", "2026-11-20", "", timed, "open", None),
+            ])
+            events = _FakeEvents(existing=[
+                {"id": "old-allday", "_slug": "relogin",
+                 "extendedProperties": {"private": {"todo_slug": "relogin"}}},
+            ] if seed_old_event else [])
+            orig_load, orig_build = CS.load_credentials, CS.build
+            CS.load_credentials = lambda *a, **k: object()
+            CS.build = lambda *a, **k: _FakeService(events)
+            try:
+                result = CS.sync_due_tasks_to_calendar(
+                    con=con, calendar_id="cal",
+                    client_secret_path=Path("/nope"), token_path=Path("/nope"), **kw)
+            finally:
+                CS.load_credentials, CS.build = orig_load, orig_build
+        return result, events
+
+    def test_default_puts_only_timed_blocks_on_the_calendar(self):
+        (created, skipped), events = self._run()
+        self.assertEqual([b["summary"] for b in events.inserted], ["interview"])
+        self.assertIn("dateTime", events.inserted[0]["start"])
+        self.assertEqual((created, skipped), (1, 3))
+        # the all-day event an untimed task got under the old rule is removed
+        self.assertEqual(events.deleted, ["old-allday"])
+
+    def test_all_dated_keeps_the_old_rule(self):
+        (created, _), events = self._run(seed_old_event=False, timed_only=False)
+        self.assertEqual(created, 4)
         self.assertEqual(events.deleted, [])
 
 

@@ -1270,6 +1270,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 client_secret_path=Path(args.gcal_client_secret),
                 token_path=Path(args.gcal_token),
                 calendar_routes=getattr(args, "calendar_route", None),
+                timed_only=not getattr(args, "calendar_all_dated", False),
             )
             print(
                 f"calendar sync complete: {created_or_updated} upserted, {skipped} skipped "
@@ -1394,6 +1395,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 client_secret_path=Path(args.gcal_client_secret),
                 token_path=Path(args.gcal_token),
                 calendar_routes=getattr(args, "calendar_route", None),
+                timed_only=not getattr(args, "calendar_all_dated", False),
             )
             print(
                 f"[{dt.datetime.now().isoformat(timespec='seconds')}] calendar sync: "
@@ -1443,6 +1445,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                             client_secret_path=Path(args.gcal_client_secret),
                             token_path=Path(args.gcal_token),
                             calendar_routes=getattr(args, "calendar_route", None),
+                            timed_only=not getattr(args, "calendar_all_dated", False),
                         )
                         last_calendar_sync = time.monotonic()
                         print(
@@ -1524,6 +1527,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                         client_secret_path=Path(args.gcal_client_secret),
                         token_path=Path(args.gcal_token),
                         calendar_routes=getattr(args, "calendar_route", None),
+                        timed_only=not getattr(args, "calendar_all_dated", False),
                     )
                     if created_or_updated:
                         print(
@@ -1806,6 +1810,7 @@ def cmd_calendar_sync(args: argparse.Namespace) -> int:
             client_secret_path=Path(args.gcal_client_secret),
             token_path=Path(args.gcal_token),
             calendar_routes=getattr(args, "calendar_route", None),
+            timed_only=not getattr(args, "calendar_all_dated", False),
         )
         print(
             f"calendar sync complete: {created_or_updated} upserted, {skipped} skipped "
@@ -1958,6 +1963,13 @@ def _add_calendar_route_arg(p: argparse.ArgumentParser) -> None:
         help="Send open tasks carrying TAG to CALENDAR_ID (repeatable; the task's first "
              "routed tag wins, otherwise --calendar-id). Every route calendar is also "
              "cleaned of stale todo events.",
+    )
+    p.add_argument(
+        "--calendar-all-dated",
+        action="store_true",
+        help="Put every dated open human task on the calendar (all-day events for a "
+             "bare due date). Default: only tasks with a timed `scheduled: DATE "
+             "HH:MM~HH:MM` block; other events the sync made earlier are removed.",
     )
 
 
