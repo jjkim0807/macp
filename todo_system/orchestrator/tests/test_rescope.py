@@ -53,6 +53,32 @@ class PlanDeclaresOversizeTest(unittest.TestCase):
         )
         self.assertTrue(rescope.plan_declares_oversize(plan))
 
+    def test_code_and_conditional_mentions_are_false(self):
+        # 2026-11-13: three design-doc plans were skipped as "oversize" by these
+        # exact shapes — none of them declared the task too big.
+        for txt in (
+            # an inline-code file citation
+            "  `todo_system/orchestrator/rescope.py` (split→leaf pattern as a model),",
+            # indented grep commands naming the file / alternating on the word
+            '     grep -n "\\.claude/commands\\|allowed_tools\\|rescope\\|followups" docs/concepts.md\n'
+            '     grep -n "_GUARDRAIL_PATHS" todo_system/orchestrator/rescope.py',
+            # a conditional wrapped across lines
+            "must exist with its table. Only if the orchestrator ever has to\n"
+            "rescope, the hand-split boundary is Phase 2 end / Phase 3 start.",
+            # fenced code
+            "```\nrescope.json written by verify\n```",
+            "만약 re-scope가 필요하면 Phase 2에서 자른다.",
+            # substrings of other words (1065-plan audit, 2026-11-14)
+            "Run the care-scoped subset of the suite.",
+            "Add `requireScope` and the agent scopes table.",
+        ):
+            self.assertFalse(rescope.plan_declares_oversize(txt), txt)
+
+    def test_declaration_wrapped_across_lines_is_true(self):
+        plan = ("## Conclusion\nThis task is too large; it exceeds a single\n"
+                "implement stage.\n")
+        self.assertTrue(rescope.plan_declares_oversize(plan))
+
     def test_empty_and_none_are_false(self):
         self.assertFalse(rescope.plan_declares_oversize(""))
         self.assertFalse(rescope.plan_declares_oversize(None))  # type: ignore[arg-type]
