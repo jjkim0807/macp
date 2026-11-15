@@ -21,6 +21,7 @@ Fictional names only (the public identifier gate): ``example-owner/example-repo`
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -546,6 +547,81 @@ def test_absence_in_one_repo_does_not_resolve_anothers_task(watch, monkeypatch):
     rw.watch_tick(now=T0)
 
     assert status("repo-issue-5-example-repo") == "open"
+
+
+# -- the tick call site ------------------------------------------------------
+
+def _quiet_tick(monkeypatch):
+    """Every other maintenance step stubbed to its "nothing happened" answer
+    (test_maintenance_embed's shape), so only this step's output is left."""
+    from todo_system import worker
+
+    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
+    for name in ("autoclose_stale_reviews_local", "sweep_remote_completed_runs",
+                 "sync_vault_state"):
+        monkeypatch.setattr(worker, name, lambda *_a, **_k: 0)
+    for name in ("rotate_logs", "check_unapplied_migrations", "pull_engine_checkout",
+                 "bump_vault_engine_pin", "sync_wrappers", "pull_browser_checkout",
+                 "restart_stale_daemons"):
+        monkeypatch.setattr(worker, name, lambda *_a, **_k: [])
+    monkeypatch.setattr(worker, "check_dispatch_silence", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, "check_work_starvation", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker.browser_watch, "check_login_watch", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", lambda *_a, **_k: None)
+    earlier: list = []
+    monkeypatch.setattr(worker.maintenance_embed, "embed_tick",
+                        lambda *_a, **_k: earlier.append("embed") or None)
+    return worker, earlier
+
+
+def test_cmd_maintenance_calls_the_step(monkeypatch, capsys):
+    worker, _earlier = _quiet_tick(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(worker.maintenance_repo_watch, "watch_tick",
+                        lambda *_a, **_k: calls.append(1) or "repo-watch: probe")
+
+    rc = worker.cmd_maintenance()
+
+    assert rc == 0
+    assert calls == [1]
+    assert "repo-watch: probe" in capsys.readouterr().out
+
+
+def test_cmd_maintenance_runs_the_real_step_end_to_end(watch, monkeypatch, capsys):
+    """Route level: the real watch_tick, reached through the tick, writes the task."""
+    worker, _earlier = _quiet_tick(monkeypatch)
+    watch.graphql[REPO] = repo_payload([issue(7)])
+
+    assert worker.cmd_maintenance() == 0
+
+    assert "repo-watch: 새 항목 1건 열림" in capsys.readouterr().out
+    assert status("repo-issue-7") == "open"
+
+
+def test_a_step_that_raises_anyway_does_not_stop_the_tick(monkeypatch, capsys):
+    worker, earlier = _quiet_tick(monkeypatch)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("contract violated")
+
+    monkeypatch.setattr(worker.maintenance_repo_watch, "watch_tick", _boom)
+
+    rc = worker.cmd_maintenance()
+
+    assert rc == 1
+    assert "repo-watch: error — contract violated" in capsys.readouterr().out
+    assert earlier == ["embed"], "the steps before it must still have run"
+
+
+def test_the_suite_wide_isolation_fixture_is_live():
+    """Negative control for conftest's ``_repo_watch_isolated``: without the
+    ``watch`` fixture the switch is OFF, state is in tmp, and the runner refuses
+    any real gh/git."""
+    assert os.environ.get(rw.KILL_ENV) == "0"
+    assert rw.watch_tick() is None
+    assert "repo-watch" in str(rw.state_dir())
+    with pytest.raises(RuntimeError, match="blocked"):
+        rw._run(["gh", "api", "user"])
 
 
 # -- the CLI -----------------------------------------------------------------
