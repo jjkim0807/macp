@@ -42,6 +42,7 @@ from . import browser_watch
 from . import kakao_format
 from . import maintenance_disk
 from . import maintenance_embed
+from . import maintenance_repo_watch
 from . import not_before as nb_gate
 from . import paths
 from .kakao_format import LEVEL_DIGEST, compose_alert
@@ -2198,6 +2199,9 @@ def cmd_maintenance() -> int:
         (content-hash diff — unchanged docs are skipped), so query_related's
         semantic half does not answer from a stale snapshot; silent when nothing
         changed, one throttled line when sqlite-vec is absent.
+      - maintenance_repo_watch.watch_tick: once a day, external issues/PRs on
+        the watched public repos with no maintainer reply become ops human
+        tasks (resolved on reply, close or merge); silent when nothing changed.
 
     doctor_recover_queue is deliberately NOT here: it heals Worker/queue.json,
     which is exactly the store the cutover retires.
@@ -2335,6 +2339,15 @@ def cmd_maintenance() -> int:
                 print(line)
         except Exception as exc:
             print(f"embed-tick: error — {exc}")
+            rc = 1
+        # An external contributor's issue on the public repo once sat 17 days
+        # unseen; nothing looked at the repo's issue/PR list at all.
+        try:
+            line = maintenance_repo_watch.watch_tick()
+            if line:
+                print(line)
+        except Exception as exc:
+            print(f"repo-watch: error — {exc}")
             rc = 1
     return rc
 
