@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,9 @@ PATH_PREFIX_RE = re.compile(r"^(?:Todo/items/|Notes/|Memory/(?:entities|episodes
 
 
 def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
+    # CRLF files (Git for Windows' core.autocrlf, Windows editors) used to parse as
+    # having no frontmatter, so their typed edges were silently dropped (#144).
+    content = content.replace("\r\n", "\n")
     if not content.startswith("---\n"):
         return {}, content
 
@@ -95,7 +99,9 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     idx = 0
     while idx < len(fm_lines):
         line = fm_lines[idx]
-        if not line.strip():
+        # Blank lines and YAML comment lines are not keys (#144: a template's
+        # `# decision_status: …` came back as the key '# decision_status').
+        if not line.strip() or line.lstrip().startswith("#"):
             idx += 1
             continue
         if ":" not in line:
@@ -439,9 +445,12 @@ def scan_vault_and_index(
         con.close()
 
     live_total = len(desired)
+    # Progress goes to stderr: callers that use stdout as a data channel (an MCP
+    # server over stdio, `x=$(tool …)`) were corrupted by this line (#145).
     print(
         f"indexed {live_total} live edges (+{tombstoned} tombstoned) "
-        f"from {file_count} files"
+        f"from {file_count} files",
+        file=sys.stderr,
     )
     return live_total
 

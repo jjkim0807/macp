@@ -1,0 +1,2 @@
+# Keep Markdown LF on every checkout (Git for Windows defaults to core.autocrlf=true; #144).
+*.md text eol=lf
