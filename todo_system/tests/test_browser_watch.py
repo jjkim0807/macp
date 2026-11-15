@@ -390,6 +390,199 @@ def test_corrupt_state_file_falls_back_to_defaults(probe):
     assert len(sent) == 1
 
 
+def test_state_round_trip_keeps_last_restart_at(probe):
+    assert bw._default_state()["last_restart_at"] == 0.0
+    st = {**bw._default_state(), "last_restart_at": T0 + 5}
+    bw._write_state(st)
+    assert bw._read_state()["last_restart_at"] == T0 + 5
+    bw.state_path().write_text(json.dumps({"last_restart_at": "abc"}))
+    assert bw._read_state()["last_restart_at"] == 0.0
+
+
+# -- self-restart on no_chrome ------------------------------------------------
+
+def seq_run(states, calls=None):
+    """Probe runner answering states[i] on call i, then repeating the last."""
+    i = {"n": 0}
+
+    def _run(cmd, **kwargs):
+        if calls is not None:
+            calls.append(cmd)
+        state = states[min(i["n"], len(states) - 1)]
+        i["n"] += 1
+        return SimpleNamespace(stdout=json.dumps({"state": state, "checked_at": "x"}),
+                               stderr="", returncode=0)
+    return _run
+
+
+def restart_runner(rc=0, calls=None, exc=None, stdout=""):
+    def _run(cmd, **kwargs):
+        if calls is not None:
+            calls.append((cmd, kwargs))
+        if exc is not None:
+            raise exc
+        return SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+    return _run
+
+
+@pytest.fixture
+def browser_sh(probe):
+    p = probe.parent / "browser.sh"
+    p.write_text("# stub\n")
+    return p
+
+
+def write_lease(d, owner, expires_epoch, raw=None):
+    text = raw if raw is not None else json.dumps(
+        {"owner": owner, "purpose": "x", "acquired_at": "x", "expires_at": "x",
+         "expires_epoch": expires_epoch})
+    (d / "lease.json").write_text(text + "\n")
+
+
+def check_r(probe_run, restart, now, sent):
+    return bw.check_login_watch(now, notify=sent.append, run=probe_run, restart_run=restart)
+
+
+def _state():
+    return json.loads(bw.state_path().read_text())
+
+
+def test_restart_then_logged_in_is_silent(browser_sh, tmp_path, monkeypatch, capsys):
+    path = _ops_task(tmp_path, monkeypatch)
+    pcalls, rcalls, sent = [], [], []
+    out = check_r(seq_run(["no_chrome", "logged_in"], pcalls),
+                  restart_runner(0, rcalls), T0, sent)
+    assert out is None and sent == []
+    assert not path.exists()
+    assert len(rcalls) == 1
+    cmd, kw = rcalls[0]
+    assert cmd == ["bash", str(browser_sh), "up"]
+    assert kw["timeout"] == bw.RESTART_TIMEOUT_S
+    assert len(pcalls) == 2
+    assert "browser-watch: chrome restarted, logged_in" in capsys.readouterr().out
+    st = _state()
+    assert st["notified"] == "logged_in"
+    assert st["last_restart_at"] == T0
+
+
+@pytest.mark.parametrize("rc,exc", [
+    (1, None),
+    (0, subprocess.TimeoutExpired(["bash"], 120)),
+    (0, OSError("x")),
+    (0, RuntimeError("boom")),
+])
+def test_restart_failure_alerts_as_today(browser_sh, tmp_path, monkeypatch, rc, exc):
+    path = _ops_task(tmp_path, monkeypatch)
+    pcalls, rcalls, sent = [], [], []
+    check_r(seq_run(["no_chrome", "logged_in"], pcalls),
+            restart_runner(rc, rcalls, exc=exc), T0, sent)
+    assert len(sent) == 1 and "Chrome 미기동" in sent[0]
+    assert _status(path) == "open"
+    assert len(rcalls) == 1
+    assert len(pcalls) == 1
+    assert _state()["last_restart_at"] == T0
+
+
+@pytest.mark.parametrize("again,needle", [("no_chrome", "Chrome 미기동"),
+                                          ("logged_out", "로그인 풀림")])
+def test_bad_reprobe_alerts_with_reprobed_state(browser_sh, tmp_path, monkeypatch,
+                                                again, needle):
+    path = _ops_task(tmp_path, monkeypatch)
+    sent = []
+    check_r(seq_run(["no_chrome", again]), restart_runner(0), T0, sent)
+    assert len(sent) == 1 and needle in sent[0]
+    assert _status(path) == "open"
+    assert _state()["notified"] == again
+
+
+def test_restart_backoff_thirty_minutes(browser_sh, monkeypatch):
+    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", "60")
+    rcalls, sent = [], []
+    check_r(seq_run(["no_chrome"]), restart_runner(1, rcalls), T0, sent)
+    assert len(rcalls) == 1 and len(sent) == 1
+    check_r(seq_run(["no_chrome"]), restart_runner(1, rcalls), T0 + 61, sent)
+    assert len(rcalls) == 1 and len(sent) == 1
+    assert _state()["last_restart_at"] == T0
+    check_r(seq_run(["no_chrome"]), restart_runner(1, rcalls), T0 + 1801, sent)
+    assert len(rcalls) == 2
+    assert _state()["last_restart_at"] == T0 + 1801
+
+
+def test_live_lease_blocks_the_restart(browser_sh):
+    write_lease(browser_sh.parent, "human-vnc", T0 + 600)
+    rcalls, sent = [], []
+    check_r(seq_run(["no_chrome", "logged_in"]), restart_runner(0, rcalls), T0, sent)
+    assert rcalls == []
+    assert len(sent) == 1 and "Chrome 미기동" in sent[0]
+    assert _state()["last_restart_at"] == 0.0
+    # read-only: the lease file is untouched
+    assert json.loads(bw.lease_path().read_text())["owner"] == "human-vnc"
+
+
+@pytest.mark.parametrize("owner,expires,raw", [
+    ("some-run", T0 - 1, None),
+    ("some-run", T0 + 600, "{not json"),
+    ("bad owner!", T0 + 600, None),
+])
+def test_free_lease_variants_allow_the_restart(browser_sh, owner, expires, raw):
+    write_lease(browser_sh.parent, owner, expires, raw)
+    rcalls, sent = [], []
+    check_r(seq_run(["no_chrome", "logged_in"]), restart_runner(0, rcalls), T0, sent)
+    assert len(rcalls) == 1
+    assert sent == []
+
+
+@pytest.mark.parametrize("state", ["logged_out", "unknown"])
+def test_logged_out_and_unknown_never_restart(browser_sh, state):
+    rcalls, sent = [], []
+    check_r(seq_run([state]), restart_runner(0, rcalls), T0, sent)
+    assert rcalls == []
+    if state == "logged_out":
+        assert len(sent) == 1 and "로그인 풀림" in sent[0]
+    assert _state()["last_restart_at"] == 0.0
+
+
+def test_missing_browser_sh_falls_back(probe):
+    rcalls, sent = [], []
+    check_r(seq_run(["no_chrome", "logged_in"]), restart_runner(0, rcalls), T0, sent)
+    assert rcalls == []
+    assert len(sent) == 1 and "Chrome 미기동" in sent[0]
+    assert _state()["last_restart_at"] == 0.0
+
+
+def test_later_successful_restart_recovers(browser_sh, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", "60")
+    path = _ops_task(tmp_path, monkeypatch)
+    probe_run = seq_run(["no_chrome", "no_chrome", "logged_in"])
+    sent = []
+    check_r(probe_run, restart_runner(1), T0, sent)
+    assert len(sent) == 1 and _status(path) == "open"
+    capsys.readouterr()
+    msg = check_r(probe_run, restart_runner(0), T0 + 1801, sent)
+    assert msg and "복구" in msg and "복구" in sent[-1]
+    assert _status(path) == "done"
+    assert "browser-watch: chrome restarted, logged_in" in capsys.readouterr().out
+
+
+def test_default_restart_runner_is_bound_at_call_time(browser_sh, monkeypatch):
+    rcalls = []
+    monkeypatch.setattr(bw.subprocess, "run", restart_runner(0, rcalls))
+    sent = []
+    bw.check_login_watch(T0, notify=sent.append, run=seq_run(["no_chrome", "logged_in"]))
+    assert [c for c, _ in rcalls] == [["bash", str(browser_sh), "up"]]
+    assert sent == []
+
+
+def test_restart_output_never_leaks(browser_sh):
+    secret = "someone@example.com SID=abc123secret"
+    sent = []
+    check_r(seq_run(["no_chrome"]), restart_runner(1, stdout=secret), T0, sent)
+    assert len(sent) == 1
+    for leaked in ("someone@example.com", "SID=abc123secret"):
+        assert leaked not in sent[0]
+        assert leaked not in bw.state_path().read_text()
+
+
 def test_defaults_are_home_relative(monkeypatch):
     for name in ("MACP_BROWSER_DIR", "MACP_BROWSER_WATCH_DIR", "MACP_BROWSER_NODE"):
         monkeypatch.delenv(name, raising=False)
