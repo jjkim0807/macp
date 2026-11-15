@@ -27,12 +27,31 @@ Environment (read at call time):
 Messages carry the re-login steps (start the browser, tunnel noVNC from the
 Mac, log in by hand) so the page is actionable on its own. They carry nothing
 the probe printed and no credential of any kind.
+
+Self-restart (no_chrome only): before paging on ``no_chrome`` the watch runs
+``bash <browser_dir>/browser.sh up`` once and probes again; ``decide`` gets the
+second result. Restarted and logged in → no page, one log line
+(``browser-watch: chrome restarted, logged_in``). A failed restart (rc≠0,
+timeout, any exception, missing ``browser.sh``) or a bad re-probe pages exactly
+as before. Guards:
+
+  * at most one attempt per 30 minutes, tracked by ``last_restart_at`` in the
+    state file (stamped on every attempt, so a failing ``up`` cannot loop);
+  * no attempt while the default browser lease (``<browser_dir>/lease.json``,
+    read-only here) is live — a human may be working over VNC;
+  * ``logged_out`` and ``unknown`` never restart: re-login is the human's job.
+
+Background: the 2026-11-14 and 11-15 pages were the Remote Control restart
+killing Xvfb along with Chrome (fixed in macp-browser#22), and 11-12 was an OOM
+kill. The cookies stay in the profile, so ``up`` alone recovers the session.
+Nothing ``browser.sh`` prints reaches a message, a log line or the state file.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -45,10 +64,14 @@ STATES = ("logged_in", "logged_out", "no_chrome", "unknown")
 BAD = frozenset({"logged_out", "no_chrome", "unknown"})
 UNKNOWN_ALERT_STREAK = 3
 RUN_TIMEOUT_S = 90  # the probe's own watchdog is 60s
+RESTART_TIMEOUT_S = 120  # `browser.sh up`; a timeout is a failed restart
+RESTART_BACKOFF_S = 1800.0  # one restart attempt per 30 minutes
 DEFAULT_INTERVAL_S = 3600.0
 DEFAULT_SSH_HINT = "<hq-instance> --zone <zone> --project <project>"
 
 _EXIT_STATES = {0: "logged_in", 1: "logged_out", 2: "no_chrome"}
+# Same owner rule as the `macp-browser` wrapper's lease check.
+_LEASE_OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]+")
 
 
 def _env(name: str) -> str:
@@ -62,6 +85,15 @@ def browser_dir() -> Path:
 
 def script_path() -> Path:
     return browser_dir() / "login-check.mjs"
+
+
+def browser_sh_path() -> Path:
+    return browser_dir() / "browser.sh"
+
+
+def lease_path() -> Path:
+    """The default instance's lease (the only one that runs the watched Chrome)."""
+    return browser_dir() / "lease.json"
 
 
 def node_bin() -> str:
@@ -125,12 +157,85 @@ def run_login_check(script: Path, *, run: Callable = subprocess.run) -> str | No
     return _EXIT_STATES.get(proc.returncode, "unknown")
 
 
+# -- self-restart ------------------------------------------------------------
+
+def lease_held(now: float) -> bool:
+    """True when the default browser lease is live (read-only; never written).
+
+    Mirrors the wrapper: live = a dict whose ``owner`` matches the allowed
+    characters and whose numeric ``expires_epoch`` is after ``now``. A missing,
+    unreadable, unparseable or expired file is free. The watch has no owner
+    identity, so any live lease is someone else's.
+    """
+    try:
+        text = lease_path().read_text(encoding="utf-8")
+    except OSError:
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    try:
+        data = json.loads(lines[0])
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    owner = data.get("owner")
+    expires = data.get("expires_epoch")
+    if not isinstance(owner, str) or not _LEASE_OWNER_RE.fullmatch(owner):
+        return False
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return False
+    return expires > now
+
+
+def restart_chrome(*, run: Callable) -> bool:
+    """Run ``browser.sh up`` once; True on rc 0. Output is never read."""
+    try:
+        proc = run(["bash", str(browser_sh_path()), "up"], capture_output=True, text=True,
+                   timeout=RESTART_TIMEOUT_S, check=False)
+    except Exception:  # noqa: BLE001 - a restart is best-effort; failure pages as before
+        return False
+    return getattr(proc, "returncode", 1) == 0
+
+
+def _maybe_restart(script: Path, prev: dict, now: float, *,
+                   run: Callable, restart_run: Callable) -> tuple[str, float]:
+    """(state observed after the restart attempt, last_restart_at to persist)."""
+    last = prev.get("last_restart_at", 0.0)
+    if not browser_sh_path().is_file():
+        print("browser-watch: chrome restart skipped — browser.sh missing")
+        return "no_chrome", last
+    # A last restart in the future (clock stepped back) does not suppress.
+    if 0 <= now - last < RESTART_BACKOFF_S:
+        print("browser-watch: chrome restart skipped — backoff")
+        return "no_chrome", last
+    if lease_held(now):
+        print("browser-watch: chrome restart skipped — lease held")
+        return "no_chrome", last
+    stamp = now
+    try:
+        if not restart_chrome(run=restart_run):
+            print("browser-watch: chrome restart failed")
+            return "no_chrome", stamp
+        again = run_login_check(script, run=run)
+        if again is None:
+            return "no_chrome", stamp
+        if again == "logged_in":
+            print("browser-watch: chrome restarted, logged_in")
+        return again, stamp
+    except Exception as exc:  # noqa: BLE001 - fall back to today's page
+        print(f"browser-watch: restart error — {type(exc).__name__}")
+        return "no_chrome", stamp
+
+
 # -- state file --------------------------------------------------------------
 
 def _default_state() -> dict:
     # No file yet: assume the last thing we told anyone was "logged in", so a
     # profile that is already broken at deploy time pages once.
-    return {"last_checked_at": 0.0, "notified": "logged_in", "unknown_streak": 0}
+    return {"last_checked_at": 0.0, "notified": "logged_in", "unknown_streak": 0,
+            "last_restart_at": 0.0}
 
 
 def _read_state() -> dict:
@@ -143,6 +248,10 @@ def _read_state() -> dict:
         return state
     try:
         state["last_checked_at"] = float(data.get("last_checked_at", 0.0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        state["last_restart_at"] = float(data.get("last_restart_at", 0.0))
     except (TypeError, ValueError):
         pass
     if data.get("notified") in STATES:
@@ -162,7 +271,10 @@ def _write_state(state: dict) -> None:
         tmp = p.with_name(p.name + ".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({k: state[k] for k in ("last_checked_at", "notified", "unknown_streak")}, fh)
+            json.dump({"last_checked_at": state["last_checked_at"],
+                       "notified": state["notified"],
+                       "unknown_streak": state["unknown_streak"],
+                       "last_restart_at": state.get("last_restart_at", 0.0)}, fh)
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except OSError as exc:
@@ -257,8 +369,12 @@ def _sync_ops_task(kind: str) -> None:
 
 def check_login_watch(now: float | None = None, *,
                       notify: Callable[[str], object] | None = None,
-                      run: Callable = subprocess.run) -> str | None:
+                      run: Callable = subprocess.run,
+                      restart_run: Callable | None = None) -> str | None:
     """Probe at most once per interval; return the message sent, if any.
+
+    On ``no_chrome`` try one ``browser.sh up`` (``restart_run``, default
+    ``subprocess.run`` resolved at call time) and decide on the re-probe.
 
     Never raises. The state is written BEFORE notifying, so a broken notifier
     cannot turn into one page per tick.
@@ -278,8 +394,18 @@ def check_login_watch(now: float | None = None, *,
             print(f"browser-watch: node binary not found ({node_bin()}) — skipped")
             _write_state({**prev, "last_checked_at": now})
             return None
+        last_restart_at = prev.get("last_restart_at", 0.0)
+        if observed == "no_chrome":
+            try:
+                observed, last_restart_at = _maybe_restart(
+                    script, prev, now, run=run,
+                    restart_run=restart_run or subprocess.run)
+            except Exception as exc:  # noqa: BLE001 - fall back to today's page
+                print(f"browser-watch: restart error — {type(exc).__name__}")
+                observed = "no_chrome"
         new, kind = decide(prev, observed)
         new["last_checked_at"] = now
+        new["last_restart_at"] = last_restart_at
         _write_state(new)
         if kind is None:
             return None
