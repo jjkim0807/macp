@@ -301,6 +301,63 @@ minutes). The 600 s / 900 s defaults leave room for that; do not set either belo
 twice your sync interval. `max_parallel_gradle_builds` (off by default) still counts
 heavy runs that went to a remote.
 
+#### Game mode (pause a heavy remote)
+
+A heavy remote is often someone's own desktop. When its owner wants the machine back (say,
+to play a game), switch the agent to **game** mode. Game and the worker never run at the
+same time: the switch stops the remote's work and hands it back, it does not merely lower
+its priority. Switch it back to **work** to make it a candidate again.
+
+Each agent has a mode, `work` (default) or `game`, kept in one state file in the vault,
+`Worker/agents/_state/agent_mode.json` (gitignored, replaced atomically). A missing file
+means every agent is `work`. A broken file also means `work` — the router fails open and
+prints one `[agent_mode] … treating as work` line to stderr.
+
+**Command line** — one line in, one line out:
+
+```bash
+P="uv run --project $HOME/macp python"
+$P -m todo_system.orchestrator.orchestrator agent-mode desktop-runner game --reason "playing"
+# agent-mode desktop-runner: work -> game since 2026-01-01T20:00:00+09:00 (reason: playing)
+$P -m todo_system.orchestrator.orchestrator agent-mode desktop-runner        # show
+$P -m todo_system.orchestrator.orchestrator agent-mode desktop-runner work   # resume
+```
+
+Only a non-human agent in the registry has a mode; any other id exits with code 2. Setting
+the mode an agent already has keeps its `since`. `orchestrator agents` appends
+`mode: game since <ts>` to an agent in game mode and leaves every other line as it was.
+
+**HTTP API** — on the dashboard, behind the same token as every other `/api` route (so a
+token is required whenever `MACP_PUBLIC_EXPOSURE` is set or the bind is not loopback):
+
+| request | response |
+| --- | --- |
+| `GET /api/agent-mode?agent=<id>` | `{agent, mode, since, reason}`; 404 for an unknown or human id |
+| `GET /api/agent-mode` | `{agents: [{agent, mode, since, reason}, …]}` for every non-human agent |
+| `POST /api/agent-mode` with body `{agent, mode, reason}` | `{agent, mode, since, reason, changed}` |
+
+The POST needs `Content-Type: application/json` (otherwise 415) and a body of at most
+4096 bytes. `mode` must be `work` or `game` (400), `agent` a registered non-human agent
+(404); `reason` is optional, kept to 200 printable characters. A watcher on the remote
+machine can poll the GET and POST `game` when it sees a game start, e.g.
+`curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d
+'{"agent":"desktop-runner","mode":"game","reason":"game started"}' <dashboard>/api/agent-mode`.
+
+**Dashboard.** Each remote's card in the agents section has a **Game mode** / **Resume
+work** button that sends that POST, and shows the mode and its start time while in game.
+`/api/status` carries the same data on every agent row — `agents[].mode`,
+`agents[].mode_since`, `agents[].mode_reason` — so other clients read what the page shows.
+
+**Routing effect.** A game agent counts as offline for heavy routing: new heavy tasks go
+to the next usable remote or stay with their owner. On the next tick, every heavy task
+that agent holds in flight (dispatched, accepted or in progress) is moved back to its owner
+with reason `paused:game`, through the same path as the table above: the remote gets a
+`CANCEL`, the row gets a new `corr_id` and `rerouted_from`, and `refail_count`, `attempts`,
+`timeout_streak` and `capacity_retry_count` stay as they were. Unlike `rejected`,
+`paused:game` does not bar that remote: once it is back to `work`, it is picked for new
+heavy tasks and for later re-dispatches of the moved one. A task a remote owns by project
+is never moved, and nothing moves while the system is `PAUSED`.
+
 ## A healthy system, at a glance
 
 ```bash
