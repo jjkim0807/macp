@@ -543,6 +543,58 @@ def _default_embedder(text: str, dim: int = EMBED_DIM) -> list[float]:
     return vec
 
 
+# Weight of a Hangul character bigram relative to its whole token (1.0) in the
+# ``hash-ko`` embedder (issue #146).
+HASH_KO_BIGRAM_WEIGHT = 0.7
+
+
+def _has_hangul(tok: str) -> bool:
+    """True if ``tok`` contains at least one precomposed Hangul syllable."""
+    return any("가" <= ch <= "힣" for ch in tok)
+
+
+def _hash_ko_features(text: str) -> list[tuple[str, float]]:
+    """``(feature, weight)`` pairs for the ``hash-ko`` embedder, in token order.
+
+    Every token contributes itself at weight 1.0. A token containing a Hangul
+    syllable additionally contributes each consecutive character bigram of the
+    whole token (all characters, so ``v2임베딩`` → ``v2, 2임, 임베, 베딩``) at
+    :data:`HASH_KO_BIGRAM_WEIGHT`. A one-character token has no bigram; a
+    two-character token's single bigram equals the token and is kept as-is."""
+    feats: list[tuple[str, float]] = []
+    for tok in _embed_tokens(text):
+        feats.append((tok, 1.0))
+        if _has_hangul(tok):
+            for i in range(len(tok) - 1):
+                feats.append((tok[i : i + 2], HASH_KO_BIGRAM_WEIGHT))
+    return feats
+
+
+def _hash_ko_embedder(text: str, dim: int = EMBED_DIM) -> list[float]:
+    """Feature-hashing embedder with Hangul character bigrams (``hash-ko``).
+
+    Korean attaches particles and endings to the stem (``논문을`` / ``논문``), so the
+    whole-token :func:`_default_embedder` sees unrelated tokens and scores
+    ``'논문을 쓰는 일'`` vs ``'논문 작성'`` at cosine 0.0. Here each Hangul-bearing
+    token also hashes its character bigrams (see :func:`_hash_ko_features`) into
+    the **same** key space as whole tokens, so the bigram ``논문`` of ``논문을``
+    shares a bucket with the token ``논문``.
+
+    Same bucket/sign rule (``hashlib`` sha1 — never the salted builtin ``hash``)
+    and L2 normalisation as :func:`_default_embedder`; text with no Hangul yields
+    a bit-identical vector. Stdlib-only, deterministic, offline."""
+    vec = [0.0] * dim
+    for feat, weight in _hash_ko_features(text):
+        digest = hashlib.sha1(feat.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], "big") % dim
+        sign = 1.0 if digest[4] & 1 else -1.0
+        vec[bucket] += sign * weight
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0.0:
+        vec = [v / norm for v in vec]
+    return vec
+
+
 # --- embedder backend registry + call-time resolution (G4 §5 bench) ----------
 #
 # The embedder is selectable by config so the §5 bench can compare ① the stdlib
@@ -556,15 +608,22 @@ def _default_embedder(text: str, dim: int = EMBED_DIM) -> list[float]:
 # lazy-loaded inside their factories via ``importlib.import_module`` (string
 # import): a static third-party import — even function-local — would break
 # graph_memory's bare-clone stdlib-only contract (``test_session_log`` AST gate).
+# ``hash-ko`` is an opt-in stdlib variant of ``hash`` that adds Hangul character
+# bigrams (issue #146); selecting it does not change the ``hash`` default.
 
 EMBEDDER_DEFAULT = "hash"
 
 # Expected native output dim per backend — a sanity constant, NOT authority: each
 # factory probes the real vector length, and :func:`resolve_embedder` warns (never
 # silently relabels) when a backend's probed dim differs. hash=256 (``EMBED_DIM``),
-# local=384 (multilingual-e5-small int8 ONNX), vertex=768
-# (text-multilingual-embedding-002).
-EMBEDDER_EXPECTED_DIMS: dict[str, int] = {"hash": 256, "local": 384, "vertex": 768}
+# hash-ko=256 (same space as hash), local=384 (multilingual-e5-small int8 ONNX),
+# vertex=768 (text-multilingual-embedding-002).
+EMBEDDER_EXPECTED_DIMS: dict[str, int] = {
+    "hash": 256,
+    "hash-ko": 256,
+    "local": 384,
+    "vertex": 768,
+}
 
 
 class EmbedderUnavailable(RuntimeError):
@@ -583,6 +642,18 @@ def _hash_backend() -> tuple[Callable[[str], Sequence[float]], int]:
 
     def fn(text: str) -> list[float]:
         return _default_embedder(text, dim=dim)
+
+    return fn, dim
+
+
+def _hash_ko_backend() -> tuple[Callable[[str], Sequence[float]], int]:
+    """Factory for ``hash-ko``: the stdlib feature-hashing embedder plus Hangul
+    character bigrams (:func:`_hash_ko_embedder`). Zero deps, offline,
+    deterministic. Returns ``(fn, EMBED_DIM)``."""
+    dim = EMBED_DIM
+
+    def fn(text: str) -> list[float]:
+        return _hash_ko_embedder(text, dim=dim)
 
     return fn, dim
 
@@ -783,6 +854,7 @@ def _vertex_backend() -> tuple[Callable[[str], Sequence[float]], int]:
 # call time rather than snapshotting it.
 _EMBEDDER_BACKENDS: dict[str, Callable[[], tuple[Callable[[str], Sequence[float]], int]]] = {
     "hash": _hash_backend,
+    "hash-ko": _hash_ko_backend,
     "local": _local_backend,
     "vertex": _vertex_backend,
 }
