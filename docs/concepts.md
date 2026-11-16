@@ -136,8 +136,9 @@ account is used), with an effort level (heavy max, standard high, light medium) 
 stage timeout (3 h / 2 h / 1 h).
 
 **Tools.** Each stage has a default allowlist. A task's `allowed_tools` string replaces
-it, for example to allow `Bash(./gradlew:*)`. The runner always strips a few dangerous
-rules. Treat the allowlist as a guard rail, not a sandbox (see [SECURITY.md](../SECURITY.md)).
+it, for example to allow `Bash(./gradlew:*)`. The runner refuses to start a stage whose final
+allowlist contains a few dangerous rules (`_safe_tools` raises `ValueError`; it does not
+strip them), and `validate` reports the same as an ERROR beforehand. Treat the allowlist as a guard rail, not a sandbox (see [SECURITY.md](../SECURITY.md)).
 
 **Isolation and concurrency.** Every run gets its own git worktree on
 `worker/<slug>`. Two tasks on the same repository run at the same time only when both
