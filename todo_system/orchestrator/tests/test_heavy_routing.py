@@ -458,6 +458,82 @@ class TickRerouteTest(_Base):
         self.assertEqual(res["reaped"], [])
 
 
+_DASH_SRC = Path(__file__).resolve().parents[3] / "scripts" / "macp_dashboard.py"
+
+
+def _load_dashboard():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("macp_dashboard_heavy", _DASH_SRC)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class ObservabilityTest(_Base):
+    """status · trace · /api/status show the assigned agent and rerouted_from."""
+
+    def _rerouted(self):
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        return self.ledger.load("app-build")
+
+    def test_status_line(self):
+        from todo_system.orchestrator.orchestrator import status_line
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        heavy = status_line(self.ledger.load("app-build"))
+        self.assertIn(REMOTE, heavy)
+        self.assertIn(f"(heavy; fallback {DEFAULT})", heavy)
+        row = self._rerouted_from_existing()
+        line = status_line(row)
+        self.assertIn(DEFAULT, line)
+        self.assertIn(f"rerouted from {REMOTE} (accept-timeout @ ", line)
+        # an ordinary row keeps the historical format exactly
+        plain = Assignment(task_id="t", agent_id=DEFAULT, corr_id="c")
+        self.assertEqual(status_line(plain), f"{'dispatched':14s} {'t':40s} {DEFAULT}")
+
+    def _rerouted_from_existing(self):
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        return self.ledger.load("app-build")
+
+    def test_trace_shows_agent_and_rerouted_from(self):
+        from todo_system.orchestrator import trace
+        row = self._rerouted()
+        md = trace.render("app-build", self.ledger, runs_dir=self.tmp / "runs",
+                          repo_dir=self.tmp, pr_lookup=lambda *a, **k: None,
+                          branch_lookup=lambda *a, **k: None)
+        self.assertIn(f"(agent: `{DEFAULT}`)", md)
+        self.assertIn(f"`{REMOTE}`", md)
+        self.assertIn("accept-timeout", md)
+        self.assertIn(row.rerouted_from["ts"], md)
+
+    def test_api_status_rows_carry_agent_and_rerouted_from(self):
+        self._rerouted()
+        M = _load_dashboard()
+        patches = [mock.patch.object(M, "ASSIGN", self.ledger.root),
+                   mock.patch.object(M, "RUNS", self.tmp / "runs"),
+                   mock.patch.object(M, "STATE", self.tmp / "_state"),
+                   mock.patch.object(M, "TODO_DB", self.tmp / "todo.db")]
+        for name, val in (("collect_human", []), ("collect_deps", []),
+                          ("collect_agents", []), ("collect_todo", {}),
+                          ("collect_usage", None), ("_worker_running", []),
+                          ("_todo_status_map", {}), ("_title_map", {}),
+                          ("_project_map", {})):
+            patches.append(mock.patch.object(M, name, return_value=val))
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            d = M.collect_status()
+            detail = M._ledger_row("app-build")
+        [row] = [r for r in d["recent"] if r["task"] == "app-build"]
+        self.assertEqual(row["agent"], DEFAULT)
+        self.assertEqual(row["rerouted_from"]["agent"], REMOTE)
+        self.assertEqual(row["rerouted_from"]["reason"], "accept-timeout")
+        self.assertEqual(detail["agent"], DEFAULT)
+        self.assertEqual(detail["rerouted_from"]["agent"], REMOTE)
+
+
 # --- remote runner side: CANCEL + busy heartbeat ------------------------------
 
 class _RecordingExecutor:

@@ -328,6 +328,11 @@ def collect_assignments() -> list[dict]:
             "state": display_state(d) or "?",
             "deferred": is_deferred(d),
             "agent": d.get("agent_id", ""),
+            # Heavy routing (additive): the default agent a heavy-remote task
+            # comes back to, and the latest reroute away from a remote
+            # ({agent, reason, ts, corr_id}); "" / None when not applicable.
+            "fallback_agent": d.get("fallback_agent") or "",
+            "rerouted_from": d.get("rerouted_from") or None,
             "refail": d.get("refail_count", 0),
             "capacity_limited": bool(d.get("capacity_limited")),
             "note": (d.get("last_note") or "")[:90],
@@ -415,6 +420,8 @@ def _ledger_row(slug: str) -> dict:
         return {}
     return {"state": display_state(d), "deferred": is_deferred(d),
             "agent": d.get("agent_id", ""),
+            "fallback_agent": d.get("fallback_agent") or "",
+            "rerouted_from": d.get("rerouted_from") or None,
             "refail": d.get("refail_count", 0),
             "note": d.get("last_note") or "",
             "updated": d.get("updated_ts", ""),

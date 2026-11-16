@@ -3391,6 +3391,21 @@ class Orchestrator:
             return []
 
 
+def status_line(a: Assignment) -> str:
+    """One `orchestrator status` row. The head (state, task, agent, nudge#) is
+    the historical format; heavy routing only APPENDS — the fallback agent of a
+    task sent to a heavy remote, and the latest reroute away from one."""
+    extra = f" nudge#{a.nudge_index}" if a.state == AWAITING_HUMAN else ""
+    line = f"{a.state:14s} {a.task_id:40s} {a.agent_id}{extra}"
+    if getattr(a, "fallback_agent", ""):
+        line += f" (heavy; fallback {a.fallback_agent})"
+    rr = getattr(a, "rerouted_from", None) or {}
+    if rr:
+        line += (f" ⇐rerouted from {rr.get('agent', '?')} "
+                 f"({rr.get('reason', '')} @ {rr.get('ts', '')})")
+    return line
+
+
 def _usage_hold_suffix(result: dict) -> str:
     """The ` USAGE-HOLD (...)` part of the `auto` tick line, with the release
     ETA (ISO) when the guard knows one."""
@@ -3746,8 +3761,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "status":
         for a in orch.ledger.all():
-            extra = f" nudge#{a.nudge_index}" if a.state == AWAITING_HUMAN else ""
-            print(f"{a.state:14s} {a.task_id:40s} {a.agent_id}{extra}")
+            print(status_line(a))
         return 0
 
     if args.cmd == "agents":
