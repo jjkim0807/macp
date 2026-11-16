@@ -221,7 +221,7 @@ approvals:
 브라우저 인스턴스로 열어 본문 텍스트를 읽었다. 최종 URL 은 브라우저가 보고한 주소이고 조회일은 모두 2026-11-17
 이다. 커뮤니티 글·블로그는 쓰지 않았다.
 
-| # | 출처 | 최종 URL | 이 노트가 기대는 확인 사실 | 미확인 |
+| # | 출처 | 최종 URL (조회 2026-11-17) | 이 노트가 기대는 확인 사실 | 미확인 |
 |---|---|---|---|---|
 | V1 | CLI reference | `https://code.claude.com/docs/en/cli-reference` | `--permission-prompt-tool` 은 비대화 모드의 권한 프롬프트를 MCP 도구(`mcp__<server>__<tool>`)로 넘기고, 그 서버 연결을 `MCP_TIMEOUT`(기본 30 s)까지 기다린다. `--resume` 은 세션 ID·이름·**.jsonl 절대 경로**를 받고 ID 는 이 머신의 모든 프로젝트에서 찾는다. `--settings` 는 파일 또는 인라인 JSON 이고 세션 한정이다 | 권한 위임 도구가 돌려줄 JSON 의 정확한 모양(문서가 가리키는 절을 이 런에서 찾지 못함) |
 | V2 | Run Claude Code programmatically | `https://code.claude.com/docs/en/headless` | 권한 모드를 정하지 않은 `-p` 런은 Manual 이고, 승인이 필요한 호출은 PermissionRequest hook 이나 권한 위임 도구가 승인하지 않으면 거부된다. 권한 호스트가 있으면 런이 그 답을 **기다린다**. 권한 프롬프트 대기 중 SIGTERM 이면 답하지 않은 채 끝나고(exit 143), 재개 때 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 이면 끊긴 턴을 잇는다 | — |
@@ -591,10 +591,100 @@ POST /api/approvals        (Content-Type: application/json, 본문 ≤ 4 KiB)
 
 ## §6 단계별 구현 분할안 · 라우트·화면 수준 완료 조건
 
-> (이 런의 다음 페이즈에서 채움)
+> **분할 원칙**: expand → migrate → contract(parallel-change)로 **각 leaf 가 단독으로 컴파일·테스트 green**. 첫 leaf 는
+> 소비자 없는 additive 저장소·정책이다(가장 안전하고 독립적). 완료 조건은 전부 **로컬 명령**이다 — "CI green" 금지
+> (Actions 미사용, [[Decisions/2026-09-11-no-github-actions-local-release-lane]]). 각 leaf 는 이 리포의 태스크이고
+> `touches` 는 아래 열거한다.
+
+### 6.1 leaf 목록 · 로컬 검증
+
+| leaf | 단계 | 범위(touches) | depends_on | 로컬 검증 명령 |
+|---|---|---|---|---|
+| **A1** 승인 저장소 · 정책 해석기 · 감사 로그 | expand — 소비자 없음, `MACP_APPROVALS` 기본 0 | `todo_system/orchestrator/approvals.py`(신규: 저장소 리졸버, request·answer·consumed, 만료 순수 판정, 정책 우선순위와 바닥 패턴, 해시 체인 audit) · `todo_system/orchestrator/tests/test_approvals.py`(신규) · `docs/configuration.md` | **없음** — 안전한 첫 leaf | `uv run pytest todo_system/orchestrator/tests/test_approvals.py` · `uvx ruff check .` · `bash scripts/check_engine_isolation.sh`(stdlib only) |
+| **A2** `approvals:` → payload 배선과 검증 | expand | `todo_system/orchestrator/tasks.py`(`load_dispatchable`) · `todo_system/orchestrator/repos.py`(`task_approvals_from_fm`) · `todo_system/task_validate.py` · 테스트 · 태스크 필드 문서 | A1 | `uv run pytest todo_system/orchestrator/tests/test_tasks.py todo_system/tests/test_task_validate.py -k approvals` |
+| **A3** 스테이지 측 브로커와 argv 배선(꺼짐 기본) | expand | `todo_system/orchestrator/approval_hook.py`(신규: PreToolUse 게이트 — 분류·인라인 대기·defer/deny) · `todo_system/orchestrator/approval_broker.py`(신규: stdlib stdio MCP 서버 — `permission`·`confirm`) · `stages.py`(`build_stage_argv` 의 `--mcp-config` 병합·`--permission-prompt-tool`·`--settings`·메타데이터 줄, `stage_env` 의 토큰 env 제거) · `todo_system/tests/test_agent_backend_golden.py`(**의식적 갱신** — 꺼짐 무수정, 켜짐 새로 핀) · `todo_system/orchestrator/tests/test_approval_broker.py`(신규 — 위임 도구 반환 모양과 hook 발화의 캡처 픽스처) | A1, A2, run-event-stream S1 | `uv run pytest todo_system/tests/test_agent_backend_golden.py todo_system/tests/test_agent_backend.py todo_system/orchestrator/tests/test_approval_broker.py` |
+| **A4** 대시보드 카드 API 와 웹 화면 | expand → migrate | `scripts/macp_dashboard.py` · `todo_system/tests/test_macp_dashboard.py` | A1 | `uv run pytest todo_system/tests/test_macp_dashboard.py -k Approvals` · `uvx ruff check .` |
+| **A5** 인라인 왕복 배선 | migrate | `todo_system/orchestrator/runner.py`(스테이지 시작 때 정책 스냅샷·마감 시각 전달, watcher 스레드의 PROGRESS 미러, `events.in/` 의 `approval.*` 를 저장소와 대조) · `todo_system/orchestrator/tests/test_approvals_e2e.py`(신규) | A3, A4 | `uv run pytest todo_system/orchestrator/tests/test_approvals_e2e.py todo_system/orchestrator/tests/test_runner.py` |
+| **A6** 일시정지 · 세션 재개 · 만료 파킹 | migrate | `runner.py`("열린 카드 = 일시정지" → NEEDS_INPUT, rescue·checkpoint 재사용, `approval_resume` — run_id 재사용·완료 스테이지 건너뛰기·`--resume`·usage 차분) · `stages.py`(재개 argv) · `assignment.py`(`approval_pending`·`apply_reply`) · `orchestrator.py`(`reconcile_approvals` — 재개 송신·만료 파킹) · `docs/concepts.md`("When a person is needed") · 골든(재개 모양) · 테스트 | A5 | `uv run pytest todo_system/orchestrator/tests/test_approvals_resume.py todo_system/orchestrator/tests/test_orchestrator.py todo_system/orchestrator/tests/test_assignment.py todo_system/tests/test_agent_backend_golden.py` · 전체 `uv run pytest -q` |
+| **A7** 알림과 원격 러너 경로 | migrate | `orchestrator.py`(카드 immediate 알림·리마인더) · `todo_system/orchestrator/state_store_remote.py`(`POST /approvals/request`·`GET /approvals/get`) · `approval_broker.py`(원격 모드) · 테스트 | A6, 상태 API 의 네트워크 노출(사람 단계), run-event-stream S4 | `uv run pytest todo_system/orchestrator/tests/test_state_store_remote.py -k approvals` · 가짜 notifier 를 쓰는 알림 테스트 |
+| **A8** 사람 게이트 묶음 | human_gate (contract 포함) | 숫자(인라인 540 s · 만료 24 h · 런당 카드 5 · 스테이지당 일시정지 2 · 전역 10 · 보존 기간), kill switch 기본 0 → 1, 별도 OS 사용자(§5.2 a), 볼트 반영((볼트) CLAUDE.md §12 바닥 · `docs/dashboard-parity.md` 카드 계약 — 저장소가 XDG 라 볼트 `.gitignore` 변경은 필요 없다), Android 짝 태스크, chat-channels §4 연결(leaf b 몫), 브라우저 MCP 서버 쪽 클릭 가드(다른 리포), 읽기 전용 스테이지의 질문 허용(2.2), C3 이 깨질 때의 바닥 태그 태스크 처리(3.1) | A4, A6, A7 | 사람 결정이라 로컬 명령이 없다. 문서 leaf 는 `uvx ruff check .` 와 식별자 스캔 |
+
+### 6.2 depends_on 체인
+
+`A1 → {A2, A4}` · `A2 → A3` · `{A3, A4} → A5 → A6 → A7` · `{A4, A6, A7} → A8`. 바깥 의존은 run-event-stream S1 → A3,
+상태 API 노출과 S4 → A7 이다. 오케스트레이터 자동 분할이면 **첫 서브태스크는 A1** 이다 — 소비자 없는 저장소·정책이고
+`MACP_APPROVALS` 가 기본 꺼짐이라 어떤 argv·화면도 바꾸지 않는다. 나머지는 위 체인대로 `blocked` + `on_unblock: auto`
++ `depends_on` 으로 줄 세운다. A4 는 A2·A3 과 병렬로 갈 수 있다.
+
+### 6.3 라우트·화면 수준 완료 조건 (§6 AC 의 이빨)
+
+부품(저장소·hook·서버)이 아니라 **배선**(스테이지가 묻고 → 화면이 보이고 → 사람이 답하고 → 같은 런이 끝난다)을 완료
+조건으로 삼는다. 각 배선 leaf 는 새 프로덕션 호출 위치를 verify.md `## Wiring` 에 적는다. **부품 단위 테스트만
+녹색이면 어느 leaf 도 PASS 가 아니다**(형제 `run-event-stream.md:572-601` 과 같은 규율).
+
+- **A4**: 바인딩된 서버에 **실제 HTTP GET** 하면 대기 카드가 서버 판정 필드와 함께 온다. **실제 HTTP POST** 는 첫 답
+  200, 두 번째 409, 만료 카드 410, 토큰 없는 서버 403 이다 — 양성 대조군으로 토큰 있는 서버의 정상 답 200 을 같은
+  테스트에 둔다. 웹 셸에 카드 구역이 그려진다(셸 계약). Wiring = `do_GET`·`do_POST` 분기 줄과 셸 JS 의 fetch.
+- **A5** — AC 의 문장을 그대로 이빨로 쓴다: 가짜 에이전트 seam(`test_runner.py` 의 agent seam)이 **실제 승인 서버
+  프로세스**의 `permission` 을 부른다 → `GET /api/approvals` 에 카드가 보인다 → **실제 HTTP POST 로 카드에 답한다** →
+  **대기 중이던 스테이지가 이어진다** → **같은 run_id 의 `events.ndjson` 에** `approval.requested` →
+  `approval.resolved{decision: allow}` → `stage.finished` → `run.finished{outcome: ok}` 가 이 순서로 남는다. 즉 **런이
+  끝난다.** 거부 경로도 같은 모양으로 짝을 이룬다. Wiring = 러너의 브로커 전달 줄, `build_stage_argv` 의
+  `--permission-prompt-tool` 줄, 대시보드 POST 분기 줄.
+- **A6**: 인라인 상한을 1 s 로 줄인 테스트에서 러너는 FAIL 이 아니라 NEEDS_INPUT 을 보내고, 원장은 `awaiting_human` +
+  `approval_pending` 이 된다. 실제 HTTP POST 로 답하면 다음 `reconcile_approvals` 가 **같은 run_id** 로 재디스패치하고,
+  스텁 러너가 같은 run dir 에서 `--resume <session_id>` argv 로 그 스테이지만 잇는다(완료 스테이지는 다시 돌지 않는다).
+  `approval.resolved`·`run.finished` 가 같은 run_id 에 남고 `refail_count`·`attempts` 는 그대로다. 만료 경로는 답이
+  없으면 `blocked_on` 파킹과 ⛔ 1회 — 양성 대조군으로 만료 전 답은 파킹하지 않는다. defer 왕복과 응답 없는
+  tool_use 로 끝난 세션의 `--resume` 거동은 캡처 픽스처로 확정한다.
+- **A7**: 원격 모드 브로커의 실제 POST 가 본부 GET 에 카드로 보이고 답이 폴링으로 돌아간다. 본부가 다운이면 즉시
+  거부하고 파킹한다.
+- **A1~A3**: 네거티브 단언은 양성 대조군과 함께 둔다(`run-event-stream.md:461-470`). 바닥 설정 거절 ↔ 정상 설정 통과,
+  골든 꺼짐 모양 무수정 green ↔ 켜짐 모양 핀, 카드 요약에 합성 비밀 마커 0회 ↔ 카드 행은 있음. A2 는 `approvals` 가
+  payload 에 실리는 것까지 보여야 PASS 다.
+
+### 6.4 규약 · 범위 가드
+
+- `.claude/**` 변경(예: 스테이지 프롬프트에 승인 규칙 추가)은 헤드리스가 쓸 수 없다. 완성본을 `Worker/proposals/` 에
+  두고 사람이 `cp` 한다. 그 전까지는 규칙을 메타데이터 줄로 싣는다(2.3 c).
+- leaf 태스크 md 는 만들지 않는다. 설계 머지 뒤 사람이 게이트를 풀 때 만든다. 이 런은 이 리포 체크아웃에서 돌아 볼트
+  `Todo/` 를 쓰지도 못한다.
+- 볼트 문서 반영은 A8 이다. 자매 노트는 고치지 않는다 — `run-event-stream.md` 의 예약표를 이 노트가 의미로 채웠다는
+  역링크도, `chat-channels.md` §4·§5 도 각 담당 leaf 의 몫이다.
+- "CI green" 금지 — 완료 조건은 위 표의 로컬 명령이다.
 
 ---
 
 ## 부록: 이 노트가 확정한 설계 결정 요약
 
-> (이 런의 다음 페이즈에서 채움)
+1. **공백 셋**: 스테이지 안에서 사람에게 묻는 채널이 없고, 웹·앱에 답하는 면이 없으며, 답한 뒤 같은 런을 잇지 못한다.
+   네 상황 모두 "스테이지 종료 → 파킹 → 터미널 답 → 새 run_id" 로 처리된다(§1).
+2. **세 층과 바닥**: 자동 허용 = 허용 목록, 카드 = 목록 밖·바닥·질문·확인, 거부 = FORBIDDEN·`.claude/**`·비밀과 승인
+   장치·로그인·읽기 전용 스테이지. 실계좌·결제·사용자 명의 제출은 **본문이 허용해도 카드**, 한 번 허용만 — 볼트
+   CLAUDE.md §12 보다 엄격하고 그 반영은 A8 이다(§2.2, §2.3).
+3. **설정**: frontmatter `approvals:`(`ask`·`deny`·`expire`·`inline_hold`)와 config `[approvals]`. 우선순위는 바닥 >
+   거부 > `deny` > `ask` > 허용 목록 > 기본값. 넓히는 키가 없고, payload 배선은 A2 가 따로 맡는다(§2.4).
+4. **대기 = 혼합**: PreToolUse hook(`--settings` 인라인)이 1차 게이트, 권한 위임 MCP 도구가 백스톱이다. 짧게 붙잡고,
+   넘으면 PreToolUse `defer` 로 일시정지한 뒤 `claude -p --resume` 으로 잇는다. 공식 문서 7페이지를 최종 URL·조회
+   2026-11-17 로 확인했고, 위임 도구의 반환 모양만 미확인이다(§3.1).
+5. **바닥에는 defer 를 쓰지 않는다**: 묶인 호출이면 defer 가 무시되고 허용 목록이 그 호출을 통과시킨다. 그래서 거부 +
+   턴 종료 + 러너 규칙 "열린 카드 = 일시정지"로 처리한다(§3.1).
+6. **상태 기계**: NEEDS_INPUT → AWAITING_HUMAN + `approval_pending`. `reconcile_approvals` 가 `dispatch()` 를 거치지 않고
+   봉투 전용 `approval_resume` 으로 재개해 `refail_count`·`attempts` 를 지킨다. 러너는 run_id 를 재사용하고 완료 스테이지를
+   건너뛴다(§3.2).
+7. **시간 예산 R-T1~R-T6**: 대기는 스테이지 시계를 멈추지 않고, 세 불변식(REAP_MARGIN·`_stale_bound_for`·하트비트)은
+   그대로다. hook·서버 시간 한도는 주입 JSON 에 명시하고, 일시정지 전에 rescue·checkpoint 로 작업을 보존한다(§3.3).
+8. **만료 = 오늘의 파킹**: 만료를 먼저 보고 깨진 값은 만료로 본다. `blocked_on` + ⛔, 복구는 `cli resume` 이다(§3.4).
+9. **이벤트**: kind 이름과 예약 필드는 불변이고 필드만 더한다. `category` 로 네 상황을 가르고, src 는 hook·orchestrator,
+   writer 는 러너 하나다. 이벤트는 감사 거울이고 결정의 원천은 저장소다(§3.5).
+10. **재시작 생존**: 일시정지와 답-대기는 모든 재시작을 견딘다. 인라인 대기는 프로세스와 함께 죽지만 카드·세션이 남아
+    재개로 잇는다. 안 되면 같은 run_id 스테이지 재시작으로 내려간다(§3.6).
+11. **저장소**: XDG `~/.local/share/macp/approvals/`(0700/0600, SMS 선례) — run dir·`Worker/_state/` 는 에이전트 Write 가
+    닿아서 기각했다(§3.8).
+12. **대시보드**: `GET`·`POST /api/approvals`, 판정 필드는 서버, 기존 라우트는 필드 추가만, SSE 없음. 한 번 / 이 런
+    동안, 1단계 푸시는 기존 카톡·Slack. 원격은 상태 API 라우트 둘을 더하고 그것이 노출될 때까지 꺼 둔다. parity 초안을
+    포함한다(§4).
+13. **안전**: 토큰 필수·JSON 전용·첫 답 우선·민감값 422. 자기 승인 차단 1~7 은 구조적 강제지만 같은 uid 에서는
+    가드레일이고, 실제 경계는 별도 OS 사용자(A8)다. 감사는 해시 체인 audit·런 이벤트·원장 id 세 곳에 남긴다(§5).
+14. **분할**: `A1 → {A2, A4}`, `A2 → A3`, `{A3, A4} → A5 → A6 → A7 → A8`. A1 이 안전한 첫 leaf 이고, A5·A6 이 "실제 HTTP POST 로 답하면 같은
+    run_id 가 이어져 끝난다"를 라우트 수준에서 요구한다. 설계 문서만 바꾸고 leaf md·볼트 반영은 머지 뒤 사람 몫이다(§6).
