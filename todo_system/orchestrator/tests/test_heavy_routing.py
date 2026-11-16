@@ -272,5 +272,186 @@ class TickRoutingTest(_Base):
         self.assertEqual(self.ledger.load("winapp-1").fallback_agent, "")
 
 
+def _types(envs):
+    return [e.type for e in envs]
+
+
+class TickRerouteTest(_Base):
+    """The reroute sweep runs at the top of the real tick."""
+
+    def _dispatch_remote(self, slug="app-build") -> Assignment:
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task(slug)])
+        row = self.ledger.load(slug)
+        self.assertEqual(row.agent_id, REMOTE)
+        return row
+
+    def _reply(self, row: Assignment, typ: str, payload=None, corr=None):
+        self.mb.send(m.Envelope(to=m.ORCHESTRATOR, type=typ, frm=REMOTE,
+                                task_id=row.task_id, corr_id=corr or row.corr_id,
+                                payload=payload or {}))
+
+    def _assert_rerouted(self, before: Assignment, reason: str) -> Assignment:
+        row = self.ledger.load(before.task_id)
+        self.assertEqual(row.agent_id, DEFAULT)
+        self.assertEqual(row.kind, "ai-local")
+        self.assertEqual(row.state, A.DISPATCHED)
+        self.assertEqual(row.rerouted_from["agent"], REMOTE)
+        self.assertEqual(row.rerouted_from["reason"], reason)
+        self.assertEqual(row.rerouted_from["corr_id"], before.corr_id)
+        self.assertTrue(row.rerouted_from["ts"])
+        self.assertNotEqual(row.corr_id, before.corr_id)
+        self.assertEqual(row.fallback_agent, "")
+        # not the task's fault
+        self.assertEqual(row.refail_count, before.refail_count)
+        self.assertEqual(row.attempts, before.attempts)
+        self.assertEqual(row.timeout_streak, before.timeout_streak)
+        self.assertEqual(row.capacity_retry_count, before.capacity_retry_count)
+        self.assertEqual(row.payload, before.payload)
+        self.assertEqual(row.history[-1]["type"], "rerouted")
+        # remote gets a CANCEL for the OLD run
+        cancels = [e for e in self.inbox(REMOTE) if e.type == m.CANCEL]
+        self.assertEqual(len(cancels), 1)
+        self.assertEqual(cancels[0].corr_id, before.corr_id)
+        # default gets the task, with its own payload (no `requires`)
+        [env] = [e for e in self.inbox(DEFAULT) if e.type == m.TASK_ASSIGN]
+        self.assertEqual(env.corr_id, row.corr_id)
+        self.assertNotIn("requires", env.payload)
+        return row
+
+    def test_accept_timeout_reroutes_to_default(self):
+        row = self._dispatch_remote()
+        res = _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 599)
+        self.assertEqual(res["rerouted"], [])
+        self.assertEqual(self.ledger.load("app-build").agent_id, REMOTE)
+        res = _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        self.assertEqual([a.task_id for a in res["rerouted"]], ["app-build"])
+        self.assertEqual(res["dispatched"], [])          # same tick: row is busy
+        self._assert_rerouted(row, "accept-timeout")
+
+    def test_accept_timeout_comes_from_env(self):
+        os.environ[REMOTE_ACCEPT_TIMEOUT_ENV] = "60"
+        row = self._dispatch_remote()
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 61)
+        self._assert_rerouted(row, "accept-timeout")
+
+    def test_stale_after_accept_reroutes(self):
+        row = self._dispatch_remote()
+        self._reply(row, m.ACCEPT)
+        _tick(self.orch, [self.heavy_task()], live=("collect",))
+        self.assertEqual(self.ledger.load("app-build").state, A.ACCEPTED)
+        # still online → stays put
+        self.seen(REMOTE, 60)
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(res["rerouted"], [])
+        self.assertEqual(self.ledger.load("app-build").agent_id, REMOTE)
+        # goes stale with no RESULT/FAIL → back to default
+        self.seen(REMOTE, 1000)
+        before = self.ledger.load("app-build")
+        _tick(self.orch, [self.heavy_task()])
+        self._assert_rerouted(before, "agent-stale")
+
+    def test_reject_reroutes_without_refail_and_bars_that_remote(self):
+        row = self._dispatch_remote()
+        self._reply(row, m.REJECT, {"reason": "missing capability"})
+        _tick(self.orch, [self.heavy_task()], live=("collect",))
+        before = self.ledger.load("app-build")
+        self.assertEqual(before.state, A.REJECTED)
+        _tick(self.orch, [self.heavy_task()])
+        after = self._assert_rerouted(before, "rejected")
+        self.assertEqual(after.refail_count, 0)
+        # The default run later fails; after the cooldown the task re-dispatches —
+        # never back to the remote that refused it, even though it is online.
+        after.state = A.FAILED
+        after.updated_ts = _iso_ago(10 * 3600)
+        self.ledger.save(after)
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        again = self.ledger.load("app-build")
+        self.assertEqual(again.agent_id, DEFAULT)
+        self.assertEqual(again.rerouted_from["reason"], "rejected")
+        self.assertEqual(_types(self.inbox(REMOTE)).count(m.TASK_ASSIGN), 1)
+
+    def test_timeout_rerouted_task_returns_to_remote_once_online(self):
+        self._dispatch_remote()
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        row = self.ledger.load("app-build")
+        self.assertEqual(row.agent_id, DEFAULT)
+        # Same tick and following ticks: the rerouted row is busy → no bounce.
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(self.ledger.load("app-build").agent_id, DEFAULT)
+        # Default run fails; after the cooldown a re-dispatch sees the remote
+        # online again and sends it there (accept-timeout is not a bar).
+        row = self.ledger.load("app-build")
+        row.state = A.FAILED
+        row.updated_ts = _iso_ago(10 * 3600)
+        self.ledger.save(row)
+        _tick(self.orch, [self.heavy_task()])
+        again = self.ledger.load("app-build")
+        self.assertEqual(again.agent_id, REMOTE)
+        self.assertEqual(again.fallback_agent, DEFAULT)
+        self.assertEqual(_types(self.inbox(REMOTE)).count(m.TASK_ASSIGN), 2)
+
+    def test_project_owned_remote_row_is_never_rerouted(self):
+        self.ledger.save(Assignment(task_id="owned", agent_id=REMOTE, corr_id="c1",
+                                    kind="ai-remote", updated_ts=_iso_ago(86400),
+                                    payload={"repo": REPO}))
+        self.seen(REMOTE, None)
+        res = _tick(self.orch, [], now=dt.datetime.now().timestamp() + 86400)
+        self.assertEqual(res["rerouted"], [])
+        row = self.ledger.load("owned")
+        self.assertEqual((row.agent_id, row.state, row.rerouted_from),
+                         (REMOTE, A.DISPATCHED, {}))
+        self.assertEqual(self.inbox(REMOTE), [])
+
+    def test_paused_moves_nothing(self):
+        self._dispatch_remote()
+        with mock.patch.object(self.orch, "paused", return_value=True):
+            self.assertEqual(
+                self.orch.reroute_remote(dt.datetime.now().timestamp() + 601), [])
+        self.assertEqual(self.ledger.load("app-build").agent_id, REMOTE)
+
+    def test_late_messages_from_the_old_remote_change_nothing(self):
+        row = self._dispatch_remote()
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        moved = self.ledger.load("app-build")
+        for typ in (m.ACCEPT, m.PROGRESS, m.RESULT, m.FAIL):
+            self._reply(row, typ, {"summary": "late"}, corr=row.corr_id)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _tick(self.orch, [self.heavy_task()], live=("collect",))
+        now_row = self.ledger.load("app-build")
+        self.assertEqual(now_row.state, A.DISPATCHED)
+        self.assertEqual(now_row.agent_id, DEFAULT)
+        self.assertEqual(now_row.corr_id, moved.corr_id)
+        self.assertEqual(now_row.history, moved.history)
+        late = [ln for ln in out.getvalue().splitlines() if "ignoring late" in ln]
+        self.assertEqual(len(late), 4, out.getvalue())
+        self.assertTrue(all("rerouted to worker-default" in ln for ln in late))
+
+    def test_reap_is_not_shielded_by_the_old_remote_envelope(self):
+        self._dispatch_remote()
+        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
+        # The default runner picked its envelope up; the remote's stale copy of
+        # the OLD dispatch is still unacked in the remote inbox.
+        self.mb.ack(DEFAULT, self.inbox(DEFAULT))
+        self.assertIn(m.TASK_ASSIGN, _types(self.inbox(REMOTE)))
+        row = self.ledger.load("app-build")
+        row.updated_ts = _iso_ago(2 * 86400)
+        self.ledger.save(row)
+        res = _tick(self.orch, [], live=("reap_stale",))
+        self.assertEqual([a.task_id for a in res["reaped"]], ["app-build"])
+
+    def test_reap_still_skips_a_queued_non_rerouted_row(self):
+        self.seen(REMOTE, None)
+        _tick(self.orch, [self.heavy_task()])            # → default, unacked
+        row = self.ledger.load("app-build")
+        row.updated_ts = _iso_ago(2 * 86400)
+        self.ledger.save(row)
+        res = _tick(self.orch, [], live=("reap_stale",))
+        self.assertEqual(res["reaped"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

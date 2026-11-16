@@ -1233,6 +1233,13 @@ class Orchestrator:
                 if a is None:
                     print(f"[orchestrator] collect: dropping {msg.type} for "
                           f"{msg.task_id} from {msg.frm} — no assignment on record")
+                elif self._is_late_rerouted(a, msg):
+                    # The heavy remote this task was taken away from is still
+                    # talking about its old run. One line, no state change.
+                    rr = a.rerouted_from or {}
+                    print(f"[orchestrator] collect: ignoring late {msg.type} for "
+                          f"{msg.task_id} from {msg.frm} — rerouted to "
+                          f"{a.agent_id} ({rr.get('reason', '')})")
                 else:
                     print(f"[orchestrator] collect: dropping {msg.type} for "
                           f"{msg.task_id} from {msg.frm} — corr_id mismatch "
@@ -1819,12 +1826,18 @@ class Orchestrator:
         staged pipeline routinely runs longer than stale_timeout_s, so anything
         dispatched behind one would otherwise be failed before it ever started.
         """
-        queued: set[str] = set()
+        return {tid for tid, _corr in self._queued_pairs()}
+
+    def _queued_pairs(self) -> set[tuple[str, str]]:
+        """(task_id, corr_id) of every TASK_ASSIGN still unacked in an agent's
+        inbox. A rerouted task leaves its OLD envelope in the quiet remote's inbox;
+        only the pair tells whether the row's CURRENT dispatch is the one waiting."""
+        queued: set[tuple[str, str]] = set()
         for agent in self.reg.agents:
             try:
                 for env in self._mailbox_for(agent).receive(agent.id):
                     if env.type == m.TASK_ASSIGN and env.task_id:
-                        queued.add(env.task_id)
+                        queued.add((env.task_id, env.corr_id))
             except _MAILBOX_READ_ERRORS as exc:
                 # A write refused by the pytest tripwire (todo_system/conftest.py)
                 # is a PermissionError, but not an unreachable mailbox.
@@ -1868,11 +1881,17 @@ class Orchestrator:
         behind a task that was executing normally.
         """
         now = now if now is not None else dt.datetime.now().timestamp()
-        queued = self._queued_task_ids()
+        pairs = self._queued_pairs()
+        queued = {tid for tid, _corr in pairs}
         reaped: list[Assignment] = []
         for a in self.ledger.all():
-            if a.task_id in queued:
-                continue      # dispatched but not yet picked up
+            if a.task_id in queued and not (
+                    getattr(a, "rerouted_from", None)
+                    and (a.task_id, a.corr_id) not in pairs):
+                # dispatched but not yet picked up. A rerouted row is exempt only
+                # while ITS OWN envelope waits — the quiet remote's stale copy of
+                # the old dispatch must not shield the new one forever.
+                continue
             if a.state in _IN_FLIGHT and not a.kind.startswith("human") \
                     and now - _parse_ts(a.updated_ts) >= self._stale_bound_for(a):
                 a.state = FAILED
@@ -1882,6 +1901,128 @@ class Orchestrator:
                 self.ledger.save(a)
                 reaped.append(a)
         return reaped
+
+    # -- Heavy-remote reroute ----------------------------------------------
+    @staticmethod
+    def _is_late_rerouted(a: Assignment, msg: m.Envelope) -> bool:
+        """Is `msg` a reply from the remote this task was rerouted away from,
+        about the run it was taken off (its old corr_id)?"""
+        rr = getattr(a, "rerouted_from", None) or {}
+        return bool(rr) and rr.get("agent") == msg.frm \
+            and rr.get("corr_id") == msg.corr_id
+
+    def _reroute_reason(self, a: Assignment, liveness: dict, now: float,
+                        accept_timeout: float) -> str | None:
+        if a.state == DISPATCHED:
+            if now - _parse_ts(a.updated_ts) >= accept_timeout:
+                return REROUTE_ACCEPT_TIMEOUT
+            return None
+        if a.state in (ACCEPTED, IN_PROGRESS):
+            if liveness.get(a.agent_id, {}).get("status") != "online":
+                return REROUTE_AGENT_STALE
+            return None
+        if a.state == REJECTED and a.history:
+            last = a.history[-1]
+            if isinstance(last, dict) and last.get("type") == m.REJECT \
+                    and last.get("from") == a.agent_id:
+                return REROUTE_REJECTED
+        return None
+
+    def reroute_remote(self, now: float | None = None) -> list[Assignment]:
+        """Bring heavy tasks back from a remote that went quiet.
+
+        Only rows the heavy router sent away (`fallback_agent` set) are looked
+        at — a project-owned remote task is never moved. Three triggers:
+        no ACCEPT within MACP_REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
+        unacked envelope that exempts the row from reap_stale is exactly the
+        offline-remote case), the remote stopped being online after it took the
+        task (`agent-stale`), or it REJECTED the task (`rejected`). The row is
+        re-dispatched to its fallback agent with a NEW corr_id, the remote gets a
+        CANCEL for the old one, and nothing counts against the task. Fail-open:
+        never raises into the tick. Nothing moves while PAUSED.
+        """
+        moved: list[Assignment] = []
+        try:
+            if self.paused():
+                return moved
+            now = now if now is not None else dt.datetime.now().timestamp()
+            rows = [a for a in self.ledger.all()
+                    if getattr(a, "fallback_agent", "")
+                    and a.agent_id != a.fallback_agent]
+            if not rows:
+                return moved
+            liveness = self.agent_liveness(stale_after_s=self._remote_online_s(),
+                                           now=now)
+            timeout = self._remote_accept_timeout_s()
+            tally = _SkipTally("reroute_remote")
+            for a in rows:
+                try:
+                    reason = self._reroute_reason(a, liveness, now, timeout)
+                    if reason and self._reroute(a, reason):
+                        moved.append(a)
+                except Exception as e:  # noqa: BLE001 - one row never kills the sweep
+                    tally.record(a.task_id, e)
+            tally.flush()
+        except Exception as e:  # noqa: BLE001 - fail-open
+            print(f"[orchestrator] reroute_remote skipped (fail-open): {e}")
+        return moved
+
+    def _reroute(self, a: Assignment, reason: str) -> bool:
+        """Move one row from its heavy remote back to `fallback_agent`. True when
+        the row changed."""
+        old_agent, old_corr = a.agent_id, a.corr_id
+        try:
+            target = self.reg.get(a.fallback_agent)
+        except KeyError:
+            target = self.reg.for_project(a.task_id)
+        if target is None or target.is_remote or target.is_human:
+            print(f"[orchestrator] reroute: {a.task_id} — no usable fallback agent "
+                  f"({a.fallback_agent or '?'}); left on {old_agent}")
+            return False
+        # Tell the remote to drop the old run: an unstarted envelope is skipped,
+        # a running one stops at its next stage boundary without pushing.
+        cancel = m.Envelope(to=old_agent, type=m.CANCEL, task_id=a.task_id,
+                            corr_id=old_corr,
+                            payload={"reason": f"rerouted: {reason}",
+                                     "rerouted_to": target.id})
+        try:
+            try:
+                mb = self._mailbox_for(self.reg.get(old_agent))
+            except KeyError:
+                mb = self.mb
+            mb.send(cancel)
+        except Exception as e:  # noqa: BLE001 - the reroute still proceeds
+            print(f"[orchestrator] reroute: {a.task_id} — CANCEL to {old_agent} "
+                  f"failed: {e}")
+        ts = m.now_iso()
+        a.rerouted_from = {"agent": old_agent, "reason": reason, "ts": ts,
+                           "corr_id": old_corr}
+        a.history.append({"ts": ts, "type": "rerouted", "from": "orchestrator",
+                          "agent": old_agent, "reason": reason})
+        a.fallback_agent = ""
+        a.updated_ts = ts
+        if self._task_md_closed(Task(a.task_id, a.payload)):
+            # Closed meanwhile: cancel only, never re-send closed work.
+            a.state = REJECTED
+            a.last_note = "rerouted: task md closed — not re-dispatched"
+            self.ledger.save(a)
+            print(f"[orchestrator] reroute: {a.task_id} from {old_agent} ({reason}) "
+                  "— task closed, not re-dispatched")
+            return True
+        # The ledger payload never carries `requires: [heavy]` (envelope-only), so
+        # the default agent gets exactly the task's own payload.
+        env = m.Envelope(to=target.id, type=m.TASK_ASSIGN, task_id=a.task_id,
+                         payload=a.payload)
+        self._mailbox_for(target).send(env)
+        a.agent_id = target.id
+        a.kind = target.kind
+        a.corr_id = env.corr_id
+        a.state = DISPATCHED
+        a.last_note = f"rerouted from {old_agent}: {reason}"[:200]
+        self.ledger.save(a)
+        print(f"[orchestrator] reroute: {a.task_id} {old_agent} → {target.id} "
+              f"({reason}); refail unchanged")
+        return True
 
     def reconcile_merged(self) -> list[Assignment]:
         """#5: auto-close tasks whose PR already merged but whose todo stayed open.
@@ -3118,6 +3259,10 @@ class Orchestrator:
 
     def tick(self, tasks: list[Task], now: float | None = None, *,
              unblock_flips: list | None = None) -> dict:
+        # FIRST: a heavy task whose remote went quiet (or refused) moves back to
+        # its default agent on the no-refail path before reap_stale could fail
+        # it, and before a REJECTED row reaches dispatch()'s refail+1 cooldown.
+        rerouted = self.reroute_remote(now)
         reaped = self.reap_stale(now)
         usage_hold = self.usage_hold()
         # stop starting new work; in-flight replies below are still collected
@@ -3180,7 +3325,8 @@ class Orchestrator:
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
         nudged = self.renudge_due(now)
-        return {"reaped": reaped, "dispatched": dispatched, "updated": updated,
+        return {"rerouted": rerouted,
+                "reaped": reaped, "dispatched": dispatched, "updated": updated,
                 "reconciled": reconciled, "closed": closed, "unblocked": unblocked,
                 "unparked": unparked,
                 "resumed": resumed,
@@ -3658,7 +3804,14 @@ def _main(argv: list[str] | None = None) -> int:
               # Appended at the END on purpose: macp_monitor keys off the
               # `candidates=N dispatched=N` prefix and the trailing hold suffixes,
               # and test_orchestrator_cli asserts the existing token run verbatim.
-              f"human_ready={len(result.get('human_ready', []))}{budget}")
+              f"human_ready={len(result.get('human_ready', []))}"
+              # Only when something moved, so an ordinary tick line is unchanged.
+              + (f" rerouted={len(result['rerouted'])}" if result.get("rerouted") else "")
+              + budget)
+        for a in result.get("rerouted") or []:
+            rr = a.rerouted_from or {}
+            print(f"  rerouted {a.task_id} {rr.get('agent', '?')} -> {a.agent_id} "
+                  f"({rr.get('reason', '')})")
         for a in result["dispatched"]:
             print(f"  dispatched {a.task_id} -> {a.agent_id}")
         return 0
