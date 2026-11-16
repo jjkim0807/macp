@@ -2376,8 +2376,11 @@ class AgentsExcludeHumans(unittest.TestCase):
         rows = M.collect_agents()
         self.assertEqual(len(rows), 1)
         row = rows[0]
+        # 2026-11-16: + mode / mode_since / mode_reason (agent work|game mode,
+        # desktop-worker-3-game-mode-engine) — added keys only, none renamed.
         self.assertEqual(set(row), {"id", "kind", "host", "projects",
-                                    "last_seen", "age", "alive"})
+                                    "last_seen", "age", "alive",
+                                    "mode", "mode_since", "mode_reason"})
         self.assertEqual(row["kind"], "ai-local")
         self.assertEqual(row["host"], "acme-hq")
         self.assertEqual(row["projects"], ["macp", "dripcoffee"])
@@ -2674,8 +2677,12 @@ class StatusSingleFlightTests(unittest.TestCase):
 # 2026-11-13: +104 bytes = the header's `<a id="graph-link" class="pill" href="graph">`
 # link to the new /graph page (one new i18n key) and its `a.pill` reset rule; the
 # rest of the page is byte-identical to the previous golden.
-_KO_HTML_SHA256 = "738fe574ae915d52ba6f93ff5d2312e0e98d12cf5185c52dea32b737841380aa"
-_KO_HTML_LEN = 44572
+# 2026-11-16: +1477 bytes = the agent card's work|game mode badge + [게임 모드]/
+# [작업 재개] button (`agentModeBadge`/`agentModeBtn`/`setAgentMode`, five new
+# i18n keys), its `.amode` CSS and one delegated click line
+# (desktop-worker-3-game-mode-engine); the rest of the page is byte-identical.
+_KO_HTML_SHA256 = "a19f8c8e67c186ca6da7f23675e3cd4dc3e064467b242cc907393d022dd99940"
+_KO_HTML_LEN = 46049
 _HANGUL = re.compile("[가-힣]")
 
 

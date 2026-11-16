@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from . import human, message as m, stages
+from . import agent_mode, human, message as m, stages
 from .. import i18n, kakao_format, not_before as _nb, paths
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
@@ -336,6 +336,7 @@ DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
 REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
 REROUTE_AGENT_STALE = "agent-stale"
 REROUTE_REJECTED = "rejected"
+REROUTE_PAUSED_GAME = "paused:game"      # the remote's owner switched it to game
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -474,6 +475,25 @@ class Orchestrator:
     def _seen_path(self) -> Path:
         return self.ledger.root.parent / "_state" / "agent_seen.json"
 
+    # -- Agent work|game mode (agent_mode.py) -----------------------------
+    def _agent_mode_path(self) -> Path:
+        """`Worker/agents/_state/agent_mode.json`, anchored like paused() /
+        _seen_path(). A ledger without a `.root` (the SQLite backend) falls back
+        to the vault's `Worker/` dir."""
+        try:
+            worker_dir = self.ledger.root.parent
+        except AttributeError:
+            worker_dir = paths.vault_root_or_cwd() / "Worker"
+        return agent_mode.state_path(worker_dir)
+
+    def agent_modes(self) -> dict[str, dict]:
+        """`{agent_id: {"mode", "since", "reason"}}`; `{}` (everyone works) on
+        any error — fail-open, never raises into the tick."""
+        try:
+            return agent_mode.read_modes(self._agent_mode_path())
+        except Exception:  # noqa: BLE001 - fail-open to work
+            return {}
+
     def _record_seen(self, agent_id: str) -> None:
         """Any inbound message = a liveness signal from that agent. Recorded to a
         gitignored state file so the control plane knows who's alive without SSH."""
@@ -604,17 +624,21 @@ class Orchestrator:
         """The first heavy-capable remote (registry order) that is usable now.
 
         This is THE single "is this remote available?" check — online by
-        agent_liveness (MACP_REMOTE_ONLINE_S), below its `concurrency` in flight,
+        agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
+        counts as offline — agent_mode.py), below its `concurrency` in flight,
         and not the agent that last REJECTED this very task. Any future
-        availability rule (e.g. a remote's game-mode switch) belongs here."""
+        availability rule belongs here."""
         remotes = self.reg.heavy_remotes()
         if not remotes:
             return None
         liveness = self.agent_liveness(stale_after_s=self._remote_online_s(), now=now)
+        modes = self.agent_modes()
         rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
         refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
         for a in remotes:
             if liveness.get(a.id, {}).get("status") != "online":
+                continue
+            if agent_mode.is_game(modes, a.id):
                 continue
             if a.id == refused:
                 continue
@@ -1912,7 +1936,11 @@ class Orchestrator:
             and rr.get("corr_id") == msg.corr_id
 
     def _reroute_reason(self, a: Assignment, liveness: dict, now: float,
-                        accept_timeout: float) -> str | None:
+                        accept_timeout: float, *,
+                        modes: dict | None = None) -> str | None:
+        if (a.state in (DISPATCHED, ACCEPTED, IN_PROGRESS)
+                and agent_mode.is_game(modes, a.agent_id)):
+            return REROUTE_PAUSED_GAME
         if a.state == DISPATCHED:
             if now - _parse_ts(a.updated_ts) >= accept_timeout:
                 return REROUTE_ACCEPT_TIMEOUT
@@ -1932,8 +1960,10 @@ class Orchestrator:
         """Bring heavy tasks back from a remote that went quiet.
 
         Only rows the heavy router sent away (`fallback_agent` set) are looked
-        at — a project-owned remote task is never moved. Three triggers:
-        no ACCEPT within MACP_REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
+        at — a project-owned remote task is never moved. Four triggers:
+        the remote was switched to game mode while the row was in flight
+        (`paused:game` — agent_mode.py), no ACCEPT within
+        MACP_REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
         unacked envelope that exempts the row from reap_stale is exactly the
         offline-remote case), the remote stopped being online after it took the
         task (`agent-stale`), or it REJECTED the task (`rejected`). The row is
@@ -1954,10 +1984,12 @@ class Orchestrator:
             liveness = self.agent_liveness(stale_after_s=self._remote_online_s(),
                                            now=now)
             timeout = self._remote_accept_timeout_s()
+            modes = self.agent_modes()
             tally = _SkipTally("reroute_remote")
             for a in rows:
                 try:
-                    reason = self._reroute_reason(a, liveness, now, timeout)
+                    reason = self._reroute_reason(a, liveness, now, timeout,
+                                                  modes=modes)
                     if reason and self._reroute(a, reason):
                         moved.append(a)
                 except Exception as e:  # noqa: BLE001 - one row never kills the sweep
@@ -3633,6 +3665,44 @@ def resolve_dispatch_limits() -> tuple:
     return budget, cap, gradle_cap
 
 
+def _cmd_agent_mode(orch: Orchestrator, agent_id: str, mode: str | None,
+                    reason: str) -> int:
+    """`agent-mode <id> [game|work] [--reason …]` — one output line. rc 2 for an
+    unknown or human agent, 1 when the state file cannot be written."""
+    try:
+        ag = orch.reg.get(agent_id)
+    except KeyError:
+        print(f"error: unknown agent '{agent_id}'", file=sys.stderr)
+        return 2
+    if ag.is_human:
+        print(f"error: '{agent_id}' is a human agent — it has no work|game mode",
+              file=sys.stderr)
+        return 2
+    path = orch._agent_mode_path()
+
+    def _why(r: str) -> str:
+        return f" (reason: {r})" if r else ""
+
+    if mode is None:
+        cur = agent_mode.get_mode(path, agent_id)
+        print(f"agent-mode {agent_id}: {cur['mode']} since {cur['since'] or '-'}"
+              f"{_why(cur['reason'])}")
+        return 0
+    old = agent_mode.get_mode(path, agent_id)["mode"]
+    try:
+        res = agent_mode.set_mode(path, agent_id, mode, reason)
+    except OSError as e:
+        print(f"error: could not write {path}: {e}", file=sys.stderr)
+        return 1
+    if res["changed"]:
+        print(f"agent-mode {agent_id}: {old} -> {res['mode']} since {res['since']}"
+              f"{_why(res['reason'])}")
+    else:
+        print(f"agent-mode {agent_id}: {res['mode']} (unchanged since {res['since']})"
+              f"{_why(res['reason'])}")
+    return 0
+
+
 def _main(argv: list[str] | None = None) -> int:
     import argparse
     import json
@@ -3652,6 +3722,14 @@ def _main(argv: list[str] | None = None) -> int:
     sub.add_parser("renudge", help="Re-nudge parked humans whose backoff elapsed")
     sub.add_parser("status", help="List assignments")
     sub.add_parser("agents", help="Show agent liveness (health)")
+
+    pam = sub.add_parser(
+        "agent-mode",
+        help="Show or set a remote agent's work|game mode "
+             "(game = heavy routing treats it as offline)")
+    pam.add_argument("agent")
+    pam.add_argument("mode", nargs="?", choices=agent_mode.MODES)
+    pam.add_argument("--reason", default="")
 
     ptr = sub.add_parser(
         "trace",
@@ -3764,10 +3842,17 @@ def _main(argv: list[str] | None = None) -> int:
             print(status_line(a))
         return 0
 
+    if args.cmd == "agent-mode":
+        return _cmd_agent_mode(orch, args.agent, args.mode, args.reason)
+
     if args.cmd == "agents":
+        modes = orch.agent_modes()
         for aid, h in orch.agent_liveness().items():
             age = f"{h['age_s']}s ago" if h["age_s"] is not None else "never"
-            print(f"{h['status']:8s} {aid:24s} last-seen: {age}")
+            # Only a game agent gets the suffix: every working line is unchanged.
+            game = (f" mode: game since {modes[aid].get('since') or '-'}"
+                    if agent_mode.is_game(modes, aid) else "")
+            print(f"{h['status']:8s} {aid:24s} last-seen: {age}{game}")
         return 0
 
     if args.cmd == "trace":
