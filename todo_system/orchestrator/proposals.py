@@ -6,7 +6,8 @@ that changes a prompt leaves the finished file under
 plus a README, and a person applies it with one ``cp``. Nothing announced those
 proposals, so one sat unapplied for days. :func:`pending_proposals` finds every
 proposal whose command files still differ from (or are missing in)
-``<root>/.claude/commands/`` and returns one ``why="todo"`` row per proposal, in
+``<root>/.claude/commands/`` (``<root>`` = the vault/data root, where workers
+write proposals) and returns one ``why="todo"`` row per proposal, in
 exactly the key set of the dashboard's other human rows (app compatibility).
 
 Polling cost: the dashboard polls every few seconds, so the result is cached
