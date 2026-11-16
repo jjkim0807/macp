@@ -433,13 +433,159 @@ V3 에서 결정에 쓰인 사실을 더 적는다. ⓐ 한 턴에 호출이 여
 
 ## §4 대시보드 — 카드 API · 화면(웹·앱 동일) · 푸시 · 범위 · 원격 러너 경로
 
-> (이 런의 다음 페이즈에서 채움)
+### 4.1 카드 API 계약
+
+```
+GET  /api/approvals[?state=pending|recent][&run=<run-id>]
+→ 200 {"now": "...", "approvals": [{
+        "approval_id": "<ULID>", "run_id": "...", "task_id": "...", "task_title": "...",
+        "stage": "verify", "kind": "permission", "category": "permission_denied",
+        "summary": "Bash: pnpm --version", "options": ["allow_once", "allow_run", "deny"],
+        "created_at": "...", "expires_at": "...",
+        "expired": false, "answerable": true, "allowed_decisions": ["allow", "deny"],
+        "allowed_scopes": ["once", "run"], "floor": false, "remaining_s": 431,
+        "hold": "inline", "remote_host": null }]}
+
+POST /api/approvals        (Content-Type: application/json, 본문 ≤ 4 KiB)
+     {"approval_id": "<ULID>", "decision": "allow|deny|answer", "scope": "once|run",
+      "answer": "<선택지 또는 자유 답>", "note": "<선택>", "confirm": "<바닥 카드 id 끝 4자>"}
+→ 200 {"approval_id": "...", "decision": "...", "scope": "...", "resumes": "inline|next_tick"}
+→ 400 형식 · 401 인증 · 403 서버에 토큰 없음 · 404 없는 카드 · 409 이미 답함(기존 결정을 돌려준다)
+  · 410 만료 · 413 크기 · 415 JSON 아님 · 422 민감값처럼 보이는 답 · 429 스로틀
+```
+
+- `expired`·`answerable`·`allowed_decisions`·`allowed_scopes`·`floor`·`remaining_s`·`hold`·`remote_host` 는 **서버가
+  판정**한다(볼트 `docs/dashboard-parity.md` 의 공통 규칙). 클라이언트는 그리기만 한다.
+- 기존 라우트에는 **필드 추가만** 한다. `/api/status` 에 `approvals_pending`·`approvals_next_expiry_s`, active 행에
+  `approval_pending`. `/api/run?id=` 에 `approvals[]`. 기존 키는 그대로라 옛 앱이 깨지지 않는다.
+- SSE 는 쓰지 않는다. 웹은 이미 3초 폴링이고, 증분이 필요하면 형제의 cursor GET 선례(`run-event-stream.md:368-415`)를
+  따른다.
+- POST 핸들러가 하는 일은 순서대로 다섯이다: `answer.json` O_EXCL 쓰기 → "이 런 동안"이면 `grants.json` → audit 한 줄 →
+  `events.in/` 에 `approval.resolved` 드롭 → 상태 캐시 무효화(`/api/agent-mode` 의 선례 `macp_dashboard.py:3154`).
+- 앵커: `_dashboard_gate`(`:2992-3021`), JSON 전용과 크기 검사(`:3114-3126`), `AGENT_MODE_MAX_BYTES = 4096`(`:3093`).
+  지금 `do_GET` 은 7 라우트(`:3023-3063`), `do_POST` 는 둘(`:3157-3213`)이다.
+
+### 4.2 화면 (웹·앱 동일)
+
+- 맨 위에 "승인 대기" 구역을 두고, 비어 있으면 숨긴다. 접힘 키는 `mdash.sec.approvals`.
+- 카드: 태스크 제목 · 스테이지 · 범주 배지 · 바닥 배지(빨강) · 마스킹된 요약 · 남은 시간(`remaining_s`).
+- 버튼은 서버가 준 `allowed_decisions`·`allowed_scopes` 대로만 그린다.
+  - `permission`: [한 번 허용] [이 런 동안 허용] [거부]
+  - 바닥: [한 번 허용] → 카드 id 끝 4자 입력 확인 → 전송, 그리고 [거부]
+  - `question`: 선택지 버튼 + 자유 답(≤ 500자, "비밀번호·인증번호를 적지 마세요" 안내)
+  - `confirm`(human_step): [완료했어요] [못 함]
+- 답한 뒤에는 응답의 `resumes` 로 "바로 이어 갑니다"(inline) 또는 "다음 틱(약 5분 안)에 재개합니다"를 보여 준다.
+- run 상세에 승인 타임라인(요청 · 답 · 재개)을 둔다. payload 는 텍스트로 escape 한다(XSS — `run-event-stream.md:399-403`).
+
+### 4.3 한 번 허용 vs 이 런 동안 허용
+
+| 범위 | 무엇에 적용 | 수명 | 바닥 카드 | verify | 기록 |
+|---|---|---|---|---|---|
+| **once** | 그 호출 하나(`tool_use_id` + `input_sha256`) | 그 호출 | 유일한 허용 선택지 | 가능 | `answer.json`, audit |
+| **run** | `suggested_rule` 하나 × 그 run_id | 그 런 끝까지. 재개된 세션에는 이어지고, 새 run_id(재시도)에는 이어지지 않는다 | 없음 | Bash 러너 규칙만 | `grants.json`, audit |
+
+- **규칙 도출.** Bash 는 첫 토큰으로 `Bash(<cmd>:*)` 를 만든다 — 허용 목록은 공백으로 쪼개지므로 공백 든 규칙은
+  아무것도 허용하지 못한다(`stages.py:281-284`). MCP 는 `mcp__<server>__<tool>`. `*` 전체 규칙과 FORBIDDEN 에 걸리는
+  규칙은 만들지 않는다.
+- **영구화**는 사람이 md 의 `allowed_tools` 나 `approvals.ask` 를 고쳐서 한다. 카드가 그 안내를 보여 준다.
+
+### 4.4 푸시 알림
+
+- **1단계는 기존 카톡·Slack 이다.** `_notify_routed`(`orchestrator.py:1309-1329`)로 immediate, `event_key =
+  approval:<approval_id>`. 보내는 주체는 오케스트레이터 틱의 `reconcile_approvals` 이고, 새 카드를 처음 본 틱에 한
+  번 보낸다(약 5분 안 — 인라인 상한 9분 안쪽이다). 카드 딥링크는 버튼으로만 보내고 본문에 넣지 않는다(`:1392-1396`).
+  본문은 태스크 제목 · 범주 · 마스킹된 한 줄 요약이다.
+- 리마인더는 만료 시간의 50% 지점에 한 번. 만료되면 기존 ⛔ blocked 알림이 간다. 채널 opt-in 은
+  `scripts/NOTIFICATIONS.md:15-28` 을 따른다.
+- 앱 badge 는 `/api/status` 의 `approvals_pending` 으로 띄운다 — 앱은 이미 이 라우트를 폴링한다. 네이티브 푸시는 앱
+  리포 몫이라 미확인이고 사람 게이트(A8)다.
+- **chat-channels §4 와의 경계.** 채널은 같은 API 를 보여 주는 또 하나의 화면이다. 알림은 approval_id 마다 한 번
+  (`event_key` 로 병합)이고 채널 표시는 따로 알림을 내지 않는다. 채널에서 답하면 `by: channel:<channel-id>` 다.
+
+### 4.5 원격 러너 경로
+
+- 원격 러너의 브로커는 본부 상태 API(`state_store_remote` — `docs/configuration.md:138-171`)에 라우트 둘을 더해 쓴다:
+  `POST /approvals/request`(카드 생성)와 `GET /approvals/get?id=`(답 폴링). 기존 라우트 표(`state_store_remote.py:214-233`)
+  에 더하고, 인증은 같은 bearer 다(`:256-263`; `MACP_STATE_REMOTE_TOKEN` 은 env 전용·로그 금지 `configuration.md:59`).
+- 본부는 카드를 본부 저장소에 쓰므로 대시보드 경로가 로컬 카드와 같다. 화면에는 `remote_host`(합성 라벨)를 보인다.
+  이벤트는 형제 S4 경로(`run-event-stream.md:337-366`)로 온다.
+- 재개 봉투는 원장 행의 `agent_id` 로, 그 에이전트 자기 전송로(`orchestrator.py:1760-1767`)로 보낸다. 세션
+  transcript 가 원격 호스트에 있기 때문이다.
+- **본부가 다운이면** 카드를 만들 수 없다. 즉시 거부하고 오늘의 파킹으로 간다(fail-safe). 상태 API 의 outbox
+  (`configuration.md:165-168`)에 카드를 쌓지 않는다 — 답할 수 없는 카드는 의미가 없다.
+- 상태 API 의 네트워크 노출은 사람 단계(`configuration.md:173-176`)이고 S4 도 아직 없다. 그 둘이 생길 때까지 원격
+  러너의 승인은 꺼 둔다 — 원격에서 `MACP_APPROVALS=1` 이어도 브로커는 "remote unsupported" 로 즉시 거부한다.
+
+### 4.6 Parity 계약 초안
+
+머지 뒤 볼트 `docs/dashboard-parity.md` 에 사람이 옮긴다(이 리포는 볼트 문서를 고칠 수 없다). 앱 짝 태스크는 앱 리포
+몫이고 사람 게이트다.
+
+> **Dashboard parity contract — 승인 카드** (웹 먼저, 앱이 따른다. 판정은 전부 서버, 클라이언트는 렌더만.)
+> **1. 데이터 계약(서버, 추가만)** — 새 라우트 `GET`·`POST /api/approvals`(4.1). `/api/status` 에 `approvals_pending`·
+> `approvals_next_expiry_s`, active 행에 `approval_pending`. `/api/run` 에 `approvals[]`. `expired`·`answerable`·
+> `allowed_decisions`·`allowed_scopes`·`floor`·`remaining_s`·`hold`·`remote_host` 는 서버 판정. **2. 렌더** — 맨 위
+> "승인 대기" 구역(비면 숨김). 카드 = 제목·스테이지·범주·바닥 배지·요약·남은 시간. 버튼은 `allowed_*` 그대로이고,
+> 바닥은 끝 4자 확인. 답 뒤 `resumes` 문구. 모르는 `kind`·`category` 는 회색 배지와 [거부]만. **3. 상태** — 접힘 키
+> 웹 `mdash.sec.approvals`, 앱 FoldStore 같은 이름. **4. 제약** — 외부 네트워크 의존 없음, payload 는 escape 된 텍스트,
+> 390px 가로 스크롤 0, 자격 증명 입력란 없음. **5. 테스트** — `todo_system/tests/test_macp_dashboard.py` 의
+> `ApprovalsRoute`(바인딩된 서버에 실제 GET·POST — 기존 `_LiveServer` `:655` 모양) · `ApprovalsShell`(셸 계약).
 
 ---
 
 ## §5 안전 — 응답 인증 · 자기 승인 차단(강제와 가드레일) · 감사 기록
 
-> (이 런의 다음 페이즈에서 채움)
+### 5.1 카드 응답의 인증
+
+- `_dashboard_gate`(`macp_dashboard.py:2992-3021`)를 지난다 — 토큰·스로틀·쿠키.
+- **토큰 필수.** 서버에 토큰이 없으면 POST 는 403 이다. 오늘 토큰 없는 loopback 대시보드는 열려 있고 스로틀도 하지
+  않으며(`:2998-3000`), 바인드 거부는 비-loopback 이나 공개 노출일 때만이다(`:3224-3229`). 승인은 그 열린 모양을
+  상속하지 않는다.
+- JSON 전용이다(`:3114-3119`). 교차 사이트 form POST 는 이 서버가 답하지 않는 CORS preflight 없이 보낼 수 없다.
+  쿠키는 HttpOnly·SameSite=Strict(`:3018-3020`)이고 본문은 ≤ 4 KiB 다.
+- approval_id 는 엔진의 ULID(`message.py:47-51`)다. 시간순이라 추측이 불가능하지는 않지만 토큰 뒤에 있다.
+- **첫 답이 이긴다**(`answer.json` O_EXCL). 두 화면이 경합하면 두 번째는 409 와 기존 결정을 받는다.
+- 바닥 카드는 `confirm` 으로 id 끝 4자를 받는다. 보안 장치가 아니라 실수 탭을 막는 확인 장치다.
+- 인증 실패 스로틀(`_note_auth_failure`)을 그대로 쓴다.
+- 자유 답에 민감값 패턴(형제 §4.2 의 토큰·키=값·인증번호·이메일·전화)이 보이면 422 다. 카드는 비밀을 건네는 통로가
+  아니다. 로그인·인증번호는 카드로 받지 않는다 — human_step 카드는 "사람이 직접 하고 [완료했어요]"뿐이고, 인증번호는
+  에이전트가 `macp-sms`·`macp-mail` 로 읽는다((볼트) CLAUDE.md §11·§11b).
+
+### 5.2 자기 승인과 설정 변경 차단 — 강제와 가드레일을 나눈다
+
+| # | 장치 | 막는 것 | 강도 |
+|---|---|---|---|
+| 1 | 브로커 도구(hook·승인 MCP 서버)에 "답을 쓰는" 연산이 없다 — 요청·대기·읽기만 | 에이전트가 도구로 스스로 승인 | 구조적 강제 |
+| 2 | 저장소는 `--add-dir`·볼트 밖, 0700/0600(§3.8) | Write·Edit 로 `answer.json` 쓰기 | 도구 수준 강제 — 위치에 대해서만 |
+| 3 | MCP 서버 env 는 config 의 `env` 블록뿐이다(`stages.py:331-336`). 거기에 토큰을 넣지 않는다 | 브로커가 대시보드에 스스로 POST | 구조적 강제 |
+| 4 | 정책은 런 시작 때 스냅샷으로 뜨고 `policy_sha256` 을 남긴다. 런 중간의 md·config 변경은 무시한다 | 볼트 md 를 고쳐 `ask` 를 넓히기 | 그 런에 대해 강제. 다음 런에 쓰이려면 볼트 커밋이 필요하고 git 에 남는다 |
+| 5 | 바닥을 내리는 설정 키가 없다(2.4) | 설정으로 바닥 해제 | 구조적 강제 |
+| 6 | FORBIDDEN 은 카드가 되지 않는다(2.2) | 사회공학 | 구조적 강제 |
+| 7 | 이벤트는 결정의 원천이 아니다(3.5) | `events.in/` 위조 | 구조적 강제 |
+| 8 | 스테이지 env 에서 대시보드·상태 API 토큰 env 를 뺀다. 오늘 `stage_env` 는 `os.environ` 을 통째로 복사한다(`stages.py:3103`) | env 의 토큰으로 POST | 부분적 — 토큰 파일과 서비스 env 파일은 같은 uid 가 여전히 읽는다 |
+
+**가드레일의 한계를 그대로 적는다.** 워커는 사용자와 같은 uid 로 돌고, 허용 목록은 샌드박스가 아니다(`SECURITY.md:3-23`
+— `Bash(uv:*)` 같은 접두 규칙은 임의 코드 실행이다). 그런 코드는 토큰 파일을 읽어 POST 하거나 `answer.json` 을 직접 쓸
+수 있다. 그래서 위 1~8 은 **실수하는 에이전트와 평범한 프롬프트 주입**에 대한 보장이지, **작정한 코드 실행**에 대한
+보장이 아니다. "에이전트가 절대 스스로 승인할 수 없다"고 쓰지 않는다.
+
+- **탐지.** audit 의 출처(client key 해시)와 시각 이상 — 요청 직후 ms 단위의 답, 스테이지와 같은 호스트 loopback 에서
+  온 답 — 을 경보로 잡는다.
+- **진짜 강제를 위한 사람 게이트 선택지.** (a) 대시보드와 승인 저장소를 별도 OS 사용자로 돌린다. `SECURITY.md:25-28`
+  의 전용 OS 사용자 권고이고, 유일한 실제 경계다. (b) HMAC 서명 — 검증자가 키를 들어야 하므로 (a) 가 있을 때만 의미가
+  있다. (c) 토큰 env 제거(8) — 값싸지만 부분적이다. 권장: (c) 는 A3 에 넣고, (a) 는 A8 에서 사람이 정한다.
+
+### 5.3 감사 기록 — 세 곳
+
+- **승인 저장소 `audit.jsonl`** — append-only, 줄마다 `prev_sha256` 해시 체인을 단다(위조를 막지는 못하지만 드러낸다).
+  필드: `ts`·`approval_id`·`run_id`·`event`(requested·answered·expired·consumed·rejected_auth)·`decision`·`scope`·
+  `channel`·`client_key_hash`.
+- **런 이벤트** `approval.*`(3.5).
+- **원장 `history`** — `{ts, type: "approval", id}` 만 남긴다. git 추적 원장(`assignment.py:1-5`)이라 요약을 넣지 않는다.
+- 보존 기간은 사람 게이트(A8 — 형제 이벤트의 30일과 맞추는 안)다.
+- **남기지 않는 것.** 자유 답 원문은 에이전트에 건네기 위해 저장소의 `answer.json` 에만 두고 보존 기간이 지나면
+  지운다. 이벤트에는 마스킹본과 `answer_sha256` 만 넣는다. SMS·메일·브라우저 본문과 스크린샷은 어디에도 넣지 않는다
+  ((볼트) CLAUDE.md §11·§11b·§12).
 
 ---
 
