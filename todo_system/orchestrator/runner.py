@@ -1217,8 +1217,21 @@ class StagedExecutor(ClaudeCodeExecutor):
         ui_merge_hold = False
         ui_merge_hold_sha = ""
         ui_merge_hold_reason = ""
+        # Set when the orchestrator CANCELs this run (it rerouted the task to
+        # another agent): the loop stops at the next stage boundary and NOTHING is
+        # pushed — no checkpoint, no report stage (no PR), no delegate publish.
+        # Before the `try` so the `finally` never sees it unbound.
+        cancelled = False
         try:
             for stage in self._pipeline_for(payload):
+                if _cancel_requested_now():
+                    cancelled = True
+                    progress(f"cancelled by orchestrator before stage {stage} — "
+                             "stopping, nothing pushed")
+                    return ExecOutcome(
+                        False, "cancelled by orchestrator (rerouted) — not pushed",
+                        {"cancelled": True, "branch": branch, "run_dir": str(run_dir),
+                         "stages": completed, "repo": repo_url})
                 if stage in inherited:
                     completed.append(stage)
                     stages.record_stage(run_dir, stage)
@@ -1356,7 +1369,11 @@ class StagedExecutor(ClaudeCodeExecutor):
                                     with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                                         f.write(f"\n=== implement WIP rescue (timeout) ===\n{rsc['note']}\n")
                                     progress(f"implement rescue (timeout): {rsc['note']}")
-                            cp = stages.checkpoint_push(repo, branch)
+                            if _cancel_requested_now():
+                                cancelled = True
+                                progress("checkpoint skipped — cancelled")
+                            else:
+                                cp = stages.checkpoint_push(repo, branch)
                             if cp.get("note"):
                                 progress(f"timeout checkpoint: {cp['note']}")
                         stages.record_timeout(run_dir, stage, cp.get("tip"))
@@ -1440,7 +1457,11 @@ class StagedExecutor(ClaudeCodeExecutor):
                                 with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                                     f.write(f"\n=== implement WIP rescue (capacity) ===\n{rsc['note']}\n")
                                 progress(f"implement rescue (capacity): {rsc['note']}")
-                        cp = stages.checkpoint_push(repo, branch)
+                        if _cancel_requested_now():
+                            cancelled = True
+                            progress("checkpoint skipped — cancelled")
+                        else:
+                            cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"capacity checkpoint: {cp['note']}")
                     stages.record_capacity(run_dir, stage, cp.get("tip"))
@@ -1491,7 +1512,12 @@ class StagedExecutor(ClaudeCodeExecutor):
                             with (run_dir / "run.log").open("a", encoding="utf-8") as f:
                                 f.write(f"\n=== implement WIP rescue ===\n{rescued['note']}\n")
                             progress(f"implement rescue: {rescued['note']}")
-                        cp = stages.checkpoint_push(repo, branch)
+                        if _cancel_requested_now():
+                            cancelled = True
+                            progress("checkpoint skipped — cancelled")
+                            cp = {}
+                        else:
+                            cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"implement checkpoint: {cp['note']}")
                     except Exception as e:      # noqa: BLE001 — best-effort, fail open
@@ -1733,7 +1759,18 @@ class StagedExecutor(ClaudeCodeExecutor):
             # Gated on delegate + vault deliberately. `auto`/`quick` have their own
             # merge semantics (report stage, landed gate), and an external delegate
             # task's branch lives in the ~/Worker clone, not here.
-            if not repo_url and (payload.get("worker_mode") or "").lower() == "delegate":
+            is_vault_delegate = (not repo_url and
+                                 (payload.get("worker_mode") or "").lower() == "delegate")
+            if is_vault_delegate and (cancelled or _cancel_requested_now()):
+                # Rerouted away: the task runs elsewhere now, so this run's
+                # branch must not become a second PR. _cancel_requested_now never
+                # raises; the progress line is guarded like the publish below.
+                cancelled = True
+                try:
+                    progress("publish: skipped — cancelled by orchestrator")
+                except Exception:  # noqa: BLE001 - this block may not raise
+                    pass
+            if is_vault_delegate and not cancelled:
                 try:
                     # auto_merge:true delegate is merged like every other lane (the
                     # Report stage's server-side squash); auto_merge:false opens the
@@ -1871,6 +1908,40 @@ def _mem_available_mb() -> float | None:
 # `_account_env` takes its byte-identical pre-assignment path.
 _ASSIGNED_ACCOUNT = threading.local()
 
+# Carries "has the orchestrator cancelled THIS run?" into the staged executor on
+# the run's own thread (same pattern as _ASSIGNED_ACCOUNT). `_run_claimed` sets
+# `.check` to a callable for a TASK_ASSIGN and clears it afterwards; unset (a
+# direct executor call, a test) reads as "not cancelled" → behaviour unchanged.
+_CANCEL = threading.local()
+
+# Busy-time liveness for a REMOTE runner (seconds between HEARTBEATs while a run
+# holds it). The orchestrator reroutes a heavy task whose remote stops looking
+# online; without this a remote mid-stage (a stage can run for an hour with no
+# PROGRESS) would look dead and its task would run twice.
+BUSY_HEARTBEAT_ENV = "RUNNER_BUSY_HEARTBEAT_S"
+DEFAULT_BUSY_HEARTBEAT_S = 300.0
+
+
+def _cancel_requested_now() -> bool:
+    """True when the orchestrator has cancelled the run on this thread (it was
+    rerouted to another agent). Never raises."""
+    check = getattr(_CANCEL, "check", None)
+    if check is None:
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+
+def _busy_heartbeat_interval() -> float:
+    raw = os.environ.get(BUSY_HEARTBEAT_ENV, "")
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_BUSY_HEARTBEAT_S
+    return v if v > 0 else DEFAULT_BUSY_HEARTBEAT_S
+
 
 def _account_named(start: str, name: str):
     """The profile's claude account named `name` and currently available at
@@ -1957,6 +2028,8 @@ class Runner:
     _code_baseline: float | None = None
     _code_checked_at: float | None = None
     ledger_root: Path | None = None
+    _cancelled: frozenset = frozenset()   # inert default; __init__ makes it a set
+    _busy_beat_thread = None
 
     def __init__(self, mailbox: Mailbox, agent: Agent, executor: Executor,
                  log: Callable[[str], None] = print,
@@ -1981,6 +2054,7 @@ class Runner:
         self._inflight: dict[str, str] = {}   # msg_id -> checkout key
         self._inflight_acct: dict[str, str | None] = {}  # msg_id -> assigned claude account
         self._busy = 0                        # runs holding the heartbeat
+        self._cancelled: set[str] = set()     # corr_ids the orchestrator CANCELled
         self._mem_hold_logged = False
         # Self-drain on code change (see _code_changed). `code_time_fn` is NOT
         # called here: tests build Runners by the dozen and __init__ must stay free
@@ -2129,6 +2203,13 @@ class Runner:
             if row is not None and row.state == DONE:
                 return (f"ledger row already done (row corr={row.corr_id}, "
                         f"envelope corr={msg.corr_id})")
+            rr = (getattr(row, "rerouted_from", None) or {}) if row is not None else {}
+            if rr.get("agent") == self.agent.id and row.corr_id != msg.corr_id:
+                # Second line behind CANCEL: the orchestrator took this task
+                # off this agent and re-sent it elsewhere under a new corr_id.
+                return (f"ledger row rerouted away from this agent "
+                        f"({rr.get('reason', '')}; row corr={row.corr_id}, "
+                        f"envelope corr={msg.corr_id})")
             tp = (msg.payload or {}).get("task_path") or ""
             if tp:
                 p = Path(tp)
@@ -2147,6 +2228,40 @@ class Runner:
             self.log(f"  skip-guard failed (running anyway): {e}")
         return None
 
+    # -- CANCEL (the orchestrator rerouted a task away from this agent) -----
+    def _cancel_set(self) -> set:
+        if not isinstance(self._cancelled, set):
+            self._cancelled = set()           # a Runner built without __init__
+        return self._cancelled
+
+    def _note_cancels(self, msgs) -> None:
+        """Remember every CANCEL in a received batch BEFORE anything runs, so a
+        TASK_ASSIGN sitting in the same batch is already known to be cancelled
+        whatever order the batch is handled in (poll_parallel sorts control
+        messages to the tail)."""
+        ids = [x.corr_id for x in msgs if x.type == m.CANCEL and x.corr_id]
+        if ids:
+            with self._lock:
+                self._cancel_set().update(ids)
+
+    def _cancel_requested(self, msg: m.Envelope) -> bool:
+        """Has the orchestrator cancelled `msg`'s run? Checks the remembered set,
+        then peeks the inbox WITHOUT acking — a serial runner is blocked inside
+        handle() for the whole run, so a CANCEL that arrives mid-run is only seen
+        this way. Never raises."""
+        try:
+            if msg.corr_id in self._cancel_set():
+                return True
+            with self._lock:
+                pending = self.mailbox.receive(self.agent.id)
+            hit = any(x.type == m.CANCEL and x.corr_id == msg.corr_id for x in pending)
+            if hit:
+                with self._lock:
+                    self._cancel_set().add(msg.corr_id)
+            return hit
+        except Exception:
+            return False
+
     def handle(self, msg: m.Envelope) -> None:
         self.log(f"recv {msg.type} task={msg.task_id} from={msg.frm}")
         if msg.type == m.TASK_ASSIGN:
@@ -2154,6 +2269,11 @@ class Runner:
             if reason:
                 self._send(msg, m.REJECT, reason=reason)
                 self.log(f"  REJECT: {reason}")
+                return
+            if msg.corr_id and msg.corr_id in self._cancel_set():
+                # Rerouted before it started: the task already runs elsewhere.
+                # No reply — any reply would only be a late message there.
+                self.log("  SKIP (cancelled before start; no reply)")
                 return
             skip = self._skip_reason(msg)
             if skip:
@@ -2165,6 +2285,10 @@ class Runner:
                 progress=lambda t: self._send(msg, m.PROGRESS, note=t),
                 on_run_start=lambda rid, rdir: self.claims.attach_run(msg.msg_id, rid, rdir),
             )
+            if (outcome.payload or {}).get("cancelled"):
+                # Stopped at a stage boundary on CANCEL; nothing was pushed.
+                self.log(f"  CANCELLED: {outcome.summary} (no reply)")
+                return
             if outcome.ok:
                 self._send(msg, m.RESULT, summary=outcome.summary, **outcome.payload)
                 self.log(f"  RESULT: {outcome.summary}")
@@ -2174,7 +2298,12 @@ class Runner:
         elif msg.type in (m.PING, m.QUERY):
             self._send(msg, m.HEARTBEAT, mode=self.executor.mode, status="idle")
         elif msg.type == m.CANCEL:
-            self.log(f"  CANCEL for {msg.task_id} (nothing running in sync model)")
+            if msg.corr_id:
+                with self._lock:
+                    self._cancel_set().add(msg.corr_id)
+            self.log(f"  CANCEL for {msg.task_id} corr={msg.corr_id} — a queued run "
+                     "is skipped, a run in flight stops at its next stage boundary, "
+                     "nothing is pushed")
         # WAKE / others: just acknowledged by consumption
 
     def _classify_redelivery(self, msg: m.Envelope, claim: dict) -> str:
@@ -2226,6 +2355,7 @@ class Runner:
         un-acked, so `receive()` hands it to whatever process comes up next."""
         with self._lock:
             msgs = self.mailbox.receive(self.agent.id)
+        self._note_cancels(msgs)
         # Serial handle() can block for an entire staged run. Service control
         # messages first, in arrival order, before starting queued assignments.
         # Within assignments, use the same stable priority order and legacy DB
@@ -2288,9 +2418,13 @@ class Runner:
         # the only_bypass filter and the redelivery `continue` too: neither
         # path does any work, so neither may hold the heartbeat.
         self._work_begin()
+        if msg.type == m.TASK_ASSIGN:
+            _CANCEL.check = lambda: self._cancel_requested(msg)
         try:
             self.handle(msg)
         finally:
+            if msg.type == m.TASK_ASSIGN:
+                _CANCEL.check = None          # never outlive its own run
             # Released first, and never able to raise (it swallows OSError),
             # so a heartbeat cannot outlive its work even if the ack below
             # throws — otherwise the 90-minute stale cutoff would be the only
@@ -2307,6 +2441,45 @@ class Runner:
         with self._lock:
             self._busy += 1
             _worker.runner_heartbeat_start()
+            start_beat = (self._busy == 1
+                          # `is True`: a stand-in agent (a Mock) must not count
+                          and getattr(self.agent, "is_remote", False) is True
+                          and (self._busy_beat_thread is None
+                               or not self._busy_beat_thread.is_alive()))
+            if start_beat:
+                self._busy_beat_thread = threading.Thread(
+                    target=self._busy_heartbeat_loop, name="busy-heartbeat",
+                    daemon=True)
+        if start_beat:
+            self._busy_beat_thread.start()
+
+    def _busy_heartbeat_loop(self) -> None:
+        """REMOTE runners only: keep sending HEARTBEAT {status: busy} while any
+        run holds this runner, so the orchestrator's liveness view does not read
+        a long stage as a dead remote and reroute its task. A thread, so it
+        beats even while serial poll_once is blocked inside handle()."""
+        interval = _busy_heartbeat_interval()
+        stop = threading.Event()
+        try:
+            while True:
+                with self._lock:
+                    if self._busy <= 0:
+                        return
+                try:
+                    with self._lock:
+                        self.mailbox.send(m.Envelope(
+                            to=m.ORCHESTRATOR, frm=self.agent.id, type=m.HEARTBEAT,
+                            payload={"mode": getattr(getattr(self, "executor", None),
+                                                     "mode", ""),
+                                     "status": "busy",
+                                     "capabilities": list(self.agent.capabilities)}))
+                except Exception as e:  # noqa: BLE001 - liveness must not kill a run
+                    log = getattr(self, "log", None)
+                    if log is not None:
+                        log(f"busy heartbeat failed (continuing): {e}")
+                stop.wait(interval)
+        except Exception:  # noqa: BLE001 - a half-built Runner (tests) just stops
+            return
 
     def _work_end(self) -> None:
         with self._lock:
@@ -2344,6 +2517,7 @@ class Runner:
                 _worker.runner_heartbeat_start()   # keep the busy flag fresh
             msgs = self.mailbox.receive(self.agent.id)
             inflight_counts = Counter(a for a in self._inflight_acct.values() if a)
+        self._note_cancels(msgs)
         # Fill the few free slots highest-priority-first, not purely in arrival
         # (ULID) order: a late high-priority TASK_ASSIGN should start ahead of
         # earlier low/none-priority ones. Stable, so priority-less envelopes (old
