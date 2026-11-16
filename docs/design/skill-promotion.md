@@ -720,7 +720,89 @@ OpenMausBot 의 규율(내보낼 때 비밀값·대화록·권한을 빼고, 가
 
 ## §6 단계별 구현 분할안
 
-> 다음 leaf에서 채움 — 형제 leaf `macp-skill-promotion-ladder-design-b-safety-metrics-split`(`depends_on` 이 leaf, `on_unblock: auto`)가 이 절을 제자리에서 채운다.
+> **분할 원칙**: expand → migrate → contract(parallel-change) 로 **각 leaf 가 단독으로 컴파일·테스트 green**. 첫 leaf 는
+> 소비자 없는 **additive** 레지스트리(가장 안전·독립). 완료 조건은 전부 **로컬 명령** — "CI green" 금지(Actions 미사용,
+> [[Decisions/2026-09-11-no-github-actions-local-release-lane]]). 각 leaf 는 부모와 동일하게 `repo: jjkim0807/macp`,
+> `touches` 는 아래 열거. 접두사 **K** 는 자매 설계의 G(graph-memory)·E(event-triggers)·S(run-event-stream)와 겹치지
+> 않게 골랐다.
+
+### 6.1 leaf 목록 · depends_on 체인 · 로컬 검증
+
+| leaf | 단계 | 범위(touches) | depends_on | 로컬 검증 명령 |
+|---|---|---|---|---|
+| **K1** 레지스트리 스키마·파서·상태 기계·검증기·해시 | expand | `todo_system/skills.py`(신규 — `Worker/skills/<id>.md`·`Worker/routines/<id>.md` 파싱, §3.1+§4.7 전이, §4.2 검증기, §4.3 템플릿 허용 목록, §4.4 `approved_sha256`, §2.1 서명 정규화 + B 레이어; 주입·CLI·디스패치 배선 **없음**) + `todo_system/tests/test_skills_registry.py`(신규, 합성 픽스처) | **없음**(소비자 없는 순수 추가 — 안전한 첫 leaf) | `uv run pytest todo_system/tests/test_skills_registry.py` · `uvx ruff check .` · `bash scripts/check_engine_isolation.sh` |
+| **K2** 반복 감지기 + 플래너 블록 | expand→migrate | `todo_system/orchestrator/skill_candidates.py`(신규 — §2.1 캐스케이드·§2.2 임계·§2.3 규칙 → host-local `Worker/_state/skill_candidates.json`; `emit-context` 여섯째: 메타데이터만·언제나 exit 0; 블록 머리에 초안 지시(§6.3); reconcile·rejected jsonl·`MAX_INJECTIONS` 만료) + `scripts/planner_tick.sh`(emit-context 호출 한 줄 — `--allowed-tools` 줄은 바이트 동일) + `todo_system/tests/test_skill_candidates.py`(신규, `test_related_context_wiring.py` 식 셸 하니스) | **K1** | `uv run pytest todo_system/tests/test_skill_candidates.py todo_system/tests/test_related_context_wiring.py` · `uvx ruff check .` |
+| **K3** 승인 CLI + 헤드리스 표식 | migrate | `todo_system/cli.py`(`skills` 하위명령 `approve`·`reject`·`suspend`·`retire`·`validate` — approve = 검증기 + 해시 + `version + 1` + 트레일러 커밋; approve·재승인은 표식이 있으면 거부) + `todo_system/skills.py` + 표식(§4.4 — `todo_system/orchestrator/stages.py` 의 `STAGE_ENV_OVERRIDES` + `scripts/planner_tick.sh` 한 줄) + `todo_system/tests/test_skills_cli.py`(신규) | **K1** | `uv run pytest todo_system/tests/test_skills_cli.py todo_system/tests/test_stage_command_budget.py todo_system/tests/test_related_context_wiring.py` · `uvx ruff check .` |
+| **K4** 대시보드 형제 수집기 | expand | 수집기(신규·가칭 `todo_system/orchestrator/skill_proposals.py` — `proposed`·`suspended`·해시 불일치·측정 불가 스킬을 `pending_proposals` 와 같은 키 집합의 `why="todo"` 행으로, `proposals.py:200-208`) + `scripts/macp_dashboard.py`(**`VAULT` 를 스캔** — 엔진 루트가 아니다, §3.4) + `todo_system/tests/test_macp_dashboard.py`(라우트 테스트). 앱 짝은 이 리포 밖(§6.3) | **K1** | `uv run pytest todo_system/tests/test_macp_dashboard.py -k Skill` · `uvx ruff check .` |
+| **K5** 주입기 — 엔진 절반 | migrate | `todo_system/orchestrator/repos.py`(`task_skill_from_fm`) + `todo_system/orchestrator/tasks.py`(payload `skill`, 있을 때만) + 주입기(신규·가칭 `todo_system/orchestrator/skills_context.py` — 매처 = §2.1 C + 명시 `skill:`, §4.4 읽는 쪽 검증, §4.2 검증기, §4.5 데이터 블록·상한, `MACP_SKILLS` 킬 스위치·fail-open) + `todo_system/orchestrator/runner.py`(런 시작에 `<run_dir>/skills.md` — `record_related` 거울 `runner.py:1104-1120`; stages.json `skills_applied` + 스테이지별 `wired`) + `todo_system/orchestrator/stages.py`(`record_skills`) + proposals 묶음 `Worker/proposals/<slug>/.claude/commands/{worker-research,worker-implement,worker-delegate,worker-report}.md`(K6 용) + 테스트(신규: seam·러너 시작 경로·권한 불변) | **K1, K3** | `uv run pytest todo_system/tests/test_skills_context.py todo_system/tests/test_skills_wiring.py todo_system/tests/test_related_context_wiring.py` · `uvx ruff check .` · `bash scripts/check_engine_isolation.sh` |
+| **K6** 프롬프트 배선 한 번 — proposals → 사람 `cp` | human_gate | 사람이 K5 묶음을 README 의 `cp` 한 줄로 적용: research·implement·delegate 에 "`<run_dir>/skills.md` 가 있으면 **Read** 하라 — 태스크 본문이 이긴다"(Read 만 — "실행하라"는 거기서 죽은 지시 `related_context.py:3-9`); delegate 엔 Progress Log `skills_applied` 줄, report 엔 에피소드 frontmatter `skills_applied` 줄(§5.1) | **K5** | (사후 확인) `git grep -n -F "skills.md" -- .claude/commands/worker-research.md .claude/commands/worker-implement.md .claude/commands/worker-delegate.md .claude/commands/worker-report.md`(네 파일 모두 적중) · `AUDIT_ROOT=<tree> bash <vault>/ops/check_public_identifiers.sh --export`(게이트가 `.claude/commands/` 를 스캔한다; 엔진 트리의 `pytest -q` 는 이 게이트를 건너뛴다 `test_public_gates_real_tree.py:84-90`) |
+| **K7** 엔드투엔드 배선 게이트 | contract | `todo_system/tests/test_skills_e2e.py`(신규 — **실제** `.claude/commands/` 프롬프트를 읽으므로 K6 뒤에만 green) + 첫 실 런 관찰을 verify.md `## Wiring` 에 | **K6** | `uv run pytest todo_system/tests/test_skills_e2e.py` · `uv run pytest -q` |
+| **K8** 효과 측정 + 자동 강등 | migrate | `todo_system/orchestrator/skill_eval.py`(신규 — §5.2~5.4, `table` CLI, `approved → suspended` + 경보) + maintenance 틱 훅(`todo_system/worker.py` 의 `cmd_maintenance` `:2182`) + `todo_system/tests/test_skill_eval.py`(신규 — 합성 run dir·원장·에피소드) | **K5** — "후"는 `wired: true` 런만 세므로 K7 전 런은 저절로 빠진다 | `uv run pytest todo_system/tests/test_skill_eval.py` · `uvx ruff check .` |
+| **K9** 루틴 레지스트리 + 사람 수동 인스턴스화 `cli routine run <id>` | migrate | `todo_system/cli.py`(`routine run <id>` — `enabled: true`·스킬 `approved`·§4.3 허용 목록 확인 → `Todo/items/<routine-id>-<YYYYMMDD>.md` 를 `cli new --template` 경로(`cmd_new` `cli.py:1348`, 파서 `:2009-2013`)로 생성 → `skill: <id>` 찍기 → `overlap: skip`) + `todo_system/tests/test_routine_run.py`(신규) | **K1, K5** | `uv run pytest todo_system/tests/test_routine_run.py` · `uvx ruff check .` |
+| **K10** 내보내기·가져오기 (후순위 — 공유 상대가 생기면) | expand | `todo_system/skills.py`(§4.6 필드표·마스킹 종류 설정·fail-closed; import → `suspended`, 루틴 → `enabled: false`) + `todo_system/cli.py`(`skills export`·`skills import`) + `todo_system/tests/test_skills_export.py`(신규 — 네거티브 + 양성 대조군) | **K1, K3** | `uv run pytest todo_system/tests/test_skills_export.py` · `uvx ruff check .` · `AUDIT_ROOT=<tree> bash <vault>/ops/check_public_identifiers.sh --export` |
+| **K11** 트리거 결합 | human_gate | event-triggers 선언의 `targets: - routine: <id>`(`event-triggers.md:136`) → K9 의 인스턴스화 함수 + 테스트 | **K9** + event-triggers **E1·E3·E5**(미구현, 소프트 의존 `event-triggers.md:310-314`) | `uv run pytest todo_system/tests/test_triggers_routine.py`(E5 landing 뒤) |
+
+**depends_on 체인**: `K1 → {K2, K3, K4} → K5(K1, K3) → {K6 → K7, K8, K9 → K11}`, 그리고 K10(K1, K3)은 후순위.
+오케스트레이터 자동 분할이면 **첫 서브태스크는 K1**(레지스트리 — 소비자가 없는 순수 추가라 어떤 런·화면도 바꾸지
+않는다)이고 나머지는 위 체인대로 `blocked` + `on_unblock: auto` + `depends_on` 으로 직렬화한다. K2·K3·K4 는 K1 만 읽는
+서로 독립한 leaf 다. **감지기(K2)는 주입 경로 위에 없다** — 사람이 손으로 쓴 `status: proposed` 스킬도 K3·K5 만으로
+승인·주입된다. K8 과 K9 는 K5 뒤에 병렬이고, K11 은 event-triggers 가 E5 까지 머지된 뒤에 연다.
+
+### 6.2 배선 완료 조건 (§6 AC 의 teeth)
+
+**"승인된 스킬이 다음 런의 실제 프롬프트 경로에 실린다"** — 이것이 K5·K6·K7 의 완료 조건이고, 구현 부모는 **K7 이
+끝나야** 닫힌다. 엔진 절반(K5)만으로는 닫히지 않는다. 부품(파서·매처·검증기·마스킹기)이 아니라 **배선**(승인 →
+디스패치 payload → 런 시작 → `skills.md` → 스테이지 프롬프트가 읽음)을 완료 조건으로 삼는다 — 기억 부품 5개가 다
+머지됐는데 실제 경로가 한 번도 부르지 않은 선례([[Notes/macp-worker-quality-root-causes-20261110]])를 피하는 규율이다.
+각 배선 leaf 는 **새 프로덕션 호출 위치**를 verify.md `## Wiring` 에 적는다.
+
+- **K5**: (a) **seam** — 합성 태스크 md(`skill: <id>`) → 픽스처 `todo.db` → `tasks.load_dispatchable` 의 payload 에
+  `skill` 이 있고, `skill:` 없는 태스크의 payload 는 **바이트 동일**하다(payload 에 닿지 않는 frontmatter 필드는 죽은
+  필드다 `tasks.py:217-220`). (b) **실제 러너 시작 경로**(가짜 agent 백엔드 — `test_runner.py` 가 쓰는 seam)가
+  `<run_dir>/skills.md` 와 stages.json `skills_applied` 를 남긴다 — 스테이지를 `mock.Mock()` 에이전트로 부르는
+  `test_stages.py` 모양의 테스트만으로는 PASS 아님. (c) 스킬 유무만 다른 두 런의 `--allowed-tools` 바이트 동일 +
+  `STAGE_TOOLS`·`TASK_TOOLS_STAGES` 글자 그대로 + 양성 대조군(§4.1). (d) 해시 불일치·검증기 거부·`suspended` → 싣지
+  않음, 양성 대조군(`approved` + 해시 일치 → 실림). (e) `MACP_SKILLS=0` → 파일 없음, 양성 대조군(기본값 → 있음).
+  (f) 주입기 예외 → 런은 계속된다. Wiring = 러너의 `record_skills` 호출 줄 + `tasks.py` 의 payload 줄.
+- **K6**: 사후 확인 grep 이 네 프롬프트 파일 모두에 적중하고, research 줄이 **Read** 지시임을 사람이 눈으로 확인한다.
+- **K7 (핵심)**: 한 테스트 안에서 **실제** `.claude/commands/` 프롬프트(`load_stage_prompt`)·실제 승인 CLI 함수·실제
+  `load_dispatchable`·실제 러너 시작 경로·`build_stage_argv` 를 잇는다 — research·implement 프롬프트에 Read 줄이 있고,
+  `skills.md` 에 그 스킬의 `## 절차` 가 있고, `skills_applied[].wired` 가 참이고, `--allowed-tools` 가 스킬 없는 런과
+  같다. 그리고 첫 사람 승인 스킬이 생긴 뒤 **다음 실 런**의 run dir 에 `skills.md` + `skills_applied` 가 있음을
+  `## Wiring` 에 적는다. 그 전까지 K7 은 `blocked_on` 으로 파킹한다.
+- **K2**: **실제 `planner_tick.sh` 실행**(가짜 claude·python — `test_related_context_wiring.py` 하니스)이 후보가 있으면
+  블록을 얻고, 없으면 프롬프트가 바이트 동일하며, `--allowed-tools` 줄은 그대로다.
+- **K3**: **실제 `skills approve` 서브프로세스** — 표식 없음 → 상태 전이 + `approved_sha256` + 트레일러 커밋(양성
+  대조군); 표식 있음 → exit≠0 이고 파일이 바이트 동일; 거부 규칙에 걸린 본문 → 거절.
+- **K4**: 바인딩된 서버에 **실제 HTTP GET** 이 픽스처 볼트의 `proposed` 스킬을 `why="todo"` 행으로 돌려준다. 엔진
+  루트에만 있는 스킬 파일은 행을 만들지 않는다(`VAULT` 스캔의 증명).
+- **K8**: 픽스처 볼트에서 **실제 maintenance 틱 1회**가 `demote` 스킬을 정지시키고 경보 1회를 내며, 다음 런 시작이
+  그 스킬을 싣지 않는다. 양성 대조군: `keep` 스킬은 계속 실린다. N 미달 → 아무 변화 없음.
+- **K9**: `routine run` 이 인스턴스 md 를 만들고, 그것이 `load_dispatchable` 을 지나 payload `skill` 을 갖고, 러너가
+  주입한다. `enabled: false`·정지된 스킬·금지 템플릿 키는 각각 거절되고, 각각 양성 대조군을 갖는다.
+- **K10**: 합성 비밀 마커와 `evidence_runs` slug 가 내보낸 파일에 0회이고 `## 절차` 는 있다(§4.6). 가져온 파일은
+  `suspended` 이고 주입되지 않는다(양성 대조군: 재승인 뒤엔 실린다).
+- **K11**: E5 의 실제 틱 드레인 → 트리거 매치 → 루틴 대상 → 인스턴스 md 를 라우트 테스트로.
+
+부품 단위 테스트(파서·매처·검증기·마스킹기)만 녹색인 것은 어느 leaf 에서도 PASS 가 아니다. 네거티브 단언은 언제나
+양성 대조군과 함께다(`run-event-stream.md:461-470`).
+
+### 6.3 규약 · 범위 가드
+
+- **`.claude/**` 는 한 번만** — K5 의 proposals 묶음 + 사람 `cp`(K6). 헤드리스 워커는 `.claude/**` 를 쓸 수 없다(하드
+  가드 `worker-implement.md:177-182`, §1.1). 스킬·버전은 어느 것도 `.claude` 를 거치지 않는다. **플래너 초안 지시도
+  `.claude` 변경이 아니다** — K2 의 `emit-context` 블록 머리가 엔진이 쓴 초안 지시(`Worker/skills/<id>.md` 를
+  `status: proposed` + `from_candidate` 로 쓰거나 rejected jsonl 에 한 줄)를 후보 메타데이터와 함께 싣는다. `.claude/**`
+  를 고칠 수 없어 규칙을 엔진이 만든 텍스트에 싣는 선례(`stages.py:588-591`)와 같다.
+- **범위 가드** — 이 §6 은 **문서 내부 서술만**이다. 실제 `Todo/items/<slug>.md` leaf 파일은 **생성하지 않는다** — 설계
+  머지 뒤 **사람이 권장안을 보고 게이트를 풀 때** 생성한다. 이 run 은 macp 체크아웃에서 돌아 볼트 `Todo/` 를 쓰지도
+  못한다(`graph-memory.md:324-330` 과 같은 규율).
+- **볼트 측 변경은 이 리포의 PR 이 할 수 없다** — 해당 leaf 의 PR 본문에 명시한다(run-event-stream §6.3 모양):
+  `Worker/skills/`·`Worker/routines/` 를 동기화 데몬의 커밋 범위 안 추적 경로로 두기(K1), 대시보드 parity 문서와 앱
+  짝(K4).
+- **후속으로 남기는 관찰(leaf 아님)** — §3.4 의 대시보드 proposals 스캔 루트(`_INSTALL_DIR` vs `VAULT`), §4.1 의
+  `SECURITY.md`·`concepts.md` "strips" 문구 대 실제 거부 동작.
+- **"CI green" 금지** — 모든 완료 조건은 위 표의 로컬 명령이다.
 
 ---
 
