@@ -7,7 +7,7 @@ related:
   - Todo/items/macp-chat-channel-entry-design-a-census-model-routing.md  # leaf — §1~§3
   - Todo/items/macp-chat-channel-entry-design-b-reply-safety-split.md    # leaf — §4~§6·부록
   - Todo/items/macp-run-event-stream-design.md            # 자매 — 런 이벤트 스트림(설계 머지됨)
-  - Todo/items/macp-inflight-approval-cards-design.md     # 자매 — 승인 카드(설계 문서 미존재)
+  - Todo/items/macp-inflight-approval-cards-design.md     # 자매 — 승인 카드(docs/design/inflight-approvals.md)
   - Todo/items/macp-event-triggers-design.md              # 자매 — 대시보드 확장·저장/드레인 분리 선례
   - Todo/items/macp-skill-promotion-ladder-design.md      # 자매 (같은 날 설계 묶음)
   - docs/design/run-event-stream.md      # 봉투 어휘·git 밖 보존·마스킹 패턴(§2.1·§3·§4)
@@ -26,8 +26,7 @@ related:
 > `파일:줄` 앵커는 이 리포(`jjkim0807/macp`) 트리를 **읽어** 확인한 것이고, 각 절의 범례가 읽은 HEAD 를
 > 밝힌다. 볼트 쪽 파일은 `(볼트)` 로 표시하고, 이 체크아웃 밖(대시보드 Android 앱, mailroom, 원격 조종
 > 운영 스택)은 '미확인'으로 남겼다. 자매 설계 `docs/design/run-event-stream.md` 는 머지되어 있어 § 번호로
-> 인용한다. 승인 카드 설계는 아직 문서가 없어 '미존재(설계 단계)'로 표기하고, 그 태스크의 AC 만
-> 인터페이스 가정으로 쓴다. 외부 URL 은 인용하지 않는다 — 배경은 태스크 Spec 요약이다. 공개 리포라
+> 인용한다. 승인 카드 설계 [inflight-approvals.md](inflight-approvals.md) 도 머지되어 있어 § 번호로 인용한다. 외부 URL 은 인용하지 않는다 — 배경은 태스크 Spec 요약이다. 공개 리포라
 > 예시·스키마는 합성 placeholder(`<channel-id>`·`<ULID>`·`<token>`)이고 실명·토큰·엔드포인트 host·절대
 > 홈경로·SMS/메일 본문을 넣지 않는다. **Spec 이 뺀 것**: 이름과 페르소나를 가진 봇들의 명단(봇 명단)은 두지
 > 않는다 — macp 의 단위는 프로젝트다.
@@ -369,9 +368,9 @@ ledger 행도 없으니 `WORKER_MODES`(`config.py:35`)에 더할 것도 없다.
 
 범례 — §4~§6 의 `파일:줄` 앵커는 이 리포 HEAD(`b2eb533`)를 읽어 확인했다. 작성 중 `origin/main` 이 `9368596` 으로
 나아갔지만 바뀐 파일은 `docs/design/skill-promotion.md` 하나라 앵커는 그대로다. **HEAD 기준 상태**: 자매 런 이벤트
-스트림 설계는 머지돼 있어 § 번호로 인용한다. 승인 카드 설계 `docs/design/inflight-approvals.md` 는 `origin/main` 에도
-없다 — '미존재(설계 단계)'다. 그 인터페이스 가정은 그 태스크의 AC 와 run-event-stream 이 예약한 `approval.*` 필드(§2.2)
-뿐이다. AC 의 내용: 세 층(항상 허용·카드로 묻기·항상 거부), 실계좌·결제·사용자 명의 제출은 본문이 허용해도 카드,
+스트림 설계는 머지돼 있어 § 번호로 인용한다. 승인 카드 설계 [inflight-approvals.md](inflight-approvals.md) 는 이 앵커를 읽은
+뒤 머지됐다(작성 당시에는 없었다). 이 절의 인터페이스 가정은 당시 그 태스크의 AC 와 run-event-stream 이 예약한
+`approval.*` 필드(§2.2)였고, 현재는 그 문서가 정본이다. 당시 AC 의 내용: 세 층(항상 허용·카드로 묻기·항상 거부), 실계좌·결제·사용자 명의 제출은 본문이 허용해도 카드,
 카드 응답 인증, 자기 승인 불가, 감사 기록.
 
 ### 4.1 회신의 집 — 진행은 읽는 순간 조립하고, 런의 끝만 대화록에 남긴다
@@ -641,7 +640,7 @@ allowlist 는 샌드박스가 아니다(`SECURITY.md:7-13,22-23`). 금지 목록
 | **C7** 결과 회신 + 메신저 중복 방지 | migrate | `channel_drain.py`(`result` 줄) + `scripts/macp_dashboard.py`(GET 의 스레드 조립 §4.2) + `todo_system/kakao_format.py`(`route()` 안의 강등 + 딥링크 헬퍼, stdlib) + 발신처 셋의 링크 인자(`orchestrator.py`·`human.py`·`worker.py` — 딥링크만, 등급·키는 그대로) + `scripts/KAKAO_ALERTS.md`(채널 규칙 한 절 + 새 발신처 행) + `todo_system/tests/test_channel_reply.py`(신규) | **C5** — 라이브 진행은 run-event-stream S1 이 있으면 쓴다(블로커 아님) | `uv run pytest todo_system/tests/test_channel_reply.py todo_system/tests/test_channel_e2e.py todo_system/tests/test_kakao_format.py todo_system/tests/test_kakao_alerts_doc_anchors.py todo_system/orchestrator/tests/test_orchestrator_kakao_alerts.py todo_system/tests/test_macp_dashboard.py` · `uvx ruff check .` |
 | **C8** 웹 채널 화면 | migrate | `scripts/macp_dashboard.py` 의 `HTML` 셸: 채널 목록·스레드·입력창, 메시지마다 라우팅 결과와 "다시 나누기"(→ `/reroute`, §3.5), "채널 열기"(→ `POST /api/channels`). 3초 `since=` 증분, escape + 셸 계약 테스트 | **C6, C7** | `uv run pytest todo_system/tests/test_macp_dashboard.py` · `uvx ruff check .` · 390px 측정(§6.2) |
 | **C9** 앱 채널 화면 | migrate | 별도 리포 `macp-dashboard-android`(이 체크아웃 밖). `worker_mode: blocked` + `depends_on: [C8]`, `emulator: true`, `screen_check: true`, 앱 표준 AC(§6.2) | **C8** | `flutter analyze` · `flutter test` · 에뮬레이터 화면 확인 |
-| **C10** 채널 안 승인 카드 + 라이브 스트림 | human_gate | `scripts/macp_dashboard.py`: 스레드의 `approval` 카드(응답은 자매 ① 카드 API 로만), `live` 스레드의 런 링크 → `GET /api/run/events` + 테스트 | **C7** + 자매 ①(설계 미존재) + run-event-stream S1·S3 | `uv run pytest todo_system/tests/test_macp_dashboard.py`(① 착지 후) |
+| **C10** 채널 안 승인 카드 + 라이브 스트림 | human_gate | `scripts/macp_dashboard.py`: 스레드의 `approval` 카드(응답은 자매 ① 카드 API 로만), `live` 스레드의 런 링크 → `GET /api/run/events` + 테스트 | **C7** + 자매 ①([inflight-approvals.md](inflight-approvals.md)) + run-event-stream S1·S3 | `uv run pytest todo_system/tests/test_macp_dashboard.py`(① 착지 후) |
 
 **depends_on 체인**: `C1 → {C2, C3, C4} → C5 → {C6, C7} → C8 → C9`. `C10`(human_gate)은 C7 + 자매 ① + run-event-stream
 S1·S3 뒤다.

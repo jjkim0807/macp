@@ -8,7 +8,7 @@ related:
   - Todo/items/macp-chat-channel-entry-design-b-reply-safety-split.md  # 자매 — chat-channels §4·§5 가 이 노트를 인터페이스로 쓴다
   - Todo/items/macp-event-triggers-design.md                           # 자매 — 새 상시 인프라 없이 본부 대시보드를 확장한다
   - docs/design/run-event-stream.md      # 봉투·단일 writer·events.in/ 드롭박스·approval.* 예약·마스킹(§2.1·§2.2·§4)
-  - docs/design/chat-channels.md         # R2 바닥·CANCEL 한계·§4 자리표시
+  - docs/design/chat-channels.md         # R2 바닥·CANCEL 한계·§4~§6 (머지됨)
   - docs/design/event-triggers.md        # 대시보드 프로세스 확장 원칙
   - docs/design/state-store.md           # leaf ⑦ — 본부 HTTP 상태 API(원격 러너 경로)
   - docs/design/agent-backends.md        # AgentBackend capability(`approval_broker` 를 서술할 자리)
@@ -24,7 +24,7 @@ related:
 > '미확인'으로 남겼다. 외부 문서는 이 런에서 **열어 확인한 것만** '확인'(최종 도달 URL, 조회 2026-11-17)이고,
 > 못 연 것은 '미확인'이다(열람 수단은 §3.1 확인표 머리말). 자매 `run-event-stream.md` 가 확인한 출처(U1~U5,
 > 조회 2026-11-13)는 "형제 확인"으로 다시 인용한다. 자매 `run-event-stream.md` 는 머지되어 § 번호로 인용하고,
-> `chat-channels.md` 의 §4~§6 은 아직 자리표시(`chat-channels.md:368-387`)라 이 노트를 인터페이스로 가정한다.
+> [chat-channels.md](chat-channels.md) 의 §4~§6 은 머지되어 있고 이 노트를 인터페이스로 쓴다.
 > 공개 리포라 예시·스키마는 합성 placeholder(`example.invalid`·`<token>`·`<ULID>`·
 > `00000000-0000-4000-8000-000000000000`)이고 실명·토큰·호스트·절대 홈경로·SMS/메일 본문을 넣지 않는다.
 
