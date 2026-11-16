@@ -518,3 +518,5 @@ def test_per_model_limit_notice_is_unavailable_and_capacity():
     assert stages.is_capacity_limit(msg)
     assert stages.is_capacity_limit("You've hit your session limit · resets 5pm")
     assert not stages.is_capacity_limit("the loop should hit your target slowly")
+    # account-wide limits are capacity, but not "this model is unavailable"
+    assert not ms.model_unavailable("You've hit your weekly limit · resets 8am")
