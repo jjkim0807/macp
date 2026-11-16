@@ -19,7 +19,10 @@ a tool allowlist (`todo_system/orchestrator/stages.py`, `STAGE_TOOLS`; a task's
   test fixtures) can try to steer the agent — prompt injection. Only point tasks at
   repositories you trust.
 
-The runner removes a few obviously dangerous rules from any allowlist and sets
+The runner checks every stage's final allowlist (defaults, task-supplied and standing
+rules) against a short list of obviously dangerous rules (`FORBIDDEN_TOOL_SUBSTRINGS` in
+`todo_system/orchestrator/stages.py`) and **refuses to start the stage** if one matches —
+it does not silently drop the rule. It also sets
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, but it does not isolate the process.
 
 ## Recommended setup

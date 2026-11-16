@@ -7,7 +7,7 @@ related:
   - Todo/items/macp-chat-channel-entry-design-a-census-model-routing.md  # leaf — §1~§3
   - Todo/items/macp-chat-channel-entry-design-b-reply-safety-split.md    # leaf — §4~§6·부록
   - Todo/items/macp-run-event-stream-design.md            # 자매 — 런 이벤트 스트림(설계 머지됨)
-  - Todo/items/macp-inflight-approval-cards-design.md     # 자매 — 승인 카드(설계 문서 미존재)
+  - Todo/items/macp-inflight-approval-cards-design.md     # 자매 — 승인 카드(docs/design/inflight-approvals.md)
   - Todo/items/macp-event-triggers-design.md              # 자매 — 대시보드 확장·저장/드레인 분리 선례
   - Todo/items/macp-skill-promotion-ladder-design.md      # 자매 (같은 날 설계 묶음)
   - docs/design/run-event-stream.md      # 봉투 어휘·git 밖 보존·마스킹 패턴(§2.1·§3·§4)
@@ -26,8 +26,7 @@ related:
 > `파일:줄` 앵커는 이 리포(`jjkim0807/macp`) 트리를 **읽어** 확인한 것이고, 각 절의 범례가 읽은 HEAD 를
 > 밝힌다. 볼트 쪽 파일은 `(볼트)` 로 표시하고, 이 체크아웃 밖(대시보드 Android 앱, mailroom, 원격 조종
 > 운영 스택)은 '미확인'으로 남겼다. 자매 설계 `docs/design/run-event-stream.md` 는 머지되어 있어 § 번호로
-> 인용한다. 승인 카드 설계는 아직 문서가 없어 '미존재(설계 단계)'로 표기하고, 그 태스크의 AC 만
-> 인터페이스 가정으로 쓴다. 외부 URL 은 인용하지 않는다 — 배경은 태스크 Spec 요약이다. 공개 리포라
+> 인용한다. 승인 카드 설계 [inflight-approvals.md](inflight-approvals.md) 도 머지되어 있어 § 번호로 인용한다. 외부 URL 은 인용하지 않는다 — 배경은 태스크 Spec 요약이다. 공개 리포라
 > 예시·스키마는 합성 placeholder(`<channel-id>`·`<ULID>`·`<token>`)이고 실명·토큰·엔드포인트 host·절대
 > 홈경로·SMS/메일 본문을 넣지 않는다. **Spec 이 뺀 것**: 이름과 페르소나를 가진 봇들의 명단(봇 명단)은 두지
 > 않는다 — macp 의 단위는 프로젝트다.
@@ -230,7 +229,7 @@ tags: [todo, <tag>]       # 생성 태스크의 기본 태그
 | 타깃 | `worker_mode` | 만드는 것 | 실행 | 근거 |
 |---|---|---|---|---|
 | **즉답** | 없음 | 태스크·런·ledger 행 없음 — 대화록 `reply` 줄 하나 | 읽기 전용 호출 한 번(3.4) | — |
-| **quick** | `quick` | `Todo/items/<slug>.md` | 단계 하나로 끝낸다 — 코드 수정·PR·로컬 검사·머지(`worker-quick.md:5-7,23-42`) | `tasks.md:79`; `STAGES_QUICK` `stages.py:164` |
+| **quick** | `quick` | `Todo/items/<slug>.md` | 단계 하나로 끝낸다 — 코드 수정·PR·로컬 검사·머지(`worker-quick.md:5-7,17-42`) | `tasks.md:79`; `STAGES_QUICK` `stages.py:164` |
 | **delegate** | `delegate` | md | 단계 하나 — 태스크 파일이나 노트를 고친다. 코드 머지 없음 | `tasks.md:80`, `concepts.md:110-111`; `STAGES_DELEGATE` `stages.py:163` |
 | **정식 태스크** | `auto` · `review` · `manual` | md | `auto` = 5 단계(`tasks.md:78`, `stages.py:162`); `review` = 사람이 먼저 본다(`:83`); `manual` = 사람이 한다(`:84`) | `/todo` 라우터 `todo.md:14-29` |
 
@@ -332,7 +331,7 @@ ledger 행도 없으니 `WORKER_MODES`(`config.py:35`)에 더할 것도 없다.
     도는 런은 다음 단계 경계에서 멈추며, 아무것도 push 하지 않는다(`runner.py:2231-2263,2300-2306`; 단계 루프
     `:1220-1233`).
   - **한계 — 그대로 적는다.** 취소 확인은 단계 **사이**에서만 한다. 단계가 하나뿐인 `quick`·`delegate` 가 이미
-    그 단계 안에 있으면 끝까지 간다. `quick` 은 그 단계 안에서 PR 을 열고 머지까지 하므로(`worker-quick.md:23-42`)
+    그 단계 안에 있으면 끝까지 간다. `quick` 은 그 단계 안에서 PR 을 열고 머지까지 하므로(`worker-quick.md:21-42`)
     이미 머지됐을 수 있다. 볼트 `delegate` 는 단계 뒤 publish 만 건너뛴다(`runner.py:1759-1772`). 이 경우
     `/reroute` 는 취소가 아니라 **되돌리기·다시 하기 후속 태스크**를 만든다.
   - R2 바닥은 `/reroute` 에도 걸린다.
@@ -369,9 +368,9 @@ ledger 행도 없으니 `WORKER_MODES`(`config.py:35`)에 더할 것도 없다.
 
 범례 — §4~§6 의 `파일:줄` 앵커는 이 리포 HEAD(`b2eb533`)를 읽어 확인했다. 작성 중 `origin/main` 이 `9368596` 으로
 나아갔지만 바뀐 파일은 `docs/design/skill-promotion.md` 하나라 앵커는 그대로다. **HEAD 기준 상태**: 자매 런 이벤트
-스트림 설계는 머지돼 있어 § 번호로 인용한다. 승인 카드 설계 `docs/design/inflight-approvals.md` 는 `origin/main` 에도
-없다 — '미존재(설계 단계)'다. 그 인터페이스 가정은 그 태스크의 AC 와 run-event-stream 이 예약한 `approval.*` 필드(§2.2)
-뿐이다. AC 의 내용: 세 층(항상 허용·카드로 묻기·항상 거부), 실계좌·결제·사용자 명의 제출은 본문이 허용해도 카드,
+스트림 설계는 머지돼 있어 § 번호로 인용한다. 승인 카드 설계 [inflight-approvals.md](inflight-approvals.md) 는 이 앵커를 읽은
+뒤 머지됐다(작성 당시에는 없었다). 이 절의 인터페이스 가정은 당시 그 태스크의 AC 와 run-event-stream 이 예약한
+`approval.*` 필드(§2.2)였고, 현재는 그 문서가 정본이다. 당시 AC 의 내용: 세 층(항상 허용·카드로 묻기·항상 거부), 실계좌·결제·사용자 명의 제출은 본문이 허용해도 카드,
 카드 응답 인증, 자기 승인 불가, 감사 기록.
 
 ### 4.1 회신의 집 — 진행은 읽는 순간 조립하고, 런의 끝만 대화록에 남긴다
@@ -557,8 +556,8 @@ GET /api/channels → 200 {"channels": [ {"id": "...", "title": "...", "can_post
 - 이 규칙을 담는 C4 가 디스패치를 켜는 C5 보다 먼저 머지되도록 체인을 짰다(§6.1). 그래서 채널 태스크가 래퍼를 받는 창이 없다.
 
 **R6 (a) 에서 모델이 고르는 `delegate`.** 모델 보조는 R6 에서 {`answer`·`delegate`·`review`} 중 `delegate` 를 고를 수
-있다(§3.3). 채널 출처 delegate 의 allowlist 는 `Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*)` 다
-(`stages.py:386-388` 에서 위 래퍼를 뺀 것). R2 바닥이 모델 뒤에 다시 걸리고, 채널별 일일 자동 실행 ≤ 20·5 게이트·일일 런
+있다(§3.3). 채널 출처 delegate 의 allowlist 는 `Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*) Bash(macp-remote-gate:*)` 다
+(`stages.py:386-388` 에서 `macp-sms`·`macp-browser`·`macp-mail` 래퍼를 뺀 것). R2 바닥이 모델 뒤에 다시 걸리고, 채널별 일일 자동 실행 ≤ 20·5 게이트·일일 런
 예산도 지난다(§3.6). 의도한 최대치는 "노트·태스크 편집 + 공개 웹 읽기"다. 다만 `Bash(git:*)` 도 훅·별칭으로 임의 코드를
 돌릴 수 있어(`SECURITY.md:11-13`) 이것은 가드레일이다. 바닥은 R2 와 5.3 의 토큰 미보유다.
 
@@ -641,7 +640,7 @@ allowlist 는 샌드박스가 아니다(`SECURITY.md:7-13,22-23`). 금지 목록
 | **C7** 결과 회신 + 메신저 중복 방지 | migrate | `channel_drain.py`(`result` 줄) + `scripts/macp_dashboard.py`(GET 의 스레드 조립 §4.2) + `todo_system/kakao_format.py`(`route()` 안의 강등 + 딥링크 헬퍼, stdlib) + 발신처 셋의 링크 인자(`orchestrator.py`·`human.py`·`worker.py` — 딥링크만, 등급·키는 그대로) + `scripts/KAKAO_ALERTS.md`(채널 규칙 한 절 + 새 발신처 행) + `todo_system/tests/test_channel_reply.py`(신규) | **C5** — 라이브 진행은 run-event-stream S1 이 있으면 쓴다(블로커 아님) | `uv run pytest todo_system/tests/test_channel_reply.py todo_system/tests/test_channel_e2e.py todo_system/tests/test_kakao_format.py todo_system/tests/test_kakao_alerts_doc_anchors.py todo_system/orchestrator/tests/test_orchestrator_kakao_alerts.py todo_system/tests/test_macp_dashboard.py` · `uvx ruff check .` |
 | **C8** 웹 채널 화면 | migrate | `scripts/macp_dashboard.py` 의 `HTML` 셸: 채널 목록·스레드·입력창, 메시지마다 라우팅 결과와 "다시 나누기"(→ `/reroute`, §3.5), "채널 열기"(→ `POST /api/channels`). 3초 `since=` 증분, escape + 셸 계약 테스트 | **C6, C7** | `uv run pytest todo_system/tests/test_macp_dashboard.py` · `uvx ruff check .` · 390px 측정(§6.2) |
 | **C9** 앱 채널 화면 | migrate | 별도 리포 `macp-dashboard-android`(이 체크아웃 밖). `worker_mode: blocked` + `depends_on: [C8]`, `emulator: true`, `screen_check: true`, 앱 표준 AC(§6.2) | **C8** | `flutter analyze` · `flutter test` · 에뮬레이터 화면 확인 |
-| **C10** 채널 안 승인 카드 + 라이브 스트림 | human_gate | `scripts/macp_dashboard.py`: 스레드의 `approval` 카드(응답은 자매 ① 카드 API 로만), `live` 스레드의 런 링크 → `GET /api/run/events` + 테스트 | **C7** + 자매 ①(설계 미존재) + run-event-stream S1·S3 | `uv run pytest todo_system/tests/test_macp_dashboard.py`(① 착지 후) |
+| **C10** 채널 안 승인 카드 + 라이브 스트림 | human_gate | `scripts/macp_dashboard.py`: 스레드의 `approval` 카드(응답은 자매 ① 카드 API 로만), `live` 스레드의 런 링크 → `GET /api/run/events` + 테스트 | **C7** + 자매 ①([inflight-approvals.md](inflight-approvals.md)) + run-event-stream S1·S3 | `uv run pytest todo_system/tests/test_macp_dashboard.py`(① 착지 후) |
 
 **depends_on 체인**: `C1 → {C2, C3, C4} → C5 → {C6, C7} → C8 → C9`. `C10`(human_gate)은 C7 + 자매 ① + run-event-stream
 S1·S3 뒤다.
