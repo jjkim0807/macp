@@ -76,7 +76,8 @@ def test_reschedule_writes_md_and_log(tmp_path, monkeypatch):
     overdue = _md(tmp_path, "late", "2026-11-16 10:00~10:30")
     future = _md(tmp_path, "soon", "2026-11-16 15:00~15:30")
     stays = _md(tmp_path, "pinned", "2026-11-16 09:00~09:30", "reschedule: false\n")
-    con = sqlite3.connect(":memory:"); con.row_factory = sqlite3.Row
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE t (slug TEXT, path TEXT)")
     con.executemany("INSERT INTO t VALUES (?, ?)", [("late", overdue), ("soon", future), ("pinned", stays)])
     rows = con.execute("SELECT * FROM t").fetchall()
