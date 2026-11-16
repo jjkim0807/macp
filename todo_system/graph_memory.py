@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 from . import paths
+from .frontmatter_lists import parse_inline_list
 
 ROOT = paths.vault_root()
 MEMORY_DIR = ROOT / "Memory"
@@ -125,6 +126,11 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
                     continue
                 break
             result[key] = items
+            continue
+        inline = parse_inline_list(value)
+        if inline is not None:
+            result[key] = inline
+            idx += 1
             continue
         value = value.strip().strip('"').strip("'")
         result[key] = value
