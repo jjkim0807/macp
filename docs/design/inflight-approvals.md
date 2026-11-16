@@ -215,7 +215,219 @@ approvals:
 
 ## §3 실행 의미 — 대기 방식 · 시간 예산 · 만료 · 이벤트 · 재시작 생존
 
-> (이 런의 다음 페이즈에서 채움)
+### 3.1 대기 방식 — 공식 문서 확인과 결정
+
+**확인표.** 이 런의 implement 스테이지에는 WebFetch 도구가 없어서, 공개 문서 페이지를 로그인 없는 일회용
+브라우저 인스턴스로 열어 본문 텍스트를 읽었다. 최종 URL 은 브라우저가 보고한 주소이고 조회일은 모두 2026-11-17
+이다. 커뮤니티 글·블로그는 쓰지 않았다.
+
+| # | 출처 | 최종 URL | 이 노트가 기대는 확인 사실 | 미확인 |
+|---|---|---|---|---|
+| V1 | CLI reference | `https://code.claude.com/docs/en/cli-reference` | `--permission-prompt-tool` 은 비대화 모드의 권한 프롬프트를 MCP 도구(`mcp__<server>__<tool>`)로 넘기고, 그 서버 연결을 `MCP_TIMEOUT`(기본 30 s)까지 기다린다. `--resume` 은 세션 ID·이름·**.jsonl 절대 경로**를 받고 ID 는 이 머신의 모든 프로젝트에서 찾는다. `--settings` 는 파일 또는 인라인 JSON 이고 세션 한정이다 | 권한 위임 도구가 돌려줄 JSON 의 정확한 모양(문서가 가리키는 절을 이 런에서 찾지 못함) |
+| V2 | Run Claude Code programmatically | `https://code.claude.com/docs/en/headless` | 권한 모드를 정하지 않은 `-p` 런은 Manual 이고, 승인이 필요한 호출은 PermissionRequest hook 이나 권한 위임 도구가 승인하지 않으면 거부된다. 권한 호스트가 있으면 런이 그 답을 **기다린다**. 권한 프롬프트 대기 중 SIGTERM 이면 답하지 않은 채 끝나고(exit 143), 재개 때 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 이면 끊긴 턴을 잇는다 | — |
+| V3 | Hooks reference | `https://code.claude.com/docs/en/hooks` | PreToolUse 결정은 allow·deny·ask·**defer**. defer 는 `-p` 에서 한 턴에 도구 호출이 **하나일 때만** 받아들여지고, 턴이 `stop_reason: "tool_deferred"` 로 끝나며 대기 호출이 transcript 에 남는다. `claude -p --resume <id>` 로 같은 호출이 PreToolUse 를 다시 탄다. hook `timeout` 기본 600 s | 아래 사실 목록 |
+| V4 | Settings | `https://code.claude.com/docs/en/settings` | `--settings` 는 user·project·local 위, managed 아래에 놓이고 "user 설정 파일이 둘 수 있는 키는 모두" 둘 수 있다. user 설정 파일은 hook 위치다(V3) | 실제 발화는 A3 캡처 테스트가 못박는다 |
+| V5 | MCP | `https://code.claude.com/docs/en/mcp` | 서버 항목의 `timeout`(ms)이 그 서버 도구 호출의 벽시계 상한이고 idle 상한의 하한도 된다(stdio idle 기본 30분). 2분 넘는 호출의 자동 백그라운드는 비대화 모드와 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 에서 일어나지 않는다 | 인라인 `--mcp-config` 항목도 같은 `timeout` 필드를 받는가(A3) |
+| V6 | Permissions | `https://code.claude.com/docs/en/permissions` | 막는 hook 은 allow 규칙보다 먼저 평가된다. dontAsk 모드는 AskUserQuestion 을 거부한다 | — |
+| V7 | Agent SDK — Configure permissions | `https://code.claude.com/docs/en/agent-sdk/permissions` | 열었으나 권한 위임 도구의 반환 모양이 이 페이지에 없다 | V1 과 같다 |
+| U1~U5 | 형제 확인(조회 2026-11-13) | `run-event-stream.md:258-266` | `result.permission_denials[{tool_name, tool_use_id, tool_input}]`(U5), hooks 가 `-p` 에서 돈다(U3) | — |
+
+V3 에서 결정에 쓰인 사실을 더 적는다. ⓐ 한 턴에 호출이 여럿이면 defer 는 무시되고 그 호출은 **일반 권한
+흐름**으로 간다. ⓑ defer 에는 "no timeout or retry limit" 이고, 세션은 `cleanupPeriodDays`(기본 30일)까지
+디스크에 남는다. ⓒ 재개 때 권한 모드는 복원되지 않는다. ⓓ PermissionRequest 의 결정은 `decision.behavior`
+(allow·deny, `updatedInput`)이고, 권한 위임 도구와 함께 돌면 먼저 결정한 쪽이 이긴다. ⓔ PreToolUse hook 이 시간
+초과면 호출을 막지 **않는다** — `onFailure: "block"`(v2.1.295 이상)이어야 막는다. ⓕ AskUserQuestion 은 `-p` 에서
+권한 호스트가 있을 때만 제공되고, defer → resume → `allow` + `updatedInput.answers` 가 문서화된 왕복이다.
+
+**방식 비교.**
+
+| 방식 | 재시작 생존 | 스테이지 예산 | 러너 슬롯·체크아웃 | 세션 문맥 | 주입·argv | 공식 확인 |
+|---|---|---|---|---|---|---|
+| 붙잡기(inline) — hook·위임 도구 안에서 블록 | ✗ 프로세스가 죽으면 대기도 죽는다(카드는 디스크에 남는다) | 쓴다(R-T2) | 잡는다 — in-flight 행만 체크아웃을 잡는다(`orchestrator.py:831-837`) | ✓ 같은 프로세스 | `--permission-prompt-tool`·`--mcp-config` 병합·`--settings` | V1·V2·V3·V5 |
+| 끝내고 세션 재개(suspend) | ✓ 디스크의 세션·카드만 남는다 | 쓰지 않는다 | 놓는다 — AWAITING_HUMAN 은 체크아웃을 잡지 않는다 | ✓ 같은 세션(transcript), 프로세스만 새로 | 재개 argv `--resume <session_id>` | V3 의 defer 왕복·V1·V2 |
+| **혼합(채택)** — 짧게 붙잡고 넘으면 suspend | ✓ 붙잡는 동안 죽어도 카드·세션이 남아 재개로 잇는다(3.6) | 짧은 대기만 | 짧은 대기 동안만 | ✓ | 위 둘의 합 | 위 둘의 합 |
+
+**결정 규칙.** 계획 단계의 확인 항목 C1~C7 을 위 확인표로 판정했다.
+
+- **C1 ✓ (V1·V2) — 백스톱 = 권한 위임 MCP 도구.** `--permission-prompt-tool mcp__macp-approval__permission`.
+  승인 서버는 브라우저 서버와 함께 **하나의 인라인 `--mcp-config`** 에 합치고 `--strict-mcp-config` 를 유지한다
+  (`stages.py:465-477`, `:691-695`). 이 도구는 기다릴 수만 있고 defer 할 수 없다(defer 는 PreToolUse 전용).
+- **C2 ✓ ∧ C3 ✓ (V3·V4) — 1차 게이트 = PreToolUse command hook.** `--settings` 인라인 JSON 으로 그 세션에만
+  싣는다. 볼트 `.claude/settings.json` 은 헤드리스 하드 가드에 걸리고 대화형 세션까지 오염시키므로 쓰지 않는다.
+  matcher 없이 모든 도구에 걸고, `timeout` = 인라인 상한 + 60 s, `onFailure: "block"`(ⓔ)을 준다. 호출마다 뜨는
+  프로세스라 stdlib 만 쓰고, 엔진 venv 의 python 을 직접 부르며, 결정할 것이 없으면 즉시 아무 결정 없이 끝난다.
+- **C4 ✓ (V1·V2·V3) — 오래 기다리면 일시정지했다가 `claude -p --resume <session_id>`.**
+- **C5 ✓ (V3 ⓕ) — 질문은 내장 AskUserQuestion.** 별도 `ask` 도구를 만들지 않는다. 확인(human_step·바닥
+  선언)만 승인 서버의 `confirm` 도구로 둔다. MCP elicitation 은 비대화 세션에서 취소되므로 쓰지 않는다(V5).
+- **C6 ✓ (V5) — 시간 한도는 env 가 아니라 주입 JSON 에 명시한다.** 승인 서버 항목 `timeout` = 인라인 상한 +
+  60 s(ms). 자동 백그라운드는 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`(`stages.py:3137-3141`)과 비대화 모드라
+  일어나지 않는다.
+- **C7 ✓ (V2·V6) — 권한 모드는 지금처럼 정하지 않는다(Manual).** `--permission-prompts none`·dontAsk 는 호스트를
+  건너뛰거나 AskUserQuestion 을 없애므로 켜진 모양에서 쓰지 않는다.
+- **C3 이 A3 캡처에서 깨지면**: hook 없이 위임 도구만 쓴다. defer 가 없으니 일시정지는 아래 ② 하나뿐이고,
+  허용 목록 **안**의 바닥 호출은 선언(2.3 c)과 태그(a)로만 잡는다. 그때 바닥 태그 태스크의 `allowed_tools` 에서
+  외부 쓰기 명령을 뺄지는 A8 이 정한다. **C1 이 깨지면**: 권한 거부는 오늘처럼 즉시 거부하고 "다음 런에
+  허용할까요" 사후 카드로 degrade 한다.
+- **자매 경계.** run-event-stream 은 hooks 를 **관측** 소스로 쓰지 않았다(`run-event-stream.md:238-240`). 이
+  노트는 hook 을 **통제** 수단으로 쓴다.
+
+**일시정지는 두 길이다.**
+
+- ① **defer** — AskUserQuestion, `confirm`, hook 이 잡은 `permission_denied`. 한 턴에 호출이 하나면 턴이
+  `tool_deferred` 로 끝나 프로세스가 종료된다. 여럿이면 defer 가 무시되어 일반 권한 흐름으로 가고(ⓐ), 허용 목록
+  밖이므로 위임 도구가 받는다. 위임 도구는 같은 `input_sha256` 의 열린 카드를 보면 기다리지 않고 "승인 대기 중
+  — 이 호출만 단독으로 다시 하라"로 거부하고, 단독 재시도가 defer 된다.
+- ② **거부 후 턴 종료** — **바닥 호출에는 defer 를 쓰지 않는다.** 묶인 호출이면 defer 가 무시되고, 허용 목록
+  안의 바닥 호출이 일반 흐름에서 그대로 실행돼 버린다(ⓐ). 그래서 바닥은 인라인 대기가 끝나면 `deny` 와 사유
+  "승인 카드 <id> 대기 — 턴을 끝내라"를 돌려준다.
+- **러너 규칙 "열린 카드 = 일시정지".** 스테이지 프로세스가 끝났을 때 승인 저장소에 그 런·스테이지의 열린
+  카드(pending·suspended)가 있으면, rc·아티팩트와 상관없이 그 스테이지를 **완료도 실패도 아닌 일시정지**로 본다.
+  카드를 남기고 턴을 끝냈다면 그 단계를 하지 않은 것이다. FAIL 로 보면 `_retry` 가 새 run_id 를 만들고, 완료로
+  보면 카드가 버려진다. 판정은 저장소로 하고 stdout 의 `stop_reason` 은 읽지 않는다 — 텍스트 출력 모드를 지킨
+  이유(`stages.py:523-528`)가 그대로다.
+
+### 3.2 상태 기계
+
+```
+ hook·위임 도구가 카드 생성
+          │
+   requested(inline) ──답(≤ 인라인 상한)──► answered ──► 같은 프로세스가 계속          (resumed_via: inline)
+          │
+   인라인 상한 초과 · 예산 문턱 → defer, 또는 바닥이면 deny + 턴 종료
+          ▼
+     suspended ── 스테이지 종료 → 러너: NEEDS_INPUT{approval_pending} → collect: AWAITING_HUMAN
+          │
+    ┌─────┴───────────────────────────────┐
+  답(만료 전)                          만료(expires_at)
+    │                                     │
+  reconcile_approvals(틱, dispatch 전)    approval.resolved{expired}
+  → TASK_ASSIGN{approval_resume}          blocked_on = "approval expired: <category>"
+    │                                     ⛔ blocked 알림 = 오늘의 파킹
+  러너: 같은 run_id · 완료 스테이지 건너뜀
+  → 그 스테이지를 --resume <session_id> 로   (resumed_via: session_resume) → consumed
+```
+
+- **원장.** NEEDS_INPUT 봉투(`message.py:36`) payload 에 `approval_pending{approval_id, run_id, stage, session_id,
+  expires_at}` 를 싣는다. collect 가 AWAITING_HUMAN 으로 바꾸고(`orchestrator.py:1185-1186`), `apply_reply` 가
+  `blocked_on`(`assignment.py:239`)처럼 이 필드를 원장에 옮긴다. 새 필드라 옛 빌드는 모르는 키로 버린다(`:249-257`).
+  AWAITING_HUMAN 은 dedup 상 busy 라 재디스패치되지 않고(`orchestrator.py:776-784`), reaper 대상이 아니며(`:1919`),
+  체크아웃을 잡지 않는다(`:831-837`).
+- **재개 송신.** `reconcile_approvals` 는 `dispatch()` 를 거치지 않는다. AWAITING_HUMAN 은 거기서 busy 이고, FAILED
+  분기를 타면 `refail_count += 1`(`:734-736`)이 된다. `_retry` 의 송신 모양(`:1755-1767` — 새 corr_id, 에이전트 자기
+  전송로)을 쓰되 `attempts`·`refail_count` 는 바꾸지 않는다. `approval_resume{run_id, stage, approval_id,
+  session_id}` 는 봉투에만 싣는다 — `envelope_extra` 가 원장 payload 를 오염시키지 않게 한 선례(`:658-660`)와 같다.
+- **러너 재개.** run_id 를 새로 만들지 않는다(`runner.py:1091-1093` 대신 기존 run dir 을 검증해 재사용 — 그
+  태스크의 dir 인가, 저장소의 카드가 answered 인가). 브랜치 준비는 그대로다(외부 리포는 origin/<branch> 를 이어 감
+  `:1042`, 볼트 `:1070`). `stages.json` 의 완료 스테이지는 상속과 같은 모양으로 건너뛰고(`:1235-1238`), 멈췄던
+  스테이지만 재개 argv 로 돈다.
+- **재개 argv.** `claude -p --resume <session_id>` 에 같은 `--mcp-config`·`--permission-prompt-tool`·`--settings`·
+  `--allowed-tools`·`--add-dir` 를 붙인다. defer 였으면 프롬프트 없이 재개한다(V3: hook 이 allow·deny 를 낼
+  때까지 프롬프트 없이). 바닥 거부였으면 한 줄 프롬프트 "승인 카드 <id> 의 답: <decision> — 같은 호출을 다시
+  하라"를 준다. transcript 는 계정별 config dir 에 있으므로(`transcript_path` `stages.py:2334-2345`) 같은 계정으로
+  재개하고, 계정이 바뀌었으면 .jsonl 절대 경로를 넘긴다(V1). 다른 계정으로 이어지는지는 미확인이고, 안 되면
+  3.6 의 "같은 run_id 스테이지 재시작"으로 간다.
+- **usage.** 같은 transcript 에 이어 쓰므로 `transcript_usage`(`stages.py:2348-2403`)가 앞선 턴을 다시 센다.
+  A6 이 재개 전후 차분으로 기록한다.
+
+### 3.3 시간 예산 규칙
+
+- **R-T1 — 인라인 대기 상한** = min(`inline_hold`, 스테이지 남은 예산 − 마무리 여유 10분). 러너가 스테이지 시작
+  시각과 `stage_timeout` 으로 마감 시각을 계산해 브로커에 넘긴다. 남은 예산이 문턱보다 작으면 붙잡지 않고 바로
+  일시정지한다. 스테이지 벽시계는 `communicate(timeout)` 하나다(`stages.py:2965`).
+- **R-T2 — 대기는 `stage_timeout` 을 늘리지 않는다**(시계를 멈추지 않는다). 그래서 세 불변식이 그대로다:
+  `STAGE_TIMEOUTS` + `REAP_MARGIN`(`stages.py:119-132`), `_stale_bound_for`(`orchestrator.py:1873-1890`),
+  `MAX_STAGE_TIMEOUT + REAP_MARGIN < RUNNER_HEARTBEAT_STALE_S`(10800 + 900 < 16200, `worker.py:155-174`).
+- **R-T3 — 대기는 Bash 호출이 아니다.** `BASH_MAX_TIMEOUT_MS`(`stages.py:3135-3141`)의 지배를 받지 않는다. 대신
+  hook `timeout`(기본 600 s, V3)과 승인 서버 `timeout`(V5)이 인라인 상한 + 60 s 이상이어야 하고, 둘 다 주입 JSON 에
+  명시한다. 기본 제안 540 s 는 hook 기본값 600 s 아래다.
+- **R-T4 — 일시정지 중에는** 스테이지 예산을 쓰지 않고 `_IN_FLIGHT` 도 아니다. reaper·하트비트와 무관하다
+  (하트비트는 스테이지마다 다시 찍는다 `runner.py:1240-1244`). 재개 호출은 새 `stage_timeout` 을 받는다. 무한 연장은
+  상한으로 막는다: 스테이지당 일시정지 ≤ 2회, 런당 카드 ≤ 5장, 전역 열린 카드 ≤ 10장(숫자는 A8). 넘으면 새 카드를
+  만들지 않고 거부하며 사유에 "카드 상한"을 적는다.
+- **R-T5 — 일시정지할 때 작업을 보존한다.** 타임아웃 arm 의 순서를 그대로 쓴다: implement 면 WIP rescue →
+  `checkpoint_push`(`runner.py:1360-1378`), report 는 checkpoint 를 건너뛴다(`:1353-1359`). 결과는 `stages.json` 에
+  `suspended.<stage>` 로 남긴다(`record_timeout` 선례).
+- **R-T6 — 카드가 생기면** 러너의 watcher 스레드가 PROGRESS "승인 대기: <category>" 를 보낸다. 대시보드 active 행
+  (`last_note`)에 바로 보이게 하기 위해서다. `updated_ts` 가 갱신돼 reaper 기한이 늘지만 스테이지 자체 타임아웃이
+  그대로라 해가 없다.
+
+### 3.4 만료
+
+- 판정은 순수 함수이고 **만료를 먼저** 본다(`resume.py:122-152` 선례). `expires_at` 이 없거나 깨졌으면 만료다
+  (`:108-119`). 기본 24 h 는 `DEFAULT_EXPIRE_HOURS`(`:51`) 선례이고 숫자는 사람 게이트다. 세션 보존(30일, V3)
+  안이다.
+- 일시정지 중 만료되면 `approval.resolved{decision: expired, by: system}` 를 남기고, 행은 AWAITING_HUMAN 에 둔 채
+  `blocked_on = "approval expired: <category>"` 를 달아 `_notify_review` 의 blocked 문구(`orchestrator.py:1399-1403`)로
+  알린다. **오늘의 파킹과 같은 모양**이다. 복구도 오늘처럼 md 수정 + `cli resume`(`concepts.md:190-193`)이고, 그때는
+  새 run_id 다.
+- 인라인 대기 중 만료되면(짧은 `expire`) 브로커가 deny 를 돌려주고 스테이지는 계속 간다. 그 호출만 거부되는
+  것이라 오늘의 즉시 거부와 같다.
+- 만료 뒤에 온 답은 410 으로 거절한다(§4.1).
+
+### 3.5 이벤트 형식 — 예약 어휘는 그대로, 필드만 더한다
+
+봉투는 `run-event-stream.md` §2.1 과 같다. 합성 예시 — 인라인으로 답한 권한 카드 하나와, 일시정지됐다가 만료된
+질문 카드 하나:
+
+```json
+{"v":1,"run_id":"20260101T000000-demo-task","seq":57,"ts":"2026-01-01T00:12:00.000Z","stage":"verify","kind":"approval.requested","src":"hook","payload":{"approval_id":"<ULID>","kind":"permission","tool":"Bash","summary":"Bash: pnpm --version","options":["allow_once","allow_run","deny"],"expires_at":"2026-01-02T00:12:00.000Z","category":"permission_denied","scope_options":["once","run"],"suggested_rule":"Bash(pnpm:*)","tool_use_id":"toolu_<id>","input_sha256":"<hex>","floor":false,"hold":"inline","session_id":"00000000-0000-4000-8000-000000000000","policy_sha256":"<hex>"}}
+{"v":1,"run_id":"20260101T000000-demo-task","seq":58,"ts":"2026-01-01T00:13:30.000Z","stage":"verify","kind":"approval.resolved","src":"orchestrator","payload":{"approval_id":"<ULID>","decision":"allow","by":"dashboard:web","note":null,"scope":"once","channel":"dashboard","latency_ms":90000,"resumed_via":"inline","answer_sha256":null}}
+{"v":1,"run_id":"20260101T000000-demo-task","seq":71,"ts":"2026-01-01T00:30:00.000Z","stage":"verify","kind":"approval.requested","src":"hook","payload":{"approval_id":"<ULID>","kind":"question","tool":"AskUserQuestion","summary":"설정 키를 A 와 B 중 어느 쪽으로 둘까요","options":["A","B"],"expires_at":"2026-01-02T00:30:00.000Z","category":"direction","scope_options":["once"],"suggested_rule":null,"tool_use_id":"toolu_<id>","input_sha256":"<hex>","floor":false,"hold":"inline","session_id":"00000000-0000-4000-8000-000000000000","policy_sha256":"<hex>"}}
+{"v":1,"run_id":"20260101T000000-demo-task","seq":72,"ts":"2026-01-01T00:39:00.000Z","stage":"verify","kind":"state.transition","src":"orchestrator","payload":{"from":"in_progress","to":"awaiting_human","reason":"approval:<ULID>","via":"NEEDS_INPUT"}}
+{"v":1,"run_id":"20260101T000000-demo-task","seq":73,"ts":"2026-01-02T00:30:00.000Z","stage":"verify","kind":"approval.resolved","src":"orchestrator","payload":{"approval_id":"<ULID>","decision":"expired","by":"system","note":null,"scope":null,"channel":null,"latency_ms":86400000,"resumed_via":null,"answer_sha256":null}}
+```
+
+| kind | 예약 필드(`run-event-stream.md:192-193` — 불변) | 이 노트가 더하는 필드(같은 `v`) |
+|---|---|---|
+| `approval.requested` | `approval_id` · `kind` · `tool` · `summary` · `options[]` · `expires_at` | `category` · `scope_options[]` · `suggested_rule` · `tool_use_id` · `input_sha256` · `floor` · `hold`(`inline`·`suspended`) · `session_id` · `policy_sha256` |
+| `approval.resolved` | `approval_id` · `decision` · `by` · `note` | `scope` · `channel` · `latency_ms` · `resumed_via`(`inline`·`session_resume`·`stage_restart`) · `answer_sha256` |
+
+- `decision` 값은 `allow`·`deny`·`answer`·`expired`·`superseded`. `by` 값은 `dashboard:web`·`dashboard:app`·
+  `channel:<channel-id>`·`cli`·`system` 이고 사람 이름은 들어가지 않는다.
+- 한 approval_id 에 `requested`·`resolved` 는 한 번씩이다. 일시정지는 `requested` 를 다시 쓰지 않고
+  `state.transition{via: NEEDS_INPUT, reason: "approval:<id>"}` 로 남긴다.
+- **src 매핑.** `requested` 는 `hook` — 스테이지 프로세스 트리 안의 가로채기 생산자(PreToolUse hook 또는 승인 MCP
+  서버). `resolved` 는 `orchestrator` — 본부 제어면의 응답 핸들러와 만료 sweep. 새 src 값은 없다. 둘 다 `events.in/`
+  드롭박스로 쓰고 writer 는 러너 하나다(`run-event-stream.md:157-166`).
+- **마스킹.** 형제 §4.1 의 `approval.*` 행(`:443`)과 §4.2 패턴을 따른다. `summary` 는 마스킹 뒤 ≤ 200자이고, 자유
+  답 원문은 이벤트에 넣지 않는다(`answer_sha256` 만 — §5.3).
+- **이벤트는 감사 거울이지 결정의 원천이 아니다.** `events.in/` 은 `--add-dir`(`stages.py:702-704`) 안이라 에이전트가
+  쓸 수 있다. 그래서 러너는 접을 때 `approval.*` 드롭을 승인 저장소와 대조해 맞지 않으면 버리고 로그를 남긴다.
+  결정은 언제나 저장소의 `answer.json` 에서 읽는다.
+
+### 3.6 본부 재시작 생존표
+
+| 상태 \ 사건 | 러너 재시작 | 대시보드 재시작 | 오케스트레이터 재시작 | 호스트 재부팅 |
+|---|---|---|---|---|
+| **인라인 대기 중** | 스테이지 프로세스 트리가 죽는다 — 러너 유닛은 KillMode=control-group 으로 서술돼 있다(`jobs.py:111-116`, 실제 유닛 설정은 미확인). 대기 중이던 권한 프롬프트는 답 없이 끝난다(V2). 카드는 디스크에 남고 재전달 NEEDS_INPUT(`runner.py:2309-2332`)이 AWAITING_HUMAN 으로 만든다. sweep 이 그 런의 열린 카드를 입양하고, 답이 오면 `--resume` + `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`(V2)로 잇는다 | 대기와 무관하다(저장소는 파일). 진행 중이던 POST 는 실패할 수 있고, 재전송은 409 와 함께 기존 결정을 받는다 | 무관(틱은 원래 일회성) | 러너 재시작과 대시보드 재시작을 합친 것과 같다 |
+| **일시정지 중** | 무관 — 도는 프로세스가 없다. 세션은 30일 보존(V3), 카드는 디스크 | 무관 | 무관 | 무관 |
+| **답은 왔지만 sweep 전** | 무관 — `answer.json` 이 있고 `consumed` 가 없으니 다음 sweep 이 한 번 소비한다 | 무관 | 다음 틱이 소비한다 | 무관 |
+
+- 멱등 키는 `approval_id` 다. sweep 은 `resume_sent{corr_id}` 를 남긴 뒤 보내고, 러너는 같은 approval_id 의 재개를
+  두 번째로 받으면 클레임으로 SKIP 한다(재전달 분류 `claims.py:77` 선례).
+- 응답 없는 tool_use 로 끝난 세션을 `--resume` 했을 때의 거동은 V2 의 두 문장(끊긴 턴은 그대로 두고 다음
+  프롬프트가 대화를 이끈다, env 로 끊긴 턴을 잇는다) 이상은 미확인이다. A6 이 캡처 픽스처로 확정한다. 안 되면 같은
+  run_id 로 그 스테이지를 새 세션으로 재시작하고 답을 메타데이터 블록으로 넘긴다(`resumed_via: stage_restart`).
+  "같은 런"은 지키고 세션 문맥만 잃는다.
+
+### 3.7 백엔드 중립
+
+- 처음에는 claude 만 지원한다. Solar 루프(엔진 안 HTTP 도구 루프)는 나중에 브로커 라이브러리를 직접 부를 수 있다.
+  Gemini 는 승인을 끈다 — 오늘과 같다.
+- capability `approval_broker` 는 서술만 하고 `required_capabilities`(`stages.py:239-249`)에 넣지 않는다. 형제가
+  `event_stream` 을 다룬 방식(`run-event-stream.md:293-305`)과 같다. 없는 백엔드는 오늘처럼 즉시 거부한다.
+
+### 3.8 승인 저장소 위치
+
+| 후보 | 에이전트의 Write 가 닿나 | 판정 |
+|---|---|---|
+| run dir `Worker/runs/<run-id>/` | 닿는다 — `--add-dir` 가 `Worker/` 전체다(`stages.py:702-704`) | 기각 |
+| `Worker/_state/` | 닿는다(같은 이유) | 기각 |
+| **XDG `~/.local/share/macp/approvals/`**(0700/0600) | 작업 디렉토리·`--add-dir` 밖이다. 그 밖으로의 Write 가 `-p` 에서 실제로 막히는지는 미확인이고, 프롬프트가 되더라도 그 경로는 "항상 거부"라 카드가 되지 않는다(2.2) | **채택** — SMS 저장소 선례(`sms.py:16-19`, 0700 `:85-88`, 0600 `:119-123`). override 는 `MACP_APPROVALS_DIR` → config `approvals_dir` |
+
+구조는 `<run_id>/<approval_id>/request.json` · `answer.json`(O_EXCL — 첫 답이 이긴다) · `consumed`,
+`<run_id>/grants.json`("이 런 동안" 규칙 — 응답 핸들러만 쓴다), 최상위 `audit.jsonl`(§5.3)이다. `Bash(uv:*)` 같은
+임의 코드는 여전히 닿으므로 위치는 가드레일일 뿐이다(§5.2).
 
 ---
 
