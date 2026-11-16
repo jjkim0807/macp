@@ -18,6 +18,10 @@ KIND_HUMAN = "human"
 KIND_AI_LOCAL = "ai-local"
 KIND_AI_REMOTE = "ai-remote"
 
+# Capability a remote advertises to receive heavy tasks (gradle builds,
+# emulator runs, long jobs) — see Orchestrator._route_decision.
+CAP_HEAVY = "heavy"
+
 
 @dataclass
 class Agent:
@@ -95,6 +99,11 @@ class Registry:
 
     def humans(self) -> list[Agent]:
         return [a for a in self.agents if a.is_human]
+
+    def heavy_remotes(self) -> list[Agent]:
+        """Remote agents advertising the `heavy` capability, in registry order."""
+        return [a for a in self.agents
+                if a.is_remote and CAP_HEAVY in (a.capabilities or [])]
 
 
 def load_registry(path: str | Path | None = None, base: Path | None = None) -> Registry:

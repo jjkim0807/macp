@@ -322,6 +322,76 @@ def _touches_disjoint(a_globs: list[str], b_globs: list[str]) -> bool:
     return not any(_globs_overlap(a, b) for a in a_globs for b in b_globs)
 
 
+# --- heavy-task routing ----------------------------------------------------
+# A heavy task (gradle build, emulator run, long job) goes to an online remote
+# that advertises the `heavy` capability, and comes back to its for_project
+# owner when that remote goes quiet. Both thresholds are read on every call so
+# an env change takes effect on the next tick without a restart.
+REMOTE_ONLINE_ENV = "MACP_REMOTE_ONLINE_S"            # liveness "online" bound
+REMOTE_ACCEPT_TIMEOUT_ENV = "MACP_REMOTE_ACCEPT_TIMEOUT_S"  # DISPATCHED -> ACCEPT bound
+DEFAULT_REMOTE_ONLINE_S = 900.0
+DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
+
+# Ledger `rerouted_from.reason` values — shown in status/trace/api: wire format.
+REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
+REROUTE_AGENT_STALE = "agent-stale"
+REROUTE_REJECTED = "rejected"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive number of seconds from env `name`; `default` when unset,
+    blank, unparseable or not positive."""
+    import os
+    raw = os.environ.get(name, "")
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+def _payload_bool(v) -> bool | None:
+    """True/False for a bool or a true/false-ish string; None otherwise."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0"):
+            return False
+    return None
+
+
+def is_heavy(payload: dict | None, repo_dir: Path | None) -> bool:
+    """Is this task heavy enough to prefer a stronger machine?
+
+    1. `heavy: false` — never (the explicit opt-out beats every signal below).
+    2. `heavy: true` — always.
+    3. `emulator` / `screen_check` (carried as `heavy_signals` by the loader, or
+       under their own names) or a `long_job`.
+    4. A `gradlew` at the resolved repo checkout root (`repo_dir`; None for a
+       vault task or a clone not on disk yet).
+    Pure apart from that one stat. Any error → False, i.e. the existing routing.
+    """
+    try:
+        p = payload or {}
+        flag = _payload_bool(p.get("heavy"))
+        if flag is not None:
+            return flag
+        if p.get("heavy_signals"):
+            return True
+        if _payload_bool(p.get("emulator")) or _payload_bool(p.get("screen_check")):
+            return True
+        if p.get("long_job"):
+            return True
+        if repo_dir is not None and (Path(repo_dir) / "gradlew").exists():
+            return True
+        return False
+    except Exception:  # noqa: BLE001 - fail-closed to the existing routing
+        return False
+
+
 class Orchestrator:
     def __init__(self, mailbox: Mailbox, registry: Registry, ledger: Ledger,
                  notify: human.Notifier = human.kakao_notifier, max_attempts: int = 2,
@@ -484,8 +554,74 @@ class Orchestrator:
         return self._agent_mb[uri]
 
     # -- Router -----------------------------------------------------------
-    def route(self, slug: str) -> Agent | None:
-        return self.reg.for_project(slug)
+    def route(self, slug: str, payload: dict | None = None, *,
+              existing: Assignment | None = None) -> Agent | None:
+        """The agent a task goes to. With no payload this is the plain
+        for_project owner — every slug-only caller (queue view, human-owned
+        check) keeps its exact old answer."""
+        return self._route_decision(slug, payload, existing)[0]
+
+    def _route_decision(self, slug: str, payload: dict | None,
+                        existing: Assignment | None = None,
+                        ) -> tuple[Agent | None, Agent | None]:
+        """(agent, fallback). `fallback` is the for_project owner when the heavy
+        router picked a remote instead of it, else None. Only an AI-local owner
+        is ever bypassed: a human or a project-owned remote keeps its task."""
+        base = self.reg.for_project(slug)
+        if (payload is None or base is None or base.is_human or base.is_remote
+                or not is_heavy(payload, self._heavy_repo_dir(payload))):
+            return base, None
+        pick = self._pick_heavy_remote(existing)
+        return (pick, base) if pick is not None else (base, None)
+
+    @staticmethod
+    def _heavy_repo_dir(payload: dict | None) -> Path | None:
+        """The shared clone root of an external-repo task (where `gradlew` would
+        sit) — the same resolution as _is_gradle_checkout. None for a vault task."""
+        repo = (payload or {}).get("repo")
+        if not repo:
+            return None
+        try:
+            from . import repos
+            return repos.local_path(str(repo))
+        except Exception:  # noqa: BLE001 - unresolvable → not gradle-heavy
+            return None
+
+    @staticmethod
+    def _remote_online_s() -> float:
+        return _env_seconds(REMOTE_ONLINE_ENV, DEFAULT_REMOTE_ONLINE_S)
+
+    @staticmethod
+    def _remote_accept_timeout_s() -> float:
+        return _env_seconds(REMOTE_ACCEPT_TIMEOUT_ENV, DEFAULT_REMOTE_ACCEPT_TIMEOUT_S)
+
+    def _inflight_count(self, agent_id: str) -> int:
+        return sum(1 for a in self.ledger.all()
+                   if a.state in _IN_FLIGHT and a.agent_id == agent_id)
+
+    def _pick_heavy_remote(self, existing: Assignment | None = None,
+                           now: float | None = None) -> Agent | None:
+        """The first heavy-capable remote (registry order) that is usable now.
+
+        This is THE single "is this remote available?" check — online by
+        agent_liveness (MACP_REMOTE_ONLINE_S), below its `concurrency` in flight,
+        and not the agent that last REJECTED this very task. Any future
+        availability rule (e.g. a remote's game-mode switch) belongs here."""
+        remotes = self.reg.heavy_remotes()
+        if not remotes:
+            return None
+        liveness = self.agent_liveness(stale_after_s=self._remote_online_s(), now=now)
+        rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
+        refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
+        for a in remotes:
+            if liveness.get(a.id, {}).get("status") != "online":
+                continue
+            if a.id == refused:
+                continue
+            if self._inflight_count(a.id) >= max(1, int(a.concurrency or 1)):
+                continue
+            return a
+        return None
 
     # -- Dispatcher -------------------------------------------------------
     def dispatch(self, task: Task, now: float | None = None, *,
@@ -524,9 +660,21 @@ class Orchestrator:
             return None
         if g.kind in ("poll", "capacity", "cooldown"):
             return None
-        agent = self.route(task.slug)
+        agent, fallback = self._route_decision(task.slug, task.payload, existing)
         if agent is None:
             return None
+        if fallback is not None:
+            # Heavy → remote: `requires: [heavy]` rides on the ENVELOPE only. In
+            # the ledger payload it would follow a reroute/_retry to the default
+            # agent, which lacks the capability and would REJECT it forever.
+            extra = dict(envelope_extra or {})
+            base_req = extra.get("requires", (task.payload or {}).get("requires")) or []
+            if isinstance(base_req, str):
+                base_req = [base_req]
+            extra["requires"] = sorted({*base_req, "heavy"})
+            envelope_extra = extra
+            print(f"[orchestrator] {task.slug}: heavy → {agent.id} "
+                  f"(fallback {fallback.id})")
         env_payload = ({**(task.payload or {}), **envelope_extra}
                        if envelope_extra else task.payload)
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=task.slug,
@@ -534,6 +682,12 @@ class Orchestrator:
         self._mailbox_for(agent).send(env)   # via the agent's own transport
         a = Assignment(task_id=task.slug, agent_id=agent.id, corr_id=env.corr_id,
                        kind=agent.kind, payload=task.payload)
+        if fallback is not None:
+            a.fallback_agent = fallback.id
+        if existing is not None and getattr(existing, "rerouted_from", None):
+            # Keep the latest reroute on the row: it is what bars a remote that
+            # REJECTED this task from being picked again (_pick_heavy_remote).
+            a.rerouted_from = dict(existing.rerouted_from)
         if existing and existing.state in (FAILED, REJECTED):
             # carry the accumulated count forward; only a real failure escalates it
             # (a capacity limit preserves it but doesn't count against the task).
@@ -1079,6 +1233,13 @@ class Orchestrator:
                 if a is None:
                     print(f"[orchestrator] collect: dropping {msg.type} for "
                           f"{msg.task_id} from {msg.frm} — no assignment on record")
+                elif self._is_late_rerouted(a, msg):
+                    # The heavy remote this task was taken away from is still
+                    # talking about its old run. One line, no state change.
+                    rr = a.rerouted_from or {}
+                    print(f"[orchestrator] collect: ignoring late {msg.type} for "
+                          f"{msg.task_id} from {msg.frm} — rerouted to "
+                          f"{a.agent_id} ({rr.get('reason', '')})")
                 else:
                     print(f"[orchestrator] collect: dropping {msg.type} for "
                           f"{msg.task_id} from {msg.frm} — corr_id mismatch "
@@ -1665,12 +1826,18 @@ class Orchestrator:
         staged pipeline routinely runs longer than stale_timeout_s, so anything
         dispatched behind one would otherwise be failed before it ever started.
         """
-        queued: set[str] = set()
+        return {tid for tid, _corr in self._queued_pairs()}
+
+    def _queued_pairs(self) -> set[tuple[str, str]]:
+        """(task_id, corr_id) of every TASK_ASSIGN still unacked in an agent's
+        inbox. A rerouted task leaves its OLD envelope in the quiet remote's inbox;
+        only the pair tells whether the row's CURRENT dispatch is the one waiting."""
+        queued: set[tuple[str, str]] = set()
         for agent in self.reg.agents:
             try:
                 for env in self._mailbox_for(agent).receive(agent.id):
                     if env.type == m.TASK_ASSIGN and env.task_id:
-                        queued.add(env.task_id)
+                        queued.add((env.task_id, env.corr_id))
             except _MAILBOX_READ_ERRORS as exc:
                 # A write refused by the pytest tripwire (todo_system/conftest.py)
                 # is a PermissionError, but not an unreachable mailbox.
@@ -1714,11 +1881,17 @@ class Orchestrator:
         behind a task that was executing normally.
         """
         now = now if now is not None else dt.datetime.now().timestamp()
-        queued = self._queued_task_ids()
+        pairs = self._queued_pairs()
+        queued = {tid for tid, _corr in pairs}
         reaped: list[Assignment] = []
         for a in self.ledger.all():
-            if a.task_id in queued:
-                continue      # dispatched but not yet picked up
+            if a.task_id in queued and not (
+                    getattr(a, "rerouted_from", None)
+                    and (a.task_id, a.corr_id) not in pairs):
+                # dispatched but not yet picked up. A rerouted row is exempt only
+                # while ITS OWN envelope waits — the quiet remote's stale copy of
+                # the old dispatch must not shield the new one forever.
+                continue
             if a.state in _IN_FLIGHT and not a.kind.startswith("human") \
                     and now - _parse_ts(a.updated_ts) >= self._stale_bound_for(a):
                 a.state = FAILED
@@ -1728,6 +1901,128 @@ class Orchestrator:
                 self.ledger.save(a)
                 reaped.append(a)
         return reaped
+
+    # -- Heavy-remote reroute ----------------------------------------------
+    @staticmethod
+    def _is_late_rerouted(a: Assignment, msg: m.Envelope) -> bool:
+        """Is `msg` a reply from the remote this task was rerouted away from,
+        about the run it was taken off (its old corr_id)?"""
+        rr = getattr(a, "rerouted_from", None) or {}
+        return bool(rr) and rr.get("agent") == msg.frm \
+            and rr.get("corr_id") == msg.corr_id
+
+    def _reroute_reason(self, a: Assignment, liveness: dict, now: float,
+                        accept_timeout: float) -> str | None:
+        if a.state == DISPATCHED:
+            if now - _parse_ts(a.updated_ts) >= accept_timeout:
+                return REROUTE_ACCEPT_TIMEOUT
+            return None
+        if a.state in (ACCEPTED, IN_PROGRESS):
+            if liveness.get(a.agent_id, {}).get("status") != "online":
+                return REROUTE_AGENT_STALE
+            return None
+        if a.state == REJECTED and a.history:
+            last = a.history[-1]
+            if isinstance(last, dict) and last.get("type") == m.REJECT \
+                    and last.get("from") == a.agent_id:
+                return REROUTE_REJECTED
+        return None
+
+    def reroute_remote(self, now: float | None = None) -> list[Assignment]:
+        """Bring heavy tasks back from a remote that went quiet.
+
+        Only rows the heavy router sent away (`fallback_agent` set) are looked
+        at — a project-owned remote task is never moved. Three triggers:
+        no ACCEPT within MACP_REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
+        unacked envelope that exempts the row from reap_stale is exactly the
+        offline-remote case), the remote stopped being online after it took the
+        task (`agent-stale`), or it REJECTED the task (`rejected`). The row is
+        re-dispatched to its fallback agent with a NEW corr_id, the remote gets a
+        CANCEL for the old one, and nothing counts against the task. Fail-open:
+        never raises into the tick. Nothing moves while PAUSED.
+        """
+        moved: list[Assignment] = []
+        try:
+            if self.paused():
+                return moved
+            now = now if now is not None else dt.datetime.now().timestamp()
+            rows = [a for a in self.ledger.all()
+                    if getattr(a, "fallback_agent", "")
+                    and a.agent_id != a.fallback_agent]
+            if not rows:
+                return moved
+            liveness = self.agent_liveness(stale_after_s=self._remote_online_s(),
+                                           now=now)
+            timeout = self._remote_accept_timeout_s()
+            tally = _SkipTally("reroute_remote")
+            for a in rows:
+                try:
+                    reason = self._reroute_reason(a, liveness, now, timeout)
+                    if reason and self._reroute(a, reason):
+                        moved.append(a)
+                except Exception as e:  # noqa: BLE001 - one row never kills the sweep
+                    tally.record(a.task_id, e)
+            tally.flush()
+        except Exception as e:  # noqa: BLE001 - fail-open
+            print(f"[orchestrator] reroute_remote skipped (fail-open): {e}")
+        return moved
+
+    def _reroute(self, a: Assignment, reason: str) -> bool:
+        """Move one row from its heavy remote back to `fallback_agent`. True when
+        the row changed."""
+        old_agent, old_corr = a.agent_id, a.corr_id
+        try:
+            target = self.reg.get(a.fallback_agent)
+        except KeyError:
+            target = self.reg.for_project(a.task_id)
+        if target is None or target.is_remote or target.is_human:
+            print(f"[orchestrator] reroute: {a.task_id} — no usable fallback agent "
+                  f"({a.fallback_agent or '?'}); left on {old_agent}")
+            return False
+        # Tell the remote to drop the old run: an unstarted envelope is skipped,
+        # a running one stops at its next stage boundary without pushing.
+        cancel = m.Envelope(to=old_agent, type=m.CANCEL, task_id=a.task_id,
+                            corr_id=old_corr,
+                            payload={"reason": f"rerouted: {reason}",
+                                     "rerouted_to": target.id})
+        try:
+            try:
+                mb = self._mailbox_for(self.reg.get(old_agent))
+            except KeyError:
+                mb = self.mb
+            mb.send(cancel)
+        except Exception as e:  # noqa: BLE001 - the reroute still proceeds
+            print(f"[orchestrator] reroute: {a.task_id} — CANCEL to {old_agent} "
+                  f"failed: {e}")
+        ts = m.now_iso()
+        a.rerouted_from = {"agent": old_agent, "reason": reason, "ts": ts,
+                           "corr_id": old_corr}
+        a.history.append({"ts": ts, "type": "rerouted", "from": "orchestrator",
+                          "agent": old_agent, "reason": reason})
+        a.fallback_agent = ""
+        a.updated_ts = ts
+        if self._task_md_closed(Task(a.task_id, a.payload)):
+            # Closed meanwhile: cancel only, never re-send closed work.
+            a.state = REJECTED
+            a.last_note = "rerouted: task md closed — not re-dispatched"
+            self.ledger.save(a)
+            print(f"[orchestrator] reroute: {a.task_id} from {old_agent} ({reason}) "
+                  "— task closed, not re-dispatched")
+            return True
+        # The ledger payload never carries `requires: [heavy]` (envelope-only), so
+        # the default agent gets exactly the task's own payload.
+        env = m.Envelope(to=target.id, type=m.TASK_ASSIGN, task_id=a.task_id,
+                         payload=a.payload)
+        self._mailbox_for(target).send(env)
+        a.agent_id = target.id
+        a.kind = target.kind
+        a.corr_id = env.corr_id
+        a.state = DISPATCHED
+        a.last_note = f"rerouted from {old_agent}: {reason}"[:200]
+        self.ledger.save(a)
+        print(f"[orchestrator] reroute: {a.task_id} {old_agent} → {target.id} "
+              f"({reason}); refail unchanged")
+        return True
 
     def reconcile_merged(self) -> list[Assignment]:
         """#5: auto-close tasks whose PR already merged but whose todo stayed open.
@@ -2964,6 +3259,10 @@ class Orchestrator:
 
     def tick(self, tasks: list[Task], now: float | None = None, *,
              unblock_flips: list | None = None) -> dict:
+        # FIRST: a heavy task whose remote went quiet (or refused) moves back to
+        # its default agent on the no-refail path before reap_stale could fail
+        # it, and before a REJECTED row reaches dispatch()'s refail+1 cooldown.
+        rerouted = self.reroute_remote(now)
         reaped = self.reap_stale(now)
         usage_hold = self.usage_hold()
         # stop starting new work; in-flight replies below are still collected
@@ -3026,7 +3325,8 @@ class Orchestrator:
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
         nudged = self.renudge_due(now)
-        return {"reaped": reaped, "dispatched": dispatched, "updated": updated,
+        return {"rerouted": rerouted,
+                "reaped": reaped, "dispatched": dispatched, "updated": updated,
                 "reconciled": reconciled, "closed": closed, "unblocked": unblocked,
                 "unparked": unparked,
                 "resumed": resumed,
@@ -3089,6 +3389,21 @@ class Orchestrator:
         except Exception as e:
             print(f"[orchestrator] min-progress skipped (fail-open → hold): {e}")
             return []
+
+
+def status_line(a: Assignment) -> str:
+    """One `orchestrator status` row. The head (state, task, agent, nudge#) is
+    the historical format; heavy routing only APPENDS — the fallback agent of a
+    task sent to a heavy remote, and the latest reroute away from one."""
+    extra = f" nudge#{a.nudge_index}" if a.state == AWAITING_HUMAN else ""
+    line = f"{a.state:14s} {a.task_id:40s} {a.agent_id}{extra}"
+    if getattr(a, "fallback_agent", ""):
+        line += f" (heavy; fallback {a.fallback_agent})"
+    rr = getattr(a, "rerouted_from", None) or {}
+    if rr:
+        line += (f" ⇐rerouted from {rr.get('agent', '?')} "
+                 f"({rr.get('reason', '')} @ {rr.get('ts', '')})")
+    return line
 
 
 def _usage_hold_suffix(result: dict) -> str:
@@ -3446,8 +3761,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "status":
         for a in orch.ledger.all():
-            extra = f" nudge#{a.nudge_index}" if a.state == AWAITING_HUMAN else ""
-            print(f"{a.state:14s} {a.task_id:40s} {a.agent_id}{extra}")
+            print(status_line(a))
         return 0
 
     if args.cmd == "agents":
@@ -3504,7 +3818,14 @@ def _main(argv: list[str] | None = None) -> int:
               # Appended at the END on purpose: macp_monitor keys off the
               # `candidates=N dispatched=N` prefix and the trailing hold suffixes,
               # and test_orchestrator_cli asserts the existing token run verbatim.
-              f"human_ready={len(result.get('human_ready', []))}{budget}")
+              f"human_ready={len(result.get('human_ready', []))}"
+              # Only when something moved, so an ordinary tick line is unchanged.
+              + (f" rerouted={len(result['rerouted'])}" if result.get("rerouted") else "")
+              + budget)
+        for a in result.get("rerouted") or []:
+            rr = a.rerouted_from or {}
+            print(f"  rerouted {a.task_id} {rr.get('agent', '?')} -> {a.agent_id} "
+                  f"({rr.get('reason', '')})")
         for a in result["dispatched"]:
             print(f"  dispatched {a.task_id} -> {a.agent_id}")
         return 0

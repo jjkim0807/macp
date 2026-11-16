@@ -189,6 +189,13 @@ def _ledger_section(slug: str, ledger) -> list[str]:
         out.append(i18n.t("trace.ledger.long_job"))
     if getattr(a, "checkout_busy", False):
         out.append(i18n.t("trace.ledger.checkout_busy"))
+    if getattr(a, "fallback_agent", ""):
+        out.append(i18n.t("trace.ledger.heavy_routed", agent=a.agent_id,
+                          fallback=a.fallback_agent))
+    rr = getattr(a, "rerouted_from", None) or {}
+    if rr:
+        out.append(i18n.t("trace.ledger.rerouted_from", agent=rr.get("agent", "?"),
+                          reason=rr.get("reason", ""), ts=rr.get("ts", "")))
     if a.last_note:
         out.append(f"- last_note: {a.last_note}")
     rd = a.payload.get("run_dir")

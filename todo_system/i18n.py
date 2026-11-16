@@ -178,6 +178,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "— 원장 수기 편집 불필요"),
         "trace.ledger.long_job": "- long_job 실행 중",
         "trace.ledger.checkout_busy": "- 체크아웃 대기 (다른 런이 같은 체크아웃 사용 중 — 끝나면 자동 재시도)",
+        "trace.ledger.heavy_routed": (
+            "- 무거운 태스크로 원격 `{agent}`에 보냄 — 응답이 없거나 오프라인이면 "
+            "`{fallback}`로 되돌림"),
+        "trace.ledger.rerouted_from": (
+            "- 되돌림: `{agent}`에서 옮겨 옴 (사유 {reason}, {ts}) — 실패가 아니라 "
+            "refail_count는 그대로"),
         "trace.ledger.run_dir": "- 원장이 가리키는 run_dir: `{run_dir}`",
         "trace.branch.heading": "## 브랜치 · PR",
         "trace.branch.origin_unknown": "- origin에 존재: unknown (git 조회 실패 — 실패가 아님)",
@@ -349,6 +355,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "trace.ledger.checkout_busy": (
             "- waiting for the checkout (another run is using the same checkout "
             "— retries automatically when it finishes)"),
+        "trace.ledger.heavy_routed": (
+            "- sent to heavy remote `{agent}` — comes back to `{fallback}` if it "
+            "goes silent or offline"),
+        "trace.ledger.rerouted_from": (
+            "- rerouted: moved here from `{agent}` (reason {reason}, {ts}) — not a "
+            "failure, refail_count unchanged"),
         "trace.ledger.run_dir": "- run_dir the ledger points at: `{run_dir}`",
         "trace.branch.heading": "## Branch · PR",
         "trace.branch.origin_unknown": "- exists on origin: unknown (git lookup failed — not a failure)",

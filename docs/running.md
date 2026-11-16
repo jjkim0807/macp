@@ -236,6 +236,71 @@ and the remote host sets `MACP_STATE_BACKEND=remote` with `MACP_STATE_REMOTE_URL
 degrades when HQ is down, and guarantees single execution. Actually exposing the HQ port on
 the tailnet or installing the server as a unit is a separate step (not done by the engine).
 
+### Heavy tasks on a stronger machine
+
+A remote runner can offer to take **heavy** tasks — Gradle builds, emulator runs, long
+jobs — off the dispatching host. Give it the `heavy` capability in the registry:
+
+```yaml
+agents:
+  - id: worker-default
+    kind: ai-local
+    projects: ["*"]
+  - id: desktop-runner
+    kind: ai-remote
+    capabilities: [heavy]
+    concurrency: 1
+```
+
+A task is heavy when, in this order:
+
+1. `heavy: false` in its frontmatter — **never** heavy (the opt-out beats every rule below);
+2. `heavy: true` — always heavy;
+3. `emulator: true`, `screen_check: true` or a `long_job:` is set;
+4. its external repo's shared clone has a `gradlew` at the root.
+
+A vault task (no `repo`) is heavy only by rules 1–3. Only a task whose `for_project` owner
+is an **AI-local** agent is moved; a human-owned task, or one a remote owns by project
+(say a Windows-only project), keeps its owner.
+
+The dispatcher sends a heavy task to the first `heavy` remote, in registry order, that is
+**online** — it has sent any message within `MACP_REMOTE_ONLINE_S` seconds (default 900;
+`orchestrator agents` shows the same liveness) — and has fewer runs in flight than its
+`concurrency`. The envelope carries `requires: [heavy]`; the ledger payload does not, so a
+retry on the default agent is never refused for the capability. With no such remote the
+task goes to its owner exactly as before. `orchestrator status` marks a task sent this way
+`(heavy; fallback worker-default)`.
+
+**Coming back.** At the start of every tick the dispatcher moves a heavy task back to its
+owner when its remote:
+
+| reason | when |
+| --- | --- |
+| `accept-timeout` | no ACCEPT within `MACP_REMOTE_ACCEPT_TIMEOUT_S` seconds (default 600) — the remote is off |
+| `agent-stale` | it ACCEPTed, but is no longer online and sent no RESULT/FAIL |
+| `rejected` | it REJECTed the task; that remote is not picked for this task again |
+
+The ledger row keeps its `attempts` and `refail_count` (it was not the task's fault), gets
+a new `corr_id`, and records `rerouted_from: {agent, reason, ts, corr_id}` — shown by
+`status`, `trace <slug>` and `/api/status` (`recent[].rerouted_from`). The remote gets a
+`CANCEL` for the old run. Replies the remote still sends about that run are logged as
+`ignoring late …` and change nothing. A task moved for `accept-timeout` or `agent-stale`
+can go to the remote again on a later dispatch, once it is online.
+
+**What CANCEL does on the remote.** A queued assignment with a CANCEL is skipped without a
+reply. A run in progress stops at its next stage boundary: no checkpoint push, no report
+stage (so no PR and no merge), no delegate publish, no reply. A report stage that was
+already running when the CANCEL arrived cannot be stopped, so its PR may still open.
+
+**Busy remotes stay online.** A remote runner sends `HEARTBEAT {status: busy}` every
+`RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) while it is running something, because a
+single stage can run for an hour without a progress message. Local runners do not.
+
+With the git mailbox, messages and liveness arrive at the vault sync cadence (a few
+minutes). The 600 s / 900 s defaults leave room for that; do not set either below about
+twice your sync interval. `max_parallel_gradle_builds` (off by default) still counts
+heavy runs that went to a remote.
+
 ## A healthy system, at a glance
 
 ```bash

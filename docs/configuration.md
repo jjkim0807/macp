@@ -60,10 +60,33 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `MACP_BROWSER_MCP_SERVER` | macp-browser MCP server script for the browser stages (key `browser_mcp_server`; default unset = no MCP wiring; `MACP_BROWSER_NODE` picks the node binary, default `node`). See [Browser MCP server](#browser-mcp-server) |
 | `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
 | `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
+| `MACP_REMOTE_ONLINE_S` | heavy routing: a `heavy` remote counts as online if it sent any message within this many seconds (default 900). See [Heavy tasks](#heavy-tasks) |
+| `MACP_REMOTE_ACCEPT_TIMEOUT_S` | heavy routing: a task sent to a remote comes back to its owner when no ACCEPT arrives within this many seconds (default 600) |
+| `RUNNER_BUSY_HEARTBEAT_S` | remote runners only: seconds between `HEARTBEAT {status: busy}` while a run is going (default 300) |
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |
 | `USAGE_GUARD_DISABLE` | `1` turns usage pacing off |
 | `USAGE_GUARD_*` | pacing thresholds (below) |
 | `ANTHROPIC_ADMIN_KEY` | Anthropic Admin API key for the usage/cost CLI |
+
+The three heavy-routing variables are read on every tick, so a change takes effect
+without a restart. Blank, non-numeric or non-positive values fall back to the default.
+
+### Heavy tasks
+
+A remote runner with `capabilities: [heavy]` in the registry receives heavy tasks while it
+is online; when it goes quiet they come back to their owner. Task frontmatter decides what
+is heavy:
+
+| field | effect |
+| --- | --- |
+| `heavy: false` | never heavy — beats every other signal |
+| `heavy: true` | always heavy |
+| `emulator: true`, `screen_check: true`, `long_job: …` | heavy |
+| (none of the above) | heavy when the task's repo clone has a `gradlew` at its root |
+
+The rules, the reroute reasons (`accept-timeout`, `agent-stale`, `rejected`) and what a
+remote does on `CANCEL` are in [Running 24/7 → Heavy tasks on a stronger
+machine](running.md#heavy-tasks-on-a-stronger-machine).
 
 ## Switching to the external state backend
 
