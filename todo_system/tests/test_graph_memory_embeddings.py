@@ -13,8 +13,9 @@ Covers the second additive leaf of the graph-memory v2 design
   removed; ``embed --dry-run`` reports the plan with zero side effects. (Phase 3.)
 * **sqlite-vec vec0** — the optional extension loads lazily, builds the ``vec0``
   virtual table, inserts/updates/deletes vectors by rowid, and a KNN query
-  returns the nearest source; absent, embed skips with a clear message and the
-  rest of graph_memory keeps working. (Phase 4.)
+  returns the nearest source; absent, embed falls back to the pure-Python backend
+  (``test_graph_memory_vec_fallback.py``) and the rest of graph_memory keeps
+  working. (Phase 4.)
 
 Isolation: the pure-function cases (embedder / filter / corpus) drive the
 functions directly against a ``tmp_path`` or ``isolated_vault`` with explicit
@@ -325,11 +326,15 @@ def test_cli_embed_dry_run_prints_plan_and_exits_zero(tmp_path, capsys):
     assert "vec_sources" not in names
 
 
-def test_embed_skips_gracefully_when_sqlite_vec_absent(isolated_vault, monkeypatch, capsys):
-    """Optional-dep contract: with sqlite-vec unavailable, a non-dry-run embed
-    prints a clear skip message and returns 0 effect — and the rest of
-    graph_memory (scan / get_related / render_index) keeps working untouched."""
+def test_embed_falls_back_when_sqlite_vec_absent_and_rest_keeps_working(
+    isolated_vault, monkeypatch, capsys
+):
+    """Optional-dep contract (#147): with sqlite-vec unavailable, a non-dry-run
+    embed falls back to the pure-Python vector table instead of skipping — it never
+    builds the sqlite-vec tables — and the rest of graph_memory (scan / get_related
+    / render_index) keeps working untouched."""
     isolated_vault.write("Notes/a.md", "[[x]] alpha fact\n")
+    monkeypatch.setattr(gm, "_VEC_FALLBACK_NOTICED", False, raising=False)
     con = isolated_vault.connect()
     try:
         def _raise(_con):
@@ -338,12 +343,13 @@ def test_embed_skips_gracefully_when_sqlite_vec_absent(isolated_vault, monkeypat
         monkeypatch.setattr(gm, "_load_sqlite_vec", _raise)
 
         result = gm.embed_vault(con, vault_root=isolated_vault.root, dry_run=False)
-        assert result.skipped_reason is not None
-        assert result.embedded == 0
-        assert "skipping embed" in capsys.readouterr().out
-        # the absent path returned before building anything
+        assert result.skipped_reason is None
+        assert result.embedded == 1
+        assert "skipping embed" not in capsys.readouterr().out
+        # the fallback never builds the sqlite-vec tables — only its own
         assert not gm._table_exists(con, "vec_embeddings")
         assert not gm._table_exists(con, "vec_sources")
+        assert gm._table_exists(con, "vec_embeddings_py")
 
         # rest of graph_memory still works on the same connection
         gm.scan_vault_and_index(vault_root=isolated_vault.root, con=con)
