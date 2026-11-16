@@ -308,8 +308,8 @@ class AuthWatchTest(unittest.TestCase):
         A.check_accounts(watched, problems, notes)
         self.assertIsNone(ACC.unavailable_entry(self._acct("school")))      # not marked
         self.assertEqual(ACC.unavailable_reason(self._acct("dev")), "auth")  # marked
-        self.assertTrue(any("[dev]" in p for p in problems))    # both dirs visited
-        self.assertTrue(any("[school]" in n for n in notes))
+        self.assertTrue(any("/dev] " in p for p in problems))    # both dirs visited
+        self.assertTrue(any("/school] " in n for n in notes))
 
     def test_expired_refresh_token_marks_account(self):
         self._profile()
@@ -326,7 +326,7 @@ class AuthWatchTest(unittest.TestCase):
         problems = []
         A.check_accounts(A._watched_accounts(), problems, [])
         self.assertIsNone(ACC.unavailable_entry(self._acct("dev")))   # still valid → no mark
-        self.assertTrue(any("[dev]" in p and "expires in" in p for p in problems))
+        self.assertTrue(any("/dev] " in p and "expires in" in p for p in problems))
 
     def test_no_profile_falls_back_to_single_legacy_and_never_marks(self):
         watched = A._watched_accounts()               # no profile written

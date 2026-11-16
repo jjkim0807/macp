@@ -49,6 +49,7 @@ import json
 import pathlib
 import os
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -169,9 +170,21 @@ def _acc():
     return ACC
 
 
+def _host_label() -> str:
+    """Short name of the host this watch runs on: ``MACP_HOST_LABEL`` if set,
+    else the hostname's first label, else ``host``. Evaluated per call."""
+    env = (os.environ.get("MACP_HOST_LABEL") or "").strip()
+    if env:
+        return env
+    try:
+        return socket.gethostname().split(".")[0].strip() or "host"
+    except OSError:
+        return "host"
+
+
 def _acct_label(name) -> str:
-    """Prefix for every per-account message so an alert names the account."""
-    return f"[{name}] " if name else "[legacy] "
+    """Prefix for every per-account message so an alert names host and account."""
+    return f"[{_host_label()}/{name or 'legacy'}] "
 
 
 def _credentials_file(config_dir) -> Path:
@@ -250,6 +263,7 @@ def check_credential(name, config_dir, problems: list[str], notes: list[str]) ->
     token (WARN_DAYS) is a warning but not a mark: it is still valid, matching the
     usage guard's rule (a refreshable access token is never an auth failure)."""
     label = _acct_label(name)
+    key = ops_alerts.account_key(name, _host_label())
     creds = read_credentials(config_dir)
     if creds is None:
         problems.append(
@@ -284,7 +298,7 @@ def check_credential(name, config_dir, problems: list[str], notes: list[str]) ->
             )
             logged_out = True
             ops_alerts.open_alert(
-                ops_alerts.account_key(name), "Claude 리프레시 토큰 만료",
+                key, label + "Claude 리프레시 토큰 만료",
                 ["터미널에서 claude 실행 후 /login", f"만료 {when:%Y-%m-%d %H:%MZ}"],
                 level="critical")
         elif days <= WARN_DAYS:
@@ -293,13 +307,13 @@ def check_credential(name, config_dir, problems: list[str], notes: list[str]) ->
                 "re-login before it does"
             )
             ops_alerts.open_alert(
-                ops_alerts.account_key(name), "Claude 리프레시 토큰 만료 임박",
+                key, label + "Claude 리프레시 토큰 만료 임박",
                 ["터미널에서 claude 실행 후 /login", f"만료 {when:%Y-%m-%d %H:%MZ}"],
                 level="warn")
         else:
             notes.append(label + f"refresh token good for {days:.0f}d (until {when:%Y-%m-%d})")
             # healthy runway → close any open auth task for this account (no-op if none)
-            ops_alerts.resolve_alert(ops_alerts.account_key(name), "토큰 갱신 확인")
+            ops_alerts.resolve_alert(key, label + "토큰 갱신 확인")
     else:
         notes.append(label + "refresh token carries no expiry field")
 
@@ -836,9 +850,12 @@ def main() -> int:
     if problems:
         summary = "; ".join(problems)
         log(f"PROBLEM {summary}")
+        first = problems[0]
+        if not first.startswith("["):      # unlabelled shared-resource problem
+            first = f"[{_host_label()}] {first}"
         notify(
             "Claude Code 인증 이상",
-            problems[0] + " — 터미널에서 claude 실행 후 /login",
+            first + " — 터미널에서 claude 실행 후 /login",
         )
         return 1
 

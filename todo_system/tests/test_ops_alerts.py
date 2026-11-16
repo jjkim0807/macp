@@ -46,6 +46,25 @@ def test_account_key_is_stable_and_handles_missing_name():
     assert oa.account_key("") == "claude-auth-legacy"
 
 
+def test_account_key_with_host_is_per_host_and_slugged():
+    assert oa.account_key("acct", host="hostA") == "claude-auth-hosta-acct"
+    assert oa.account_key("acct", host="Host.Local") == "claude-auth-host-local-acct"
+    assert oa.account_key(None, host="hostA") == "claude-auth-hosta-legacy"
+    assert oa.account_key("acct", host=None) == "claude-auth-acct"
+
+
+def test_resolve_on_another_host_does_not_close_this_hosts_alert(vault, monkeypatch):
+    _fixed_day(monkeypatch, "2049-01-10")
+    a = oa.account_key("acct", host="hostA")
+    b = oa.account_key("acct", host="hostB")
+    oa.open_alert(a, "t", ["s"], level="critical")
+    path = vault / "Todo" / "items" / "ops-claude-auth-hosta-acct.md"
+    oa.resolve_alert(b, "회복")
+    assert _fm(path)["status"] == "open"
+    oa.resolve_alert(a, "회복")
+    assert _fm(path)["status"] == "done"
+
+
 # -- open: creation / exact frontmatter --------------------------------------
 
 def test_open_creates_task_with_the_documented_frontmatter(vault, monkeypatch):

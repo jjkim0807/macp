@@ -70,11 +70,17 @@ def _slug(key: str) -> str:
     return s or "legacy"
 
 
-def account_key(name: object) -> str:
+def account_key(name: object, host: object = None) -> str:
     """The ops key for a Claude account's auth alert: ``claude-auth-<slug>``
-    (``None`` / empty → ``claude-auth-legacy``). Keeps the per-account key building
-    in one place so callers never hand-slug a real account name."""
-    return f"claude-auth-{_slug(name if name else 'legacy')}"
+    (``None`` / empty → ``claude-auth-legacy``). With ``host`` the key is
+    per-host, ``claude-auth-<host-slug>-<slug>``, so one host's healthy check
+    never closes another host's open alert. (Host and account slugs are joined by
+    a hyphen, so ``a-b``+``c`` and ``a``+``b-c`` collide — ignorable in practice.)
+    Keeps the key building in one place so callers never hand-slug a real name."""
+    acct = _slug(name if name else "legacy")
+    if host:
+        return f"claude-auth-{_slug(host)}-{acct}"
+    return f"claude-auth-{acct}"
 
 
 def _items_dir() -> Path:
