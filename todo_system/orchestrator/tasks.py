@@ -37,6 +37,22 @@ DISPATCHABLE_MODES = ("auto", "delegate", "quick", "discover")  # 5-stage / sing
 CLOSE_TRACE = "closed by orchestrator"
 
 
+def _fm_bool(v) -> bool | None:
+    """A frontmatter boolean: True/False for a bool or a true/yes/1 · false/no/0
+    string, None for absent or anything else (a placeholder like `-`)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0"):
+            return False
+    return None
+
+
 def _open_leaf_rows(db_path: str | Path) -> tuple[list, bool, bool]:
     """(rows, has_auto_merge, has_not_before) — every open, non-parent task row,
     read-only. Shared by load_dispatchable and the queue-view loaders."""
@@ -172,6 +188,19 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         long_job = repos.task_long_job_from_fm(fm)
         if long_job:            # gated on a detached job; see orchestrator/jobs.py
             payload["long_job"] = long_job
+        # Heavy-task routing inputs (orchestrator.is_heavy). Only when present,
+        # so a task without them keeps a byte-identical payload. `heavy` carries
+        # both True and False (False is the explicit opt-out that beats every
+        # other signal). emulator/screen_check travel as `heavy_signals`, NOT
+        # under their own names: screen_check.requested() already reads
+        # payload["screen_check"] and putting it there would change what the
+        # runner's screen check does — routing must not.
+        heavy = _fm_bool(fm.get("heavy"))
+        if heavy is not None:
+            payload["heavy"] = heavy
+        signals = [k for k in ("emulator", "screen_check") if _fm_bool(fm.get(k))]
+        if signals:
+            payload["heavy_signals"] = signals
         if repos.task_bypass_guard_from_fm(fm):
             payload["bypass_guard"] = True   # run despite a cost hold; see tick()
         tools = repos.task_allowed_tools_from_fm(fm)

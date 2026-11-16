@@ -189,6 +189,21 @@ class Assignment:
                                          # not touch it. Empty = no evidence (a row
                                          # from an older build) -> the old
                                          # unconditional re-close.
+    fallback_agent: str = ""              # set ONLY when the heavy router sent this
+                                         # task to a heavy-capable remote instead of
+                                         # its for_project owner: the owner's id, so
+                                         # the reroute sweep knows where to bring it
+                                         # back. Empty = the ordinary owner routing
+                                         # (never rerouted — a project-owned remote
+                                         # task must stay on its remote). Stamped by
+                                         # the orchestrator; apply_reply must not
+                                         # touch it.
+    rerouted_from: dict = field(default_factory=dict)
+                                         # the latest reroute away from a heavy
+                                         # remote: {"agent", "reason", "ts",
+                                         # "corr_id"}. Late replies from that agent
+                                         # on that corr_id are logged and ignored.
+                                         # Not a failure — refail_count is untouched.
     history: list[dict] = field(default_factory=list)
     payload: dict = field(default_factory=dict)
 

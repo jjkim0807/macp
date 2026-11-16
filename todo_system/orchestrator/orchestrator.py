@@ -322,6 +322,76 @@ def _touches_disjoint(a_globs: list[str], b_globs: list[str]) -> bool:
     return not any(_globs_overlap(a, b) for a in a_globs for b in b_globs)
 
 
+# --- heavy-task routing ----------------------------------------------------
+# A heavy task (gradle build, emulator run, long job) goes to an online remote
+# that advertises the `heavy` capability, and comes back to its for_project
+# owner when that remote goes quiet. Both thresholds are read on every call so
+# an env change takes effect on the next tick without a restart.
+REMOTE_ONLINE_ENV = "MACP_REMOTE_ONLINE_S"            # liveness "online" bound
+REMOTE_ACCEPT_TIMEOUT_ENV = "MACP_REMOTE_ACCEPT_TIMEOUT_S"  # DISPATCHED -> ACCEPT bound
+DEFAULT_REMOTE_ONLINE_S = 900.0
+DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
+
+# Ledger `rerouted_from.reason` values — shown in status/trace/api: wire format.
+REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
+REROUTE_AGENT_STALE = "agent-stale"
+REROUTE_REJECTED = "rejected"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive number of seconds from env `name`; `default` when unset,
+    blank, unparseable or not positive."""
+    import os
+    raw = os.environ.get(name, "")
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+def _payload_bool(v) -> bool | None:
+    """True/False for a bool or a true/false-ish string; None otherwise."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0"):
+            return False
+    return None
+
+
+def is_heavy(payload: dict | None, repo_dir: Path | None) -> bool:
+    """Is this task heavy enough to prefer a stronger machine?
+
+    1. `heavy: false` — never (the explicit opt-out beats every signal below).
+    2. `heavy: true` — always.
+    3. `emulator` / `screen_check` (carried as `heavy_signals` by the loader, or
+       under their own names) or a `long_job`.
+    4. A `gradlew` at the resolved repo checkout root (`repo_dir`; None for a
+       vault task or a clone not on disk yet).
+    Pure apart from that one stat. Any error → False, i.e. the existing routing.
+    """
+    try:
+        p = payload or {}
+        flag = _payload_bool(p.get("heavy"))
+        if flag is not None:
+            return flag
+        if p.get("heavy_signals"):
+            return True
+        if _payload_bool(p.get("emulator")) or _payload_bool(p.get("screen_check")):
+            return True
+        if p.get("long_job"):
+            return True
+        if repo_dir is not None and (Path(repo_dir) / "gradlew").exists():
+            return True
+        return False
+    except Exception:  # noqa: BLE001 - fail-closed to the existing routing
+        return False
+
+
 class Orchestrator:
     def __init__(self, mailbox: Mailbox, registry: Registry, ledger: Ledger,
                  notify: human.Notifier = human.kakao_notifier, max_attempts: int = 2,
@@ -484,8 +554,74 @@ class Orchestrator:
         return self._agent_mb[uri]
 
     # -- Router -----------------------------------------------------------
-    def route(self, slug: str) -> Agent | None:
-        return self.reg.for_project(slug)
+    def route(self, slug: str, payload: dict | None = None, *,
+              existing: Assignment | None = None) -> Agent | None:
+        """The agent a task goes to. With no payload this is the plain
+        for_project owner — every slug-only caller (queue view, human-owned
+        check) keeps its exact old answer."""
+        return self._route_decision(slug, payload, existing)[0]
+
+    def _route_decision(self, slug: str, payload: dict | None,
+                        existing: Assignment | None = None,
+                        ) -> tuple[Agent | None, Agent | None]:
+        """(agent, fallback). `fallback` is the for_project owner when the heavy
+        router picked a remote instead of it, else None. Only an AI-local owner
+        is ever bypassed: a human or a project-owned remote keeps its task."""
+        base = self.reg.for_project(slug)
+        if (payload is None or base is None or base.is_human or base.is_remote
+                or not is_heavy(payload, self._heavy_repo_dir(payload))):
+            return base, None
+        pick = self._pick_heavy_remote(existing)
+        return (pick, base) if pick is not None else (base, None)
+
+    @staticmethod
+    def _heavy_repo_dir(payload: dict | None) -> Path | None:
+        """The shared clone root of an external-repo task (where `gradlew` would
+        sit) — the same resolution as _is_gradle_checkout. None for a vault task."""
+        repo = (payload or {}).get("repo")
+        if not repo:
+            return None
+        try:
+            from . import repos
+            return repos.local_path(str(repo))
+        except Exception:  # noqa: BLE001 - unresolvable → not gradle-heavy
+            return None
+
+    @staticmethod
+    def _remote_online_s() -> float:
+        return _env_seconds(REMOTE_ONLINE_ENV, DEFAULT_REMOTE_ONLINE_S)
+
+    @staticmethod
+    def _remote_accept_timeout_s() -> float:
+        return _env_seconds(REMOTE_ACCEPT_TIMEOUT_ENV, DEFAULT_REMOTE_ACCEPT_TIMEOUT_S)
+
+    def _inflight_count(self, agent_id: str) -> int:
+        return sum(1 for a in self.ledger.all()
+                   if a.state in _IN_FLIGHT and a.agent_id == agent_id)
+
+    def _pick_heavy_remote(self, existing: Assignment | None = None,
+                           now: float | None = None) -> Agent | None:
+        """The first heavy-capable remote (registry order) that is usable now.
+
+        This is THE single "is this remote available?" check — online by
+        agent_liveness (MACP_REMOTE_ONLINE_S), below its `concurrency` in flight,
+        and not the agent that last REJECTED this very task. Any future
+        availability rule (e.g. a remote's game-mode switch) belongs here."""
+        remotes = self.reg.heavy_remotes()
+        if not remotes:
+            return None
+        liveness = self.agent_liveness(stale_after_s=self._remote_online_s(), now=now)
+        rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
+        refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
+        for a in remotes:
+            if liveness.get(a.id, {}).get("status") != "online":
+                continue
+            if a.id == refused:
+                continue
+            if self._inflight_count(a.id) >= max(1, int(a.concurrency or 1)):
+                continue
+            return a
+        return None
 
     # -- Dispatcher -------------------------------------------------------
     def dispatch(self, task: Task, now: float | None = None, *,
@@ -524,9 +660,21 @@ class Orchestrator:
             return None
         if g.kind in ("poll", "capacity", "cooldown"):
             return None
-        agent = self.route(task.slug)
+        agent, fallback = self._route_decision(task.slug, task.payload, existing)
         if agent is None:
             return None
+        if fallback is not None:
+            # Heavy → remote: `requires: [heavy]` rides on the ENVELOPE only. In
+            # the ledger payload it would follow a reroute/_retry to the default
+            # agent, which lacks the capability and would REJECT it forever.
+            extra = dict(envelope_extra or {})
+            base_req = extra.get("requires", (task.payload or {}).get("requires")) or []
+            if isinstance(base_req, str):
+                base_req = [base_req]
+            extra["requires"] = sorted({*base_req, "heavy"})
+            envelope_extra = extra
+            print(f"[orchestrator] {task.slug}: heavy → {agent.id} "
+                  f"(fallback {fallback.id})")
         env_payload = ({**(task.payload or {}), **envelope_extra}
                        if envelope_extra else task.payload)
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=task.slug,
@@ -534,6 +682,12 @@ class Orchestrator:
         self._mailbox_for(agent).send(env)   # via the agent's own transport
         a = Assignment(task_id=task.slug, agent_id=agent.id, corr_id=env.corr_id,
                        kind=agent.kind, payload=task.payload)
+        if fallback is not None:
+            a.fallback_agent = fallback.id
+        if existing is not None and getattr(existing, "rerouted_from", None):
+            # Keep the latest reroute on the row: it is what bars a remote that
+            # REJECTED this task from being picked again (_pick_heavy_remote).
+            a.rerouted_from = dict(existing.rerouted_from)
         if existing and existing.state in (FAILED, REJECTED):
             # carry the accumulated count forward; only a real failure escalates it
             # (a capacity limit preserves it but doesn't count against the task).
