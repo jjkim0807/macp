@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import heapq
 import importlib
 import math
 import os
 import re
 import sqlite3
 import sys
+from array import array
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -1097,11 +1099,17 @@ def init_vec_sources(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+# The pure-Python fallback's self-contained table (see "pure-Python vector
+# fallback" below). Declared here because ``plan_embedding`` diffs against it too.
+PY_VEC_TABLE = "vec_embeddings_py"
+
+
 def plan_embedding(
     con: sqlite3.Connection,
     corpus: Iterable[CorpusDoc],
     *,
     rebuild: bool = False,
+    table: str = "vec_sources",
 ) -> tuple[list[PlanItem], list[str], list[str]]:
     """Diff the current corpus against ``vec_sources`` — **read-only, no writes**.
 
@@ -1115,10 +1123,17 @@ def plan_embedding(
 
     A missing ``vec_sources`` table reads as "nothing embedded yet" → first run
     is a full batch. Never writes, so the dry-run path is side-effect-free.
+
+    ``table`` selects the content-hash cache to diff against: ``vec_sources`` (the
+    sqlite-vec path, default) or :data:`PY_VEC_TABLE` (the pure-Python fallback,
+    which keeps its own independent cache). Only those two names are accepted —
+    the name is interpolated into the SQL.
     """
+    if table not in ("vec_sources", PY_VEC_TABLE):
+        raise ValueError(f"plan_embedding: unknown vector table {table!r}")
     existing: dict[str, str] = {}
-    if _table_exists(con, "vec_sources"):
-        for row in con.execute("SELECT source_file, content_hash FROM vec_sources"):
+    if _table_exists(con, table):
+        for row in con.execute(f"SELECT source_file, content_hash FROM {table}"):
             existing[row["source_file"]] = row["content_hash"]
 
     to_embed: list[PlanItem] = []
@@ -1145,8 +1160,9 @@ def plan_embedding(
 class EmbeddingsUnavailable(RuntimeError):
     """The sqlite-vec extension could not be loaded (not installed, or this
     Python/SQLite was built without loadable-extension support). Callers turn
-    this into a clear "skipping embed" message and keep the rest of
-    graph_memory working — it is never fatal."""
+    this into the pure-Python vector fallback (:data:`PY_VEC_TABLE`, one stderr
+    notice per process) and keep the rest of graph_memory working — it is never
+    fatal."""
 
 
 class VecDimMismatch(RuntimeError):
@@ -1170,7 +1186,8 @@ def _load_sqlite_vec(con: sqlite3.Connection):
     stdlib-only contract (CLAUDE.md §9, ``test_session_log`` AST gate), and a
     static ``import sqlite_vec`` anywhere in the file — even guarded — would
     break it. The dependency stays genuinely optional: ``ImportError`` here is
-    turned into a graceful skip, so a dependency-free clone never crashes.
+    turned into the pure-Python vector fallback, so a dependency-free clone never
+    crashes.
     Raises :class:`EmbeddingsUnavailable` for both "not installed" and "this
     python has no loadable-extension support". Returns the ``sqlite_vec`` module
     (for ``serialize_float32``).
@@ -1240,6 +1257,189 @@ def init_vec0(con: sqlite3.Connection, dim: int, *, rebuild: bool = False) -> No
     con.commit()
 
 
+# --- pure-Python vector fallback (no sqlite-vec; #147) -----------------------
+#
+# Where the sqlite-vec wheel does not exist (e.g. Windows ARM64 on a brand-new
+# CPython) or SQLite cannot load extensions, the semantic layer used to be skipped
+# silently. Instead, vectors go into one plain, self-contained table — float32
+# BLOBs packed with ``array('f')`` — and a query scans every row. Stdlib only.
+#
+# The fallback never reads, writes or drops ``vec_sources`` / ``vec_embeddings``:
+# touching the vec0 table without the module raises ``no such module: vec0``, and
+# sharing ``vec_sources`` would make a later sqlite-vec install see every doc as
+# "unchanged" and leave vec0 empty. The two backends keep independent
+# content-hash caches, so switching either way re-embeds once, correctly.
+
+_VEC_FALLBACK_NOTICED = False
+
+
+def _announce_vec_fallback(reason: object) -> None:
+    """Say once per process that the pure-Python fallback is in use. On stderr:
+    callers that use stdout as a data channel (an MCP server over stdio,
+    ``x=$(tool …)``) must not see it (#145)."""
+    global _VEC_FALLBACK_NOTICED
+    if _VEC_FALLBACK_NOTICED:
+        return
+    _VEC_FALLBACK_NOTICED = True
+    print(
+        f"sqlite-vec unavailable ({reason}) — using the pure-Python vector fallback "
+        f"({PY_VEC_TABLE}: exact scan, slower on large vaults)",
+        file=sys.stderr,
+    )
+
+
+def init_py_vec(con: sqlite3.Connection) -> None:
+    """Create the fallback's self-contained :data:`PY_VEC_TABLE` (idempotent): the
+    ``vec_sources`` columns plus the vector itself as a native-float32 BLOB."""
+    con.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {PY_VEC_TABLE} (
+            rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file TEXT UNIQUE NOT NULL,
+            content_hash TEXT NOT NULL,
+            mtime REAL,
+            dim INTEGER NOT NULL,
+            embedded_at TEXT NOT NULL,
+            embedding BLOB NOT NULL
+        )
+        """
+    )
+    con.commit()
+
+
+def _py_vec_stored_dims(con: sqlite3.Connection) -> set[int]:
+    """The distinct dims stored in the fallback table; empty if absent or empty."""
+    if not _table_exists(con, PY_VEC_TABLE):
+        return set()
+    return {int(row[0]) for row in con.execute(f"SELECT DISTINCT dim FROM {PY_VEC_TABLE}")}
+
+
+def _py_vec_pack(vector: Sequence[float]) -> bytes:
+    """Native float32 bytes — the same layout ``sqlite_vec.serialize_float32`` makes."""
+    return array("f", [float(x) for x in vector]).tobytes()
+
+
+def _py_vec_unpack(blob: bytes) -> array:
+    vec = array("f")
+    vec.frombytes(bytes(blob))
+    return vec
+
+
+def _apply_embedding_py(
+    con: sqlite3.Connection,
+    to_embed: list[PlanItem],
+    to_remove: list[str],
+    *,
+    embed_fn: Callable[[str], Sequence[float]],
+    dim: int,
+    rebuild: bool,
+) -> tuple[int, int]:
+    """Apply an embed plan to the fallback table; returns ``(embedded, removed)``.
+
+    Dim contract mirrors :func:`init_vec0`: stored vectors at another dim and no
+    ``rebuild`` → :class:`VecDimMismatch` **before any write**; with ``rebuild`` the
+    table is emptied and every planned doc re-inserted at the new dim."""
+    dim = int(dim)
+    init_py_vec(con)
+    stored = _py_vec_stored_dims(con)
+    if stored and stored != {dim}:
+        if not rebuild:
+            shown = ",".join(str(d) for d in sorted(stored))
+            raise VecDimMismatch(
+                f"{PY_VEC_TABLE} holds dim {shown} vectors but the embedder produces "
+                f"dim {dim}; re-run embed with --rebuild to rebuild the fallback "
+                f"index at the new dimension"
+            )
+        con.execute(f"DELETE FROM {PY_VEC_TABLE}")
+
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    embedded = 0
+    for item in to_embed:
+        vector = list(embed_fn(item.text))
+        if len(vector) != dim:
+            raise ValueError(
+                f"embedder returned {len(vector)} dims, expected {dim} "
+                f"(for {item.source_file}) — embedder/dim mismatch"
+            )
+        con.execute(
+            f"INSERT INTO {PY_VEC_TABLE} "
+            "(source_file, content_hash, mtime, dim, embedded_at, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_file) DO UPDATE SET content_hash = excluded.content_hash, "
+            "mtime = excluded.mtime, dim = excluded.dim, "
+            "embedded_at = excluded.embedded_at, embedding = excluded.embedding",
+            (item.source_file, item.content_hash, item.mtime, dim, now, _py_vec_pack(vector)),
+        )
+        embedded += 1
+
+    removed = 0
+    for source_file in to_remove:
+        con.execute(f"DELETE FROM {PY_VEC_TABLE} WHERE source_file = ?", (source_file,))
+        removed += 1
+
+    con.commit()
+    return embedded, removed
+
+
+def _knn_seeds_py(
+    con: sqlite3.Connection,
+    query_text: str,
+    *,
+    k: int,
+    embedder: Callable[[str], Sequence[float]],
+    dim: int,
+) -> dict[str, dict[str, Any]]:
+    """:func:`_knn_seeds` over the fallback table — an exact scan of every row.
+
+    Ranking and score are the vec0 ones: L2 distance ascending (ties by rowid),
+    the first ``k`` rows taken, then the first row per slug (path stem) kept, scored
+    ``1.0 / (1.0 + distance)``. Both sides are float32-rounded first, as in vec0, so
+    the numbers agree. For unit vectors (every real backend — hash, hash-ko, local,
+    vertex — is L2-normalised) L2-ascending is exactly cosine-descending, so this is
+    the exhaustive cosine scan; using L2 keeps ranks *and* scores identical to vec0
+    for any embedder. Cost is O(rows × dim) per query.
+
+    ``{}`` when the table is absent; a stored dim ≠ ``dim`` prints one warning and
+    returns ``{}`` (BFS-only), like vec0. An embedder whose output length ``!= dim``
+    is a loud ``ValueError``."""
+    if k <= 0 or not _table_exists(con, PY_VEC_TABLE):
+        return {}
+    stored = _py_vec_stored_dims(con)
+    if stored and stored != {int(dim)}:
+        shown = ",".join(str(d) for d in sorted(stored))
+        print(
+            f"warning: {PY_VEC_TABLE} is dim {shown} but the query embedder "
+            f"produces dim {dim}; skipping the semantic layer (re-embed with "
+            f"--rebuild) — BFS-only"
+        )
+        return {}
+
+    vector = list(embedder(query_text))
+    if len(vector) != dim:
+        raise ValueError(
+            f"embedder returned {len(vector)} dims, expected {dim} — embedder/dim mismatch"
+        )
+    query = array("f", [float(x) for x in vector])
+
+    def _candidates():
+        for row in con.execute(
+            f"SELECT rowid, source_file, embedding FROM {PY_VEC_TABLE}"
+        ):
+            stored_vec = _py_vec_unpack(row["embedding"])
+            if len(stored_vec) != len(query):
+                continue  # defensive: a malformed blob never crashes a query
+            dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(stored_vec, query)))
+            yield dist, row["rowid"], row["source_file"]
+
+    seeds: dict[str, dict[str, Any]] = {}
+    for dist, _rowid, source_file in heapq.nsmallest(k, _candidates()):
+        slug = Path(source_file).stem
+        if slug in seeds:
+            continue  # distance-ordered → the first row per slug is its nearest doc
+        seeds[slug] = {"vector": 1.0 / (1.0 + dist), "source_file": source_file}
+    return seeds
+
+
 def _print_embed_plan(
     to_embed: list[PlanItem], unchanged: list[str], to_remove: list[str], *, dim: int
 ) -> None:
@@ -1268,10 +1468,15 @@ def embed_vault(
     with :func:`plan_embedding`, and:
 
     * ``dry_run=True`` — prints the plan and returns, touching **nothing** (no
-      vec0 / vec_sources write, no sqlite-vec needed);
-    * configured embedder backend unavailable, or sqlite-vec absent, or a dim
-      change requested without ``rebuild`` — prints a clear skip message and returns
-      with ``skipped_reason`` set (the rest of graph_memory is unaffected);
+      vector-table write; sqlite-vec is optional — its absence just plans against
+      the fallback table);
+    * configured embedder backend unavailable, or a dim change requested without
+      ``rebuild`` — prints a clear skip message and returns with ``skipped_reason``
+      set (the rest of graph_memory is unaffected);
+    * sqlite-vec absent (:class:`EmbeddingsUnavailable`) — the **pure-Python
+      fallback**: the plan is diffed against and applied to :data:`PY_VEC_TABLE`
+      (its own content-hash cache, float32 BLOBs), with one stderr notice per
+      process; the vec0 tables are never touched (#147);
     * otherwise — builds the tables, applies the plan (insert new vectors,
       update changed ones in place by rowid, delete gone/denied ones), and upserts
       ``vec_sources``.
@@ -1307,15 +1512,36 @@ def embed_vault(
         print(f"embedder backend unavailable — skipping embed ({exc})")
         return _result(0, 0, str(exc), dry_run, dim_used=(int(dim) if dim else 0))
 
+    # Pick the backend before the dry-run so the plan shown is the one that would
+    # be applied. Loading the extension into the connection writes nothing.
+    try:
+        vec_ext = _load_sqlite_vec(con)
+    except EmbeddingsUnavailable as exc:
+        vec_ext = None
+        _announce_vec_fallback(exc)
+        # ``_result`` reads these names from the enclosing scope, so rebinding
+        # them to the fallback table's plan is what it reports.
+        to_embed, unchanged, to_remove = plan_embedding(
+            con, corpus, rebuild=rebuild, table=PY_VEC_TABLE
+        )
+
     if dry_run:
         _print_embed_plan(to_embed, unchanged, to_remove, dim=embed_dim)
         return _result(0, 0, None, True, dim_used=embed_dim)
 
-    try:
-        vec_ext = _load_sqlite_vec(con)
-    except EmbeddingsUnavailable as exc:
-        print(f"sqlite-vec not installed — skipping embed ({exc})")
-        return _result(0, 0, str(exc), False, dim_used=embed_dim)
+    if vec_ext is None:
+        try:
+            embedded, removed = _apply_embedding_py(
+                con, to_embed, to_remove, embed_fn=embed_fn, dim=embed_dim, rebuild=rebuild
+            )
+        except VecDimMismatch as exc:
+            print(f"py-vec dim mismatch — skipping embed ({exc})")
+            return _result(0, 0, str(exc), False, dim_used=embed_dim)
+        print(
+            f"embedded {embedded} docs ({len(unchanged)} unchanged, {removed} removed) "
+            f"into py-vec[{embed_dim}] from {len(corpus)} corpus docs"
+        )
+        return _result(embedded, removed, None, False, dim_used=embed_dim)
 
     init_vec_sources(con)
     try:
@@ -1569,10 +1795,15 @@ def _knn_seeds(
     """Semantic layer: the ``k`` nearest embedded corpus docs to ``query_text`` as
     ``{slug: {"vector": score, "source_file": path}}``, slug = the doc's path stem.
 
+    When sqlite-vec cannot be loaded at query time (:class:`EmbeddingsUnavailable`)
+    the seeds come from the pure-Python fallback table instead
+    (:func:`_knn_seeds_py` — same ranking, score and shape; one stderr notice per
+    process), or ``{}`` if the vault was never embedded there.
+
     Graceful degradation, identical to :func:`embed_vault`: yields ``{}`` (never
     raises) when ``k <= 0``, when the vault was never embedded (``vec_embeddings`` /
-    ``vec_sources`` absent), when sqlite-vec cannot be loaded at query time
-    (:class:`EmbeddingsUnavailable`), or when the index was built at a **different
+    ``vec_sources`` absent with sqlite-vec loadable, or neither backend's table
+    present), or when the index was built at a **different
     dimension** than the query embedder produces (an index embedded under one
     ``MACP_EMBEDDER`` then queried under another, before a ``--rebuild``). The last
     case prints one warning line and returns ``{}`` rather than letting sqlite-vec
@@ -1589,12 +1820,16 @@ def _knn_seeds(
     """
     if k <= 0:
         return {}
-    if not _table_exists(con, "vec_embeddings") or not _table_exists(con, "vec_sources"):
-        return {}
+    have_vec0 = _table_exists(con, "vec_embeddings") and _table_exists(con, "vec_sources")
+    if not have_vec0 and not _table_exists(con, PY_VEC_TABLE):
+        return {}  # never embedded by either backend — no extension load
     try:
         vec_ext = _load_sqlite_vec(con)
-    except EmbeddingsUnavailable:
-        return {}
+    except EmbeddingsUnavailable as exc:
+        _announce_vec_fallback(exc)
+        return _knn_seeds_py(con, query_text, k=k, embedder=embedder, dim=dim)
+    if not have_vec0:
+        return {}  # sqlite-vec is present → vec0 is authoritative; re-run embed to fill it
 
     stored_dim = _vec0_declared_dim(con)
     if stored_dim is not None and stored_dim != dim:
@@ -1670,10 +1905,12 @@ def query_related(
     (the brief/maintenance wiring) follows the configured backend without a signature
     change. An explicit pair is used verbatim.
 
-    **Graceful fallback** (never raises): when the configured embedder backend is
-    unavailable, when sqlite-vec is unavailable, when the vault was never embedded, or
-    when the index dim ≠ the query embedder's dim, the semantic layer yields nothing
-    and the result is BFS-only — the same contract :func:`embed_vault` honours. (An
+    **Graceful fallback** (never raises): when sqlite-vec is unavailable the
+    semantic layer reads the pure-Python fallback table if the vault was embedded
+    there (#147). When the configured embedder backend is unavailable, when the
+    vault was never embedded, or when the index dim ≠ the query embedder's dim, the
+    semantic layer yields nothing and the result is BFS-only — the same contract
+    :func:`embed_vault` honours. (An
     *unknown* ``MACP_EMBEDDER`` name still raises ``ValueError`` — a config typo is
     loud, not a silent BFS-only degrade.)
 
@@ -2135,7 +2372,8 @@ def cmd_show_related(args: argparse.Namespace) -> int:
 def cmd_embed(args: argparse.Namespace) -> int:
     """Embed the vault corpus into the vec0 table (or just show the plan with
     ``--dry-run``). Returns 0 even when the configured backend or sqlite-vec is
-    unavailable — both are graceful skips, not errors. Returns 2 only for an
+    unavailable — the former is a graceful skip, the latter uses the pure-Python
+    vector fallback; neither is an error. Returns 2 only for an
     unknown ``--embedder`` name (a config error, which argparse ``choices`` already
     guards against for CLI input)."""
     root, db_path, _index_path = _cli_paths(args)
