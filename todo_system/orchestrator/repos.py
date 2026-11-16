@@ -222,7 +222,13 @@ def _str_list(v) -> list[str]:
     counts — a bare string yields [] on purpose: the dispatcher's overlap
     predicate (`orchestrator._as_glob_list`) reads a bare string as "nothing
     declared", and task_validate flags it as an ERROR, so the loader must not
-    quietly promote it into a one-element list and make the two disagree."""
+    quietly promote it into a one-element list and make the two disagree.
+
+    A YAML flow list (`touches: [a, b]`) already arrives as a list from
+    `yaml.safe_load`. The only way a `"[a, b]"` string reaches here is a QUOTED
+    value (`touches: "[a, b]"`), which YAML reads as a string — so [] is right,
+    and it matches `frontmatter_lists.parse_inline_list`, which the hand-rolled
+    parsers use and which also leaves a quoted `"[a, b]"` a string."""
     if not isinstance(v, (list, tuple)):
         return []
     return [x.strip() for x in v if isinstance(x, str) and x.strip()]

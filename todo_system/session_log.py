@@ -197,7 +197,8 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
 
     Handles scalars and simple ``- item`` block lists (the only shapes this
     module writes), plus one-line ``[a, b]`` flow lists via
-    ``frontmatter_lists.parse_inline_list`` (written back as block lists). Mirrors the lightweight parser used elsewhere in the vault.
+    ``frontmatter_lists.parse_inline_list`` (written back as block lists).
+    Mirrors the lightweight parser used elsewhere in the vault.
     """
     if not content.startswith("---\n"):
         return {}, content
