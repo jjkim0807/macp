@@ -334,6 +334,7 @@ class BenchRow:
 
 _BENCH_NAMES = {
     "hash": "① 해싱 (stdlib feature-hashing, 기본값)",
+    "hash-ko": "①' 해싱 + 한글 글자 바이그램 (hash-ko, #146)",
     "local": "② 로컬 ONNX (multilingual-e5-small 계열)",
     "vertex": "③ Vertex AI (text-multilingual-embedding-002)",
 }
@@ -791,7 +792,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument(
         "--embedders",
         default="hash,local,vertex",
-        help="comma-separated backends to bench (default: hash,local,vertex)",
+        help=(
+            "comma-separated backends to bench, any of hash,hash-ko,local,vertex "
+            "(default: hash,local,vertex)"
+        ),
     )
     p_bench.add_argument("--k", default="5,10", help="comma-separated k values (default: 5,10)")
     p_bench.set_defaults(func=cmd_bench)
