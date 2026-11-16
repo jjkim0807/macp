@@ -224,7 +224,7 @@ approvals:
 | # | 출처 | 최종 URL (조회 2026-11-17) | 이 노트가 기대는 확인 사실 | 미확인 |
 |---|---|---|---|---|
 | V1 | CLI reference | `https://code.claude.com/docs/en/cli-reference` | `--permission-prompt-tool` 은 비대화 모드의 권한 프롬프트를 MCP 도구(`mcp__<server>__<tool>`)로 넘기고, 그 서버 연결을 `MCP_TIMEOUT`(기본 30 s)까지 기다린다. `--resume` 은 세션 ID·이름·**.jsonl 절대 경로**를 받고 ID 는 이 머신의 모든 프로젝트에서 찾는다. `--settings` 는 파일 또는 인라인 JSON 이고 세션 한정이다 | 권한 위임 도구가 돌려줄 JSON 의 정확한 모양(문서가 가리키는 절을 이 런에서 찾지 못함) |
-| V2 | Run Claude Code programmatically | `https://code.claude.com/docs/en/headless` | 권한 모드를 정하지 않은 `-p` 런은 Manual 이고, 승인이 필요한 호출은 PermissionRequest hook 이나 권한 위임 도구가 승인하지 않으면 거부된다. 권한 호스트가 있으면 런이 그 답을 **기다린다**. 권한 프롬프트 대기 중 SIGTERM 이면 답하지 않은 채 끝나고(exit 143), 재개 때 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 이면 끊긴 턴을 잇는다 | — |
+| V2 | Run Claude Code programmatically | `https://code.claude.com/docs/en/headless` | 권한 모드를 정하지 않은 `-p` 런은 Manual(v2.1.302 이상)이고, 승인이 필요한 호출은 PermissionRequest hook 이나 권한 위임 도구가 승인하지 않으면 거부된다. 권한 호스트가 있으면 런이 그 답을 **기다린다**(`--permission-prompts none` 이면 호스트를 건너뛰고 AskUserQuestion 을 없앤다). 권한 프롬프트 대기 중 SIGTERM 이면 답하지 않은 채 끝나고(exit 143), 재개 때 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 이면 끊긴 턴을 잇는다 | — |
 | V3 | Hooks reference | `https://code.claude.com/docs/en/hooks` | PreToolUse 결정은 allow·deny·ask·**defer**. defer 는 `-p` 에서 한 턴에 도구 호출이 **하나일 때만** 받아들여지고, 턴이 `stop_reason: "tool_deferred"` 로 끝나며 대기 호출이 transcript 에 남는다. `claude -p --resume <id>` 로 같은 호출이 PreToolUse 를 다시 탄다. hook `timeout` 기본 600 s | 아래 사실 목록 |
 | V4 | Settings | `https://code.claude.com/docs/en/settings` | `--settings` 는 user·project·local 위, managed 아래에 놓이고 "user 설정 파일이 둘 수 있는 키는 모두" 둘 수 있다. user 설정 파일은 hook 위치다(V3) | 실제 발화는 A3 캡처 테스트가 못박는다 |
 | V5 | MCP | `https://code.claude.com/docs/en/mcp` | 서버 항목의 `timeout`(ms)이 그 서버 도구 호출의 벽시계 상한이고 idle 상한의 하한도 된다(stdio idle 기본 30분). 2분 넘는 호출의 자동 백그라운드는 비대화 모드와 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 에서 일어나지 않는다 | 인라인 `--mcp-config` 항목도 같은 `timeout` 필드를 받는가(A3) |
@@ -276,7 +276,9 @@ V3 에서 결정에 쓰인 사실을 더 적는다. ⓐ 한 턴에 호출이 여
 - ① **defer** — AskUserQuestion, `confirm`, hook 이 잡은 `permission_denied`. 한 턴에 호출이 하나면 턴이
   `tool_deferred` 로 끝나 프로세스가 종료된다. 여럿이면 defer 가 무시되어 일반 권한 흐름으로 가고(ⓐ), 허용 목록
   밖이므로 위임 도구가 받는다. 위임 도구는 같은 `input_sha256` 의 열린 카드를 보면 기다리지 않고 "승인 대기 중
-  — 이 호출만 단독으로 다시 하라"로 거부하고, 단독 재시도가 defer 된다.
+  — 이 호출만 단독으로 다시 하라"로 거부하고, 단독 재시도가 defer 된다. 그래서 `mcp__macp-approval__*` 는
+  `--allowed-tools` 에 넣지 않는다. PreToolUse 의 allow 는 권한 프롬프트를 건너뛰므로(V3) 답이 붙은 호출은 그대로
+  돌고, 답 없이 실행된 `confirm` 은 성공이 아니라 "답 없음" 오류를 돌려준다.
 - ② **거부 후 턴 종료** — **바닥 호출에는 defer 를 쓰지 않는다.** 묶인 호출이면 defer 가 무시되고, 허용 목록
   안의 바닥 호출이 일반 흐름에서 그대로 실행돼 버린다(ⓐ). 그래서 바닥은 인라인 대기가 끝나면 `deny` 와 사유
   "승인 카드 <id> 대기 — 턴을 끝내라"를 돌려준다.
