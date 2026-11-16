@@ -619,7 +619,102 @@ OpenMausBot 의 규율(내보낼 때 비밀값·대화록·권한을 빼고, 가
 
 ## §5 효과 측정
 
-> 다음 leaf에서 채움 — 형제 leaf `macp-skill-promotion-ladder-design-b-safety-metrics-split`(`depends_on` 이 leaf, `on_unblock: auto`)가 이 절을 제자리에서 채운다.
+스킬은 "이 절차를 실으면 다음 런이 낫다"는 **가설**이다. 측정 없이 사다리만 쌓지 않는다 — 자매 그래프 메모리 설계의
+원칙 그대로, **측정이 설계를 반증할 수 있다**(`graph-memory.md:369-371`). 이 절은 무엇을 키로, 어떤 기존 데이터에서,
+무엇과 견줘, 언제 내리는지를 정한다. 새 텔레메트리는 측정 키(`skills_applied`) 하나뿐이고 나머지는 이미 있는 필드다.
+
+### 5.1 측정 키 — 런마다 실린 `id@version`
+
+§3.2 가 약속한 "실린 `id`·`version` 을 런 기록에 남긴다"의 자리:
+
+- **러너가 쓴다** — 주입기(K5)가 `skills.md` 를 쓰는 같은 지점에서 `<run_dir>/stages.json` 에
+  `skills_applied: [{id, version, sha256, wired}]` 를 남긴다. stages.json 은 metrics 가 이미 읽는 파일이다
+  (`_run_stage_calls`·`_run_usage` `metrics.py:103-124`). 맞는 스킬이 없으면 빈 목록, 주입기 예외면 `error` 키(§4.5).
+- **`wired`** — 스테이지마다 "그 스테이지가 로드한 프롬프트(`load_stage_prompt` `stages.py:429-430`)에 `skills.md` Read
+  줄이 있다"를 판정한 값. 사람 `cp`(§6 K6) 전의 런은 `skills.md` 가 있어도 아무 스테이지도 읽지 않으므로
+  `wired: false` — "후"로 세지 않는다.
+- **영속 사본** — run dir 는 호스트 로컬·git 밖이고 원장 행은 재디스패치 때 교체된다(§1.1). 그래서 둘을 더 둔다:
+  5스테이지 런은 에피소드 frontmatter 의 `skills_applied:` 한 줄(report 프롬프트), delegate 런은 태스크 md Progress Log
+  한 줄(delegate 프롬프트). run-event-stream S5 의 엔진 생성 `run_stats`(`run-event-stream.md:482-499`)가 생기면 그쪽이
+  이 역할을 맡는다(소프트 의존).
+- **배선은 여전히 한 번의 `cp`** — 위 두 프롬프트 줄은 §3.2 의 배선 줄과 **같은 proposals 묶음**에 실린다. §3.2 의
+  "딱 한 번"은 스킬·버전마다 `.claude` 를 거치지 않는다는 뜻이다 — 배선은 여전히 한 번의 `cp` 이고, 그 묶음에
+  `worker-report.md` 가 더해진다(§3.2 가 이름 댄 세 파일 + report).
+- **두 모집단**(`metrics.py:76-89`) — 원장(`Worker/assignments/`)은 영속·전체 모집단이고, run dir 는 비추적·최근 로컬
+  **표본**이다. 아래 모든 표는 두 N 을 함께 적는다 — 표본을 전체로 오독하지 않게.
+- **delegate 는 "완료"로 센다**(§2.2 표의 "완료" 행) — verify 스테이지가 없어 "검증"을 모른다. **quick 은 스킬을 받지
+  않는다**(§3.2 의 배선 대상에 quick 이 없다) — 측정 대상 밖이다.
+
+### 5.2 지표 셋과 데이터 소스
+
+| 지표 | 정의 | 소스 (`파일:줄`) | 모집단 | 한계 |
+|---|---|---|---|---|
+| **런 소요** | 런의 Σ `usage.<stage>.duration_ms` (보조: Σ `num_turns`) | stages.json `usage` — 키 `USAGE_KEYS` `stages.py:532-534`, 읽기 `metrics.py:117-124` | run dir 표본 | 2026-09-19 이전 런엔 없다(`metrics.py:85-88`). 큐 대기는 빠진다 — 원장 `created_ts → updated_ts`(`assignment.py:104-105`)는 큐·재시도가 섞여 보조로만 |
+| **재시도** | 한 태스크가 첫 런 뒤 다시 돈 횟수 | ① 원장 `refail_count`(`assignment.py:101-103` — 재디스패치에도 이월) ② slug 별 run dir 수(`metrics.py:237-238,251-252`) | ① 원장(영속) ② 표본 | `attempts`·`history` 는 쓰지 않는다(재디스패치 때 리셋, §2.2). 결함이 아닌 플래그(`capacity_retry_count`·`capacity_limited`·`job_running`·`checkout_busy` `assignment.py:110-133`)로 생긴 재시도는 뺀다. 타임아웃 연속(`timeout_streak` `:148`)은 따로 센다 |
+| **검증 통과율** (5스테이지) | 런 단위 `pass` ÷ (`pass` + `fail`) | ① 에피소드 런 절의 `- overall: pass`(§2.2 표 — 1차) ② `verify.md` `overall_status`(`parse_verify_verdict` `stages.py:708-711`, 집계 `metrics.py:233-236` — 보조) | ① 영속 ② 표본 | SKIP·UNSTATED 는 분모에서 빼고 **건수로** 따로 보고한다 |
+| **완료율** (delegate) | `status: done`(태스크 md) + `state: done`(원장)인 런 비율 | 태스크 md·원장 | 영속 | 통과율과 **섞지 않는다** — 검증이 아니라 완료다(§2.2) |
+
+### 5.3 전후 비교 — 기준선은 근거 런이 아니다
+
+`evidence_runs` 는 정의상 **전부 성공한** 런이다(§2.2 승격 조건). 그것을 "전"으로 쓰면 어떤 스킬도 나빠 보인다(선택
+편향). 그래서:
+
+- **"전"** = 승인 전 90일 동안 **주입기와 같은 매처**(§2.1 캐스케이드 + 명시 `skill:`)가 맞췄을 런 전부 — 실패 포함.
+  그 스킬이 있었다면 실렸을 바로 그 모집단이다.
+- **"후"** = `skills_applied` 에 그 `id@version` 이 있고 `wired: true` 인 런. 새 `version` 은 새 창을 연다(재승인 포함,
+  §4.7).
+- **최소 N** = 양쪽 각각 ≥ 5(선례 `VERIFY_FAIL_RETRY_MIN_N = 5` `metrics.py:355`). 미달이면 판정은 `insufficient`(metrics
+  의 판정 어휘 `metrics.py:338-343`).
+- **층화** — `usage.model` × 태스크 tier 로 나눈다. 모델은 호출마다 해석되어(`stages.py:62-67`) 같은 창 안에서도 바뀐다.
+  층마다 N 을 따로 채운다.
+- **교란 요인 둘** — ① 한 런에 여러 스킬이 실리면 각 스킬에 모두 귀속하고 그 런에 `co_applied` 표시를 남긴다(표에서
+  걸러 볼 수 있게). ② 같은 창의 엔진 변경(프롬프트·모델 사다리·게이트)은 통제할 수 없다 — 창의 기간과 그 사이 엔진
+  머지 범위만 기록하고, 통제하지 못했음을 표에 밝힌다.
+- **측정 창** = 승인 뒤 최대 90일 또는 "후" N 이 20 에 닿을 때까지(둘 다 설정값).
+
+### 5.4 판정·강등 — 올리는 건 사람, 내리는 건 엔진도
+
+**판정**(층마다):
+
+- `keep` ⇔ (통과율 또는 완료율) 후 ≥ 전 **그리고** (소요 중앙값 후 < 전 **또는** 재시도율 후 < 전)
+- `demote` ⇔ 그 밖 — 나빠졌거나 나아진 것이 없다. **측정에서 나아지지 않은 스킬은 내린다.**
+- `insufficient` ⇔ 어느 쪽이든 N < 5
+- 최소 개선 폭(예: 소요 −10%)은 설정 기본값으로 둔다 — 잡음 수준의 "개선"으로 `keep` 이 나지 않게. 층이 여럿이면 N
+  가중으로 합치되, 어느 층이든 통과율이 떨어지면 `demote` 다.
+
+**강등** — `demote` 면 엔진(`skill_eval`, 결정적)이 `approved → suspended` 로 내리고 경보 1회를 낸다(§4.4 ② 와 같은
+경로). 주입기는 다음 런부터 싣지 않는다. 이 전이는 되돌릴 수 있다 — 사람이 보고 재승인하면 `version + 1` 로 새 창이
+열린다. **원칙: 올리는 건 사람, 내리는 건 엔진도.** 엔진이 하는 전이는 이 하나뿐이고, `approve`·재승인(오르는 전이)과
+`reject`·`retire`(되돌릴 수 없는 종료)는 사람만이다(§4.4).
+
+**빠른 길** — "후" 런에서 verify FAIL 이 연속 2회면 N 을 기다리지 않고 내린다. 내리는 비용이 싸기 때문이다.
+
+**측정 불가** — 창이 끝날 때까지 `insufficient` 인 스킬은 자동으로 아무것도 하지 않고, 대시보드(§6 K4)에 "측정 불가 —
+은퇴 후보"로 띄운다. 정지된 스킬도 같은 수집기로 보인다.
+
+### 5.5 측정이 설계를 반증할 수 있다
+
+판정을 받은 스킬이 3개 이상인데 `keep` 이 **하나도 없으면** 사다리의 가설 — "끝난 런에서 뽑은 절차를 주입하면 다음
+런이 낫다" — 은 이 시스템에서 반증된 것이다. 그때는 **1단(제안)에서 멈춘다**: 초안은 사람이 읽는 문서로 남기고, 주입은
+끄며(`MACP_SKILLS=0` 을 기본값으로), 루틴 단은 열지 않는다. 그래프 메모리가 하이브리드 검색에 건 것과 같은 규율이다
+(`graph-memory.md:369-371` — 재조정하거나 설계를 되돌린다).
+
+### 5.6 측정 도구
+
+- `todo_system/orchestrator/skill_eval.py`(신규·가칭) — 결정적·stdlib.
+  `python -m todo_system.orchestrator.skill_eval table [--skill <id>]` 가 (`id@version`, 층)마다 한 행을 낸다. LLM 없는
+  maintenance 틱(`todo_system.worker maintenance`, 5분 `scripts/systemd/gen_units.py:213-216`)에 걸어 하루 한 번쯤으로
+  조이고, §5.4 의 강등도 여기서 한다.
+- 표 모양(**합성 예시** — 수치는 자리표시다):
+
+| 스킬 `id@version` | 층(model·tier) | N 전/후 (영속) | n 전/후 (표본) | 통과율 전/후 | 소요 중앙값 전/후 | 재시도율 전/후 | 판정 |
+|---|---|---|---|---|---|---|---|
+| `<skill-a>@1` | `<model-x>`·standard | 12 / 8 | 9 / 7 | 0.75 / 0.88 | 40m / 30m | 0.25 / 0.13 | `keep` |
+| `<skill-a>@1` | `<model-y>`·heavy | 3 / 2 | 3 / 2 | — | — | — | `insufficient` |
+| `<skill-b>@2` | `<model-x>`·standard | 10 / 6 | 8 / 6 | 0.80 / 0.67 | 30m / 35m | 0.20 / 0.33 | `demote` |
+
+- 회귀는 로컬 pytest 로 고정한다(`todo_system/tests/test_skill_eval.py` — 합성 run dir·원장·에피소드 픽스처). "CI green"
+  은 완료 조건이 아니다.
 
 ---
 
