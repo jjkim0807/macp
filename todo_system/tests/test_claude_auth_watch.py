@@ -35,6 +35,11 @@ def _load():
 A = _load()
 
 
+@pytest.fixture(autouse=True)
+def _fake_host(monkeypatch):
+    monkeypatch.setenv("MACP_HOST_LABEL", "fakehost")
+
+
 def test_auth_alert_keeps_the_login_remedy_within_budget():
     title = "Claude Code 인증 이상"
     message = ("refreshTokenExpiresAt가 지났고 accessToken이 비었습니다 — "
@@ -109,14 +114,14 @@ def test_plan_change_problem_carries_the_remedy(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "credential_created_at", lambda config_dir: _utc(2026, 10, 19, 0, 46, 45))
     problems, notes = [], []
     A.check_plan_change(None, tmp_path, problems, notes)
-    assert not problems and notes == ["[legacy] login newer than plan"]
+    assert not problems and notes == ["[fakehost/legacy] login newer than plan"]
 
 
 def test_plan_change_check_skips_without_a_login_stamp(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "credential_created_at", lambda config_dir: None)
     problems, notes = [], []
     A.check_plan_change("hq", tmp_path, problems, notes)
-    assert not problems and notes[0].startswith("[hq] plan-vs-login check n/a")
+    assert not problems and notes[0].startswith("[fakehost/hq] plan-vs-login check n/a")
 
 
 # --- ops human task wiring (ops-claude-auth-<account>) -------------------------
@@ -139,7 +144,38 @@ def auth_ops_task(tmp_path, monkeypatch):
     monkeypatch.setattr(oa, "_today", lambda: "2049-01-10")
     monkeypatch.setattr(A, "_mark_auth", lambda *a, **k: None)
     monkeypatch.setattr(A, "_check_automation_token", lambda *a, **k: None)
-    return root / "Todo" / "items" / "ops-claude-auth-acct-a.md"
+    return root / "Todo" / "items" / "ops-claude-auth-fakehost-acct-a.md"
+
+
+def test_host_label_prefers_env_then_hostname(monkeypatch):
+    assert A._acct_label("fakeacct") == "[fakehost/fakeacct] "
+    assert A._acct_label(None) == "[fakehost/legacy] "
+    monkeypatch.setenv("MACP_HOST_LABEL", "  ")
+    monkeypatch.setattr(A.socket, "gethostname", lambda: "fake-box.example.test")
+    assert A._acct_label("fakeacct") == "[fake-box/fakeacct] "
+    monkeypatch.delenv("MACP_HOST_LABEL")
+    assert A._acct_label("fakeacct") == "[fake-box/fakeacct] "
+
+
+def test_credential_problems_and_ops_alert_carry_the_host(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(A.ops_alerts, "open_alert",
+                        lambda key, title, steps, level=None: calls.append(("open", key, title)))
+    monkeypatch.setattr(A.ops_alerts, "resolve_alert",
+                        lambda key, note: calls.append(("resolve", key, note)))
+    monkeypatch.setattr(A, "_mark_auth", lambda *a, **k: None)
+    monkeypatch.setattr(A, "_check_automation_token", lambda *a, **k: None)
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(-2)))
+    problems, notes = [], []
+    A.check_credential("fakeacct", tmp_path, problems, notes)
+    assert problems[0].startswith("[fakehost/fakeacct] ")
+    assert calls[0] == ("open", "claude-auth-fakehost-fakeacct",
+                        "[fakehost/fakeacct] Claude 리프레시 토큰 만료")
+    monkeypatch.setattr(A, "read_credentials", lambda cd: _creds(_ms_from_now(30)))
+    problems, notes = [], []
+    A.check_credential("fakeacct", tmp_path, problems, notes)
+    assert notes[0].startswith("[fakehost/fakeacct] ")
+    assert calls[1][:2] == ("resolve", "claude-auth-fakehost-fakeacct")
 
 
 def test_expired_refresh_token_opens_the_account_auth_task(auth_ops_task, monkeypatch, tmp_path):
