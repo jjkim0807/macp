@@ -2987,3 +2987,100 @@ class PendingProposalsInStatus(unittest.TestCase):
     def test_merge_without_proposals_is_identity(self):
         human = [{"slug": "a", "why": "todo", "urgent": False, "due": "", "later": False}]
         self.assertEqual(M._merge_proposals(human, []), human)
+
+
+class ProposalsScanVaultRootInStatus(unittest.TestCase):
+    """Workers write Worker/proposals/<slug>/ into the VAULT (data root), but
+    collect_proposals() used to scan the ENGINE checkout (_INSTALL_DIR). With
+    MACP_VAULT_ROOT pointing at a separate vault, no proposal ever reached
+    /api/status `human`. Runs through the real collect_status() with
+    collect_proposals NOT stubbed, engine and vault as two distinct temp dirs."""
+
+    def setUp(self):
+        from todo_system.orchestrator import proposals
+        self.proposals = proposals
+        proposals._CACHE.clear()
+        self.addCleanup(proposals._CACHE.clear)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.engine = tmp / "engine"
+        self.vault = tmp / "vault"
+        (self.engine / ".claude" / "commands").mkdir(parents=True)
+        self.vault.mkdir()
+        self._patch_roots(self.vault, self.engine)
+        stubs = {"collect_assignments": [], "_todo_status_map": {}, "_title_map": {},
+                 "_project_map": {}, "collect_human": [], "collect_runs": [],
+                 "collect_deps": [], "collect_agents": [], "collect_todo": {},
+                 "collect_usage": None, "collect_account": {},
+                 "collect_account_runtime": {}, "collect_account_slots": {},
+                 "collect_queue": {}, "_worker_running": []}
+        patches = [mock.patch.object(M, k, return_value=v) for k, v in stubs.items()]
+        patches.append(mock.patch("todo_system.macp.config.load_profile",
+                                  side_effect=RuntimeError("no profile in tests")))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _patch_roots(self, vault: Path, engine: Path):
+        paths = {"VAULT": vault, "RUNS": vault / "Worker" / "runs",
+                 "ASSIGN": vault / "Worker" / "assignments",
+                 "STATE": vault / "Worker" / "_state",
+                 "TODO_DB": vault / "Todo" / "todo.db",
+                 "ITEMS": vault / "Todo" / "items",
+                 "SESSIONS": vault / "Memory" / "sessions",
+                 "REGISTRY": vault / "Worker" / "agents" / "registry.yaml",
+                 "_INSTALL_DIR": engine}
+        for k, v in paths.items():
+            p = mock.patch.object(M, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _propose(root: Path, slug: str, body: str):
+        d = root / "Worker" / "proposals" / slug / "commands"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "foo.md").write_text(body, encoding="utf-8")
+
+    def _human_slugs(self) -> list[str]:
+        return [r["slug"] for r in M.collect_status()["human"]]
+
+    def test_vault_proposal_surfaces_in_human_rows(self):
+        self._propose(self.vault, "vault-prop", "proposed\n")
+        self._propose(self.engine, "engine-only-prop", "x\n")
+        d = M.collect_status()
+        row = next((r for r in d["human"] if r["slug"] == "vault-prop"), None)
+        self.assertIsNotNone(row, [r["slug"] for r in d["human"]])
+        self.assertEqual(row["why"], "todo")
+        self.assertEqual(row["group"], "macp")
+        every = [r["slug"] for r in d["human"] + d["human_later"]]
+        self.assertNotIn("engine-only-prop", every)
+
+    def test_applied_through_symlinked_commands_clears_row(self):
+        # Real deployment: <vault>/.claude/commands is a RELATIVE symlink into the
+        # engine checkout (relative to vault/.claude/, hence two "..").
+        (self.vault / ".claude").mkdir()
+        os.symlink(os.path.join("..", "..", "engine", ".claude", "commands"),
+                   self.vault / ".claude" / "commands")
+        self._propose(self.vault, "linked-prop", "same bytes\n")
+        live = self.engine / ".claude" / "commands" / "foo.md"
+        live.write_text("same bytes\n", encoding="utf-8")
+        self.assertNotIn("linked-prop", self._human_slugs())
+        # Positive control: the live file diverges → the proposal is pending again.
+        live.write_text("different, longer bytes\n", encoding="utf-8")
+        self.proposals._CACHE.clear()
+        self.assertIn("linked-prop", self._human_slugs())
+
+    def test_unset_vault_root_same_dir_unchanged(self):
+        # MACP_VAULT_ROOT unset: vault == engine checkout.
+        self._patch_roots(self.engine, self.engine)
+        self._propose(self.engine, "same-root-prop", "p\n")
+        self.assertIn("same-root-prop", self._human_slugs())
+        (self.engine / ".claude" / "commands" / "foo.md").write_text(
+            "p\n", encoding="utf-8")
+        self.proposals._CACHE.clear()
+        self.assertNotIn("same-root-prop", self._human_slugs())
+
+    def test_collect_proposals_default_root_is_vault(self):
+        # The default must be read at call time (patched VAULT), not bound at def.
+        self._propose(self.vault, "v", "p\n")
+        self.assertEqual([r["slug"] for r in M.collect_proposals()], ["v"])

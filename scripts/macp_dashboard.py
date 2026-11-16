@@ -1220,10 +1220,16 @@ def _human_sort_key(r: dict) -> tuple:
 def collect_proposals(root=None) -> list[dict]:
     """Unapplied Worker/proposals/<slug>/ prompt proposals as human `todo` rows.
     Headless workers can't write .claude/**, so a person applies them with one cp;
-    without this row nothing announced them. Fail-soft: any error → []."""
+    without this row nothing announced them. Fail-soft: any error → [].
+
+    Scans the VAULT (data root, honours MACP_VAULT_ROOT) — workers write their
+    proposals there, not into the engine checkout (_INSTALL_DIR). "Applied" is
+    judged against <VAULT>/.claude/commands, which in the real deployment is a
+    symlink into the engine checkout. Unset MACP_VAULT_ROOT → VAULT == engine
+    root, so that case is unchanged. VAULT is read per call (patchable)."""
     try:
         from todo_system.orchestrator.proposals import pending_proposals
-        return pending_proposals(root or _INSTALL_DIR)
+        return pending_proposals(root or VAULT)
     except Exception:
         return []
 
