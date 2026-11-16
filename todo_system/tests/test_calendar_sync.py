@@ -13,6 +13,13 @@ from todo_system import cli as CLI
 from todo_system.ownership import human_owned_sql_filter, is_worker_owned
 
 
+@pytest.fixture(autouse=True)
+def _no_overdue_reschedule(monkeypatch):
+    """These tests pin past dates against the real clock; the overdue-block
+    mover (test_calendar_reschedule.py) would otherwise rewrite their md."""
+    monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "0")
+
+
 class _FakeEvents:
     """Minimal google-api-client `service.events()` stand-in."""
 

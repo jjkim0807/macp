@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -389,7 +390,7 @@ def _event_newer_than_md(ev: dict, source_path: str) -> bool:
         return False
 
 
-def _write_scheduled(source_path: str, value: str) -> None:
+def _write_scheduled(source_path: str, value: str, note: str | None = None) -> None:
     """Set `scheduled:` in the task md (the source of truth) and log it. The
     todo-sync daemon then re-imports; the next sync finds md == calendar ==
     baseline and writes nothing, so there is no ping-pong."""
@@ -400,7 +401,8 @@ def _write_scheduled(source_path: str, value: str) -> None:
     text = update_frontmatter_value(text, "scheduled", f'"{value}"')
     text = update_frontmatter_value(text, "updated", today)
     if "## Progress Log" in text:
-        line = f"- {today}: 캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤 (calendar sync)"
+        line = f"- {today}: " + (
+            note or f"캘린더에서 일정을 옮겨 scheduled를 {value}로 맞춤") + " (calendar sync)"
         # Inside the section: after its last entry, before the next `## `
         # heading (`### ` sub-headings stay inside); EOF when it is the last.
         head = re.search(r"^## Progress Log[ \t]*$", text, re.M)
@@ -410,6 +412,191 @@ def _write_scheduled(source_path: str, value: str) -> None:
         else:
             text = text.rstrip("\n") + f"\n{line}\n"
     path.write_text(text, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Overdue time blocks → next free slot (2026-11-16)
+# ---------------------------------------------------------------------------
+# A human task whose timed block ended while it was still open used to stay on
+# a past slot, so it vanished from the forward calendar. After each sync the
+# block moves to the earliest free working slot of the same length; the move is
+# written to the md and pushed on the next sync. Runs AFTER the upserts so a
+# block the person dragged in the calendar is pulled into the md first and is
+# never overridden. Opt out per task with `reschedule: false`, or for the whole
+# host with MACP_RESCHEDULE_OVERDUE=0.
+
+RESCHEDULE_GRACE = dt.timedelta(minutes=30)   # a block ending this long ago is overdue
+RESCHEDULE_HORIZON_DAYS = 21
+_SLOT_STEP = dt.timedelta(minutes=15)
+
+
+def _reschedule_hours() -> tuple[int, int]:
+    """Working window `MACP_RESCHEDULE_HOURS=10-18` (local hours), default 10–18."""
+    raw = os.environ.get("MACP_RESCHEDULE_HOURS", "10-18")
+    try:
+        a, b = (int(x) for x in raw.split("-", 1))
+        if 0 <= a < b <= 24:
+            return a, b
+    except ValueError:
+        pass
+    return 10, 18
+
+
+def _reschedule_weekdays() -> set[int]:
+    """`MACP_RESCHEDULE_WEEKENDS=1` allows Sat/Sun; default Mon–Fri."""
+    if os.environ.get("MACP_RESCHEDULE_WEEKENDS", "") in ("1", "true", "yes"):
+        return set(range(7))
+    return set(range(5))
+
+
+def _block_bounds(sched_date: str, start: str, end: str) -> tuple[dt.datetime, dt.datetime]:
+    s = dt.datetime.fromisoformat(f"{sched_date}T{int(start.split(':')[0]):02d}:{start.split(':')[1]}")
+    e = dt.datetime.fromisoformat(f"{sched_date}T{int(end.split(':')[0]):02d}:{end.split(':')[1]}")
+    if e <= s:          # a midnight-spanning block
+        e += dt.timedelta(days=1)
+    return s, e
+
+
+def _ceil_to_step(t: dt.datetime) -> dt.datetime:
+    t = t.replace(second=0, microsecond=0)
+    extra = t.minute % 15
+    return t if extra == 0 else t + dt.timedelta(minutes=15 - extra)
+
+
+def find_free_slot(duration: dt.timedelta, busy: list[tuple[dt.datetime, dt.datetime]],
+                   earliest: dt.datetime, *, hours: tuple[int, int] = (10, 18),
+                   weekdays: set[int] | None = None,
+                   horizon_days: int = RESCHEDULE_HORIZON_DAYS) -> tuple[dt.datetime, dt.datetime] | None:
+    """Earliest [start, start+duration) inside the working window that overlaps no
+    busy interval. Naive local datetimes. Pure — unit-tested."""
+    weekdays = set(range(5)) if weekdays is None else weekdays
+    start = _ceil_to_step(earliest)
+    last_day = start.date() + dt.timedelta(days=horizon_days)
+    day = start.date()
+    while day <= last_day:
+        if day.weekday() in weekdays:
+            open_ = dt.datetime.combine(day, dt.time(hours[0]))
+            close = dt.datetime.combine(day, dt.time(0)) + dt.timedelta(hours=hours[1])
+            t = max(open_, start)
+            while t + duration <= close:
+                end = t + duration
+                clash = [b for b in busy if b[0] < end and t < b[1]]
+                if not clash:
+                    return t, end
+                t = _ceil_to_step(max(b[1] for b in clash))
+        day += dt.timedelta(days=1)
+    return None
+
+
+def _fmt_block(s: dt.datetime, e: dt.datetime) -> str:
+    return f"{s.date().isoformat()} {s:%H:%M}~{e:%H:%M}"
+
+
+def _not_before(source_path: str) -> dt.datetime | None:
+    raw = (_extract_field_from_markdown(source_path, "not_before") or "").strip()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})(?:[ T](\d{1,2}):(\d{2}))?", raw)
+    if not m:
+        return None
+    d = dt.date.fromisoformat(m.group(1))
+    return dt.datetime(d.year, d.month, d.day, int(m.group(2) or 0), int(m.group(3) or 0))
+
+
+def _opted_out(source_path: str) -> bool:
+    raw = (_extract_field_from_markdown(source_path, "reschedule") or "").strip().lower()
+    return raw in ("false", "no", "off", "0")
+
+
+def plan_overdue_moves(blocks: list[dict], busy: list[tuple[dt.datetime, dt.datetime]],
+                       now: dt.datetime, *, hours: tuple[int, int] = (10, 18),
+                       weekdays: set[int] | None = None) -> list[tuple[str, str, str]]:
+    """Pure planner. `blocks`: dicts with slug, start, end (naive local), and
+    optional not_before / priority / opt_out. Returns (slug, old, new) for every
+    overdue block that found a slot; each placed block becomes busy for the next.
+    Future blocks of the other tasks must already be in `busy`."""
+    busy = list(busy)
+    overdue = [b for b in blocks
+               if not b.get("opt_out") and b["end"] + RESCHEDULE_GRACE <= now]
+    overdue.sort(key=lambda b: (-int(b.get("priority") or 50), b["start"]))
+    moves: list[tuple[str, str, str]] = []
+    for b in overdue:
+        earliest = max(now, b.get("not_before") or now)
+        slot = find_free_slot(b["end"] - b["start"], busy, earliest,
+                              hours=hours, weekdays=weekdays)
+        if slot is None:
+            continue
+        busy.append(slot)
+        moves.append((b["slug"], _fmt_block(b["start"], b["end"]), _fmt_block(*slot)))
+    return moves
+
+
+def _freebusy(service, calendars: Sequence[str], start: dt.datetime,
+              end: dt.datetime) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Busy intervals (naive local) from Google's freebusy for `calendars`.
+    Any failure answers [] — the task blocks alone still keep slots apart."""
+    tzinfo = _event_tzinfo()
+    try:
+        body = {"timeMin": start.replace(tzinfo=tzinfo).isoformat(),
+                "timeMax": end.replace(tzinfo=tzinfo).isoformat(),
+                "items": [{"id": c} for c in calendars]}
+        tz = _event_timezone()
+        if tz:
+            body["timeZone"] = tz
+        res = service.freebusy().query(body=body).execute()
+        out = []
+        for cal in (res.get("calendars") or {}).values():
+            for b in cal.get("busy") or []:
+                s = dt.datetime.fromisoformat(b["start"].replace("Z", "+00:00"))
+                e = dt.datetime.fromisoformat(b["end"].replace("Z", "+00:00"))
+                if tzinfo is not None:
+                    s, e = s.astimezone(tzinfo), e.astimezone(tzinfo)
+                out.append((s.replace(tzinfo=None), e.replace(tzinfo=None)))
+        return out
+    except Exception:
+        return []
+
+
+def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
+                              now: dt.datetime | None = None) -> list[tuple[str, str, str]]:
+    """Move open human tasks' overdue timed blocks to the next free slot and
+    write them to the md. Returns the moves. Never raises."""
+    if os.environ.get("MACP_RESCHEDULE_OVERDUE", "1") in ("0", "false", "no", "off"):
+        return []
+    try:
+        tzinfo = _event_tzinfo()
+        now = now or dt.datetime.now(tzinfo).replace(tzinfo=None)
+        blocks, busy, paths_by_slug = [], [], {}
+        for r in rows:
+            src = str(r["path"])
+            d, s, e = _parse_scheduled(src)
+            if not (d and s and e):
+                continue
+            start, end = _block_bounds(d, s, e)
+            if end > now:
+                busy.append((start, end))
+                continue
+            paths_by_slug[str(r["slug"])] = src
+            pr = None
+            try:
+                pr = int(_extract_field_from_markdown(src, "priority") or 50)
+            except ValueError:
+                pr = 50
+            blocks.append({"slug": str(r["slug"]), "start": start, "end": end,
+                           "not_before": _not_before(src), "priority": pr,
+                           "opt_out": _opted_out(src)})
+        if not any(b["end"] + RESCHEDULE_GRACE <= now and not b["opt_out"] for b in blocks):
+            return []
+        busy += _freebusy(service, calendars, now,
+                          now + dt.timedelta(days=RESCHEDULE_HORIZON_DAYS + 1))
+        moves = plan_overdue_moves(blocks, busy, now, hours=_reschedule_hours(),
+                                   weekdays=_reschedule_weekdays())
+        for slug, old, new in moves:
+            _write_scheduled(paths_by_slug[slug], new,
+                             note=f"지난 블록 {old}이 끝났는데 열려 있어 {new}로 자동 재배치")
+            print(f"calendar: rescheduled overdue block {slug}: {old} -> {new}")
+        return moves
+    except Exception as exc:  # noqa: BLE001 - never break the sync
+        print(f"calendar: overdue reschedule skipped — {exc}")
+        return []
 
 
 # (tag, calendarId) — one `--calendar-route TAG=CALENDAR_ID` flag.
@@ -616,6 +803,10 @@ def sync_due_tasks_to_calendar(
         )
         if result != "unchanged":
             created_or_updated += 1
+
+    # After the upserts, so a block the person moved in the calendar has already
+    # been pulled into the md. The md writes reach the calendar on the next sync.
+    reschedule_overdue_blocks(service, rows, managed_calendars(calendar_id, calendar_routes))
 
     return created_or_updated, skipped
 
