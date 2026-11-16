@@ -332,9 +332,10 @@ proposed_by: planner
 곳으로 모인다.**
 
 `.claude/**` 를 거치는 것은 **딱 한 번** — 스테이지 프롬프트에 "`<run_dir>/skills.md` 가 있으면 읽어라" 한 줄을 더하는
-`worker-research.md`·`worker-implement.md`·`worker-delegate.md` 변경이다. 이 한 번은 기존 `Worker/proposals/<slug>/.claude/commands/`
-+ 사람 `cp` 로 간다(하드 가드 `worker-implement.md:177-182`). 이 주입 경로가 §6 의 완료 조건 **"승인된 스킬이 다음 런의
-실제 프롬프트 경로에 실린다"** 가 검사할 배선이다 — 파서·매처 단위 테스트가 아니라, 승인된 스킬이 실제 런의
+`worker-research.md`·`worker-implement.md`·`worker-delegate.md` 변경이다. 이 한 번은 기존 제안 경로
+(`Worker/proposals/<slug>/.claude/commands/` 에 완성본, 사람이 `cp`)로 간다(하드 가드 `worker-implement.md:177-182`).
+이 주입 경로가 §6 의 완료 조건이 검사할 배선이다:
+**"승인된 스킬이 다음 런의 실제 프롬프트 경로에 실린다"** — 파서·매처 단위 테스트가 아니라, 승인된 스킬이 실제 런의
 `skills.md` 에 실리고 그 스테이지 프롬프트가 그것을 읽으라고 지시하는지를 본다.
 
 **(c) 스킬이 담을 수 없는 것.** 도구 규칙(`allowed_tools`·`Bash(...)` — 도구는 스테이지 whitelist `stages.py:375-403` 와
