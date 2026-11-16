@@ -235,7 +235,172 @@ B 만으로 같은 유형이다 — 사람이 이미 이어 둔 관계가 유사
 
 ## §3 사다리 세 단 — 제안 · 스킬 · 루틴
 
-<!-- phase-3: §3 본문 -->
+### 3.0 한눈에
+
+세 단의 파일·디렉토리는 전부 **이 설계가 신설을 제안하는 것**이다 — 지금 엔진·볼트 어디에도 없다
+(`Worker/skills`·`Worker/routines`·스킬 모듈 모두 `git ls-files` 0건, 2026-11-16).
+
+| 단 | 객체 | 파일 (신설) | 상태 | 누가 쓰나 | 누가 올리나 |
+|---|---|---|---|---|---|
+| **① 제안** | 절차 초안 + 근거 런 목록 | `Worker/skills/<id>.md` | `proposed` | 플래너(§2.4) | 사람 — 승인 CLI |
+| **② 스킬** | 승인된 절차 | 같은 파일 | `approved` · `suspended` · `retired` (`rejected` 는 제안 단에서 끝) | 사람(승인 CLI 가 커밋) | — (엔진이 주입) |
+| **③ 루틴** | 승인된 스킬 + 인스턴스화 파라미터 | `Worker/routines/<id>.md` | `enabled: false → true` | 사람(플래너는 `enabled: false` 초안까지) | 사람이 켜고, 발화는 트리거(`event-triggers.md:136`) |
+
+세 레지스트리는 `Worker/triggers/<id>.md`(event-triggers §2.1)·`Worker/assignments/` 와 **같은 자리·같은 규율**이다 —
+볼트 git 추적(편집 소스 = SoT), 틱이 디렉토리 하나를 싸게 열거, 런타임 상태(후보 기록·주입 횟수)는 비추적
+`Worker/_state/` 로 갈라 둔다(트리거 선언/발화 상태 분리와 동형 `event-triggers.md:112-117`).
+
+### 3.1 제안(rung 1) — 절차 초안 + 근거 런 목록
+
+```markdown
+---
+# Worker/skills/<id>.md  (합성 예시 — 실명·host·홈경로 없음)
+id: <kebab-id>                     # 사람이 읽는 안정 이름 (후보 id 와 별개)
+status: proposed                   # proposed → approved | rejected ; approved → suspended | retired
+version: 0                         # 승인할 때마다 +1 — 주입된 런이 어느 버전을 받았는지 남는다
+from_candidate: sc-<sha1-12>       # §2.4 후보 id (reconcile 키)
+signature:                         # §2.1 서명 — 주입 매처가 그대로 쓴다
+  repo: <owner>/<repo>
+  tags: [<tag-a>, <tag-b>]
+  touches_shape: ["docs/design/*.md"]
+  pipeline: full
+applies_to: [research, implement]  # 주입 대상 스테이지(§3.2); delegate 체인이면 [delegate]
+evidence_runs:                     # 출처는 run_id·에피소드 경로만 (graph-memory R2 provenance 와 정합)
+  - {run_id: "<YYYYMMDDTHHMMSS>-<slug-1>", slug: <slug-1>, episode: "Memory/episodes/<date>-worker-<slug-1>.md", status: pass}
+  - {run_id: "<YYYYMMDDTHHMMSS>-<slug-2>", slug: <slug-2>, episode: "Memory/episodes/<date>-worker-<slug-2>.md", status: pass}
+  - {run_id: "<YYYYMMDDTHHMMSS>-<slug-3>", slug: <slug-3>, episode: "Memory/episodes/<date>-worker-<slug-3>.md", status: pass}
+proposed_at: <ISO>
+proposed_by: planner
+---
+
+## 절차
+1. <동사 + 목적어> — 확인: `<로컬 명령>`
+2. …
+
+## 함정
+- <근거 런의 `## 학습 / 메모` 에서 뽑은 것> (<run_id>)
+
+## 근거 런
+- <run_id> — <한 줄: 무엇을 했고 어떻게 통과했나>
+
+## 적용 범위
+- <어느 서명·스테이지에 실리나 / 어느 경우엔 실리면 안 되나>
+```
+
+본문은 근거 런의 산문에서 **절차만** 뽑은 것이다 — 단계(동사 + 목적어), 각 단계의 **로컬** 확인 명령(Actions 금지
+[[Decisions/2026-09-11-no-github-actions-local-release-lane]]), 함정. 대화록 발췌·비밀값·host·개인 데이터는 넣지
+않는다(§4).
+
+**저장 위치 결론 = `Worker/skills/<id>.md` 한 파일에 상태 필드.** 별도 `Worker/skill-proposals/` 도, 기존
+`Worker/proposals/<slug>/` 도 아니다. 근거 셋:
+
+1. **제안 → 스킬은 같은 객체의 상태 전이다** — 승인이 한 파일의 diff 커밋(`status: proposed → approved`,
+   `version: 0 → 1`)으로 남는다. event-triggers 가 `enabled:` 를 선언 안에 둔 것과 동형이고(`event-triggers.md:125`),
+   디렉토리 이동이 없어 wikilink 가 깨지지 않는다.
+2. **교차 런 집계의 키는 안정 id 다** — `Worker/proposals/<slug>/` 는 "한 태스크가 낸 한 산출물" 디렉토리라 여러
+   태스크에서 모은 근거를 담을 자리가 아니다.
+3. **기존 `proposals.py` 기계로는 나타나지도, 지워지지도 않는다** — 행은 `commands/`·`.claude/commands/` 레이아웃의
+   `*.md` 가 있어야 생기고(`_LAYOUTS`·`_command_files` `proposals.py:26,56-66`), "미반영" 판정은 `<root>/.claude/commands/<name>.md`
+   와의 **바이트 비교**다(`_judge` `:224-226`). 스킬 제안에는 `.claude` 목적지가 없다.
+
+사람에게 보이는 길은 대시보드에 `pending_proposals` 와 **같은 키 집합**의 `why="todo"` 행(`proposals.py:200-208`)을
+내는 **형제 수집기**다 — 웹·앱 동일성 계약을 그대로 탄다(이름·구현은 §6).
+
+### 3.2 스킬(rung 2) — 사람 승인 뒤 설치, 에이전트가 직접 설치하지 않는다
+
+**(a) 승인 = 사람의 커밋.** 가칭 `python -m todo_system.cli skills approve <id>` 가 `status: approved`·`approved_at`·
+`version + 1` 을 쓰고 볼트에 커밋한다. `reject <id> --reason …`·`suspend <id>`·`retire <id>` 도 같은 CLI 다 — follow-up
+의 사람 결정 CLI `approve`/`dismiss`/`reroute`(`followups.py:577-645`)와 같은 모양이다. 워커 스테이지가 쓸 수 있는
+상태는 `proposed` 뿐이라는 **규약**과, 그것을 기계로 보장하는 수단(후보: 주입기가 `approved` 를 믿기 전에 그 전이
+커밋의 출처를 확인 / `Worker/skills/` 의 `status` 변경을 워커 브랜치 diff 의 금지 변경으로 두기)은 **§4 가 정한다**.
+
+**(b) 스킬 본문은 데이터로 주입된다 — 기판 결론표.**
+
+| 기판 | 설치 = 무엇을 쓰나 | "에이전트 설치 불가"를 하드 가드가 보장? | 대상 스테이지에서 실행 가능? | 판정 |
+|---|---|---|---|---|
+| (가) 스킬마다 `.claude/commands/<skill>.md` | `.claude/**` 쓰기 → **스킬·버전마다** 사람 `cp` | 예 — 헤드리스는 못 쓴다 | 프롬프트가 대상 스테이지의 `STAGE_TOOLS` 안에서 실행 가능해야 한다. G4 제안이 research·brief 에서 "질의를 직접 돌려라"는 **죽은 지시**가 된 선례(`related_context.py:3-9`; G4 행 `graph-memory.md:298`) | 기각 — **배선 한 줄용으로만** 남긴다 |
+| ★ (나) 레지스트리 `Worker/skills/<id>.md` + **엔진 주입** | 상태 필드 전이 커밋(승인 CLI) — `.claude/**` 쓰기 **없음** | 아니오 — 규약 + §4 의 기계 장치 | 예 — 엔진이 런 시작 전에 `<run_dir>/skills.md` 를 쓰고 스테이지는 Read 만 한다(`related.md` 와 같은 모양: `runner.py:1104-1112` → `stages.py:2266` → `related_context.py:428`). 플래너 틱에는 `emit-context` 블록 | **채택** |
+| (다) `.claude/skills/<name>/SKILL.md` | `.claude/**` 쓰기 | 예 | 엔진·볼트 어디에도 디렉토리가 **없고**(`.claude` 추적 파일 = `commands/*.md` 뿐), 헤드리스 `claude -p` 스테이지가 이를 로드하는지 **미확인** | 기각 |
+| (라) `Todo/templates/` | 태스크 스캐폴드 | — | 절차가 아니라 **태스크의 모양** | 기판 아님 — §3.3 루틴 인스턴스화에서 재사용 |
+
+**결론 = (나) + (가) 하이브리드.** 절차 본문은 레지스트리 → 엔진 주입이다(권한 불변, 설치 = 데이터 상태 전이).
+주입 매처는 §2.1 의 캐스케이드를 그대로 쓴다 — 런의 태스크 서명이 `status: approved` 스킬의 `signature` 와 부분
+일치하면(또는 태스크 frontmatter 가 `skill: <id>` 로 명시하면 — §3.3) 그 스킬의 `## 절차`·`## 함정`·`## 적용 범위` 를
+`<run_dir>/skills.md` 에 싣고, 실린 `id`·`version` 을 런 기록에 남긴다(§5 측정의 키). `related.md` 처럼 **어느
+에이전트의 도구 권한도 바뀌지 않는다** — `test_related_context_wiring.py` 가 같은 불변식을 고정한 선례
+(`related_context.py:19-21`). 설치에 `.claude/**` 쓰기가 없으므로 **"에이전트가 직접 설치하지 않음"은 승인 CLI 한
+곳으로 모인다.**
+
+`.claude/**` 를 거치는 것은 **딱 한 번** — 스테이지 프롬프트에 "`<run_dir>/skills.md` 가 있으면 읽어라" 한 줄을 더하는
+`worker-research.md`·`worker-implement.md`·`worker-delegate.md` 변경이다. 이 한 번은 기존 `Worker/proposals/<slug>/.claude/commands/`
++ 사람 `cp` 로 간다(하드 가드 `worker-implement.md:177-182`). 이 주입 경로가 §6 의 완료 조건 **"승인된 스킬이 다음 런의
+실제 프롬프트 경로에 실린다"** 가 검사할 배선이다 — 파서·매처 단위 테스트가 아니라, 승인된 스킬이 실제 런의
+`skills.md` 에 실리고 그 스테이지 프롬프트가 그것을 읽으라고 지시하는지를 본다.
+
+**(c) 스킬이 담을 수 없는 것.** 도구 규칙(`allowed_tools`·`Bash(...)` — 도구는 스테이지 whitelist `stages.py:375-403` 와
+implement 의 태스크 `allowed_tools`(`TASK_TOOLS_STAGES` `:446`)만 정한다), `FORBIDDEN_TOOL_SUBSTRINGS`(`:423-426`) 우회,
+플래너 정책 파일·플래너 가드레일·`auto_merge`/승인 게이트 완화(볼트 `Worker/planner_policy.yaml` 의
+`self_guardrail_modification`; rescope 의 가드레일 경로 `rescope.py:73`), 비밀값·host·개인 데이터·대화록 발췌. 스킬은
+"무엇을 어떤 순서로, 무엇으로 확인하며 하나"만 나른다. 상세·내보내기 규칙은 §4.
+
+### 3.3 루틴(rung 3) — 승인된 스킬을 스케줄·이벤트 트리거에 묶는다
+
+**정의: 루틴 = 승인된 스킬 + 인스턴스화 파라미터.** 트리거 선언은 **아니다**.
+
+```yaml
+# Worker/routines/<id>.md frontmatter  (합성 예시)
+id: <routine-id>
+skill: <skill-id>               # status: approved 여야 유효 — suspended·retired 면 인스턴스화하지 않는다
+enabled: false                  # 기본 정지 — 사람이 true 로 켠다 (가져온 루틴은 정지 시작 — §4)
+instance_slug: "<routine-id>-{YYYYMMDD}"
+overlap: skip                   # 이전 인스턴스가 열려 있으면 새로 만들지 않는다
+task_template:                  # 인스턴스 태스크 md 의 frontmatter 초안
+  title: "<제목> — {YYYY-MM-DD}"
+  tags: [todo, <tag-a>]
+  repo: <owner>/<repo>
+  touches: ["<path-shape>"]
+  worker_mode: auto
+  estimate_p50: 30m
+  estimate_p90: 60m
+  acceptance_criteria: ["<로컬 명령으로 확인할 완료 조건>"]
+```
+
+**인스턴스화** = `Todo/items/<routine-id>-<YYYYMMDD>.md` 를 `task_template` 에서 만들고(기존 스캐폴드
+`cli new --template` 재사용 `todo_system/cli.py:2003-2007`) frontmatter 에 `skill: <skill-id>` 를 찍는다 — §3.2 주입기가
+서명 매칭과 무관하게 그 스킬을 **반드시** 싣는다.
+
+**트리거 결합은 인용만 한다.** event-triggers 의 선언 스키마가 이미 `targets:` 아래
+`- routine: <routine-id>  # 루틴(파라미터화 템플릿)에서 새 런 생성`(`event-triggers.md:136`)을 갖고 있다 — 그
+`<routine-id>` 가 이 파일의 `id` 다. 시각·이벤트·겹침·발화 상한·속도 제한은 전부 트리거 레지스트리
+(`Worker/triggers/<id>.md` `event-triggers.md:98-117`)의 몫이고, 루틴은 스케줄을 **다시 선언하지 않는다**(단일 출처).
+루틴의 `overlap` 은 "열린 인스턴스가 있으면 만들지 않음"이라는 **인스턴스** 규칙이고 트리거의 `overlap` 은 **발화**
+규칙이다 — 둘이 겹치면 보수적인 쪽(skip)이 이긴다.
+
+레지스트리를 트리거와 **분리**하는 근거(event-triggers §2.1 의 셋을 거울로 `event-triggers.md:104-110`): ① **팬아웃** —
+한 트리거가 여러 루틴을, 한 루틴이 여러 트리거(평일 스케줄 + 웹훅)를 가질 수 있다 ② **수명** — 루틴은 스킬이 은퇴할
+때까지 살고 트리거는 그보다 자주 바뀐다 ③ **열거 비용** — 틱이 루틴 디렉토리 하나만 읽는다.
+
+**지금의 손 체인을 대체한다**(§1.3 ④): 회차가 다음 회차 md 를 `not_before` 로 써 두는 delegate 체인 →
+`kind: schedule` 트리거 + 루틴 + 스킬(런북 노트의 절차가 스킬 본문으로). 엔진이 인스턴스화하므로 체인이 끊기지
+않고, 런북 갱신은 스킬 `version` 으로 남는다.
+
+**의존**: event-triggers 의 E1(스키마·파서)·E3(스케줄 평가)·E5(디스패치 배선)는 **미구현**이다(`event-triggers.md:310-314`;
+`todo_system/triggers.py` 없음) → **소프트 의존, 블로커 아님**. 트리거가 생기기 전까지는 사람이 루틴을 손으로
+인스턴스화하는 CLI(가칭 `cli routine run <id>`)가 선행 단계가 된다 — 이름과 순서는 §6 이 정한다.
+
+### 3.4 기존 제안 프로토콜과의 관계
+
+| 항목 | 유지 / 신설 / 대체 | 비고 |
+|---|---|---|
+| `Worker/proposals/<slug>/` + README `cp` 줄 + 대시보드 `why="todo"` 행 | **유지** | 모든 `.claude/**` 변경의 유일한 경로 — §3.2 의 배선 한 줄도 여기로 간다. `cp` 줄·조건부 파싱(`_cp_line` `proposals.py:129`, `_condition` `:148`) 그대로 |
+| 대시보드가 스캔하는 `<root>` | **관찰 — 확인 필요** | `collect_proposals()` 는 인자 없이 불려(`macp_dashboard.py:1784`) `pending_proposals(root or _INSTALL_DIR)` 로 가고(`:1226`), `_INSTALL_DIR = paths.engine_root()`(`:74`) — **엔진 체크아웃**이지 볼트(`VAULT` `:82`)가 아니다. 워커는 제안을 `<vault_root>/Worker/proposals/` 에 쓴다(`worker-implement.md:180`). 엔진과 볼트가 다른 디렉토리인 배치에서는 스캔 대상에 제안 디렉토리가 없어 `_signature` 가 `None` → 빈 목록이다(`proposals.py:76-81`). 실 배치에서 행이 뜨는지는 **미확인**. 이 설계의 스킬 행 수집기는 **`VAULT` 를 스캔한다** |
+| 스킬·루틴 레지스트리 + 엔진 주입(`skills.md`) + 승인 CLI | **신설** | 이 설계가 제안 — 지금 엔진·볼트 어디에도 없다(§3.0) |
+| 에피소드(산문 교훈) | **유지 + 보강** | 여전히 1차 증거. 스킬은 그 위의 파생이고, 스킬이 주입된 런의 에피소드가 §5 효과 측정의 데이터가 된다 |
+| `not_before` 회차 체인 | **대체 대상** | §3.3 루틴 + 트리거 |
+| 플래너의 `from_followup`·`from_discovery` | **동형 확장** | `from_candidate`(§2.4) — 같은 reconcile·rejected jsonl·만료 규율 |
+
+사다리 전체에서 **사람이 하는 일은 셋뿐**이다: ① 제안을 검토하고 `skills approve`(또는 `reject`) ② 배선 한 줄의
+`cp` **한 번** ③ 루틴 `enabled: true`. 나머지 — 감지·초안·주입·인스턴스화 — 는 엔진과 플래너가 한다.
 
 ---
 
