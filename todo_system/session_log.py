@@ -55,6 +55,7 @@ import subprocess
 from pathlib import Path
 
 from . import paths
+from .frontmatter_lists import parse_inline_list
 from .orchestrator import hq_host
 
 # Vault root, via the shared resolver. paths is stdlib-only, so this module
@@ -195,7 +196,9 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     """Parse leading YAML-ish frontmatter into an ordered dict + body.
 
     Handles scalars and simple ``- item`` block lists (the only shapes this
-    module writes). Mirrors the lightweight parser used elsewhere in the vault.
+    module writes), plus one-line ``[a, b]`` flow lists via
+    ``frontmatter_lists.parse_inline_list`` (written back as block lists).
+    Mirrors the lightweight parser used elsewhere in the vault.
     """
     if not content.startswith("---\n"):
         return {}, content
@@ -220,6 +223,9 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
                 items.append(lines[i].strip()[2:].strip().strip('"').strip("'"))
                 i += 1
             fm[key] = items
+        elif (inline := parse_inline_list(value)) is not None:
+            fm[key] = inline
+            i += 1
         else:
             fm[key] = value.strip('"')
             i += 1

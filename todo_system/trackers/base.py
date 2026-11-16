@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import paths
+from ..frontmatter_lists import parse_inline_list
 
 
 # --------------------------------------------------------------------------- #
@@ -343,8 +344,9 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str | list[str]], str]:
     """Parse YAML-ish frontmatter into (dict, body).
 
     Line-for-line mirror of ``cli.parse_frontmatter`` (kept off cli's import graph):
-    scalar ``key: value`` pairs plus simple ``- item`` lists. Quotes are stripped
-    from scalars.
+    scalar ``key: value`` pairs plus simple ``- item`` lists, and one-line
+    ``[a, b]`` lists via ``frontmatter_lists.parse_inline_list``. Quotes are
+    stripped from scalars.
     """
     if not content.startswith("---\n"):
         return {}, content
@@ -383,6 +385,11 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str | list[str]], str]:
                     continue
                 break
             result[key] = items
+            continue
+        inline = parse_inline_list(value)
+        if inline is not None:
+            result[key] = inline
+            idx += 1
             continue
         value = value.strip().strip('"').strip("'")
         result[key] = value

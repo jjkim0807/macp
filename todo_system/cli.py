@@ -26,6 +26,7 @@ from . import task_validate as _task_validate
 from . import session_end as _session_end
 from . import paths
 from . import i18n
+from .frontmatter_lists import parse_inline_list
 
 ROOT = paths.vault_root()
 TODO_DIR = ROOT / "Todo"
@@ -228,6 +229,11 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str | list[str]], str]:
                     continue
                 break
             result[key] = items
+            continue
+        inline = parse_inline_list(value)
+        if inline is not None:
+            result[key] = inline
+            idx += 1
             continue
         value = value.strip().strip('"').strip("'")
         result[key] = value
