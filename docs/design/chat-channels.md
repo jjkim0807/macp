@@ -229,7 +229,7 @@ tags: [todo, <tag>]       # 생성 태스크의 기본 태그
 | 타깃 | `worker_mode` | 만드는 것 | 실행 | 근거 |
 |---|---|---|---|---|
 | **즉답** | 없음 | 태스크·런·ledger 행 없음 — 대화록 `reply` 줄 하나 | 읽기 전용 호출 한 번(3.4) | — |
-| **quick** | `quick` | `Todo/items/<slug>.md` | 단계 하나로 끝낸다 — 코드 수정·PR·로컬 검사·머지(`worker-quick.md:5-7,23-42`) | `tasks.md:79`; `STAGES_QUICK` `stages.py:164` |
+| **quick** | `quick` | `Todo/items/<slug>.md` | 단계 하나로 끝낸다 — 코드 수정·PR·로컬 검사·머지(`worker-quick.md:5-7,17-42`) | `tasks.md:79`; `STAGES_QUICK` `stages.py:164` |
 | **delegate** | `delegate` | md | 단계 하나 — 태스크 파일이나 노트를 고친다. 코드 머지 없음 | `tasks.md:80`, `concepts.md:110-111`; `STAGES_DELEGATE` `stages.py:163` |
 | **정식 태스크** | `auto` · `review` · `manual` | md | `auto` = 5 단계(`tasks.md:78`, `stages.py:162`); `review` = 사람이 먼저 본다(`:83`); `manual` = 사람이 한다(`:84`) | `/todo` 라우터 `todo.md:14-29` |
 
@@ -331,7 +331,7 @@ ledger 행도 없으니 `WORKER_MODES`(`config.py:35`)에 더할 것도 없다.
     도는 런은 다음 단계 경계에서 멈추며, 아무것도 push 하지 않는다(`runner.py:2231-2263,2300-2306`; 단계 루프
     `:1220-1233`).
   - **한계 — 그대로 적는다.** 취소 확인은 단계 **사이**에서만 한다. 단계가 하나뿐인 `quick`·`delegate` 가 이미
-    그 단계 안에 있으면 끝까지 간다. `quick` 은 그 단계 안에서 PR 을 열고 머지까지 하므로(`worker-quick.md:23-42`)
+    그 단계 안에 있으면 끝까지 간다. `quick` 은 그 단계 안에서 PR 을 열고 머지까지 하므로(`worker-quick.md:21-42`)
     이미 머지됐을 수 있다. 볼트 `delegate` 는 단계 뒤 publish 만 건너뛴다(`runner.py:1759-1772`). 이 경우
     `/reroute` 는 취소가 아니라 **되돌리기·다시 하기 후속 태스크**를 만든다.
   - R2 바닥은 `/reroute` 에도 걸린다.
@@ -556,8 +556,8 @@ GET /api/channels → 200 {"channels": [ {"id": "...", "title": "...", "can_post
 - 이 규칙을 담는 C4 가 디스패치를 켜는 C5 보다 먼저 머지되도록 체인을 짰다(§6.1). 그래서 채널 태스크가 래퍼를 받는 창이 없다.
 
 **R6 (a) 에서 모델이 고르는 `delegate`.** 모델 보조는 R6 에서 {`answer`·`delegate`·`review`} 중 `delegate` 를 고를 수
-있다(§3.3). 채널 출처 delegate 의 allowlist 는 `Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*)` 다
-(`stages.py:386-388` 에서 위 래퍼를 뺀 것). R2 바닥이 모델 뒤에 다시 걸리고, 채널별 일일 자동 실행 ≤ 20·5 게이트·일일 런
+있다(§3.3). 채널 출처 delegate 의 allowlist 는 `Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*) Bash(macp-remote-gate:*)` 다
+(`stages.py:386-388` 에서 `macp-sms`·`macp-browser`·`macp-mail` 래퍼를 뺀 것). R2 바닥이 모델 뒤에 다시 걸리고, 채널별 일일 자동 실행 ≤ 20·5 게이트·일일 런
 예산도 지난다(§3.6). 의도한 최대치는 "노트·태스크 편집 + 공개 웹 읽기"다. 다만 `Bash(git:*)` 도 훅·별칭으로 임의 코드를
 돌릴 수 있어(`SECURITY.md:11-13`) 이것은 가드레일이다. 바닥은 R2 와 5.3 의 토큰 미보유다.
 
