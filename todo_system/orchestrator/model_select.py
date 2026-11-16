@@ -126,7 +126,11 @@ def model_unavailable(text: str) -> bool:
     re-probe would just burn three more calls against the same wall.
     """
     t = (text or "").lower()
-    return any(mark in t for mark in _UNAVAILABLE_MARKERS)
+    # "You've hit your Fable limit · resets …" (2026-11-16): a per-MODEL limit, so
+    # another model can run. Account-wide ones ("hit your weekly/session limit")
+    # stay out — re-probing other models would only hit the same wall.
+    return any(mark in t for mark in _UNAVAILABLE_MARKERS) or bool(
+        re.search(r"hit your [\w .-]{0,20}?\b(fable|opus|sonnet|haiku)\b[\w .-]{0,20}?limit", t))
 
 
 # The CLI's rc=1 "the model answered but wanted another turn" — proof the model

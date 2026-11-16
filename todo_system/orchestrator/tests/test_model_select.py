@@ -508,3 +508,15 @@ class ProbeIsolationTest(unittest.TestCase):
     def test_other_failures_still_fail(self):
         self.assertFalse(self._run(1, "Error: model not found")[0])
         self.assertFalse(self._run(0, "You're out of usage credits.")[0])
+
+
+def test_per_model_limit_notice_is_unavailable_and_capacity():
+    from todo_system.orchestrator import stages
+    msg = ("You've hit your Fable limit · resets Nov 22, 2pm (Asia/Seoul). Switch to "
+           "another model, or manage usage credits at https://claude.ai/settings/usage")
+    assert ms.model_unavailable(msg)
+    assert stages.is_capacity_limit(msg)
+    assert stages.is_capacity_limit("You've hit your session limit · resets 5pm")
+    assert not stages.is_capacity_limit("the loop should hit your target slowly")
+    # account-wide limits are capacity, but not "this model is unavailable"
+    assert not ms.model_unavailable("You've hit your weekly limit · resets 8am")
