@@ -221,4 +221,174 @@ tags: [todo, <tag>]       # 생성 태스크의 기본 태그
 - ③ (선택) **채널별 일일 요약** `Memory/sessions/<date>-<channel-id>.<host>.md` — `session_log` 경유(git 추적
   저널 `session_log.py:18-24`, allowed-dirty `worker.py:2583-2584`). 건수, 만든 slug, 결정 요지만 적는다.
 
-<!-- §3 이하 이어 씀 -->
+---
+
+## §3 라우팅 — 즉답 · quick · delegate · 정식 태스크 생성
+
+### 3.1 타깃 넷 — 기존 `worker_mode` 와 1:1
+
+| 타깃 | `worker_mode` | 만드는 것 | 실행 | 근거 |
+|---|---|---|---|---|
+| **즉답** | 없음 | 태스크·런·ledger 행 없음 — 대화록 `reply` 줄 하나 | 읽기 전용 호출 한 번(3.4) | — |
+| **quick** | `quick` | `Todo/items/<slug>.md` | 단계 하나로 끝낸다 — 코드 수정·PR·로컬 검사·머지(`worker-quick.md:5-7,23-42`) | `tasks.md:79`; `STAGES_QUICK` `stages.py:164` |
+| **delegate** | `delegate` | md | 단계 하나 — 태스크 파일이나 노트를 고친다. 코드 머지 없음 | `tasks.md:80`, `concepts.md:110-111`; `STAGES_DELEGATE` `stages.py:163` |
+| **정식 태스크** | `auto` · `review` · `manual` | md | `auto` = 5 단계(`tasks.md:78`, `stages.py:162`); `review` = 사람이 먼저 본다(`:83`); `manual` = 사람이 한다(`:84`) | `/todo` 라우터 `todo.md:14-29` |
+
+**새 모드는 없다.** quick·delegate·정식 태스크는 모두 진짜 `Todo/items/<slug>.md` 이고, advote 브리지가 만든
+태스크와 같은 todo-sync 경로로 커밋된다(`worker.py:2587-2588,2618`). md 를 만들지 않는 것은 즉답뿐이며, md 도
+ledger 행도 없으니 `WORKER_MODES`(`config.py:35`)에 더할 것도 없다.
+
+**출처 표시** — 채널이 만든 태스크는 어디서 왔는지 md 에 남긴다.
+
+- slug `ch-<channel-id>-<YYMMDD>-<xxxxxx>`(`xxxxxx` = ULID 끝 6자, 소문자) — advote 브리지의
+  `dc-fb-<YYMMDD>-<id>`(`advote_bridge.py:4`) 모양이다.
+- frontmatter `channel: "<channel-id>"`, `channel_msg: "<ULID>"`. **`parent:` 는 달지 않는다** — 부모는 자식이 모두
+  끝나면 닫히는데(`tasks.md:136`), 채팅 메시지 하나가 umbrella 프로젝트의 닫힘을 바꾸면 안 된다.
+- Progress Log 첫 줄: `- YYYY-MM-DD: 채널 <channel-id> 메시지 <ULID> 에서 생성 — 규칙 R<n>`.
+- 대시보드 라벨은 `channel:` 을 먼저 따라야 한다. 지금 휴리스틱은 slug 접두 `ch-<channel-id>` 를 라벨로 줄
+  것이다(`_project_of` `macp_dashboard.py:1283-1288`). 이 라벨 규칙과 위 필드를 읽는 코드는 §6 이 배선한다 —
+  새 frontmatter 필드는 읽는 쪽이 생기기 전까지 아무 효과가 없다.
+
+### 3.2 규칙 사다리 R0~R6
+
+| 규칙 | 신호(결정적 — 코드가 판정) | 타깃 | 근거 |
+|---|---|---|---|
+| **R0** | **명시 접두** — 첫 토큰이 `/ask` `/quick` `/delegate` `/auto` `/task` `/manual` | 그 타깃(`/task` = `review`). 단 이 채널이 받을 수 있을 때만이다 — `quick`·`auto` 는 `repo:` 가, `quick` 은 `allow_quick: true` 도 있어야 한다. 못 받으면 `note` 를 남기고 아래로 내려간다 | 명시 요청이 추측보다 낫다 |
+| **R1** | **질문·상태 조회** — 변경 동사 없는 의문문, 또는 기존 slug·run id + 상태 낱말 | `answer`(즉답) | 3.4 |
+| **R2** | **사람 전용 신호** — 결정·승인; 결제·구매; 실계좌·주문; 사용자 명의 제출(지원·신청·발송·게시); 로그인·2FA; 그 밖의 외부 행동 | 정식 `manual`. `decision` 태그는 **결정 신호에만** 단다 — 사람이 그냥 하는 일은 "직접 할 일"로 보인다(`_is_decision` `macp_dashboard.py:746-753`; (볼트) CLAUDE.md §3). **바닥**(아래) | `todo.md:28-29`, `worker-quick.md:55-61`, (볼트) CLAUDE.md §12 |
+| **R3** | **작은 되돌릴 수 있는 수정** — `repo:` ∧ `allow_quick` ∧ 범주 copy·cosmetic·config(문구·오타·번역·색·간격·설정값) ∧ 안전·금융 낱말(실계좌·주문·kill switch·청산·liveness 경보) 없음 | `quick` | `advote_bridge.py:11-20`(`AUTO_APPROVE_CATEGORIES` `:197`), `tasks.md:79`, `worker-quick.md:52-61` |
+| **R4** | **조사·초안·갱신** — "알아보고 적어", 정리·요약·초안, 태스크·노트 갱신 | `delegate` | `tasks.md:80`, `todo.md:27` |
+| **R5** | **기능·버그·리팩터·테스트** — `repo:` ∧ 구현 동사 ∧ 메시지가 파일을 지명 | 정식 `auto` + `repo:` + `touches:`(지명된 파일) + 배선 AC(`todo.md:18-26,70-78`). 지명된 파일이 없으면 R6 | `tasks.md:78`, `concepts.md:142-145` |
+| **R6** | **기본값** — 아무것도 맞지 않음, 또는 가드가 후보를 전부 거부 | 정식 `review`. 모델 보조가 켜져 있으면 {`answer`·`delegate`·`review`} 를 열고 그 안에서 모델이 고른다(3.3) | `tasks.md:83` |
+
+**평가 순서.** R0 이나 R2 가 맞으면 거기서 확정한다. R1·R3·R4·R5 는 후보를 모은다 — 하나만 맞거나 맞은 것이
+모두 같은 타깃이면 그것이 타깃이고, 서로 다른 타깃으로 둘 이상 맞으면 모델이 그 후보 안에서 고른다(3.3).
+아무것도 안 맞으면 R6 이다.
+
+**R2 는 순서와 무관한 바닥이다.** R2 신호가 있는 메시지는 R0 를 포함한 어떤 규칙·모델도 부작용 타깃
+(`delegate`·`auto`·`quick`)으로 보내지 못하고, 묵시 즉답(R1)도 받지 않는다 — 결과는 `manual` 이다. 예외는 사람이
+직접 고른 둘뿐이다: 명시 `/ask`(읽기 전용 즉답)와 명시 `/task`(`review` — 역시 디스패치되지 않는 사람 타깃).
+
+규칙은 순수 함수 `(메시지, 채널 선언) → (규칙 id, 후보 타깃)` 이고 §6 의 표 테스트로 못박는다. 메시지 본문은
+지시가 아니라 데이터다(event-triggers §4.4).
+
+### 3.3 판정 주체 — 규칙 우선, 모델 판정은 보조
+
+- **누가 판정하나**: 드레인 안의 라우터 코드다. 수신 핸들러는 저장만 한다(event-triggers §3.3 의 저장/드레인
+  분리; 입력 인증은 §5). 판정은 서버가 하고 웹·앱은 그리기만 한다((볼트) `docs/dashboard-parity.md` 규칙).
+- **드레인이 도는 곳**: 자기 짧은 주기(제안 60 s)로 돈다. 즉답 호출이 오케스트레이터 틱(~5분 `concepts.md:57`)을
+  막지 않게 하기 위해서다. 실행 단위(타이머·유닛)는 §6 이 정한다.
+- **모델을 부르는 때** — 아래 둘뿐이고, 메시지당 최대 한 번이다.
+  - (a) R0~R5 가 모두 빗나갔다 — 즉 R6 에서.
+  - (b) R1·R3·R4·R5 중 둘 이상이 서로 다른 타깃으로 맞았다.
+  - R0 이나 R2 로 정해진 메시지는 모델을 부르지 않는다.
+- **호출**: 의사 스테이지 `route`(capability 요건은 3.4 와 같다), light 티어(`concepts.md:129-136`), 도구 없음.
+  입력은 고정 루브릭 + 데이터 펜스 안의 메시지 ≤ 4000자, 출력은 타깃 enum 하나 + 이유 ≤ 200자.
+- **받아들이는 범위**: 자율 순서는 `manual` ≈ `review`(사람) < `answer`(읽기 전용) < `delegate`(노트 편집) <
+  `auto`(코드 + 별도 verify 단계) < `quick`(코드를 한 단계에서 자기 검증·머지 `worker-quick.md:23-42`)이다.
+  - (b) 에서는 후보 집합 안에서만 고른다.
+  - (a) 에서는 R6 가 연 {`answer`·`delegate`·`review`} 안에서만 고른다.
+  - `auto`·`quick` 은 규칙(R0·R3·R5)이 연 경우에만 후보가 된다 — 모델은 그것을 열지 못한다.
+  - R2 바닥은 모델 판정 뒤에 한 번 더 건다.
+  - 요컨대 모델은 규칙이 연 범위를 **넓히지 못하고 좁히기만** 한다.
+- **실패**(파싱 오류, 집합 밖 enum, 시간 초과, 상한 도달, HOLD): (a) 는 R6 의 기본값 `review`, (b) 는 후보 중
+  가장 덜 자율적인 것.
+- **마지막 말은 사람에게 있다** — 3.5.
+
+### 3.4 즉답 — 런 없는 읽기 전용 호출 한 번
+
+- `worker_mode` 도 디스패치도 아니다. 의사 스테이지 `answer` 한 번을 `AgentBackend`(`agent_backend.py:85`)로
+  부른다.
+- **capability**: `headless` + `tool_allowlist` 를 요구한다. 지금 `required_capabilities` 는 모르는 스테이지
+  이름에 `headless` 만 준다(`stages.py:239-249`). 그래서 `answer`·`route` 를 `_READONLY_GUARANTEE_STAGES`
+  (`:236`)에 더하는 것이 구현의 요구사항이다. 어느 백엔드든 `missing_capabilities`(`agent_backend.py:70-81`)를
+  통과해야 하고, 못 하면 claude light 로 간다. 턴 상한은 `turn_cap`(`agent_backend.py:56`)으로 건다 — 그것이
+  없는 백엔드는 시간 상한만 남으므로 즉답에 쓰지 않는다.
+- **도구**: 많아야 `Read Bash(grep:*)`. Edit·Write·gh·WebFetch·네트워크는 없다(curl 은 원래 금지
+  `stages.py:423-426`).
+- **상한(제안)**: ≤ 8 턴, ≤ 180 s, 답 ≤ 2000자.
+- **실행 맥락**: 채널 프로젝트의 프로필·계정으로 돈다(2.3). cwd 는 그 리포의 기본 브랜치 트리(읽기 전용 — 어느
+  체크아웃을 쓸지는 §6 이 정한다)이고, 볼트 채널이면 볼트다.
+- **입력**: 메시지 + 앞선 채널 대화 ≤ 4000자, 데이터 펜스 안. 프롬프트는 "변경 요청이면 답하지 말고 `/task` 를
+  권한다"를 못박는다.
+- **출력**: 답은 대화록에 쓰기 전에 마스킹한다(run-event-stream §4.2 패턴; 세부는 §5).
+- **usage guard**: **HOLD** 면 즉답도 멈춘다. `bypass_guard` 는 없다(`concepts.md:147-150`, event-triggers §4.3).
+  메시지는 가드가 열릴 때까지 대화록에서 기다린다.
+- **감사**: `reply` 줄에 `usage`(9 `USAGE_KEYS` `stages.py:530-534`)·`backend`·`rule`·`reply_to` 를 남긴다(2.4
+  예시 셋째 줄). 런 스트림에는 kind 를 더하지 않는다 — 스트림은 런마다 파일 하나이고 writer 는 그 런의 러너
+  하나다(run-event-stream §2.1). 런을 만든 메시지만 `run_id` 로 스트림과 잇는다.
+
+### 3.5 잘못 나눴을 때 사람이 고치는 방법
+
+전부 기존 면을 쓴다.
+
+- **(a) 채널에서 `/reroute <msg-id|slug> answer|quick|delegate|auto|review|manual`.**
+  - 라우터가 md 의 `worker_mode` 를 고치고(md 가 정본) Progress Log 에 `채널 /reroute: <from> → <to>` 를 남긴다.
+    대화록에는 `reroute` 줄이 남는다.
+  - 아직 디스패치 전이면 다음 틱이 새 모드를 본다.
+  - 이미 디스패치됐으면 기존 `CANCEL` 봉투(`message.py:26`)를 보내고 새 모드로 다시 디스패치한다. 지금 CANCEL
+    을 보내는 곳은 원격 호스트에서 fallback 으로 옮기는 `_reroute`(`orchestrator.py:2002-2043`, 봉투
+    `:2014-2025`) 하나뿐이라, 모드 변경용 송신 지점은 §6 이 같은 봉투로 더한다. 러너는 대기 중인 런을 건너뛰고,
+    도는 런은 다음 단계 경계에서 멈추며, 아무것도 push 하지 않는다(`runner.py:2231-2263,2300-2306`; 단계 루프
+    `:1220-1233`).
+  - **한계 — 그대로 적는다.** 취소 확인은 단계 **사이**에서만 한다. 단계가 하나뿐인 `quick`·`delegate` 가 이미
+    그 단계 안에 있으면 끝까지 간다. `quick` 은 그 단계 안에서 PR 을 열고 머지까지 하므로(`worker-quick.md:23-42`)
+    이미 머지됐을 수 있다. 볼트 `delegate` 는 단계 뒤 publish 만 건너뛴다(`runner.py:1759-1772`). 이 경우
+    `/reroute` 는 취소가 아니라 **되돌리기·다시 하기 후속 태스크**를 만든다.
+  - R2 바닥은 `/reroute` 에도 걸린다.
+- **(b) 즉답이 틀렸으면** `/task <msg-id>` 로 태스크로 만든다(`review`, 또는 모드를 함께 준다).
+- **(c) 채널 밖에서**: md 를 고치고 커밋한 뒤, 파킹된 태스크면 `cli resume <slug> --after-commit <sha>`
+  (`concepts.md:190-193`). 세션의 `/decide`(`decide.md:11-35`)도 된다.
+- **(d) 측정**: 모든 `route` 줄에 규칙 id 와 모델 판정이, 모든 `reroute` 줄에 from/to 가 있다. 그래서 규칙별
+  오분류율이 나온다. 사다리는 추측이 아니라 측정으로 고친다.
+
+웹·앱 화면은 메시지마다 아래에 라우팅 결과와 "다시 나누기" 동작을 보여 주고, 그 동작이 `/reroute` 를 보낸다
+(§6 — 웹·앱 동일).
+
+### 3.6 라우팅 호출의 비용 상한
+
+| 항목 | 상한(제안 — 사람 게이트) | 넘으면 |
+|---|---|---|
+| 라우팅 모델 호출 / 메시지 | ≤ 1 — 규칙이 정하면 0 | 재시도 없음. (a) 는 R6 `review`, (b) 는 가장 덜 자율적인 후보 |
+| 라우팅 입력 | 루브릭 + 메시지 ≤ 4000자 | 더 긴 본문은 수신 단계에서 거절돼 모델에 닿지 않는다(2.4 본문 상한) |
+| 라우팅 출력 | enum 1개 + 이유 ≤ 200자 | 실패로 본다 → 위 첫 행과 같다 |
+| 즉답 / 메시지 | 호출 ≤ 1 · ≤ 8 턴 · ≤ 180 s · 답 ≤ 2000자 | 정식 `review` 로 만들고 대화록에 "한도 초과 — 사람 확인 대기" |
+| 채널별 일일 즉답 | ≤ 50 | 위와 같다 |
+| 채널별 일일 자동 실행 태스크(quick·delegate·auto) | ≤ 20 | `review` 로 만든다(런 없음) + 같은 문구 |
+| 전 채널 합계 모델 호출(route + 즉답) / 일 | ≤ 200 | 그 뒤로는 규칙만 쓰고, 즉답 대상은 `review` 가 된다 |
+| 드레인 1회 | ≤ 5 메시지 · ≤ 300 s | 나머지는 다음 드레인 — 수신 즉시 저장했으니 잃지 않는다 |
+| usage guard HOLD | 모델 호출 0 · 즉답 0 | 규칙은 계속 md 를 만든다(디스패치는 게이트에서 멈춘다). 즉답과 애매한 메시지는 가드가 열릴 때까지 기다린다 |
+
+채널이 만드는 모든 것은 여전히 **5 디스패치 게이트**(`concepts.md:57-66`)와 프로필의 **일일 런 예산**
+(`config.py:86`)을 지나고, `bypass_guard` 를 자동으로 얻지 않는다(event-triggers §4.3). 즉답은 런이 아니라서
+런 예산이 묶지 못한다 — 그래서 위의 채널별·전체 상한이 즉답을 묶는다.
+
+---
+
+## §4 결과 회신 — 런 진행·완료·승인 요청이 채널에 나타나는 방식 · 메신저 알림 중복 방지
+
+> **자리표시 — 다음 leaf에서 채움.** 자매 leaf `macp-chat-channel-entry-design-b-reply-safety-split` 이 채운다 —
+> 런 진행·완료·승인 요청이 채널에 나타나는 방식(런 이벤트 스트림 설계와 맞춤), 기존 메신저 알림과 중복되지 않게
+> 하는 규칙.
+
+---
+
+## §5 안전 — 실계좌·결제·사용자 명의 제출 권한 비확대 · 입력 인증
+
+> **자리표시 — 다음 leaf에서 채움.** 자매 leaf `macp-chat-channel-entry-design-b-reply-safety-split` 이 채운다 —
+> 채널 메시지로는 실계좌·결제·사용자 명의 제출 권한이 넓어지지 않는다는 규칙, 입력 인증.
+
+---
+
+## §6 단계별 구현 분할안 · 라우트·화면 수준 완료 조건 (웹·앱 동일)
+
+> **자리표시 — 다음 leaf에서 채움.** 자매 leaf `macp-chat-channel-entry-design-b-reply-safety-split` 이 채운다 —
+> 단계별 구현 분할안(leaf 목록, depends_on 체인, 각 leaf의 로컬 검증 명령)과 '채널에 쓴 메시지가 실제로 런을
+> 만들고 답이 같은 채널에 보인다'를 라우트·화면 수준에서 요구하는 완료 조건. 웹과 앱 동일 제공.
+
+---
+
+## 부록: 이 노트가 확정한 설계 결정 요약
+
+> **자리표시 — 다음 leaf에서 채움.** 자매 leaf `macp-chat-channel-entry-design-b-reply-safety-split` 이 채운다 —
+> §1~§6 에서 확정한 설계 결정의 번호 목록(자매 노트와 같은 형식).
