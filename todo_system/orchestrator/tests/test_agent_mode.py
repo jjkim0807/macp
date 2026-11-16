@@ -393,5 +393,174 @@ class AgentModeCliTest(unittest.TestCase):
         self.assertIn(default_line, before.splitlines())   # byte-identical
 
 
+# --- dashboard: real HTTP server → state file → router --------------------------
+
+_DASH_SRC = Path(__file__).resolve().parents[3] / "scripts" / "macp_dashboard.py"
+
+
+def _load_dashboard():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("macp_dashboard_agent_mode", _DASH_SRC)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class AgentModeDashboardTest(_GameBase):
+    TOKEN = "tok"
+
+    def setUp(self):
+        super().setUp()
+        self.M = _load_dashboard()
+        reg = _cli_registry(self.tmp, self.uri)
+        for name, val in (("AGENT_MODE", self.mode_path), ("REGISTRY", reg),
+                          ("STATE", self.tmp / "_state")):
+            p = mock.patch.object(self.M, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self.base = self._serve(self.TOKEN)
+
+    def _serve(self, token):
+        import threading
+        srv = self.M.serve("127.0.0.1", 0, token=token)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def _req(self, method, path, body=None, *, token=TOKEN, base=None,
+             ctype="application/json", raw: bytes | None = None):
+        import urllib.error
+        import urllib.request
+        data = raw if raw is not None else (
+            json.dumps(body).encode("utf-8") if body is not None else None)
+        req = urllib.request.Request((base or self.base) + path, data=data, method=method)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        if data is not None and ctype:
+            req.add_header("Content-Type", ctype)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _post(self, body, **kw):
+        code, raw = self._req("POST", "/api/agent-mode", body, **kw)
+        try:
+            return code, json.loads(raw)
+        except ValueError:
+            return code, raw
+
+    def test_post_without_token_is_401_and_writes_nothing(self):
+        code, _ = self._post({"agent": REMOTE, "mode": "game"}, token=None)
+        self.assertEqual(code, 401)
+        self.assertFalse(self.mode_path.exists())
+        code, _ = self._post({"agent": REMOTE, "mode": "game"}, token="wrong")
+        self.assertEqual(code, 401)
+        self.assertFalse(self.mode_path.exists())
+
+    def test_post_changes_routing_on_the_next_tick(self):
+        self.seen(REMOTE, 60)
+        code, res = self._post({"agent": REMOTE, "mode": "game", "reason": "t"})
+        self.assertEqual(code, 200)
+        self.assertEqual((res["agent"], res["mode"], res["reason"], res["changed"]),
+                         (REMOTE, "game", "t", True))
+        self.assertTrue(res["since"])
+        on_disk = json.loads(self.mode_path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk[REMOTE]["mode"], "game")
+        # the router (same Worker/ layout) now treats the remote as offline
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(self.ledger.load("app-build").agent_id, DEFAULT)
+        # back to work → the next heavy task goes to the remote
+        code, res = self._post({"agent": REMOTE, "mode": "work"})
+        self.assertEqual((code, res["mode"], res["changed"]), (200, "work", True))
+        _tick(self.orch, [self.heavy_task("app-build-2", repo=OTHER_REPO)])
+        self.assertEqual(self.ledger.load("app-build-2").agent_id, REMOTE)
+
+    def test_post_game_reroutes_in_flight_row(self):
+        row = self._dispatch_remote()
+        code, _ = self._post({"agent": REMOTE, "mode": "game"})
+        self.assertEqual(code, 200)
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual([a.task_id for a in res["rerouted"]], ["app-build"])
+        self._assert_rerouted(row, "paused:game")
+
+    def test_get_shape_and_unknown(self):
+        code, raw = self._req("GET", f"/api/agent-mode?agent={REMOTE}")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(raw), {"agent": REMOTE, "mode": "work",
+                                           "since": None, "reason": ""})
+        self._post({"agent": REMOTE, "mode": "game", "reason": "r"})
+        got = json.loads(self._req("GET", f"/api/agent-mode?agent={REMOTE}")[1])
+        self.assertEqual(sorted(got), ["agent", "mode", "reason", "since"])
+        self.assertEqual((got["mode"], got["reason"]), ("game", "r"))
+        code, raw = self._req("GET", "/api/agent-mode")
+        ids = [a["agent"] for a in json.loads(raw)["agents"]]
+        self.assertEqual(ids, [DEFAULT, REMOTE])           # no human
+        self.assertEqual(self._req("GET", "/api/agent-mode?agent=nope")[0], 404)
+        self.assertEqual(self._req("GET", "/api/agent-mode?agent=owner")[0], 404)
+        self.assertEqual(self._req("GET", f"/api/agent-mode?agent={REMOTE}",
+                                   token=None)[0], 401)
+
+    def test_post_validation(self):
+        self.assertEqual(self._post({"agent": "nope", "mode": "game"})[0], 404)
+        self.assertEqual(self._post({"agent": "owner", "mode": "game"})[0], 404)
+        self.assertEqual(self._post({"agent": REMOTE, "mode": "sleep"})[0], 400)
+        self.assertEqual(self._post({"agent": REMOTE, "mode": "game",
+                                     "reason": 5})[0], 400)
+        self.assertEqual(self._post(None, raw=b"{not json")[0], 400)
+        self.assertEqual(self._post(None, raw=b"[1]")[0], 400)
+        self.assertEqual(self._post(None, raw=b"x" * 5000)[0], 413)
+        self.assertEqual(self._post({"agent": REMOTE, "mode": "game"},
+                                    ctype="text/plain")[0], 415)
+        self.assertFalse(self.mode_path.exists())
+
+    def test_collect_agents_rows_carry_mode(self):
+        rows = {r["id"]: r for r in self.M.collect_agents()}
+        self.assertEqual((rows[REMOTE]["mode"], rows[REMOTE]["mode_since"],
+                          rows[REMOTE]["mode_reason"]), ("work", None, ""))
+        self._post({"agent": REMOTE, "mode": "game", "reason": "dashboard"})
+        rows = {r["id"]: r for r in self.M.collect_agents()}
+        self.assertEqual(rows[REMOTE]["mode"], "game")
+        self.assertTrue(rows[REMOTE]["mode_since"])
+        self.assertEqual(rows[REMOTE]["mode_reason"], "dashboard")
+        self.assertEqual(rows[DEFAULT]["mode"], "work")
+        self.assertNotIn("owner", rows)
+
+    def test_status_cache_is_invalidated_by_post(self):
+        cache = self.M._StatusCache(ttl=3600)
+        n = {"calls": 0}
+
+        def compute():
+            n["calls"] += 1
+            return b"x"
+        cache.get(compute)
+        cache.get(compute)
+        self.assertEqual(n["calls"], 1)
+        cache.invalidate()
+        cache.get(compute)
+        self.assertEqual(n["calls"], 2)
+
+    def test_page_renders_buttons_and_phrases(self):
+        for lang, btn in (("ko", "작업 재개"), ("en", "Resume work")):
+            page = self.M.render_html(lang)
+            self.assertIn("data-amode", page)
+            self.assertIn("/api/agent-mode", page)
+            self.assertIn(btn, page)
+            self.assertNotIn("@@dash.js.agent_", page)
+
+    def test_sms_and_unknown_post_unchanged(self):
+        with mock.patch.dict("os.environ", {"MACP_SMS_TOKEN": ""}):
+            self.assertEqual(self._req("POST", "/api/sms", {"x": 1})[0], 503)
+        self.assertEqual(self._req("POST", "/api/other", {"x": 1})[0], 404)
+
+    def test_open_loopback_post_needs_no_token(self):
+        base = self._serve(None)
+        code, res = self._post({"agent": REMOTE, "mode": "game"}, token=None, base=base)
+        self.assertEqual((code, res["mode"]), (200, "game"))
+
+
 if __name__ == "__main__":
     unittest.main()

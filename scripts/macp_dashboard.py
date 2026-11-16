@@ -64,6 +64,8 @@ from todo_system import sms  # noqa: E402
 from todo_system import i18n  # noqa: E402
 from todo_system import not_before as _nb  # noqa: E402 — alias: is_deferred is taken below
 from todo_system.orchestrator.assignment import display_state, is_deferred  # noqa: E402
+# stdlib + atomic_io only — NOT orchestrator.orchestrator (engine-isolation).
+from todo_system.orchestrator import agent_mode as _agent_mode  # noqa: E402
 from todo_system.orchestrator.statuses import is_cancelled, is_closed  # noqa: E402
 # Engine root through the resolver: dev checkout -> repo root (same value as the
 # bootstrap above); wheel install -> todo_system/_engine, where scripts/ and
@@ -88,6 +90,9 @@ TODO_DB = VAULT / "Todo" / "todo.db"
 ITEMS = VAULT / "Todo" / "items"
 SESSIONS = VAULT / "Memory" / "sessions"
 REGISTRY = VAULT / "Worker" / "agents" / "registry.yaml"
+# Per-agent work|game mode (gitignored). Same file the orchestrator reads via
+# agent_mode.state_path(Worker/) — game takes a heavy remote out of routing.
+AGENT_MODE = _agent_mode.state_path(VAULT / "Worker")
 # graph_memory's derived index (`python -m todo_system.graph_memory scan`). Read-only here.
 RELATIONS_DB = VAULT / "Memory" / "relations.sqlite"
 
@@ -524,6 +529,13 @@ def collect_task_detail(slug: str) -> dict | None:
     }
 
 
+def _mode_fields(modes: dict, agent_id: str) -> dict:
+    """`mode` / `mode_since` / `mode_reason` for one /api/status agent row."""
+    e = modes.get(agent_id) or {}
+    return {"mode": e.get("mode", _agent_mode.WORK), "mode_since": e.get("since"),
+            "mode_reason": e.get("reason", "")}
+
+
 def collect_agents() -> list[dict]:
     seen = {}
     sp = STATE / "agent_seen.json"
@@ -532,6 +544,10 @@ def collect_agents() -> list[dict]:
             seen = json.loads(sp.read_text(encoding="utf-8"))
         except Exception:
             seen = {}
+    try:
+        modes = _agent_mode.read_modes(AGENT_MODE)
+    except Exception:  # read_modes never raises; belt and braces for /api/status
+        modes = {}
     agents = []
     try:
         from todo_system.orchestrator.registry import load_registry
@@ -548,7 +564,8 @@ def collect_agents() -> list[dict]:
             agents.append({"id": a.id, "kind": a.kind, "host": getattr(a, "host", "") or "",
                            "projects": list(getattr(a, "projects", []))[:6],
                            "last_seen": last, "age": age,
-                           "alive": secs is not None and secs < 600})
+                           "alive": secs is not None and secs < 600,
+                           **_mode_fields(modes, a.id)})
     except Exception:
         # Registry unreadable (missing file, no PyYAML, bad YAML): nothing tells us who
         # is human, so fall open and expose every seen key as before — losing runner
@@ -559,7 +576,8 @@ def collect_agents() -> list[dict]:
             secs = _age_secs(last)
             agents.append({"id": aid, "kind": "?", "host": "", "projects": [],
                            "last_seen": last, "age": age,
-                           "alive": secs is not None and secs < 600})
+                           "alive": secs is not None and secs < 600,
+                           **_mode_fields(modes, aid)})
     return agents
 
 
@@ -1968,6 +1986,9 @@ overflow:hidden;vertical-align:middle}.pbar i{display:block;height:100%;backgrou
 .more{margin-top:9px;background:color-mix(in srgb,var(--card),var(--bd));border:1px solid var(--bd);color:var(--blu);
 border-radius:8px;cursor:pointer;font-size:13px;padding:7px 12px;width:100%}
 .more:hover{border-color:var(--blu)}
+.amode{background:color-mix(in srgb,var(--card),var(--bd));border:1px solid var(--bd);color:var(--blu);
+border-radius:8px;cursor:pointer;font-size:12px;padding:3px 9px;margin-left:8px;white-space:nowrap}
+.amode:hover{border-color:var(--blu)}.amode:disabled{opacity:.5;cursor:wait}
 .empty{color:var(--mut);font-size:13px;padding:5px 0}
 .mut{color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
@@ -2152,7 +2173,22 @@ const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(
   return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="@@dash.js.last_activity@@ ${esca(r.last_activity)} @@dash.js.latest_of@@">${esc(r.last_age)}@@dash.js.ago@@</span> `:''}<span class="pbar" title="${dn}/${t}@@dash.js.done@@"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
 const runRow=r=>{const w=r.when||'';return `<div class="row clk" data-open="run:${esca(r.run)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)} <span class="age mono">${esc(w.slice(0,2))}:${esc(w.slice(2,4))}</span></div><div class="note">${stages(r.stages)||'—'}${(r.artifacts||[]).length?' · '+esc((r.artifacts||[]).join(', ')):''}</div></div></div>`};
 const recentRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.todo_status&&r.todo_status!=='open'?` <span class="age">(${esc(r.todo_status)})</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
-const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span></div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+'@@dash.js.ago@@':'—'}</span></div>`;
+// work|game mode (agent_mode.py): a game agent is out of heavy routing. A remote
+// card gets one toggle button; the mode badge shows only while in game.
+const agentGame=a=>a.mode==='game';
+const agentModeBadge=a=>agentGame(a)?` <span class="badge b-wait">@@dash.js.agent_game@@</span>${a.mode_since?` <span class="note" style="display:inline">${esc('@@dash.js.agent_game_since@@'.replace('{since}',md(String(a.mode_since).slice(0,16))))}</span>`:''}`:'';
+const agentModeBtn=a=>a.kind==='ai-remote'?`<button class="amode" data-amode="${esca(a.id)}" data-to="${agentGame(a)?'work':'game'}">${agentGame(a)?'@@dash.js.agent_btn_work@@':'@@dash.js.agent_btn_game@@'}</button>`:'';
+const agentRow=a=>`<div class="row"><div class="main"><div><span class="dot" style="display:inline-block;width:9px;height:9px;margin-right:6px;background:${a.alive?'var(--grn)':'var(--mut)'}"></span>${esc(a.id)} <span class="note" style="display:inline">${esc(a.kind)}</span>${agentModeBadge(a)}</div><div class="note">${esc(a.host)||'—'}</div></div><span class="age mono">${a.age?esc(a.age)+'@@dash.js.ago@@':'—'}</span>${agentModeBtn(a)}</div>`;
+async function setAgentMode(btn){
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/agent-mode',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({agent:btn.dataset.amode,mode:btn.dataset.to,reason:'dashboard'})});
+    if(!r.ok)throw new Error(String(r.status));
+    await tick();
+  }catch(_){btn.disabled=false;btn.textContent='✗ @@dash.js.agent_mode_failed@@'}
+}
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
 
 // @@dash.html.queue@@ (docs/dashboard-parity.md "@@dash.html.queue@@"): the server judges `wait`; rows render in the
@@ -2446,6 +2482,7 @@ function mount(){
   document.addEventListener('click',e=>{
     const tb=e.target.closest('#theme');if(tb){const i=THEMES.indexOf(themeGet());themeSet(THEMES[(i+1)%3]);return}
     const c=e.target.closest('.cp');if(c){e.stopPropagation();cp(c);return}
+    const am=e.target.closest('[data-amode]');if(am){e.stopPropagation();setAgentMode(am);return}
     if(e.target.closest('#dv-back')){history.back();return}
     if(e.target.closest('#dv-reload')){if(dstack.length)showDetail(dstack[dstack.length-1]);return}
     const gh=e.target.closest('[data-grp]');   // group header (no data-open) → toggle fold
@@ -2772,6 +2809,22 @@ def wait_ingest_alerts(timeout: float = 5.0) -> bool:
 STATUS_TTL_S = float(os.environ.get("MACP_DASHBOARD_STATUS_TTL", "2.0") or 2.0)
 
 
+def _registry_mode_agents() -> list:
+    """The registry's non-human agents (the ones with a work|game mode); [] when
+    the registry cannot be read."""
+    try:
+        from todo_system.orchestrator.registry import load_registry
+        return [a for a in load_registry(str(REGISTRY)).agents if not a.is_human]
+    except Exception:
+        return []
+
+
+def _registry_agent(agent_id: str):
+    """The non-human registry agent `agent_id`, or None (unknown / human /
+    unreadable registry)."""
+    return next((a for a in _registry_mode_agents() if a.id == agent_id), None)
+
+
 class _StatusCache:
     """Single-flight, short-TTL cache for the /api/status body.
 
@@ -2818,6 +2871,11 @@ class _StatusCache:
             self._body, self._at, self._busy = body, time.monotonic(), False
             self._cv.notify_all()
         return body
+
+    def invalidate(self) -> None:
+        """Make the next get() recompute (a write just changed what it shows)."""
+        with self._cv:
+            self._at = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2931,7 +2989,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
+    def _dashboard_gate(self) -> dict | None:
+        """The dashboard-token gate shared by GET and the dashboard's own POSTs:
+        throttle, then token. Returns the extra reply headers (Set-Cookie on a
+        fresh `?token=`) when the request may proceed, or None after replying
+        401/429 itself."""
         key = self._client_key()
         # An open (token=None) loopback dashboard is never throttled: SMS-ingest
         # failures share the bucket and must not lock out an intentionally open page.
@@ -2943,19 +3005,25 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._note_auth_failure(key)
             self._reply_throttled()
-            return
+            return None
         if not ok:
             if self._note_auth_failure(key):
                 self._reply_throttled()
             else:
                 self._reply(401, b"401 unauthorized: open /?token=<MACP_DASHBOARD_TOKEN>\n",
                             "text/plain; charset=utf-8")
-            return
+            return None
         extra = {}
         if set_cookie:
             # 30 days; HttpOnly keeps it out of page JS. `Secure` is deliberately
             # off: tailscale serve terminates TLS and forwards plain http here.
             extra["Set-Cookie"] = f"{COOKIE}={self.token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict"
+        return extra
+
+    def do_GET(self):
+        extra = self._dashboard_gate()
+        if extra is None:
+            return
         if urlparse(self.path).path == "/api/status":
             body = self._status_cache.get(
                 lambda: json.dumps(collect_status()).encode("utf-8"))
@@ -2986,6 +3054,8 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/sms-setup":
             self._reply(200, self._sms_setup_page().encode("utf-8"),
                         "text/html; charset=utf-8", extra)
+        elif urlparse(self.path).path == "/api/agent-mode":
+            self._get_agent_mode(extra)
         elif urlparse(self.path).path.startswith("/api/"):
             self._reply(404, b'{"error": "not found"}', "application/json", extra)
         else:
@@ -3018,7 +3088,76 @@ class Handler(BaseHTTPRequestHandler):
     # holds the dashboard token, and the SMS token can't read the vault.
     SMS_MAX_BYTES = 256 * 1024
 
+    # -- agent work|game mode (agent_mode.py) ----------------------------------
+    # Behind the DASHBOARD token (not the SMS one): it changes routing.
+    AGENT_MODE_MAX_BYTES = 4096
+
+    def _reply_json(self, code: int, obj, extra: dict | None = None):
+        self._reply(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                    "application/json", extra)
+
+    def _get_agent_mode(self, extra: dict):
+        agent = (parse_qs(urlparse(self.path).query).get("agent") or [""])[0]
+        if agent:
+            if _registry_agent(agent) is None:
+                self._reply_json(404, {"error": "unknown agent"}, extra)
+                return
+            self._reply_json(200, _agent_mode.get_mode(AGENT_MODE, agent), extra)
+            return
+        self._reply_json(200, {"agents": [_agent_mode.get_mode(AGENT_MODE, a.id)
+                                          for a in _registry_mode_agents()]}, extra)
+
+    def _post_agent_mode(self):
+        extra = self._dashboard_gate()
+        if extra is None:
+            return
+        # application/json only: a cross-site form/text POST cannot carry it
+        # without a CORS preflight, which this server never answers.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._reply_json(415, {"error": "Content-Type must be application/json"}, extra)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length <= 0 or length > self.AGENT_MODE_MAX_BYTES:
+            self._reply_json(413 if length > 0 else 400, {"error": "bad body size"}, extra)
+            return
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._reply_json(400, {"error": "body is not JSON"}, extra)
+            return
+        if not isinstance(data, dict):
+            self._reply_json(400, {"error": "body must be an object"}, extra)
+            return
+        agent, mode, reason = data.get("agent"), data.get("mode"), data.get("reason")
+        if not isinstance(agent, str) or _registry_agent(agent) is None:
+            self._reply_json(404, {"error": "unknown agent"}, extra)
+            return
+        if mode not in _agent_mode.MODES:
+            self._reply_json(400, {"error": "mode must be work|game"}, extra)
+            return
+        if reason is not None and not isinstance(reason, str):
+            self._reply_json(400, {"error": "reason must be a string"}, extra)
+            return
+        try:
+            res = _agent_mode.set_mode(AGENT_MODE, agent, mode, reason or "")
+        except (OSError, ValueError) as e:
+            logger.warning("agent-mode write failed agent=%s (%s)", agent,
+                           e.__class__.__name__)
+            self._reply_json(500, {"error": "state write failed"}, extra)
+            return
+        logger.info("agent-mode set agent=%s mode=%s changed=%s",
+                    agent, res["mode"], res["changed"])
+        self._status_cache.invalidate()
+        self._reply_json(200, res, extra)
+
     def do_POST(self):
+        if urlparse(self.path).path == "/api/agent-mode":
+            self._post_agent_mode()
+            return
         if urlparse(self.path).path != "/api/sms":
             self._reply(404, b'{"error": "not found"}', "application/json")
             return
