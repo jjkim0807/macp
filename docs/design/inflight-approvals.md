@@ -103,7 +103,113 @@ related:
 
 ## §2 승인 대상 분류 — 세 층 · 바닥 · 태스크·프로젝트별 설정
 
-> (이 런의 다음 페이즈에서 채움)
+### 2.1 네 상황 × 세 층
+
+네 상황은 이벤트에 **새로 더하는 필드 `category`** 로 구분한다. 형제가 예약한 payload `kind`
+(`permission`·`question`·`confirm` — `run-event-stream.md:192`)는 그 세 값 안에서만 쓴다(§3.5).
+
+| `category` | 판정 신호 (누가 탐지하나) | 기본 층 | 카드 `kind` | 범위 선택지 | 예 |
+|---|---|---|---|---|---|
+| `permission_denied` | 허용 목록 밖 호출. 1차는 PreToolUse hook 이 런 정책 스냅샷의 허용 목록과 대조한다(확실히 밖일 때만). 백스톱은 CLI 가 권한 프롬프트로 보낸 호출을 받는 `--permission-prompt-tool`(§3.1) | 쓰기 스테이지는 카드, 읽기 전용 스테이지는 거부(오늘과 같다). verify 는 Bash 러너만 예외(2.2) | `permission` | 한 번 · 이 런 동안 | verify 의 `pnpm --version`(`stages.py:263-266`) |
+| `irreversible` | 바닥(2.3): 태스크 태그, 명령·도구 패턴표, 에이전트 선언 `confirm(category=irreversible)` | **카드(바닥)** — 허용 목록 안이어도, 본문이 허용해도 | `permission`(가로챈 호출) · `confirm`(선언) | 한 번만 | 패키지 공개, 실계좌 주문, 사용자 명의 제출 |
+| `direction` | 에이전트가 내장 질문 도구 AskUserQuestion 을 부른다. 권한 호스트가 있으면 `-p` 에서도 제공된다(V3) | 카드 | `question` | 한 번(질문마다) | 두 설계안 중 선택, 빠진 정보 |
+| `human_step` | 에이전트가 `confirm(category=human_step)` 을 부른다 — 사람만 할 수 있는 단계 | 카드 | `confirm` | 한 번 | 로그아웃된 콘솔의 재로그인 요청 |
+
+### 2.2 세 층의 정의와 스테이지별 규칙
+
+- **항상 자동 허용** — 스테이지의 허용 목록에 든 호출: `STAGE_TOOLS`(`stages.py:375-403`), 태스크
+  `allowed_tools`, 상시 규칙 `_STANDING_RULES`(`:368-373`). 의미는 오늘과 같고 카드가 생기지 않는다. 인증번호
+  읽기(`macp-sms`·`macp-mail`)도 여기다 — 사람이 필요 없는 2FA 는 카드가 되지 않는다. **예외 하나**: 바닥(2.3)에
+  걸리는 호출은 허용 목록 안이어도 카드로 올라간다. PreToolUse hook 의 차단은 allow 규칙보다 먼저 평가된다(V6).
+- **카드로 묻기** — (a) 허용 목록 밖 호출 중 2.4 정책이 묻기로 두는 것(기본: 쓰기 스테이지의 `permission_denied`
+  전부), (b) 바닥 범주, (c) 에이전트의 질문(AskUserQuestion), (d) 에이전트의 확인 요청(`confirm`).
+- **항상 거부(카드도 없다)**:
+  - `FORBIDDEN_TOOL_SUBSTRINGS`(`stages.py:419-426`). 오늘 허용 목록 검증이 ValueError 로 막는 것(`:509-511`)을
+    카드가 풀면 "rm 을 허용해 주세요" 식 사회공학 표면이 생긴다.
+  - `.claude/**` 쓰기 — 헤드리스 하드 가드(형제 `run-event-stream.md` §6.3).
+  - 비밀·승인 장치 경로: `.secrets/`, 승인 저장소(§3.8), 정책 파일, 원장 `Worker/assignments/*.json`
+    (사람에게도 "손으로 고치지 말라"는 파일 — `concepts.md:80-83`).
+  - 에이전트의 로그인 폼 제출 — 로그인은 사람 몫이다(§1 ④).
+  - 읽기 전용 스테이지의 허용 목록 밖 호출 전부.
+
+| 스테이지 | 카드 | 이유 |
+|---|---|---|
+| research · plan · discover | 없음 — 오늘처럼 거부 | 읽기 전용 보장(`_READONLY_GUARANTEE_STAGES` `stages.py:236`)이 그 아티팩트를 믿는 근거다. 질문(`direction`)은 쓰기가 아니라 무해하지만 1차 범위에서 뺀다(A8 결정 항목) |
+| verify | `permission_denied` 중 **Bash 러너류만**(`FALLBACK_RUNNER_TOOLS` 모양 `:275-278`), `direction`·`human_step` | Edit·Write·NotebookEdit 는 항상 거부 — verify 는 "test-only BY DESIGN"(`:441-445`). 동기 사례 둘이 verify 에서 났다 |
+| implement · quick · delegate · report | 네 범주 전부 | 세상에 닿는 스테이지다(`:444-445`). report 의 PR 생성·머지는 `auto_merge` 가 이미 게이트라 바닥 패턴에서 뺀다(2.3) |
+
+### 2.3 바닥 — 실계좌·결제·사용자 명의 제출은 본문이 허용해도 카드
+
+**정의.** 되돌리기 어렵고 사용자의 돈·명의·공개 평판에 닿는 조작이다: 실계좌 주문·이체, 결제·구매, 사용자 명의
+제출(지원·신청·발송·게시), 공개 배포(패키지 publish, 스토어 제출). 이 범주는 **태스크 본문이 허용해도** 카드를
+거치고, 카드의 선택지는 **"한 번 허용"과 "거부"뿐**이다("이 런 동안"이 없다). 허용은 2단계 확인이다(§5.1).
+
+**탐지는 3중이다.**
+
+- (a) **태스크 신호** — tags `live`·`real-trade`·`real-account`(엔진 선례 `_LIVE_TAGS` `rescope.py:70`, 판정
+  `:154-158`)가 있으면 그 태스크의 **외부 쓰기성 호출 전부**(밖으로 나가는 Bash, 브라우저 `click`·`type`,
+  `gh` 쓰기)가 바닥 대상이다.
+- (b) **명령·도구·호스트 패턴표** — publish·deploy·release·주문·결제류 명령과 결제·주문 호스트. 구체 정규식은
+  A1 이 테스트와 함께 정한다(형제 §4.2 가 마스킹 정규식을 S2 로 미룬 것과 같은 방식). 파이프라인 자신의 PR
+  생성·머지는 `auto_merge`·UI merge hold 가 이미 게이트라 뺀다(`concepts.md:69-75`).
+- (c) **에이전트 선언** — 되돌리기 어려운 조작 **직전에** `confirm(category=irreversible, summary=…)` 을 부르라는
+  규칙. 스테이지 프롬프트는 `.claude/**` 라 헤드리스가 고칠 수 없으므로 메타데이터 줄로 싣는다(브라우저 lease
+  규칙 선례 `stages.py:588-597`).
+
+**정직한 한계.** 범용 도구 `browser_click` 은 패턴만으로 "이 클릭이 결제 버튼인가"를 가를 수 없다. (a) 태그가
+없고 (c) 선언이 빠지면 구멍이 남는다. 그래서 브라우저 MCP 서버 쪽 클릭 가드(결제·제출 화면의 버튼 문구·URL
+패턴)가 필요하다. 그것은 다른 리포라 사람 게이트(A8)다.
+
+| | 지금 — (볼트) CLAUDE.md §12 | 이 설계 |
+|---|---|---|
+| 결제·삭제·사용자 명의 제출 | "태스크 본문이 명시적으로 허용할 때만 한다" — 본문 허용이 곧 실행 | **본문이 허용해도 카드.** 본문 허용은 "카드를 띄워도 된다"는 뜻일 뿐이다 |
+| 반영 | — | 볼트 문서 반영은 사람 게이트 leaf A8(이 리포의 PR 은 볼트를 고칠 수 없다) |
+
+**chat-channels R2 와 어휘를 맞춘다**(`chat-channels.md:258`, 바닥 `:268-270`):
+
+| R2 신호 | 이 노트의 범주 | 처리 |
+|---|---|---|
+| 결정·승인 | `direction` · `permission_denied` | 카드 |
+| 결제·구매 · 실계좌·주문 · 사용자 명의 제출 | `irreversible`(바닥) | 카드 — 한 번 허용만 |
+| 로그인·2FA | 에이전트에게는 항상 거부, 사람에게는 `human_step` | 카드는 "사람이 해 주세요"라는 요청이지 자격 증명 입력창이 아니다(§5.1) |
+
+**실계좌 auto_merge 게이트는 그대로다.** 카드는 스테이지 안의 조작 **하나**를 허락할 뿐 머지 게이트를 풀지
+않는다. 실계좌 태스크의 자동 분할 거부(`rescope.py:226-227`)와 `auto_merge`·UI merge hold(`concepts.md:69-75`)는
+손대지 않는다.
+
+### 2.4 설정 방식 — 태스크 frontmatter · 프로젝트 config · env
+
+태스크 frontmatter 에는 맵 하나를 둔다(합성 예시). 값 뒤에 주석을 달지 않는다 — 볼트 규칙이다.
+
+```yaml
+approvals:
+  ask: ["Bash(pnpm:*)", "Bash(flutter:*)"]
+  deny: ["mcp__macp-browser__browser_type"]
+  expire: "6h"
+  inline_hold: "10m"
+```
+
+| 키 | 뜻 | 기본값 |
+|---|---|---|
+| `ask` | 허용 목록 밖이지만 카드로 물어도 되는 규칙. 허용 목록 **안**의 규칙을 적으면 그 호출도 매번 묻는다(좁히기) | 쓰기 스테이지의 `permission_denied` 전부 |
+| `deny` | 카드 없이 거부할 규칙. 허용 목록 안이어도 거부한다(좁히기) | 없음 |
+| `expire` | 카드 만료(§3.4) | 24h — 숫자는 사람 게이트(A8) |
+| `inline_hold` | 스테이지를 붙잡고 기다리는 상한(§3.3 R-T1) | 9m(540 s) — 숫자는 사람 게이트(A8) |
+
+- **파싱.** 태스크 frontmatter 는 `yaml.safe_load` 로 읽혀(`repos.py:77-82`) 중첩 맵이 dict 로 온다.
+- **프로젝트별.** 볼트 `.macp/config.toml` 의 `[approvals]`(이 호스트의 기본값)와 `[approvals.repo."<repo-url>"]`
+  (그 리포의 태스크 전부)에 같은 키를 둔다. env 는 `MACP_APPROVALS`(kill switch)와 `MACP_APPROVALS_DIR`(§3.8)이고,
+  리졸버는 env → config → 기본값의 기존 순서를 따른다(`docs/configuration.md:26-42`, XDG 기본값 선례 `:57`).
+- **우선순위.** 엔진 바닥(내릴 수 없음) > 엔진의 항상 거부 > `deny`(태스크 ∪ 프로젝트) > `ask`(태스크 ∪
+  프로젝트) > 허용 목록(자동 허용) > 기본값.
+- **검증 — 넓히는 키가 없다.** 설정으로 할 수 있는 일은 "카드로 물을 범위를 정하기"와 "좁히기"뿐이다. 바닥을
+  자동 허용으로 내리는 `allow:` 같은 키는 **만들지 않고**, 모르는 키·FORBIDDEN 에 걸리는 `ask` 규칙·`*` 전체
+  규칙은 디스패치를 거절한다. `_safe_tools` 가 금지 규칙을 ValueError 로 막는 선례(`stages.py:509-511`)와 같다.
+  검증 자리는 `task_validate.validate_frontmatter`(`task_validate.py:334`)다.
+- **배선.** 새 frontmatter 필드는 payload 에 실리기 전까지 아무 효과가 없다 — "A frontmatter field is dead unless
+  it reaches the payload"(`tasks.py:217-220`; `allowed_tools` 배선 `:206-208`; 그것을 잊었던 선례 `stages.py:484-489`).
+  그래서 A2 가 `tasks.py` 배선을 따로 맡는다. `allowed_tools` 는 implement 에만 먹지만(`stages.py:446`),
+  `approvals` 는 브로커가 도는 모든 스테이지(2.2 표)에 적용된다.
 
 ---
 
