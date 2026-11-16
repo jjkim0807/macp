@@ -2115,12 +2115,19 @@ _CAPACITY_MARKERS = ("out of usage credits", "usage limit", "weekly limit",
                      "reached your", "/usage-credits")
 
 
+# 2026-11-16: "You've hit your Fable limit · resets Nov 22, 2pm" — a per-model
+# weekly limit — matched none of the markers ("hit your limit" needs the words
+# adjacent), so three in-flight stages failed as defects. The CLI's shape is
+# "hit your <name> limit"; match it with any short name in between.
+_HIT_LIMIT_RE = re.compile(r"hit your [\w .-]{0,40}?limit")
+
+
 def is_capacity_limit(text: str) -> bool:
     """True if a stage failed because the account hit a usage/rate limit or lost
     auth — a transient capacity constraint, NOT a task defect. Treating these as
     task failures wrongly burns refails and poison-quarantines healthy tasks."""
     t = (text or "").lower()
-    return any(mrk in t for mrk in _CAPACITY_MARKERS)
+    return any(mrk in t for mrk in _CAPACITY_MARKERS) or bool(_HIT_LIMIT_RE.search(t))
 
 
 def usage_shows_no_api_work(rec: dict | None) -> bool:
