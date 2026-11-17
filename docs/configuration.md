@@ -94,6 +94,12 @@ app-UI change parked in a merge hold only that remote can see. A Gradle server r
 `app/`) and a non-app long job still go to a plain `heavy` remote. `screen_check: false` is
 not an exemption — the runner still checks an app diff.
 
+A remote earns `device` by running its own emulator: set `APP_TEST_NODE_MODE=local` in the
+runner's environment and `scripts/app-test-node` (screen check, `macp-emulator`, beta smoke)
+drives an AVD named `api30` on that host instead of the GCE node. The host needs the SDK's
+`emulator`, `platform-tools`, a build-tools with `aapt2` and the AVD; `app-test-node start`
+checks the first three.
+
 The rules, the reroute reasons (`accept-timeout`, `agent-stale`, `rejected`) and what a
 remote does on `CANCEL` are in [Running 24/7 → Heavy tasks on a stronger
 machine](running.md#heavy-tasks-on-a-stronger-machine).
