@@ -32,7 +32,7 @@ from .assignment import (
 from .lease import Lease
 
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
-from .registry import Agent, Registry, load_registry
+from .registry import CAP_DEVICE, Agent, Registry, load_registry
 from .state_store import open_state_store
 
 _IN_FLIGHT = (DISPATCHED, ACCEPTED, IN_PROGRESS)
@@ -393,6 +393,52 @@ def is_heavy(payload: dict | None, repo_dir: Path | None) -> bool:
         return False
 
 
+def needs_device(payload: dict | None, repo_dir: Path | None,
+                 app_paths: tuple[str, ...] = ("app/",)) -> bool:
+    """May this task need a device check (screen check / emulator) after verify?
+
+    Routing happens before any diff exists, so this mirrors what the runner's
+    post-verify screen check can do, conservatively:
+
+    1. `emulator` / `screen_check` asked for (`heavy_signals`, or under their own
+       names) → True.
+    2. A vault task (no `repo`) → False: there is no app to look at.
+    3. The repo checkout is unknown (not cloned yet / unresolvable) → True: keep
+       it where a device check is possible.
+    4. No `gradlew` at the checkout root → False: the runner's screen check is a
+       no-op for a non-app repo (screen_check.is_app_repo).
+    5. Any of the repo's `app_paths` (default `app/`; widened per repo in the
+       vault's beta_publish_config) exists as a directory → True: an app diff
+       turns the screen check on by default, and a remote without the node would
+       leave a UI change parked in a host-local merge hold.
+    Otherwise False (e.g. a Gradle server repo). Any error → True (safe side).
+
+    There is deliberately no `screen_check: false` exemption: that frontmatter
+    value never reaches the payload (tasks.load_dispatchable carries only true
+    signals), so the runner would still run the check on an app diff.
+    """
+    try:
+        p = payload or {}
+        if p.get("heavy_signals"):
+            return True
+        if _payload_bool(p.get("emulator")) or _payload_bool(p.get("screen_check")):
+            return True
+        if not p.get("repo"):
+            return False
+        if repo_dir is None or not Path(repo_dir).is_dir():
+            return True
+        root = Path(repo_dir)
+        if not (root / "gradlew").exists():
+            return False
+        for ap in app_paths:
+            rel = str(ap).strip().strip("/")
+            if rel and (root / rel).is_dir():
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - fail toward the host that has the node
+        return True
+
+
 class Orchestrator:
     def __init__(self, mailbox: Mailbox, registry: Registry, ledger: Ledger,
                  notify: human.Notifier = human.kakao_notifier, max_attempts: int = 2,
@@ -591,8 +637,22 @@ class Orchestrator:
         if (payload is None or base is None or base.is_human or base.is_remote
                 or not is_heavy(payload, self._heavy_repo_dir(payload))):
             return base, None
-        pick = self._pick_heavy_remote(existing)
+        repo_dir = self._heavy_repo_dir(payload)
+        device = needs_device(payload, repo_dir, self._app_paths(payload))
+        pick = self._pick_heavy_remote(existing, need_device=device)
         return (pick, base) if pick is not None else (base, None)
+
+    @staticmethod
+    def _app_paths(payload: dict | None) -> tuple[str, ...]:
+        """The repo's screen-check app paths (vault beta_publish_config entry,
+        default `app/`) — the same source the runner's screen check reads."""
+        try:
+            from . import beta_publish, repos, screen_check
+            repo = (payload or {}).get("repo")
+            entry = beta_publish.repo_config(repos.repo_name(str(repo))) if repo else None
+            return screen_check.app_paths(entry)
+        except Exception:  # noqa: BLE001 - config is optional
+            return ("app/",)
 
     @staticmethod
     def _heavy_repo_dir(payload: dict | None) -> Path | None:
@@ -620,13 +680,15 @@ class Orchestrator:
                    if a.state in _IN_FLIGHT and a.agent_id == agent_id)
 
     def _pick_heavy_remote(self, existing: Assignment | None = None,
-                           now: float | None = None) -> Agent | None:
+                           now: float | None = None, *,
+                           need_device: bool = False) -> Agent | None:
         """The first heavy-capable remote (registry order) that is usable now.
 
         This is THE single "is this remote available?" check — online by
         agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
         counts as offline — agent_mode.py), below its `concurrency` in flight,
-        and not the agent that last REJECTED this very task. Any future
+        and not the agent that last REJECTED this very task. With `need_device`
+        (needs_device) a remote must also advertise `device`. Any future
         availability rule belongs here."""
         remotes = self.reg.heavy_remotes()
         if not remotes:
@@ -636,6 +698,8 @@ class Orchestrator:
         rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
         refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
         for a in remotes:
+            if need_device and CAP_DEVICE not in (a.capabilities or []):
+                continue
             if liveness.get(a.id, {}).get("status") != "online":
                 continue
             if agent_mode.is_game(modes, a.id):

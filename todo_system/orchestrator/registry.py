@@ -21,6 +21,10 @@ KIND_AI_REMOTE = "ai-remote"
 # Capability a remote advertises to receive heavy tasks (gradle builds,
 # emulator runs, long jobs) — see Orchestrator._route_decision.
 CAP_HEAVY = "heavy"
+# Capability a heavy remote adds when it can run the post-verify device check
+# (screen check / emulator) itself. Without it a remote never gets a task that may
+# need one — see orchestrator.needs_device.
+CAP_DEVICE = "device"
 
 
 @dataclass
