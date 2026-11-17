@@ -94,6 +94,11 @@ app-UI change parked in a merge hold only that remote can see. A Gradle server r
 `app/`) and a non-app long job still go to a plain `heavy` remote. `screen_check: false` is
 not an exemption — the runner still checks an app diff.
 
+A task that goes to a remote is not held by this host's per-repo checkout cap or its
+global gradle cap (`max_parallel_gradle_builds`), and a remote's in-flight run does not
+count toward them: the remote builds in its own clone and memory. Its own `concurrency`
+bounds it instead.
+
 A remote earns `device` by running its own emulator: set `APP_TEST_NODE_MODE=local` in the
 runner's environment and `scripts/app-test-node` (screen check, `macp-emulator`, beta smoke)
 drives an AVD named `api30` on that host instead of the GCE node. The host needs the SDK's
