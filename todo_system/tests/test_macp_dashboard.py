@@ -2100,7 +2100,14 @@ class HumanDepsWaitingVsReady(unittest.TestCase):
         ("w_decready", None, "todo,decision", ["up_done"], ("owned", True)),
         ("w_nodeps", "manual", "todo", [], ("manual", False)),
         ("w_missingdep", "manual", "todo", ["no_such"], ("blocked", False)),
+        # 2026-11-17: a blocked leaf a WORKER takes over (on_unblock default auto)
+        # is nobody's turn when its chain completes; a person's blocked task is.
+        ("w_blk_auto", "blocked", "todo", ["up_done"], ("blocked", False)),
+        ("w_blk_manual", "blocked", "todo", ["up_done"], ("blocked", True)),
+        ("w_blk_gate", "blocked", "todo", ["up_done"], ("blocked", True)),
     ]
+    EXTRA_FM = {"w_blk_manual": ["on_unblock: manual"],
+                "w_blk_gate": ["on_unblock: auto", "human_gate: true"]}
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -2108,7 +2115,7 @@ class HumanDepsWaitingVsReady(unittest.TestCase):
         items = self.tmp / "items"
         items.mkdir()
         for slug, _wm, _tags, deps, _want in self.ROWS:
-            body = ["---", "status: open"]
+            body = ["---", "status: open"] + self.EXTRA_FM.get(slug, [])
             if deps:
                 body.append("depends_on:")
                 body += [f"  - {d}" for d in deps]
@@ -2144,6 +2151,8 @@ class HumanDepsWaitingVsReady(unittest.TestCase):
                                       if slug.startswith("w_dec") else None))
         M._DEPS_CACHE.clear()
         M._DECISION_CACHE.clear()
+        getattr(M, "_UNBLOCK_CACHE", {}).clear()
+        self.addCleanup(getattr(M, "_UNBLOCK_CACHE", {}).clear)
         self.addCleanup(M._DEPS_CACHE.clear)
         self.addCleanup(M._DECISION_CACHE.clear)
         for p in (mock.patch.object(M, "TODO_DB", db),

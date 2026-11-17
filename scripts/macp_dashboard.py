@@ -679,6 +679,43 @@ _DECISION_CACHE: dict[str, tuple[float, bool]] = {}
 _TRUTHY = {"true", "yes", "1", "on"}
 
 
+_UNBLOCK_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def _worker_takes_over_on_unblock(slug: str) -> bool:
+    """True when a `worker_mode: blocked` task's completed chain hands it to a
+    WORKER, not a person: `on_unblock:` (default `auto`, as task_deps reads it) is
+    a worker mode, there is no `human_gate`, and `auto_activate` is not off. The
+    orchestrator flips such a task within a tick, so its deps-ready moment is
+    nobody's turn — counting it as 결정/🔥 urgent was noise (2026-11-17: three
+    WorldGraph leaves sat there for a few minutes). Cached per (path, mtime);
+    any read/parse error answers False, which keeps the old (urgent) behaviour."""
+    p = ITEMS / f"{slug}.md"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return False
+    hit = _UNBLOCK_CACHE.get(slug)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    flag = False
+    try:
+        from todo_system.session_log import parse_frontmatter
+        fm, _ = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+
+        def _v(key: str) -> str:
+            return str(fm.get(key) or "").split("#")[0].strip().strip("'\"").lower()
+
+        on_unblock = _v("on_unblock") or "auto"
+        flag = (on_unblock in AUTO_MODES
+                and _v("human_gate") not in _TRUTHY
+                and _v("auto_activate") not in ("false", "no", "0", "off"))
+    except Exception:
+        flag = False
+    _UNBLOCK_CACHE[slug] = (mtime, flag)
+    return flag
+
+
 def _needs_decision(slug: str) -> bool:
     """The `needs_decision:` frontmatter of Todo/items/<slug>.md as a bool, cached
     per (path, mtime). A missing file or any parse error is swallowed → False, so
@@ -1184,6 +1221,8 @@ def collect_human(assignments: list[dict], today: dt.date | None = None,
                     deps = _task_depends_on(slug)
                     open_deps = [d for d in deps if dep_status.get(d) != "done"]
                     deps_ready = bool(deps) and not open_deps
+                    if deps_ready and wm == "blocked" and _worker_takes_over_on_unblock(slug):
+                        deps_ready = False             # the orchestrator flips it to a worker
                     if open_deps:
                         why = "blocked"
                     ready_since = ""
