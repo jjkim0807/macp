@@ -994,3 +994,67 @@ class RemoteSkipsLocalCheckoutGatesTest(_Base):
         self.seen(REMOTE, 60)
         [row] = self.orch.queue_snapshot([self.heavy_task()])
         self.assertNotEqual(row["wait"], "gradle_cap")
+
+
+class UnpublishableGitMailboxTest(_Base):
+    """A git:// remote whose mailbox checkout is off its branch cannot receive a
+    TASK_ASSIGN (the commit is refused / lands off main), so heavy routing treats
+    it as unavailable and the task stays home — through Orchestrator.tick."""
+
+    def _block_remote_mailbox(self, why: str | None):
+        real = self.orch._mailbox_for
+
+        def fake(agent):
+            mb = real(agent)
+            if agent.id != REMOTE:
+                return mb
+            stub = mock.Mock(wraps=mb)
+            stub.can_send.return_value = why
+            return stub
+        p = mock.patch.object(self.orch, "_mailbox_for", side_effect=fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_unpublishable_remote_is_skipped(self):
+        self.seen(REMOTE, 60)
+        self._block_remote_mailbox("git mailbox checkout /v is on 'worker/x', not 'main'")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(res["dispatched"]), 1)
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(len(self.inbox(DEFAULT)), 1)
+        self.assertIn("skipping desktop-runner", out.getvalue())
+
+    def test_publishable_remote_still_gets_it(self):
+        self.seen(REMOTE, 60)
+        self._block_remote_mailbox(None)
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(self.inbox(REMOTE)), 1)
+
+
+class GitMailboxCanSendTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        g = ["git", "-C", str(self.tmp)]
+        subprocess.run(g[:1] + ["init", "-q", "-b", "main", str(self.tmp)], check=True)
+        (self.tmp / "Worker" / "agents").mkdir(parents=True)
+        (self.tmp / "Worker" / "agents" / ".keep").write_text("", encoding="utf-8")
+        subprocess.run(g + ["add", "-A"], check=True)
+        subprocess.run(g + ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "commit", "-q", "-m", "init"], check=True)
+        self.g = g
+
+    def test_on_main_can_send_off_main_cannot(self):
+        from todo_system.orchestrator.mailbox import GitMailbox
+        mb = GitMailbox(self.tmp / "Worker" / "agents")
+        self.assertIsNone(mb.can_send())
+        subprocess.run(self.g + ["checkout", "-q", "-b", "worker/x"], check=True)
+        mb = GitMailbox(self.tmp / "Worker" / "agents")    # fresh: no cached answer
+        why = mb.can_send()
+        self.assertIn("worker/x", why)
+        self.assertIn("'main'", why)
+
+    def test_file_mailbox_always_can_send(self):
+        self.assertIsNone(FileMailbox(self.tmp / "fm").can_send())
