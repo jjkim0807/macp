@@ -54,6 +54,10 @@ if [ "${APP_TEST_NODE_MODE:-}" = local ]; then
   SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
   mkdir -p "$NODE_HOME"
   ln -sfn "$SDK" "$NODE_HOME/android"
+  # The emulator runs as <real sdk>/emulator/qemu/<host>/qemu-system-*. Match THIS
+  # sdk's real path only: a bare "/emulator/qemu/" also matched an unrelated shell
+  # whose command line merely mentioned it, and `stop` then waited its full 30s.
+  QEMU_PAT="$(cd -P "$SDK" 2>/dev/null && pwd || printf '%s' "$SDK")/emulator/qemu/"
   _ssh() {
     HOME="$NODE_HOME" \
     GRADLE_USER_HOME="${GRADLE_USER_HOME:-$REAL_HOME/.gradle}" \
@@ -105,12 +109,17 @@ case "$cmd" in
     echo "ssh not ready after 150s" >&2; exit 1 ;;
   stop)
     if [ "$LOCAL" = 1 ]; then
-      "$NODE_HOME/android/platform-tools/adb" emu kill >/dev/null 2>&1 || true
-      for _ in $(seq 1 20); do
-        pgrep -f "$NODE_HOME/android/emulator/" >/dev/null 2>&1 || pgrep -f "qemu-system.*-avd" >/dev/null 2>&1 || exit 0
+      # Through _ssh: the same HOME/ANDROID_USER_HOME as `shot`, so it reaches the
+      # adb server `shot` started (a different HOME found "no emulator", 2026-11-17).
+      # Then wait for this SDK's qemu (QEMU_PAT) to exit, and force it if it does not.
+      _ssh '~/android/platform-tools/adb emu kill' </dev/null >/dev/null 2>&1 || true
+      for _ in $(seq 1 30); do
+        pgrep -f "$QEMU_PAT" >/dev/null 2>&1 || exit 0
         sleep 1
       done
-      pkill -f "qemu-system.*-avd" 2>/dev/null || true
+      pkill -f "$QEMU_PAT" 2>/dev/null || true
+      sleep 2
+      pkill -9 -f "$QEMU_PAT" 2>/dev/null || true
       exit 0
     fi
     "$G" compute instances stop "$NODE" --zone "$ZONE" --quiet ;;
