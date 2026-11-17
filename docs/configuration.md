@@ -99,6 +99,10 @@ global gradle cap (`max_parallel_gradle_builds`), and a remote's in-flight run d
 count toward them: the remote builds in its own clone and memory. Its own `concurrency`
 bounds it instead.
 
+A `git://` remote is also skipped while its mailbox checkout (the vault) is on a branch
+other than `main` — a worker run on the vault itself — because a message committed there
+would never be pushed to the remote; the task stays with its owner that tick.
+
 A remote earns `device` by running its own emulator: set `APP_TEST_NODE_MODE=local` in the
 runner's environment and `scripts/app-test-node` (screen check, `macp-emulator`, beta smoke)
 drives an AVD named `api30` on that host instead of the GCE node. The host needs the SDK's

@@ -481,6 +481,7 @@ class Orchestrator:
         # quota slot and the per-repo cap, and does not double-count (counts only
         # gradle runs). Default is 0, so today's behavior is unchanged.
         self.max_parallel_gradle_builds = max_parallel_gradle_builds
+        self._unpublishable_logged: set[tuple[str, str]] = set()
         self.capacity_cooldown_s = capacity_cooldown_s  # re-check delay after a
                                                         # usage/rate limit (no refail)
         self.capacity_cooldown_max_s = capacity_cooldown_max_s  # cap on that backoff
@@ -687,7 +688,8 @@ class Orchestrator:
         This is THE single "is this remote available?" check — online by
         agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
         counts as offline — agent_mode.py), below its `concurrency` in flight,
-        and not the agent that last REJECTED this very task. With `need_device`
+        and not the agent that last REJECTED this very task, and whose mailbox can
+        publish right now (Mailbox.can_send). With `need_device`
         (needs_device) a remote must also advertise `device`. Any future
         availability rule belongs here."""
         remotes = self.reg.heavy_remotes()
@@ -707,6 +709,14 @@ class Orchestrator:
             if a.id == refused:
                 continue
             if self._inflight_count(a.id) >= max(1, int(a.concurrency or 1)):
+                continue
+            why = self._mailbox_for(a).can_send()
+            if why:
+                key = (a.id, why)
+                logged = self.__dict__.setdefault("_unpublishable_logged", set())
+                if key not in logged:
+                    logged.add(key)
+                    print(f"[orchestrator] heavy routing: skipping {a.id} — {why}")
                 continue
             return a
         return None

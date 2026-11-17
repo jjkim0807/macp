@@ -142,6 +142,11 @@ class Mailbox(ABC):
         pass
 
     # -- public API -------------------------------------------------------
+    def can_send(self) -> str | None:
+        """Why a `send` now would NOT reach its recipient, or None when it would.
+        Local transports always deliver."""
+        return None
+
     def send(self, msg: Envelope) -> Path:
         """Deliver `msg` into its recipient's inbox."""
         inbox = self._inbox(msg.to)
@@ -288,6 +293,29 @@ class GitMailbox(Mailbox):
         if r.returncode == 0 and r.stdout.strip():
             return Path(r.stdout.strip())
         return root  # not a repo (tests may run before init); best-effort
+
+    _CAN_SEND_TTL_S = 10.0
+
+    def can_send(self) -> str | None:
+        """A git mailbox publishes by committing on `self.branch` and pushing it.
+        When the checkout holding the mailbox sits on another branch (the live
+        vault while a worker run owns it), the commit is refused or lands off
+        `self.branch` and the message never reaches the remote (2026-11-17: a
+        TASK_ASSIGN to `macbook` stayed staged on a worker branch). Cached briefly:
+        the router asks once per candidate task per tick."""
+        now = time.monotonic()
+        cached = getattr(self, "_can_send_cache", None)
+        if cached and now - cached[0] < self._CAN_SEND_TTL_S:
+            return cached[1]
+        why: str | None = None
+        r = self._git("branch", "--show-current")
+        if r.returncode == 0:
+            head = r.stdout.strip()
+            if head != self.branch:
+                why = (f"git mailbox checkout {self.repo_dir} is on "
+                       f"'{head or 'detached HEAD'}', not '{self.branch}'")
+        self._can_send_cache = (now, why)
+        return why
 
     def _has_origin(self) -> bool:
         return "origin" in self._git("remote").stdout.split()
