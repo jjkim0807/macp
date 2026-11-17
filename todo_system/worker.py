@@ -50,6 +50,7 @@ from .kakao_format import LEVEL_DIGEST, compose_alert
 from .orchestrator import stages as _stages
 from .orchestrator.statuses import is_closed
 from .orchestrator import worktree_sweep as _worktree_sweep
+from .vault_git_lock import vault_git_lock
 from todo_system import daemonctl
 
 # Two roots, split the way orchestrator/human.py and stages.py split theirs.
@@ -2624,6 +2625,12 @@ VAULT_SYNC_PATHS = ("Worker", "Memory", "Todo/items")   # Todo/items tracked sin
 # time so tests can shrink it.
 STALE_REVERT_WINDOW = 20
 
+# How long a sync tick waits for the vault git lock (vault_git_lock.py) before
+# it skips. A holder is one git sequence — a pull, a mailbox push — so a wait
+# this long means something is wedged, and the next tick tries again. Read at
+# call time so tests can shrink it.
+VAULT_SYNC_LOCK_TIMEOUT_S = 30.0
+
 # A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). `--no-abbrev` is passed,
 # so a raw record always carries one of these.
 _RAW_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -2729,7 +2736,26 @@ def sync_vault_state(paths: tuple[str, ...] = VAULT_SYNC_PATHS, _run=None) -> in
     just leaves the commit local for the next tick. Nothing here may raise into
     maintenance. `_run` is a test seam; tests inject a fake to drive the
     push/rebase/re-push race without a real remote.
+
+    The whole sequence runs under the vault git lock (vault_git_lock.py) that
+    the orchestrator's `_pull_main` and the git mailbox take too: interleaved
+    with a pull, these same steps published a revert nobody made (2026-11-17).
+    A tick that cannot get the lock within VAULT_SYNC_LOCK_TIMEOUT_S runs no
+    git at all — one line, and the state waits on disk for the next tick.
     """
+    with vault_git_lock(ROOT, VAULT_SYNC_LOCK_TIMEOUT_S) as held:
+        if not held:
+            print("vault-sync: vault git lock busy — skipping this tick")
+            return 0
+        return _sync_vault_state_locked(paths, _run)
+
+
+def _sync_vault_state_locked(paths: tuple[str, ...], _run) -> int:
+    """sync_vault_state's git sequence; the caller holds the vault git lock.
+
+    Runs git only through its own `git` helper and calls nothing else that
+    takes the lock: the lock is not re-entrant, so a nested acquire would wait
+    on this very holder until the timeout and then skip."""
     run = _run or subprocess.run
 
     def git(*args: str) -> subprocess.CompletedProcess:

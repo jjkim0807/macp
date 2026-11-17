@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import io
 import json
 import os
@@ -26,11 +27,27 @@ from pathlib import Path
 from unittest import mock
 
 from todo_system import daemonctl, worker
+from todo_system import vault_git_lock as vgl
 from todo_system.orchestrator.runner import Runner
 
 
 def _git(repo, *args):
     return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+
+@contextlib.contextmanager
+def _lock_held_elsewhere(root):
+    """Hold `root`'s vault git lock through a separate open file description —
+    the way another daemon (the orchestrator's pull, a mailbox send) holds it."""
+    path = vgl.lock_path(root)
+    assert path is not None, f"{root} resolves no lock — nothing would be held"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield path
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class SyncVaultStateTest(unittest.TestCase):
@@ -269,6 +286,33 @@ class SyncVaultStateTest(unittest.TestCase):
         self.assertEqual(worker.sync_vault_state(), 1)   # reported as synced
         log = _git(self.repo, "log", "--oneline", "-1").stdout
         self.assertIn("sync vault state", log)           # and committed locally
+
+    def test_sync_runs_no_git_while_another_holder_has_the_vault_lock(self):
+        # While another engine sequence holds the vault git lock, a sync tick
+        # runs no git at all — not even the HEAD check — and leaves the state
+        # on disk; once the lock is free the same state syncs normally.
+        self._write("Worker/assignments/t.json")
+        head = _git(self.repo, "rev-parse", "HEAD").stdout
+        calls = []
+
+        def rec(argv, **kw):
+            calls.append(list(argv[1:]))
+            return subprocess.run(argv, **kw)
+
+        with _lock_held_elsewhere(self.repo), \
+             mock.patch.object(worker, "VAULT_SYNC_LOCK_TIMEOUT_S", 0.2):
+            n, out = self._sync_out(_run=rec)
+
+        self.assertEqual(n, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("vault-sync: vault git lock busy", out)
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD").stdout, head)
+
+        n, out = self._sync_out(_run=rec)                # released
+        self.assertEqual(n, 1)
+        self.assertIn(["commit", "-m", "chore: sync vault state (1 files)"], calls)
+        self.assertIn("Worker/assignments/t.json",
+                      _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
 
     # --- stale-revert guard ---------------------------------------------------
     # 2026-11-17: a tick's `merge --autostash` reset the working tree to the HEAD
