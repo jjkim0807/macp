@@ -153,7 +153,11 @@ parallel slots. A single task can pass a pacing hold with `bypass_guard: true`.
 **Splitting.** When implement finds a task too big for one stage, the worker parks it
 with a split proposal. `rescope` then writes 2–5 dependent subtasks
 (`depends_on` chains, each with `parent:`) without a person. When every subtask is
-done, the parent closes.
+done, the parent closes. A task the **plan** stage declares too big is split the same
+way: the engine writes the proposal itself along the plan's `### Phase N:` headings,
+but only when every `acceptance_criteria` item maps to exactly one Phase by its leading
+`§N` key (local-gate items go to every subtask). Anything less clear-cut, and any task
+with `auto_merge: false` or `human_gate: true`, stays parked for a person.
 
 ## Keeping the queue full
 

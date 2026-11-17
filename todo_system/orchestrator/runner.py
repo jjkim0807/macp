@@ -1535,6 +1535,18 @@ class StagedExecutor(ClaudeCodeExecutor):
                     blocked = ("task exceeds a single Implement stage — needs "
                                "re-scoping (plan stage)")
                     progress(f"plan declares oversize — skipping implement: {blocked}")
+                    # Leave the machine-readable split plan, built from this plan's
+                    # `### Phase N:` headings, so collect() hands the park to the
+                    # auto-split sweep instead of a ⛔ (rescope.write_plan_rescope).
+                    # Fail-closed and never raising: no file → today's ⛔ path, and
+                    # the outcome below is unchanged either way.
+                    try:
+                        split_note = rescope.write_plan_rescope(
+                            run_dir, parent_slug=msg.task_id,
+                            items_dir=stages._VAULT_DATA_ROOT / "Todo" / "items")
+                    except Exception as e:      # noqa: BLE001 — never alter the park
+                        split_note = f"skipped ({type(e).__name__})"
+                    progress(f"plan split: {split_note}")
                     return ExecOutcome(
                         False, f"blocked on {blocked} — not a defect",
                         {"branch": branch, "run_dir": str(run_dir),

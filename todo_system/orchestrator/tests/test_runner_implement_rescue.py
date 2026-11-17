@@ -154,8 +154,9 @@ class ImplementRescueWiringTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, repo_url="git@github.com:x/y.git", pipeline=("implement",),
-             plan_body=None):
+             plan_body=None, vault_root=None):
         order: list[str] = []
+        self.progress: list[str] = []
 
         def fake_rescue(repo_dir, branch, slug, progress=None):
             order.append(("rescue", str(repo_dir), branch, slug))
@@ -206,7 +207,9 @@ class ImplementRescueWiringTest(unittest.TestCase):
                 mock.patch("subprocess.run", side_effect=fake_run),
             ):
                 stack.enter_context(p)
-            out = StagedExecutor().execute(msg, _agent(), progress=lambda _: None)
+            if vault_root is not None:
+                stack.enter_context(mock.patch.object(stages, "_VAULT_DATA_ROOT", vault_root))
+            out = StagedExecutor().execute(msg, _agent(), progress=self.progress.append)
         return out, order
 
     def _run_dir(self) -> Path:
@@ -241,7 +244,9 @@ class ImplementRescueWiringTest(unittest.TestCase):
     def test_plan_declares_oversize_short_circuits_implement(self):
         plan = ("# Plan\nThis task exceeds a single Implement stage — it must be "
                 "re-scoped into 3 sub-tasks.\n")
-        out, order = self._run(pipeline=("plan", "implement"), plan_body=plan)
+        # an empty vault: the park finds no task md to build a split plan from
+        out, order = self._run(pipeline=("plan", "implement"), plan_body=plan,
+                               vault_root=self.tmp)
         self.assertFalse(out.ok)
         self.assertEqual(out.payload.get("verify"), "FAIL")
         self.assertIn("re-scop", out.payload.get("blocked_on", "").lower())
@@ -250,6 +255,13 @@ class ImplementRescueWiringTest(unittest.TestCase):
         # the recognised oversize park keyword set sees it
         from todo_system.orchestrator import rescope
         self.assertTrue(rescope.is_oversize_rescope_park(out.payload["blocked_on"]))
+        # The park tries to leave a split plan for the auto-split sweep and says so;
+        # with nothing to build it from it writes no file (fail-closed → today's ⛔).
+        # The full split path is test_plan_rescope_wiring.py.
+        notes = [p for p in self.progress if p.startswith("plan split: ")]
+        self.assertEqual(len(notes), 1, self.progress)
+        self.assertIn("no split", notes[0])
+        self.assertFalse((self._run_dir() / rescope.RESCOPE_FILENAME).exists())
 
     def test_template_plan_does_not_short_circuit(self):
         # Control: an ordinary plan (the `## Parallelizable subtasks` heading, no
