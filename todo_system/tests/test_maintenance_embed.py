@@ -13,13 +13,17 @@ What the acceptance criterion asks for, and where each half is pinned:
   embeds two docs, then returns **None** on a second call with nothing changed,
   and a third call after ONE doc is edited reports exactly one re-embed. That is
   the content-hash diff observed end to end, not a mock of it.
-* "**실패는 한 줄 경고만**" — a raising ``embed_vault``, a raising
-  ``init_relations_db`` and an absent sqlite-vec each produce one line and no
-  exception; ``worker.cmd_maintenance`` keeps going either way.
+* "**실패는 한 줄 경고만**" — a raising ``embed_vault`` and a raising
+  ``init_relations_db`` each produce one line and no exception; a skipped embed
+  (``skipped_reason``) produces one throttled line; ``worker.cmd_maintenance``
+  keeps going either way.
+* sqlite-vec absent is no longer a skip: the tick still calls the REAL
+  ``embed_vault``, which fills the pure-Python fallback table. Those legs force
+  the extension to fail to load, so they run without ``importorskip``.
 
-The mock-free legs guard with ``importorskip`` (the G2 convention): the gate
-command must pass whether or not the optional extension is installed, so every
-contract that can be pinned without it is pinned without it.
+The real-extension legs guard with ``importorskip`` (the G2 convention): the
+gate command must pass whether or not the optional extension is installed, so
+every contract that can be pinned without it is pinned without it.
 """
 
 from __future__ import annotations
@@ -160,33 +164,108 @@ def test_a_long_error_is_clipped(tick_vault, monkeypatch):
     assert len(line) <= me.TEXT_LIMIT + len(" — skipped")
 
 
-# -- sqlite-vec absent: cheap probe + a throttled line ------------------------
+# -- sqlite-vec absent: the pure-Python fallback ------------------------------
 
-def _no_sqlite_vec(monkeypatch, calls):
+def _force_py_vec(monkeypatch):
+    """sqlite-vec fails to load (whether or not it is installed), the fallback
+    notice is re-armed so swallowing it is actually exercised, and the stdlib
+    ``hash`` embedder is pinned so a backend is always available."""
     def _raise(_con):
         raise gm.EmbeddingsUnavailable("sqlite-vec is not installed (simulated)")
 
     monkeypatch.setattr(gm, "_load_sqlite_vec", _raise)
-    monkeypatch.setattr(gm, "embed_vault", _fake_embed(FakeResult(embedded=9), calls))
+    monkeypatch.setattr(gm, "_VEC_FALLBACK_NOTICED", False)
+    monkeypatch.setenv("MACP_EMBEDDER", "hash")
 
 
-def test_absent_sqlite_vec_skips_without_walking_the_corpus(tick_vault, monkeypatch):
-    """The point of the cheap probe: embed_vault hashes ~4,000 docs before it
-    discovers the extension is missing, and on such a host that work is thrown
-    away every five minutes."""
+def test_absent_sqlite_vec_still_calls_embed_vault(tick_vault, monkeypatch):
+    """Inverted on purpose. This used to assert ``calls == []``: the tick probed
+    for sqlite-vec first and skipped when it was missing. Since #147
+    embed_vault falls back to the pure-Python table on its own, so a probe that
+    skips only kept that table from ever being filled — the probe is gone and
+    a missing extension is no longer a skip."""
     calls: list = []
-    _no_sqlite_vec(monkeypatch, calls)
+
+    def _raise(_con):
+        raise gm.EmbeddingsUnavailable("sqlite-vec is not installed (simulated)")
+
+    monkeypatch.setattr(gm, "_load_sqlite_vec", _raise)
+    monkeypatch.setattr(gm, "embed_vault",
+                        _fake_embed(FakeResult(embedded=9, total=9), calls))
 
     line = me.embed_tick(now=1000.0)
 
+    assert calls == [{"vault_root": tick_vault.root}]
     assert line is not None
-    assert "sqlite-vec 없음" in line
-    assert calls == [], "the corpus must not be walked once the probe has failed"
+    assert line.startswith("embed-tick: embedded 9")
+    assert "건너뜀" not in line
+
+
+def test_absent_sqlite_vec_embeds_into_the_py_vec_table(tick_vault, monkeypatch, capsys):
+    """The real embed_vault, no importorskip: with the extension failing to load,
+    changed docs land in PY_VEC_TABLE, an unchanged tick says nothing, and one
+    edit re-embeds exactly one doc. Nothing leaks to stdout/stderr either —
+    embed_vault's once-per-process fallback notice would otherwise be one line
+    per (fresh-process) tick."""
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과에 대한 내용\n")
+    tick_vault.write(DOC_B, "---\ntitle: 노트 B\n---\n\n바나나에 대한 내용\n")
+
+    first = me.embed_tick()
+
+    assert first is not None and "embedded 2" in first, first
+    con = tick_vault.connect()
+    try:
+        assert gm._table_exists(con, gm.PY_VEC_TABLE)
+        rows = {r[0] for r in con.execute(f"SELECT source_file FROM {gm.PY_VEC_TABLE}")}
+        assert rows == {DOC_A, DOC_B}
+        assert not gm._table_exists(con, "vec_sources"), "the vec0 path must not be touched"
+    finally:
+        con.close()
+
+    assert me.embed_tick() is None, "nothing changed, so the tick must say nothing"
+
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과가 아니라 포도\n")
+    third = me.embed_tick()
+
+    assert third is not None
+    assert "embedded 1" in third and "unchanged 1" in third
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "pure-Python" not in err and gm.PY_VEC_TABLE not in err
+
+
+def test_absent_sqlite_vec_deleted_doc_is_removed_from_py_vec(tick_vault, monkeypatch):
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과\n")
+    tick_vault.write(DOC_B, "---\ntitle: 노트 B\n---\n\n바나나\n")
+    me.embed_tick()
+
+    (tick_vault.root / DOC_B).unlink()
+    line = me.embed_tick()
+
+    assert line is not None and "removed 1" in line
+    con = tick_vault.connect()
+    try:
+        rows = {r[0] for r in con.execute(f"SELECT source_file FROM {gm.PY_VEC_TABLE}")}
+    finally:
+        con.close()
+    assert rows == {DOC_A}
+
+
+# -- embed skipped: a throttled line ------------------------------------------
+# The throttle contract is unchanged; only its trigger moved. A missing
+# sqlite-vec used to be the trigger (via a probe) — it now falls back instead —
+# so these tests drive it through embed_vault's skipped_reason (embedder
+# backend unavailable, dim mismatch), the one remaining skip.
+
+def _embed_skips(monkeypatch, calls, reason="embedder backend unavailable (simulated)"):
+    monkeypatch.setattr(gm, "embed_vault", _fake_embed(FakeResult(reason=reason), calls))
 
 
 def test_the_skip_notice_is_throttled_to_once_a_day(tick_vault, monkeypatch):
     calls: list = []
-    _no_sqlite_vec(monkeypatch, calls)
+    _embed_skips(monkeypatch, calls)
 
     first = me.embed_tick(now=1000.0)
     inside = me.embed_tick(now=1000.0 + me.SKIP_NOTICE_COOLDOWN_S - 1)
@@ -199,7 +278,7 @@ def test_the_skip_notice_is_throttled_to_once_a_day(tick_vault, monkeypatch):
 
 def test_a_clock_that_stepped_back_does_not_suppress(tick_vault, monkeypatch):
     calls: list = []
-    _no_sqlite_vec(monkeypatch, calls)
+    _embed_skips(monkeypatch, calls)
 
     assert me.embed_tick(now=10_000.0) is not None
     assert me.embed_tick(now=1_000.0) is not None
@@ -207,7 +286,7 @@ def test_a_clock_that_stepped_back_does_not_suppress(tick_vault, monkeypatch):
 
 def test_the_state_file_holds_one_stamp_and_is_private(tick_vault, monkeypatch):
     calls: list = []
-    _no_sqlite_vec(monkeypatch, calls)
+    _embed_skips(monkeypatch, calls)
 
     me.embed_tick(now=1234.0)
 
@@ -218,7 +297,7 @@ def test_the_state_file_holds_one_stamp_and_is_private(tick_vault, monkeypatch):
 
 def test_an_unwritable_state_dir_still_yields_one_line(tick_vault, monkeypatch):
     calls: list = []
-    _no_sqlite_vec(monkeypatch, calls)
+    _embed_skips(monkeypatch, calls)
     monkeypatch.setattr(me, "_write_state", lambda _s: "state write failed (OSError)")
 
     line = me.embed_tick(now=1000.0)
@@ -228,8 +307,9 @@ def test_an_unwritable_state_dir_still_yields_one_line(tick_vault, monkeypatch):
 
 
 def test_a_skipped_reason_from_embed_vault_takes_the_same_throttle(tick_vault, monkeypatch):
-    """The probe can pass and embed_vault still skip (extension lost between the
-    two). Same shape, same throttle — not a new code path for the reader."""
+    """There is no sqlite-vec probe any more: embed_vault's skipped_reason
+    (embedder backend unavailable, dim mismatch) is the throttle's only trigger.
+    Same shape, same throttle, with or without the extension."""
     monkeypatch.setattr(gm, "_load_sqlite_vec", lambda _con: None)
     monkeypatch.setattr(gm, "embed_vault",
                         _fake_embed(FakeResult(reason="vanished mid-tick"), []))
@@ -374,6 +454,57 @@ def test_dry_run_prints_the_plan_and_writes_nothing(tick_vault, capsys):
     assert DOC_A in out
     con = tick_vault.connect()
     try:
+        assert not gm._table_exists(con, "vec_sources"), "--dry-run wrote state"
+        assert not gm._table_exists(con, gm.PY_VEC_TABLE), "--dry-run wrote state"
+    finally:
+        con.close()
+
+
+def _py_vec_snapshot(tick_vault):
+    con = tick_vault.connect()
+    try:
+        return sorted(tuple(r) for r in con.execute(
+            f"SELECT source_file, content_hash FROM {gm.PY_VEC_TABLE}"))
+    finally:
+        con.close()
+
+
+def test_dry_run_without_sqlite_vec_plans_against_the_py_vec_table(
+        tick_vault, monkeypatch, capsys):
+    """Without the extension the tick writes the fallback table, so that is what
+    the plan must be diffed against: after one edit it is 1 to embed, where a
+    diff against the (absent) vec_sources would say 2. And never 'embed nothing'."""
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과\n")
+    tick_vault.write(DOC_B, "---\ntitle: 노트 B\n---\n\n바나나\n")
+    assert "embedded 2" in me.embed_tick()
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과가 아니라 포도\n")
+    before = _py_vec_snapshot(tick_vault)
+    capsys.readouterr()
+
+    assert me.main(["--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "pure-Python 폴백" in out and gm.PY_VEC_TABLE in out
+    assert "embed nothing" not in out
+    assert "to embed (1)" in out, out
+    assert "unchanged: 1" in out, out
+    assert _py_vec_snapshot(tick_vault) == before, "--dry-run must stay read-only"
+
+
+def test_dry_run_without_sqlite_vec_on_a_fresh_db_writes_nothing(
+        tick_vault, monkeypatch, capsys):
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과\n")
+    tick_vault.connect().close()
+
+    assert me.main(["--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "pure-Python 폴백" in out and "embed nothing" not in out
+    con = tick_vault.connect()
+    try:
+        assert not gm._table_exists(con, gm.PY_VEC_TABLE), "--dry-run wrote state"
         assert not gm._table_exists(con, "vec_sources"), "--dry-run wrote state"
     finally:
         con.close()

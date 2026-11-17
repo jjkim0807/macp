@@ -15,11 +15,15 @@ of failing.
   정상이면 무음, like the disk prune, so the tick's log stays readable;
 * docs changed, were added or went away: exactly one ``embed-tick:`` line
   naming how many were embedded, removed and left unchanged;
-* sqlite-vec not installed (the shipped wheel's state): one line, **throttled to
-  once per SKIP_NOTICE_COOLDOWN_S**, and the corpus is not walked at all. The
-  throttle is the whole reason this module has state: without it a host with no
-  extension would print 288 identical lines a day, and the cheap probe is what
-  keeps it from hashing ~4,000 docs every five minutes to reach the same answer.
+* sqlite-vec not installed (the shipped wheel's state): ``embed_vault``'s
+  pure-Python fallback (``gm.PY_VEC_TABLE`` = ``vec_embeddings_py``, #147) is
+  filled instead, under the same silent / one-line rules. Its once-per-process
+  stderr notice is swallowed: every tick is a fresh process, so it would
+  otherwise be one stray line every five minutes;
+* embed skipped (``embed_vault``'s ``skipped_reason``: embedder backend
+  unavailable, vector dim mismatch): one line, **throttled to once per
+  SKIP_NOTICE_COOLDOWN_S**. The throttle is the whole reason this module has
+  state: without it such a host would print 288 identical lines a day.
 
 No new incremental logic lives here. ``plan_embedding``'s content-hash diff
 already is the "skip unchanged docs" behaviour; this module's whole job is to
@@ -35,7 +39,9 @@ step opens the DB **read-write** — embedding IS a write, and it is the one pla
 allowed to create/migrate ``Memory/relations.sqlite``. It writes only inside
 that file, which the vault gitignores, so there is no vault state to roll back.
 ``--dry-run`` stays genuinely read-only: it opens ``mode=ro`` and reports
-instead when the DB does not exist yet.
+instead when the DB does not exist yet. It says which table the plan targets
+(``vec_sources`` with sqlite-vec, the pure-Python fallback without it) and diffs
+against that one.
 
 Environment (read at call time):
 
@@ -112,6 +118,9 @@ def state_path() -> Path:
 
 
 # -- state (one stamp: the throttled skip notice) ------------------------------
+# (A missing sqlite-vec is no longer a skip — embed_vault falls back to the
+# pure-Python table — so the throttle now only covers embed_vault's
+# skipped_reason.)
 
 def _read_state() -> dict:
     state = {"last_skip_notice_ts": 0.0}
@@ -161,7 +170,8 @@ def _cooling(now: float, last: float, window: float) -> bool:
 
 
 def _skip_notice(reason: str, now: float) -> str | None:
-    """The throttled "no sqlite-vec" line, or None while still cooling."""
+    """The throttled "embed skipped" line (embedder backend unavailable, vector
+    dim mismatch — embed_vault's ``skipped_reason``), or None while still cooling."""
     state = _read_state()
     if _cooling(now, state["last_skip_notice_ts"], SKIP_NOTICE_COOLDOWN_S):
         return None
@@ -169,7 +179,7 @@ def _skip_notice(reason: str, now: float) -> str | None:
     # Stamped BEFORE returning, so a caller that dies mid-print cannot turn the
     # notice into one line per tick (maintenance_disk's rule).
     err = _write_state(state)
-    line = f"embed-tick: sqlite-vec 없음 — 건너뜀 ({reason})"[:TEXT_LIMIT]
+    line = f"embed-tick: 임베딩 건너뜀 ({reason})"[:TEXT_LIMIT]
     return f"{line}; {err}" if err else line
 
 
@@ -184,18 +194,20 @@ def embed_tick(*, now: float | None = None) -> str | None:
             return None
         t = _now() if now is None else now
         con = gm.init_relations_db(db_path())
-        # Cheap guard FIRST. embed_vault walks and hashes the whole corpus
-        # (~4,000 docs) before it discovers the extension is missing, and on a
-        # host without sqlite-vec that work is thrown away every five minutes.
-        try:
-            gm._load_sqlite_vec(con)
-        except gm.EmbeddingsUnavailable as exc:
-            return _skip_notice(str(exc), t)
+        # No sqlite-vec probe here: without the extension embed_vault falls back
+        # to the pure-Python table (gm.PY_VEC_TABLE, #147) by itself, and a probe
+        # that skipped would leave that table stale forever.
         # Incremental by construction: plan_embedding's content-hash diff IS the
         # "skip unchanged docs" behaviour, so nothing is reimplemented here.
         # embed_vault prints its own success line; swallow it so the tick gets
-        # exactly one line (ours) rather than two.
-        with contextlib.redirect_stdout(io.StringIO()):
+        # exactly one line (ours) rather than two. Its stderr is swallowed too:
+        # the only stderr write on that path is the once-per-PROCESS "using the
+        # pure-Python fallback" notice, and every tick is a fresh process, so it
+        # would be one stray line every five minutes — breaking "silent when
+        # nothing changed". Real failures still come back as skipped_reason or
+        # an exception, both of which become our one line.
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
             res = gm.embed_vault(con, vault_root=vault_root())
         if res.skipped_reason:
             return _skip_notice(res.skipped_reason, t)
@@ -217,8 +229,10 @@ def embed_tick(*, now: float | None = None) -> str | None:
 # -- entry point ---------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    """``--dry-run``: print the plan the next tick would apply. Read-only — a
-    ro connection, and no DB is created where none exists."""
+    """``--dry-run``: print the plan the next tick would apply, diffed against the
+    table that tick would write (``vec_sources`` with sqlite-vec, the pure-Python
+    fallback ``gm.PY_VEC_TABLE`` without it). Read-only — a ro connection, and no
+    DB is created where none exists."""
     ap = argparse.ArgumentParser(
         prog="python -m todo_system.maintenance_embed",
         description="Show what the maintenance vault embedding would do. Read-only.")
@@ -241,14 +255,20 @@ def main(argv: list[str] | None = None) -> int:
     con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
+        # Diff against the table the tick would actually write: vec_sources with
+        # the extension, embed_vault's pure-Python fallback table without it.
         try:
             gm._load_sqlite_vec(con)
-            print("sqlite-vec: loaded — a tick would embed the plan below")
+            table = "vec_sources"
+            print("sqlite-vec: loaded — a tick would embed the plan below into "
+                  "vec_embeddings")
         except gm.EmbeddingsUnavailable as exc:
-            print(f"sqlite-vec: UNAVAILABLE ({exc}) — a tick would print one "
-                  "throttled skip line and embed nothing")
+            table = gm.PY_VEC_TABLE
+            print(f"sqlite-vec: UNAVAILABLE ({exc}) — a tick would apply the plan "
+                  f"below to the pure-Python fallback ({gm.PY_VEC_TABLE}) — "
+                  f"pure-Python 폴백({gm.PY_VEC_TABLE})에 반영할 계획")
         to_embed, unchanged, to_remove = gm.plan_embedding(
-            con, gm.iter_embed_corpus(root))
+            con, gm.iter_embed_corpus(root), table=table)
         gm._print_embed_plan(to_embed, unchanged, to_remove, dim=gm.EMBED_DIM)
     finally:
         con.close()
