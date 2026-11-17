@@ -223,8 +223,10 @@ def embed_tick(*, now: float | None = None) -> str | None:
 # -- entry point ---------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    """``--dry-run``: print the plan the next tick would apply. Read-only — a
-    ro connection, and no DB is created where none exists."""
+    """``--dry-run``: print the plan the next tick would apply, diffed against the
+    table that tick would write (``vec_sources`` with sqlite-vec, the pure-Python
+    fallback ``gm.PY_VEC_TABLE`` without it). Read-only — a ro connection, and no
+    DB is created where none exists."""
     ap = argparse.ArgumentParser(
         prog="python -m todo_system.maintenance_embed",
         description="Show what the maintenance vault embedding would do. Read-only.")
@@ -247,14 +249,20 @@ def main(argv: list[str] | None = None) -> int:
     con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
+        # Diff against the table the tick would actually write: vec_sources with
+        # the extension, embed_vault's pure-Python fallback table without it.
         try:
             gm._load_sqlite_vec(con)
-            print("sqlite-vec: loaded — a tick would embed the plan below")
+            table = "vec_sources"
+            print("sqlite-vec: loaded — a tick would embed the plan below into "
+                  "vec_embeddings")
         except gm.EmbeddingsUnavailable as exc:
-            print(f"sqlite-vec: UNAVAILABLE ({exc}) — a tick would print one "
-                  "throttled skip line and embed nothing")
+            table = gm.PY_VEC_TABLE
+            print(f"sqlite-vec: UNAVAILABLE ({exc}) — a tick would apply the plan "
+                  f"below to the pure-Python fallback ({gm.PY_VEC_TABLE}) — "
+                  f"pure-Python 폴백({gm.PY_VEC_TABLE})에 반영할 계획")
         to_embed, unchanged, to_remove = gm.plan_embedding(
-            con, gm.iter_embed_corpus(root))
+            con, gm.iter_embed_corpus(root), table=table)
         gm._print_embed_plan(to_embed, unchanged, to_remove, dim=gm.EMBED_DIM)
     finally:
         con.close()

@@ -451,6 +451,57 @@ def test_dry_run_prints_the_plan_and_writes_nothing(tick_vault, capsys):
     con = tick_vault.connect()
     try:
         assert not gm._table_exists(con, "vec_sources"), "--dry-run wrote state"
+        assert not gm._table_exists(con, gm.PY_VEC_TABLE), "--dry-run wrote state"
+    finally:
+        con.close()
+
+
+def _py_vec_snapshot(tick_vault):
+    con = tick_vault.connect()
+    try:
+        return sorted(tuple(r) for r in con.execute(
+            f"SELECT source_file, content_hash FROM {gm.PY_VEC_TABLE}"))
+    finally:
+        con.close()
+
+
+def test_dry_run_without_sqlite_vec_plans_against_the_py_vec_table(
+        tick_vault, monkeypatch, capsys):
+    """Without the extension the tick writes the fallback table, so that is what
+    the plan must be diffed against: after one edit it is 1 to embed, where a
+    diff against the (absent) vec_sources would say 2. And never 'embed nothing'."""
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과\n")
+    tick_vault.write(DOC_B, "---\ntitle: 노트 B\n---\n\n바나나\n")
+    assert "embedded 2" in me.embed_tick()
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과가 아니라 포도\n")
+    before = _py_vec_snapshot(tick_vault)
+    capsys.readouterr()
+
+    assert me.main(["--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "pure-Python 폴백" in out and gm.PY_VEC_TABLE in out
+    assert "embed nothing" not in out
+    assert "to embed (1)" in out, out
+    assert "unchanged: 1" in out, out
+    assert _py_vec_snapshot(tick_vault) == before, "--dry-run must stay read-only"
+
+
+def test_dry_run_without_sqlite_vec_on_a_fresh_db_writes_nothing(
+        tick_vault, monkeypatch, capsys):
+    _force_py_vec(monkeypatch)
+    tick_vault.write(DOC_A, "---\ntitle: 노트 A\n---\n\n사과\n")
+    tick_vault.connect().close()
+
+    assert me.main(["--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "pure-Python 폴백" in out and "embed nothing" not in out
+    con = tick_vault.connect()
+    try:
+        assert not gm._table_exists(con, gm.PY_VEC_TABLE), "--dry-run wrote state"
+        assert not gm._table_exists(con, "vec_sources"), "--dry-run wrote state"
     finally:
         con.close()
 
