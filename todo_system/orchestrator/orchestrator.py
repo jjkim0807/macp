@@ -3143,6 +3143,21 @@ class Orchestrator:
         self.usage_hold_info = None
         try:
             from todo_system import usage_guard
+            # Limit-reset grants: spend one when the weekly limit is at the wall
+            # and the week is on pace for it (usage_resets.plan_claim). Before
+            # the verdict, so a successful claim lets this tick dispatch.
+            try:
+                from todo_system import usage_resets
+                if not usage_resets.autoclaim_enabled():
+                    raise LookupError("autoclaim off")
+                snap = usage_guard.get_snapshot()
+                claimed = usage_resets.maybe_claim(
+                    snap.get("usage"), notify=lambda m: human.kakao_notifier(m))
+                if claimed:
+                    print(f"[orchestrator] usage-reset claim: {claimed.get('grant_id')} -> "
+                          f"{claimed.get('result')} ({claimed.get('why') or claimed.get('reason')})")
+            except Exception:
+                pass
             d = usage_guard.check()
             try:
                 usage_guard.refresh_inactive_accounts()

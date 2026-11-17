@@ -438,6 +438,14 @@ def _usage_guard_not_disabled(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _usage_resets_off(monkeypatch):
+    # Limit-reset grants (usage_resets) read and claim over the network. Off for
+    # every test by default — the orchestrator's usage_hold() would otherwise read
+    # the real snapshot and grant state; tests of usage_resets turn it back on.
+    monkeypatch.setenv("USAGE_RESETS_DISABLE", "1")
+
+
+@pytest.fixture(autouse=True)
 def _ui_language_ko(monkeypatch):
     # The test vault (vault-template) leaves `language` unset, so the engine
     # default "en" would apply; the existing suites pin the Korean strings (the

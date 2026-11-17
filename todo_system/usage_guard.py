@@ -506,7 +506,8 @@ def pace_release_at(util: float, resets_at: float, window_s: float,
 
 
 def _eval_window(name: str, info: dict | None, window_s: float,
-                 hard_cap: float, allowance: float, now: float) -> dict:
+                 hard_cap: float, allowance: float, now: float,
+                 resets: dict | None = None) -> dict:
     """Decision for one rolling window (session/weekly).
 
     elapsed% is derived from resets_at: start = resets_at - window. Pacing
@@ -547,6 +548,27 @@ def _eval_window(name: str, info: dict | None, window_s: float,
                       f"(until reset)",
         })
         return out
+    if resets:
+        # Limit-reset grants (usage_resets): the week holds (1 + available +
+        # claimed) windows of budget, so the pace line climbs that much faster.
+        from . import usage_resets as _ur
+        avail, claimed = int(resets.get("available") or 0), int(resets.get("claimed") or 0)
+        mult = 1 + avail + claimed
+        line = _ur.weekly_line(elapsed_pct, allowance, avail, claimed)
+        out["pace_line"] = round(line, 1)
+        out["resets"] = {"available": avail, "claimed": claimed}
+        if util > line:
+            # catch-up: elapsed%·mult − 100·claimed + allowance == util
+            catch_pct = (util + 100.0 * claimed - allowance) / mult
+            release = resets_at - window_s * (1.0 - catch_pct / 100.0)
+            out.update({
+                "blocked": True,
+                "blocked_until": min(release, resets_at),
+                "reason": f"{name} {util:.0f}% ahead of pace "
+                          f"({elapsed_pct:.0f}% elapsed ×{mult} with {avail} reset(s) "
+                          f"left + {allowance:.0f}pp allowance)",
+            })
+        return out
     if util > elapsed_pct + allowance:
         # catch-up time: when elapsed% + allowance == util
         out.update({
@@ -558,15 +580,18 @@ def _eval_window(name: str, info: dict | None, window_s: float,
     return out
 
 
-def evaluate(usage: dict, now: float | None = None) -> dict:
-    """Pure policy: usage payload -> decision. No I/O (unit-testable)."""
+def evaluate(usage: dict, now: float | None = None, resets: dict | None = None) -> dict:
+    """Pure policy: usage payload -> decision. No I/O (unit-testable).
+    `resets` ({available, claimed}, usage_resets.pacing_inputs) widens the weekly
+    pace line by the limit-reset grants still usable this week."""
     now = time.time() if now is None else now
     cfg = _cfg()
     windows = [
         _eval_window("session", usage.get("five_hour"), SESSION_WINDOW_S,
                      cfg["session_hard_cap"], cfg["session_allowance"], now),
         _eval_window("weekly", usage.get("seven_day"), WEEKLY_WINDOW_S,
-                     cfg["weekly_hard_cap"], cfg["weekly_allowance"], now),
+                     cfg["weekly_hard_cap"], cfg["weekly_allowance"], now,
+                     resets=resets),
     ]
     blocked = [w for w in windows if w["blocked"]]
     until = max((w["blocked_until"] for w in blocked), default=None)
@@ -642,8 +667,10 @@ def window_slack(w: dict, cfg: dict | None = None) -> float | None:
     if w.get("utilization") is None or w.get("elapsed_pct") is None:
         return None
     cfg = cfg or _cfg()
-    line = min(float(w["elapsed_pct"]) + cfg[f"{name}_allowance"],
-               cfg[f"{name}_hard_cap"])
+    base = w.get("pace_line")              # set when limit-reset grants widen the week
+    if base is None:
+        base = float(w["elapsed_pct"]) + cfg[f"{name}_allowance"]
+    line = min(float(base), cfg[f"{name}_hard_cap"])
     return max(line - float(w["utilization"]), 0.0)
 
 
@@ -1027,7 +1054,12 @@ def check(*, account: str | None = None, force: bool = False,
     usage = state.get("usage")
     fetched_at = float(state.get("fetched_at") or 0)
     if usage and now - fetched_at <= cfg["stale_ok_s"]:
-        decision = evaluate(usage, now)
+        try:
+            from . import usage_resets
+            resets = usage_resets.pacing_inputs(usage, now)
+        except Exception:
+            resets = None
+        decision = evaluate(usage, now, resets=resets)
         decision["stale"] = now - fetched_at > cfg["fetch_ttl_s"]
     else:
         decision = _no_data_decision(state, cfg, now)
