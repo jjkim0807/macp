@@ -15,11 +15,15 @@ of failing.
   정상이면 무음, like the disk prune, so the tick's log stays readable;
 * docs changed, were added or went away: exactly one ``embed-tick:`` line
   naming how many were embedded, removed and left unchanged;
-* sqlite-vec not installed (the shipped wheel's state): one line, **throttled to
-  once per SKIP_NOTICE_COOLDOWN_S**, and the corpus is not walked at all. The
-  throttle is the whole reason this module has state: without it a host with no
-  extension would print 288 identical lines a day, and the cheap probe is what
-  keeps it from hashing ~4,000 docs every five minutes to reach the same answer.
+* sqlite-vec not installed (the shipped wheel's state): ``embed_vault``'s
+  pure-Python fallback (``gm.PY_VEC_TABLE`` = ``vec_embeddings_py``, #147) is
+  filled instead, under the same silent / one-line rules. Its once-per-process
+  stderr notice is swallowed: every tick is a fresh process, so it would
+  otherwise be one stray line every five minutes;
+* embed skipped (``embed_vault``'s ``skipped_reason``: embedder backend
+  unavailable, vector dim mismatch): one line, **throttled to once per
+  SKIP_NOTICE_COOLDOWN_S**. The throttle is the whole reason this module has
+  state: without it such a host would print 288 identical lines a day.
 
 No new incremental logic lives here. ``plan_embedding``'s content-hash diff
 already is the "skip unchanged docs" behaviour; this module's whole job is to
@@ -35,7 +39,9 @@ step opens the DB **read-write** — embedding IS a write, and it is the one pla
 allowed to create/migrate ``Memory/relations.sqlite``. It writes only inside
 that file, which the vault gitignores, so there is no vault state to roll back.
 ``--dry-run`` stays genuinely read-only: it opens ``mode=ro`` and reports
-instead when the DB does not exist yet.
+instead when the DB does not exist yet. It says which table the plan targets
+(``vec_sources`` with sqlite-vec, the pure-Python fallback without it) and diffs
+against that one.
 
 Environment (read at call time):
 

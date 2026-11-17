@@ -13,13 +13,17 @@ What the acceptance criterion asks for, and where each half is pinned:
   embeds two docs, then returns **None** on a second call with nothing changed,
   and a third call after ONE doc is edited reports exactly one re-embed. That is
   the content-hash diff observed end to end, not a mock of it.
-* "**실패는 한 줄 경고만**" — a raising ``embed_vault``, a raising
-  ``init_relations_db`` and an absent sqlite-vec each produce one line and no
-  exception; ``worker.cmd_maintenance`` keeps going either way.
+* "**실패는 한 줄 경고만**" — a raising ``embed_vault`` and a raising
+  ``init_relations_db`` each produce one line and no exception; a skipped embed
+  (``skipped_reason``) produces one throttled line; ``worker.cmd_maintenance``
+  keeps going either way.
+* sqlite-vec absent is no longer a skip: the tick still calls the REAL
+  ``embed_vault``, which fills the pure-Python fallback table. Those legs force
+  the extension to fail to load, so they run without ``importorskip``.
 
-The mock-free legs guard with ``importorskip`` (the G2 convention): the gate
-command must pass whether or not the optional extension is installed, so every
-contract that can be pinned without it is pinned without it.
+The real-extension legs guard with ``importorskip`` (the G2 convention): the
+gate command must pass whether or not the optional extension is installed, so
+every contract that can be pinned without it is pinned without it.
 """
 
 from __future__ import annotations
