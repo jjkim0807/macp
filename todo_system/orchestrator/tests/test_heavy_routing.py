@@ -929,3 +929,68 @@ class DeviceGateTickTest(_Base):
         self.assertEqual(self.inbox(self.DEVICE_REMOTE), [])
         self.assertEqual(len(self.inbox(DEFAULT)), 1)
 
+
+
+class RemoteSkipsLocalCheckoutGatesTest(_Base):
+    """This host's per-repo checkout cap and global gradle cap guard ITS clones
+    and memory. A task routed to a remote runs in the remote's clone, so through
+    Orchestrator.tick it is not deferred by them, and a remote's in-flight row
+    does not count toward them."""
+
+    OTHER = "https://example.invalid/acme/other-gradle.git"
+
+    def setUp(self):
+        super().setUp()
+        self.orch = Orchestrator(self.mb, self.reg, self.ledger,
+                                 notify=lambda *a, **k: None, default_uri=self.uri,
+                                 max_parallel_gradle_builds=1)
+        p = mock.patch.object(self.orch, "_is_gradle_checkout",
+                              side_effect=lambda key: key in (REPO, self.OTHER))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _live(self, slug: str, agent: str, repo: str) -> None:
+        self.ledger.save(Assignment(task_id=slug, agent_id=agent, corr_id=f"c-{slug}",
+                                    state=A.IN_PROGRESS, kind="ai-local",
+                                    payload={"repo": repo}))
+
+    def test_remote_bound_task_is_not_held_by_the_local_gradle_cap(self):
+        self._live("hq-build", DEFAULT, self.OTHER)       # HQ at its gradle cap (1)
+        self.seen(REMOTE, 60)
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(res["dispatched"]), 1)
+        [env] = self.inbox(REMOTE)
+        self.assertEqual(env.type, m.TASK_ASSIGN)
+        self.assertEqual(self.ledger.load("app-build").agent_id, REMOTE)
+
+    def test_remote_bound_task_is_not_held_by_the_local_checkout_cap(self):
+        # Same repo already busy on HQ (cap per repo = 1 via overlap) — the remote
+        # has its own clone, so the task still goes out.
+        self.orch.max_parallel_per_repo = 1
+        self._live("hq-same-repo", DEFAULT, REPO)
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(self.inbox(REMOTE)), 1)
+
+    def test_remote_inflight_row_does_not_count_toward_local_caps(self):
+        # The remote is busy (concurrency 1) with a gradle build; the next heavy
+        # task falls back to HQ, and HQ's gradle cap (1) is still free.
+        self.seen(REMOTE, 60)
+        self._live("remote-build", REMOTE, self.OTHER)
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(res["dispatched"]), 1)
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(len(self.inbox(DEFAULT)), 1)
+
+    def test_local_task_is_still_held_by_the_local_gradle_cap(self):
+        self._live("hq-build", DEFAULT, self.OTHER)
+        self.seen(REMOTE, 600_000)                         # remote stale → stays home
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(res["dispatched"], [])
+        self.assertEqual(self.inbox(DEFAULT), [])
+
+    def test_queue_view_does_not_show_a_remote_bound_task_as_capped(self):
+        self._live("hq-build", DEFAULT, self.OTHER)
+        self.seen(REMOTE, 60)
+        [row] = self.orch.queue_snapshot([self.heavy_task()])
+        self.assertNotEqual(row["wait"], "gradle_cap")

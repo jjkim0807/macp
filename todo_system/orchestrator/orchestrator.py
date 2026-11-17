@@ -913,12 +913,30 @@ class Orchestrator:
         max_parallel_per_repo > 1 — the FULL owner rows, so the overlap
         predicate can read each owner's `touches`/`depends_on` off its payload.
         Same liveness filter as `_checkout_owners`: only in-flight rows own a
-        checkout (terminal and parked rows own nothing)."""
+        checkout (terminal and parked rows own nothing). A row held by a REMOTE
+        agent owns no checkout here: it runs in the remote's own clone and memory,
+        so it neither blocks this host's per-repo cap nor counts toward its gradle
+        cap (heavy routing sends Gradle work out precisely to relieve that cap)."""
         out: dict[str, list[Assignment]] = {}
         for a in self.ledger.all():
-            if a.state in _IN_FLIGHT:
+            if a.state in _IN_FLIGHT and not self._is_remote_agent(a.agent_id):
                 out.setdefault(self._checkout_key(a.payload), []).append(a)
         return out
+
+    def _is_remote_agent(self, agent_id: str | None) -> bool:
+        try:
+            return bool(agent_id) and self.reg.get(agent_id).is_remote
+        except KeyError:
+            return False
+
+    def _routes_remote(self, t: Task) -> bool:
+        """Would `t` go to a remote agent this tick? Such a run uses the remote's
+        own clone, so this host's checkout / gradle gates do not apply to it."""
+        try:
+            agent = self.route(t.slug, t.payload, existing=self.ledger.load(t.slug))
+        except Exception:  # noqa: BLE001 - unknown → apply the local gates (old behaviour)
+            return False
+        return agent is not None and agent.is_remote
 
     def _is_gradle_checkout(self, key: str) -> bool:
         """Does this checkout key resolve to a Gradle project (a `gradlew` at its
@@ -1091,6 +1109,11 @@ class Orchestrator:
         cap = max(1, int(self.max_parallel_per_repo))   # guard against 0/negative: never below serial
         dispatched: list[Assignment] = []
         for t in runnable:
+            if self._routes_remote(t):
+                a = self.dispatch(t)
+                if a is not None:
+                    dispatched.append(a)   # claims no local checkout
+                continue
             key = self._checkout_key(t.payload)
             cg = self._checkout_gate(t, key, live, cap)
             if cg.wait == WAIT_CHECKOUT_BUSY:
@@ -1140,12 +1163,14 @@ class Orchestrator:
             key = self._checkout_key(t.payload)
             h = hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
                           budget_exceeded=budget_exceeded)
-            cg = self._checkout_gate(t, key, live, cap) if h is None else CheckoutGate(None)
+            remote = h is None and self._routes_remote(t)
+            cg = (self._checkout_gate(t, key, live, cap) if h is None and not remote
+                  else CheckoutGate(None))
             lw = {"poll": WAIT_COOLDOWN, "cooldown": WAIT_COOLDOWN,
                   "poison": WAIT_COOLDOWN, "capacity": WAIT_CAPACITY}.get(lg.kind)
             waits = [w for w in (h, lw, cg.wait) if w]
             wait = min(waits, key=WAIT_RANK.__getitem__) if waits else WAIT_NEXT_TICK
-            if h is None and cg.wait is None and lg.kind == "go":
+            if h is None and cg.wait is None and lg.kind == "go" and not remote:
                 # what dispatch() would return this tick — claims the checkout for
                 # the rest of the pass, never saved
                 live.setdefault(key, []).append(Assignment(
