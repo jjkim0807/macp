@@ -140,6 +140,7 @@ class ClaudeAgentBackend:
                   working_dir: str | None = None, auto_merge: bool = False,
                   project_context: str = "", retry_context: str = "",
                   allowed_tools: str | None = None, tier: str | None = None,
+                  max_turns: int | None = None,
                   worker_root: Path | None = None, account=None,
                   cwd: str | None = None, env: dict | None = None,
                   timeout: float | None = None,
@@ -157,7 +158,8 @@ class ClaudeAgentBackend:
             stage, task_id=task_id, run_id=run_id, run_dir=run_dir, branch=branch,
             repo=repo, working_dir=working_dir, auto_merge=auto_merge,
             worker_root=worker_root, project_context=project_context,
-            retry_context=retry_context, allowed_tools=allowed_tools, tier=tier)
+            retry_context=retry_context, allowed_tools=allowed_tools, tier=tier,
+            max_turns=max_turns)
         return stages.run_stage_subprocess(
             argv, cwd=cwd, env=env, timeout=timeout, progress=progress)
 
@@ -431,6 +433,7 @@ class GeminiAgentBackend:
                   account=None, tier: str | None = None,
                   project_context: str = "", retry_context: str = "",
                   allowed_tools: str | None = None, worker_root: Path | None = None,
+                  max_turns: int | None = None,
                   cwd: str | None = None, env: dict | None = None,
                   timeout: float | None = None,
                   progress=None) -> subprocess.CompletedProcess:

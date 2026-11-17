@@ -206,6 +206,22 @@ def read_task_agent(md_path: str | Path) -> str | None:
     return task_agent_from_fm(_frontmatter(md_path))
 
 
+def task_max_turns_from_fm(fm: dict) -> int | None:
+    """A task's `max_turns:` as a positive int, else None. The legacy worker
+    honoured it as a per-task turn budget (worker.py); the staged pipeline
+    dropped it until 2026-11-17 (dripcoffee-dial-1 hit plan 40 / verify 50
+    with `max_turns: 150` written). Garbage and non-positive values are None so
+    the stage defaults apply."""
+    v = fm.get("max_turns")
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def task_estimate_p90_from_fm(fm: dict) -> str | None:
     return _clean(fm.get("estimate_p90"))
 

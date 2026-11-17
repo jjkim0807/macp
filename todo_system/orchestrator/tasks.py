@@ -221,6 +221,12 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         agent = repos.task_agent_from_fm(fm)
         if agent:
             payload["agent"] = agent
+        # Per-task turn budget. Only when present (byte-identical payload
+        # otherwise); stages.stage_max_turns raises — never lowers — each
+        # stage's default to it.
+        max_turns = repos.task_max_turns_from_fm(fm)
+        if max_turns:
+            payload["max_turns"] = max_turns
         p90 = repos.task_estimate_p90_from_fm(fm)
         if p90:
             payload["estimate_p90"] = p90
