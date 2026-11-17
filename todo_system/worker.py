@@ -2617,6 +2617,100 @@ ALLOWED_DIRTY_EXACT = {
 # to have left in the working tree mid-run.
 VAULT_SYNC_PATHS = ("Worker", "Memory", "Todo/items")   # Todo/items tracked since 2026-09-10 (cloud-HQ SoT decision)
 
+# How far back the stale-revert guard in sync_vault_state looks: the last N
+# commits on HEAD, every commit counted — not N commits that touched the path.
+# A path whose change has scrolled out of the window commits normally again,
+# which bounds what a byte-identical legitimate revert can cost. Read at call
+# time so tests can shrink it.
+STALE_REVERT_WINDOW = 20
+
+# A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). `--no-abbrev` is passed,
+# so a raw record always carries one of these.
+_RAW_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _raw_z_entries(out: str) -> list[tuple[str | None, str, str, str]]:
+    """Parse `--raw -z` output into ``(commit, old_blob, new_blob, path)`` rows.
+
+    Reads both shapes the stale-revert guard asks git for: `git diff --cached
+    --raw -z` (commit is None) and `git log --raw -z --format=%H`, where each
+    commit's hash is its own NUL-terminated token ahead of its records (a merge
+    or an empty commit has none). Under -z the path is a token of its own, byte
+    for byte and unquoted — which is what lets the vault's Korean filenames
+    through — so it is taken verbatim and never stripped. A combined-diff record
+    (``::``, a merge under -c/--cc) is skipped together with its path. Anything
+    else is ignored, so output that is not raw at all parses as ``[]``.
+    """
+    rows: list[tuple[str | None, str, str, str]] = []
+    commit: str | None = None
+    tokens = out.split("\0")
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].strip("\n")
+        i += 1
+        if tok.startswith("::"):
+            i += 1                       # the combined record's path
+            continue
+        if tok.startswith(":"):
+            f = tok.split()
+            if (len(f) >= 5 and _RAW_OID.fullmatch(f[2])
+                    and _RAW_OID.fullmatch(f[3]) and i < len(tokens)):
+                rows.append((commit, f[2], f[3], tokens[i]))
+                i += 1
+            continue
+        if _RAW_OID.fullmatch(tok):
+            commit = tok
+    return rows
+
+
+def _is_null_oid(oid: str) -> bool:
+    """The all-zero id raw output uses for "no blob" (added / deleted side)."""
+    return not oid.strip("0")
+
+
+def _stale_revert_refusals(git, window: int) -> list[tuple[str, str]] | None:
+    """Staged paths whose bytes are exactly what a recent commit replaced.
+
+    Returns ``[(path, commit)]`` — `commit` being the newest of the last
+    `window` commits on HEAD that changed `path` away from the blob now staged
+    for it — or None when git could not answer, which the caller must treat as
+    "cannot vouch for this commit". Never raises.
+
+    Only a real blob on both sides counts:
+      - a staged DELETION is never refused: consumed mailbox messages are
+        deletions on nearly every tick, and refusing them would pile the
+        inboxes back up;
+      - a commit that ADDED the path has no earlier blob to go back to.
+    A commit that DELETED the path does count — the same bytes coming back is
+    a resurrection, and 30f97a346 brought a consumed inbox message back
+    exactly that way.
+    """
+    try:
+        diff = git("diff", "--cached", "--raw", "-z", "--no-abbrev",
+                   "--no-renames", "--no-color")
+        if diff.returncode != 0:
+            return None
+        staged = {path: new for _c, old, new, path in _raw_z_entries(diff.stdout or "")
+                  if new != old and not _is_null_oid(new)}
+        if not staged:
+            return []
+        log = git("log", f"-n{int(window)}", "--raw", "-z", "--no-abbrev",
+                  "--no-renames", "--no-color", "--no-show-signature",
+                  "--format=%H", "HEAD", "--")
+        if log.returncode != 0:
+            return None
+        refusals: list[tuple[str, str]] = []
+        # git log lists newest first, so the first match per path is the most
+        # recent commit that made this exact change — the one to name.
+        for commit, old, new, path in _raw_z_entries(log.stdout or ""):
+            if (commit and path in staged and old != new
+                    and not _is_null_oid(old) and staged[path] == old):
+                refusals.append((path, commit))
+                del staged[path]
+        return refusals
+    except Exception:  # noqa: BLE001 - "cannot tell" is answered by the caller
+        return None
+
 
 def sync_vault_state(paths: tuple[str, ...] = VAULT_SYNC_PATHS, _run=None) -> int:
     """Commit + push the tracked vault state. Returns the number of files synced.
@@ -2705,6 +2799,45 @@ def sync_vault_state(paths: tuple[str, ...] = VAULT_SYNC_PATHS, _run=None) -> in
                   f"staging) — deferring rather than committing a reverse diff{detail}")
             return 0
         git("add", "-A", *existing)
+        # 2026-11-17: a tick's `merge --autostash` reset the working tree to the
+        # HEAD of that moment and its stash was never re-applied, so HEAD held a
+        # just-committed task md while the disk held the bytes from before it.
+        # The index was back at HEAD and nothing was mid-merge — both guards
+        # above passed — and `add -A` staged the old bytes, which the next sync
+        # commit (30f97a346) published as a revert nobody made.
+        #
+        # So: a staged path whose new blob is exactly what one of the last
+        # STALE_REVERT_WINDOW commits on HEAD replaced is taken back out of the
+        # index, named in one line, and every other path commits as usual.
+        # Between `add -A` and the commit on purpose — only the staged blobs
+        # say what this commit would publish. The disk is left alone: whether
+        # the old bytes or the commit are right is a person's call, and the
+        # refusal repeats each tick until they decide or the change scrolls
+        # out of the window. If git cannot answer the check, nothing commits
+        # unchecked: the index goes back to HEAD (the index guard above has
+        # just proven it was there before `add -A`, so only this tick's staging
+        # is undone — left staged, it would trip that guard on every later
+        # tick) and the tick is deferred.
+        refusals = _stale_revert_refusals(git, STALE_REVERT_WINDOW)
+        if refusals is None:
+            print("vault-sync: stale-revert check could not read git — "
+                  "deferring rather than committing unchecked")
+            git("reset", "-q")
+            return 0
+        if refusals:
+            for path, commit in refusals:
+                print(f"vault-sync: refusing stale revert of {path} "
+                      f"(restores {commit[:12]}^ blob)")
+            # :(top,literal) — from the repo root whatever the cwd, and no
+            # glob expansion of a `*` or `[` that happens to be in a filename.
+            unstaged = git("restore", "--staged", "--",
+                           *(f":(top,literal){p}" for p, _c in refusals))
+            if unstaged.returncode != 0:
+                detail = (unstaged.stderr or unstaged.stdout or "").strip()
+                print("vault-sync: could not unstage the refused path(s) — "
+                      f"deferring: {detail}")
+                git("reset", "-q")
+                return 0
         staged = git("diff", "--cached", "--name-only").stdout.strip()
         if not staged:
             return 0

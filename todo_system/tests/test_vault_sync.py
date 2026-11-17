@@ -270,6 +270,181 @@ class SyncVaultStateTest(unittest.TestCase):
         log = _git(self.repo, "log", "--oneline", "-1").stdout
         self.assertIn("sync vault state", log)           # and committed locally
 
+    # --- stale-revert guard ---------------------------------------------------
+    # 2026-11-17: a tick's `merge --autostash` reset the working tree to the HEAD
+    # of that moment and never re-applied its stash, so HEAD held a person's
+    # just-committed task md while the disk held the bytes from before it. The
+    # index was back at HEAD and nothing was mid-merge, so both existing guards
+    # passed, and the next `chore: sync vault state` (30f97a346) staged the old
+    # bytes with `add -A` and published the revert.
+
+    def _commit(self, rel, text, msg):
+        self._write(rel, text)
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", msg)
+        return _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def _sync_out(self, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            n = worker.sync_vault_state(**kw)
+        return n, buf.getvalue()
+
+    def _stale_worktree_after_a_commit(self, rel, old, new):
+        """Commit `old`, then commit A = `new` and push it, then put `old` back
+        on disk only — index=HEAD, the working tree alone holds A^'s bytes.
+        Both preconditions are asserted, so the fixture cannot quietly stop
+        reproducing the incident and let the guard tests pass on another guard."""
+        self._commit(rel, old, f"seed {rel}")
+        a = self._commit(rel, new, f"A: edit {rel}")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self._write(rel, old)
+        self.assertEqual(
+            _git(self.repo, "diff", "--cached", "--quiet").returncode, 0,
+            "fixture left a dirty index — the index guard would defer instead")
+        self.assertEqual(
+            _git(self.repo, "diff", "--quiet").returncode, 1,
+            "fixture left no working-tree change — nothing is being tested")
+        return a
+
+    def test_a_stale_revert_of_a_recent_edit_is_not_committed(self):
+        a = self._stale_worktree_after_a_commit(
+            "Todo/items/a.md", "allowed_tools: old\n", "allowed_tools: new\n")
+
+        n, out = self._sync_out()
+
+        self.assertEqual(n, 0)
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD").stdout.strip(), a)
+        self.assertEqual(_git(self.remote, "rev-parse", "main").stdout.strip(), a)
+        self.assertEqual(_git(self.repo, "show", "HEAD:Todo/items/a.md").stdout,
+                         "allowed_tools: new\n")
+        self.assertIn("vault-sync: refusing stale revert of Todo/items/a.md "
+                      f"(restores {a[:12]}^ blob)", out)
+        # the guard only refuses the commit — the disk is a person's to resolve
+        self.assertEqual((self.repo / "Todo/items/a.md").read_text(encoding="utf-8"),
+                         "allowed_tools: old\n")
+        # and nothing stays staged: a leftover index would trip the index guard
+        # on every later tick and stop the vault syncing altogether
+        self.assertEqual(_git(self.repo, "diff", "--cached", "--quiet").returncode, 0)
+
+    def test_a_refused_revert_does_not_hold_back_the_rest(self):
+        # One stale path must not stall the ledger: everything else commits.
+        self._stale_worktree_after_a_commit(
+            "Todo/items/a.md", "allowed_tools: old\n", "allowed_tools: new\n")
+        self._write("Worker/assignments/t.json")
+
+        n, out = self._sync_out()
+
+        self.assertEqual(n, 1)
+        self.assertIn("refusing stale revert of Todo/items/a.md", out)
+        self.assertEqual(_git(self.repo, "show", "HEAD:Todo/items/a.md").stdout,
+                         "allowed_tools: new\n")
+        self.assertEqual(_git(self.repo, "log", "-1", "--format=%s").stdout.strip(),
+                         "chore: sync vault state (1 files)")
+        self.assertIn("Worker/assignments/t.json",
+                      _git(self.repo, "ls-tree", "-r", "--name-only", "HEAD").stdout)
+        self.assertIn("Worker/assignments/t.json",
+                      _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
+
+    def test_a_resurrected_deletion_is_refused(self):
+        # 30f97a346 also brought back a consumed inbox message, byte for byte,
+        # that 47c6e4880 had deleted. A deletion counts as a change to revert.
+        rel = "Worker/agents/w/inbox/m.json"
+        self._commit(rel, '{"id": 1}', "deliver m")
+        _git(self.repo, "rm", "-q", rel)
+        _git(self.repo, "commit", "-qm", "D: consume m")
+        d = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self._write(rel, '{"id": 1}')                  # the same bytes come back
+
+        n, out = self._sync_out()
+
+        self.assertEqual(n, 0)
+        self.assertIn(f"vault-sync: refusing stale revert of {rel} "
+                      f"(restores {d[:12]}^ blob)", out)
+        self.assertNotIn(rel, _git(self.repo, "ls-tree", "-r", "--name-only", "HEAD").stdout)
+        self.assertEqual(_git(self.repo, "diff", "--cached", "--quiet").returncode, 0)
+
+    def test_a_revert_older_than_the_window_is_committed(self):
+        # The window is the last N commits on HEAD, every commit counted (the
+        # spec's wording) — a change that has scrolled out of it commits again.
+        # The same state is refused one commit wider, so the window is what
+        # decides here, not some other path through the guard.
+        self._commit("Todo/items/a.md", "old\n", "seed a")
+        self._commit("Todo/items/a.md", "new\n", "A")
+        self._commit("Worker/x.json", "1", "x1")
+        self._commit("Worker/x.json", "2", "x2")
+        self._write("Todo/items/a.md", "old\n")
+
+        with mock.patch.object(worker, "STALE_REVERT_WINDOW", 3):
+            n, out = self._sync_out()
+        self.assertEqual(n, 0)                         # A is the 3rd newest commit
+        self.assertIn("refusing stale revert of Todo/items/a.md", out)
+
+        with mock.patch.object(worker, "STALE_REVERT_WINDOW", 2):
+            n, out = self._sync_out()
+        self.assertEqual(n, 1)
+        self.assertNotIn("refusing", out)
+        self.assertEqual(_git(self.repo, "show", "HEAD:Todo/items/a.md").stdout, "old\n")
+
+    def test_a_non_ascii_path_revert_is_refused(self):
+        # The vault names files in Korean. Without -z git quotes such a path
+        # ("Todo/items/\352\251..."), which matches nothing staged; with -z the
+        # path arrives verbatim and is refused under its real name.
+        rel = "Todo/items/메모.md"
+        a = self._stale_worktree_after_a_commit(rel, "old\n", "new\n")
+
+        n, out = self._sync_out()
+
+        self.assertEqual(n, 0)
+        self.assertIn(f"vault-sync: refusing stale revert of {rel} "
+                      f"(restores {a[:12]}^ blob)", out)
+        self.assertEqual(_git(self.repo, "show", f"HEAD:{rel}").stdout, "new\n")
+        self.assertEqual(_git(self.repo, "diff", "--cached", "--quiet").returncode, 0)
+
+
+class RawZEntriesTest(unittest.TestCase):
+    """The `--raw -z` parser behind the stale-revert guard — pure, no git."""
+
+    A, B, C, Z = "a" * 40, "b" * 40, "c" * 40, "0" * 40
+    C1, C2, C3 = "1" * 40, "2" * 40, "3" * 40
+
+    def test_log_records_are_attributed_to_their_commit_and_paths_kept_verbatim(self):
+        A, B, C, Z, C1, C2, C3 = self.A, self.B, self.C, self.Z, self.C1, self.C2, self.C3
+        hexname = "d" * 40                              # a path that looks like a commit
+        out = (f"{C1}\0"                                # a merge: no records at all
+               f"{C2}\0\n:100644 100644 {A} {B} M\0:colon/first.md\0"
+               f":100644 000000 {B} {Z} D\0{hexname}\0"
+               f"{C3}\0\n:000000 100644 {Z} {C} A\0\nleading-newline.md\0"
+               f":100644 100644 {A} {C} M\0Todo/items/메모.md\0")
+        self.assertEqual(worker._raw_z_entries(out), [
+            (C2, A, B, ":colon/first.md"),
+            (C2, B, Z, hexname),
+            (C3, Z, C, "\nleading-newline.md"),
+            (C3, A, C, "Todo/items/메모.md"),
+        ])
+
+    def test_diff_cached_records_have_no_commit(self):
+        A, B = self.A, self.B
+        out = f":100644 100644 {A} {B} M\0Worker/a.json\0"
+        self.assertEqual(worker._raw_z_entries(out), [(None, A, B, "Worker/a.json")])
+
+    def test_combined_merge_records_are_skipped_with_their_path(self):
+        A, B, C, C1 = self.A, self.B, self.C, self.C1
+        out = f"{C1}\0::100644 100644 100644 {A} {B} {C} MM\0f.md\0"
+        self.assertEqual(worker._raw_z_entries(out), [])
+
+    def test_sha256_ids_are_read(self):
+        old, new = "e" * 64, "f" * 64
+        out = f":100644 100644 {old} {new} M\0x.md\0"
+        self.assertEqual(worker._raw_z_entries(out), [(None, old, new, "x.md")])
+
+    def test_output_that_is_not_raw_parses_as_nothing(self):
+        # The SyncVaultRePushTest fake answers every `diff` with a name list;
+        # the guard must read that as "nothing to refuse", silently.
+        for out in ("", "Worker/a.json\n", "main\n", "\0\0"):
+            with self.subTest(out=out):
+                self.assertEqual(worker._raw_z_entries(out), [])
+
 
 class SyncVaultRePushTest(unittest.TestCase):
     """When the first push is rejected (another host pushed first), sync rebases
@@ -400,6 +575,34 @@ class SyncVaultRePushTest(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn(["commit", "-m", "chore: sync vault state (1 files)"], calls)
         self.assertEqual(out, "")
+
+    def test_an_unreadable_revert_check_defers_and_unstages(self):
+        # Fail-closed like the index guard: when git cannot answer the
+        # stale-revert check nothing commits unchecked, and this tick's staging
+        # is undone — left in place it would trip the index guard on every
+        # later tick and stop the vault syncing for good.
+        calls = []
+        raw = ":100644 100644 " + "a" * 40 + " " + "b" * 40 + " M\0Worker/a.json\0"
+
+        def run(argv, **kw):
+            calls.append(list(argv[1:]))
+            sub = argv[1]
+            if sub == "rev-parse" and "--verify" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if sub == "rev-parse":
+                return subprocess.CompletedProcess(argv, 0, "main\n", "")
+            if sub == "diff" and "--raw" in argv:
+                return subprocess.CompletedProcess(argv, 0, raw, "")
+            if sub == "log":
+                return subprocess.CompletedProcess(argv, 128, "", "fatal: bad object")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        n, out = self._sync(run)
+
+        self.assertEqual(n, 0)
+        self.assertEqual([c for c in calls if c[0] in ("commit", "push")], [])
+        self.assertIn(["reset", "-q"], calls)
+        self.assertIn("stale-revert check could not read git", out)
 
 
 class RotateLogsTest(unittest.TestCase):
