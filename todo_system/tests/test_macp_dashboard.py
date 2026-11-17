@@ -2672,6 +2672,220 @@ class StatusSingleFlightTests(unittest.TestCase):
             srv.server_close()
 
 
+def _wait_until(tc: unittest.TestCase, pred, timeout: float = 5.0, msg: str = "") -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return
+        time.sleep(0.02)
+    tc.fail(f"timed out waiting: {msg}")
+
+
+class StatusBackgroundRefreshTests(unittest.TestCase):
+    """2026-11-17: even single-flight, a request after the TTL waited a whole
+    compute (3-21 s under load) and the app's 8 s timeout showed "disconnected".
+    main() now precomputes the body in a background thread; requests return it
+    at once with `generated_at`/`age_s`. serve() alone keeps the TTL behaviour."""
+
+    def _serve(self):
+        srv = M.serve("127.0.0.1", 0, None)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def _close():
+            srv.shutdown()
+            srv.server_close()
+        self.addCleanup(_close)
+        return srv, srv.server_address[1]
+
+    @staticmethod
+    def _get(port):
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=10) as r:
+            return r.status, r.read()
+
+    def test_http_background_serves_body_without_compute(self):
+        srv, port = self._serve()
+        cache = srv.RequestHandlerClass._status_cache
+        calls = []
+
+        def compute():
+            calls.append(1)
+            if len(calls) > 1:
+                time.sleep(2)
+            return json.dumps({"ok": True, "n": len(calls)}).encode()
+
+        cache.start_background(compute, 0.05)
+        self.addCleanup(cache.stop_background, 5)
+        _wait_until(self, lambda: cache._body is not None, msg="first body")
+        req = mock.Mock(side_effect=AssertionError("request path computed"))
+        with mock.patch.object(M, "collect_status", req):
+            for _ in range(3):
+                t0 = time.perf_counter()
+                code, body = self._get(port)
+                took = time.perf_counter() - t0
+                self.assertEqual(code, 200)
+                self.assertLess(took, 0.3)
+                self.assertEqual(json.loads(body)["ok"], True)
+        self.assertEqual(req.call_count, 0)
+
+    def test_http_background_adds_only_generated_at_and_age_s(self):
+        srv, port = self._serve()
+        cache = srv.RequestHandlerClass._status_cache
+        orig = {"now": "2026-11-17 18:00:00", "active": [{"slug": "a", "state": "x"}],
+                "usage": {"age_s": 3, "session": 0.5}, "paused": False}
+        cache.start_background(lambda: json.dumps(orig).encode(), 60)
+        self.addCleanup(cache.stop_background, 5)
+        _wait_until(self, lambda: cache._body is not None, msg="first body")
+        code, body = self._get(port)
+        self.assertEqual(code, 200)
+        d = json.loads(body)
+        self.assertEqual(set(d), set(orig) | {"generated_at", "age_s"})
+        for k, v in orig.items():
+            self.assertEqual(d[k], v)
+        self.assertEqual(d["usage"]["age_s"], 3)
+        gen = dt.datetime.fromisoformat(d["generated_at"])
+        self.assertIsNotNone(gen.tzinfo)
+        self.assertIsInstance(d["age_s"], (int, float))
+        self.assertGreaterEqual(d["age_s"], 0)
+
+    def test_with_freshness_edge_cases(self):
+        out = json.loads(M._with_freshness(b"{}", "2026-11-17T18:00:00+09:00", time.monotonic()))
+        self.assertEqual(set(out), {"generated_at", "age_s"})
+        self.assertEqual(M._with_freshness(b"[1]", "2026-11-17T18:00:00+09:00", 0.0), b"[1]")
+        self.assertEqual(M._with_freshness(b'{"a": 1}', None, 0.0), b'{"a": 1}')
+
+    def test_background_failure_keeps_last_body_and_retries(self):
+        cache = M._StatusCache()
+        calls = []
+        release = threading.Event()
+
+        def compute():
+            calls.append(1)
+            n = len(calls)
+            if n == 1:
+                return b'{"n": 1}'
+            if n in (2, 3):
+                raise RuntimeError("secret-message /private/path")
+            if n == 4:
+                release.wait(10)
+            return b'{"n": 2}'
+
+        def req():
+            raise AssertionError("request path computed")
+
+        with self.assertLogs(M.logger, "WARNING") as cm:
+            cache.start_background(compute, 0.05)
+            self.addCleanup(cache.stop_background, 5)
+            _wait_until(self, lambda: len(calls) >= 4, msg="two failures then a retry")
+            self.assertEqual(cache.get(req), b'{"n": 1}')   # failures kept the last body
+            release.set()
+            _wait_until(self, lambda: cache.get(req) == b'{"n": 2}', msg="retry succeeded")
+        logs = "\n".join(cm.output)
+        self.assertIn("RuntimeError", logs)
+        self.assertNotIn("secret-message", logs)
+        self.assertNotIn("/private/path", logs)
+
+    def test_first_request_waits_for_background_compute(self):
+        cache = M._StatusCache()
+        bg_calls, req_calls = [], []
+
+        def bg():
+            bg_calls.append(1)
+            time.sleep(0.3)
+            return b"bg"
+
+        def req():
+            req_calls.append(1)
+            return b"req"
+
+        cache.start_background(bg, 60)
+        self.addCleanup(cache.stop_background, 5)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(cache.get(req))) for _ in range(10)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(out, [b"bg"] * 10)
+        self.assertEqual(len(bg_calls), 1)
+        self.assertEqual(req_calls, [])
+
+    def test_invalidate_wakes_background_thread(self):
+        cache = M._StatusCache()
+        calls = []
+
+        def bg():
+            calls.append(1)
+            return json.dumps({"n": len(calls)}).encode()
+
+        def req():
+            raise AssertionError("request path computed")
+
+        cache.start_background(bg, 60)
+        self.addCleanup(cache.stop_background, 5)
+        _wait_until(self, lambda: len(calls) == 1, msg="first compute")
+        cache.invalidate()
+        self.assertIn(cache.get(req), (b'{"n": 1}', b'{"n": 2}'))  # no wait, no request compute
+        _wait_until(self, lambda: len(calls) == 2, timeout=2.0, msg="invalidate woke the thread")
+        _wait_until(self, lambda: cache.get(req) == b'{"n": 2}', timeout=2.0, msg="new body")
+
+    def test_serve_alone_is_not_background(self):
+        before = {t.ident for t in threading.enumerate() if t.name == "macp-status-refresh"}
+        srv = M.serve("127.0.0.1", 0, None)
+        self.addCleanup(srv.server_close)
+        self.assertFalse(srv.RequestHandlerClass._status_cache.background)
+        after = {t.ident for t in threading.enumerate() if t.name == "macp-status-refresh"}
+        self.assertEqual(after - before, set())
+
+    def _run_main(self, refresh: str):
+        real_serve = M.serve
+        seen = {}
+
+        def fake_serve(*a, **kw):
+            srv = real_serve(*a, **kw)
+            self.addCleanup(srv.server_close)
+            cache = srv.RequestHandlerClass._status_cache
+            seen["cache"] = cache
+
+            def fake_forever(*_a, **_kw):
+                bg = cache._bg
+                seen["state"] = (cache.background, cache.interval,
+                                 bool(bg and bg.is_alive()))
+                raise KeyboardInterrupt
+            srv.serve_forever = fake_forever
+            return srv
+
+        env = {"MACP_DASHBOARD_STATUS_REFRESH_S": refresh}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(M, "serve", side_effect=fake_serve), \
+                mock.patch.object(M.os, "chdir"), \
+                mock.patch.object(M, "collect_status", return_value={"ok": True}), \
+                mock.patch("sys.argv", ["macp_dashboard", "--no-open", "--port", "0"]):
+            os.environ.pop("MACP_DASHBOARD_TOKEN", None)
+            os.environ.pop("MACP_PUBLIC_EXPOSURE", None)
+            rc = M.main()
+        self.assertEqual(rc, 0)
+        return seen
+
+    def test_main_starts_background_refresh(self):
+        seen = self._run_main("7")
+        self.assertEqual(seen["state"], (True, 7.0, True))
+        bg = seen["cache"]._bg
+        self.assertFalse(bg.is_alive())          # main() stopped it on exit
+
+    def test_main_refresh_zero_disables_background(self):
+        seen = self._run_main("0")
+        self.assertEqual(seen["state"], (False, 0.0, False))
+
+    def test_status_refresh_env_parsing(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("MACP_DASHBOARD_STATUS_REFRESH_S", None)
+            self.assertEqual(M._status_refresh_s(), 5.0)
+        for raw, want in (("", 5.0), ("abc", 5.0), ("2.5", 2.5), ("0", 0.0)):
+            with mock.patch.dict(os.environ, {"MACP_DASHBOARD_STATUS_REFRESH_S": raw}):
+                self.assertEqual(M._status_refresh_s(), want, raw)
+
+
 # ---- UI language (macp-ui-language-2-dashboard) -----------------------------
 # The ko goldens were captured from the pre-i18n page, before any string moved
 # into todo_system/i18n.py: with `language = "ko"` the dashboard must serve the
