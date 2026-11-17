@@ -433,6 +433,11 @@ def test_parse_plan_phases_reads_only_the_phases_section():
         (4, "§6 leaf split + appendix"),
         (5, "Gates + fixes + diff check"),
     ]
+    # An unfenced `# …` line in a Phase body does not end the section (only an H2
+    # does), and Phase-like headings in a later section are not Phases.
+    text = ("## Phases\n\n### Phase 1: §1 one\n- run:\n# a shell comment, not a heading\n\n"
+            "### Phase 2: §2 two\n\n## Notes\n\n### Phase 3: not a phase\n")
+    assert rescope.parse_plan_phases(text) == [(1, "§1 one"), (2, "§2 two")]
 
 
 # -- guard additions ----------------------------------------------------------

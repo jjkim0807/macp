@@ -869,7 +869,9 @@ def execute_rescope(ledger, vault_root, notify, *, items_dir=None, templates_dir
 _PLAN_FILENAME = "implementation_plan.md"
 _REQUIREMENTS_FILENAME = "requirements.md"
 _PHASES_H2_RE = re.compile(r"^##\s+Phases\b", re.I)
-_TOP_HEADING_RE = re.compile(r"^#{1,2}(?:\s|$)")          # an H1/H2 ends the section
+# Only the next H2 ends the section: a stray `# …` line in a Phase body (an
+# unfenced shell comment) must not cut it short and silently drop later Phases.
+_H2_RE = re.compile(r"^##(?:\s|$)")
 _PHASE_H3_ANY_RE = re.compile(r"^###\s+Phase\b", re.I)
 # `### Phase N: title` (or a `—`/`-`/`.` separator). `(?!\w|\.\d)` refuses
 # `Phase 2a` / `Phase 1.5`, which then make the whole plan ambiguous.
@@ -887,7 +889,7 @@ _RUN_REF_MAX = 200
 def parse_plan_phases(text) -> list[tuple[int, str]] | None:
     """`[(n, title)]` of the `### Phase N:` headings in the plan's single
     `## Phases` section — a pure function. Frontmatter and fenced code are
-    skipped and the section ends at the next H1/H2. None unless the Phases are
+    skipped and the section ends at the next H2. None unless the Phases are
     numbered exactly 1..n with n >= 2; a second `## Phases` section, or a Phase
     heading that cannot be numbered (`Phase 2a`), also yields None."""
     if not isinstance(text, str) or not text.strip():
@@ -911,7 +913,7 @@ def parse_plan_phases(text) -> list[tuple[int, str]] | None:
                 return None                  # two `## Phases` sections — ambiguous
             seen = in_sec = True
             continue
-        if _TOP_HEADING_RE.match(line):
+        if _H2_RE.match(line):
             in_sec = False
             continue
         if in_sec and _PHASE_H3_ANY_RE.match(line):
