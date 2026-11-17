@@ -107,7 +107,7 @@ If `Worker/planner_policy.yaml` cannot be read, use these built-in defaults:
 **Limits (defaults)**:
 - Max 3 new tasks per invocation
 - Auto queue depth limit: 5 pending auto/delegate tasks
-- Dedup: no duplicates against `Todo/items/**` open tasks or `queue.json` pending/in_progress
+- Dedup: no duplicates against `Todo/items/**` open tasks, `queue.json` pending/in_progress, **or any task (open or done) already created from the same discovery report** — the injected "discovery 리포트별 이미 생성된 태스크" block lists them per `from_discovery` stem; match a report candidate to those tasks by title and the task file's outcome/Spec, not by slug.
 - A follow-up already carried by an open `Todo/items/**` task (frontmatter `from_followup: <id>` matches) is not a fresh candidate — skip it.
 
 ## Task file format
