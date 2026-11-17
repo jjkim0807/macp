@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import io
 import json
 import os
@@ -15,7 +16,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from todo_system import usage_guard, worker
+import pytest
+
+from todo_system import usage_guard, vault_git_lock, worker
+from todo_system.orchestrator import orchestrator as orch_mod
 from todo_system.orchestrator import assignment as A
 from todo_system.orchestrator import message as m
 from todo_system.orchestrator import dashboard, repos, stages, tasks, trace
@@ -3541,13 +3545,22 @@ class PullMainRaceTest(unittest.TestCase):
     genuine divergence, and never swallows a persistent failure in a truncated
     line. All git is faked through `_run`; no real pull ever executes."""
 
-    def _fake(self, head="main", merge_rcs=None, merge_stderr="", fetch_rc=0):
+    def _fake(self, head="main", merge_rcs=None, merge_stderr="", fetch_rc=0,
+              merge_head=True):
+        """`merge_head` is whether `rev-parse --verify MERGE_HEAD` finds one,
+        i.e. whether a failed merge had actually started. True keeps the
+        answer every `rev-parse` got before that probe existed. Each call's
+        kwargs are kept on `run.kws`, index-aligned with `calls`."""
         merge_rcs = list(merge_rcs or [])
         calls = []
+        kws = []
 
         def run(argv, **kw):
             calls.append(list(argv[1:]))
+            kws.append(kw)
             sub = argv[1]
+            if sub == "rev-parse" and "--verify" in argv:
+                return subprocess.CompletedProcess(argv, 0 if merge_head else 1, "", "")
             if sub == "rev-parse":
                 return subprocess.CompletedProcess(argv, 0, head + "\n", "")
             if sub == "fetch":
@@ -3561,6 +3574,7 @@ class PullMainRaceTest(unittest.TestCase):
                     argv, rc, "", merge_stderr if rc else "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
+        run.kws = kws
         return run, calls
 
     def _pull(self, run, **kw):
@@ -3617,6 +3631,280 @@ class PullMainRaceTest(unittest.TestCase):
         merges = [c for c in calls if c[0] == "merge"]
         self.assertEqual(len(fetches), 2)         # attempts exhausted
         self.assertEqual(len(merges), 0)          # never got past fetch
+
+    # A dirty refusal exactly as git 2.43 prints it under LC_ALL=C.
+    _DIRTY = ("error: Your local changes to the following files would be "
+              "overwritten by merge:\n\tTodo/items/a.md\nPlease commit your "
+              "changes or stash them before you merge.\nAborting\n")
+
+    def test_no_merge_ever_passes_autostash(self):
+        # 2026-11-17: `--autostash` stashed the dirty tree and reset it to the
+        # HEAD of that moment; the merge and then its abort failed, the stash was
+        # never re-applied, and the stale disk was committed as a revert. Every
+        # merge says --no-autostash, which also beats a merge.autoStash config.
+        for rcs in ([0], [1, 0], [1, 1, 0], [1] * 6):
+            with self.subTest(merge_rcs=rcs):
+                run, calls = self._fake(merge_rcs=rcs)
+                self._pull(run)
+                merges = [c for c in calls if c[0] == "merge"]
+                self.assertTrue(merges)
+                for argv in calls:
+                    self.assertNotIn("--autostash", argv)    # an element, not a substring
+                for argv in merges:
+                    if "--abort" not in argv:
+                        self.assertIn("--no-autostash", argv)
+
+    def test_a_dirty_refusal_defers_without_abort_or_retry(self):
+        # git refused before touching anything: nothing to abort, and retrying a
+        # second later meets the same dirt. One line; the next sync commits the
+        # edit and the pull after it is clean.
+        run, calls = self._fake(merge_rcs=[1], merge_stderr=self._DIRTY)
+        out = self._pull(run)
+        self.assertIn("hq-host pull: dirty — deferring pull", out)
+        self.assertIn("Todo/items/a.md", out)
+        self.assertNotIn("non-fatal", out)
+        self.assertEqual(len([c for c in calls if c[0] == "fetch"]), 1)
+        merges = [c for c in calls if c[0] == "merge"]
+        self.assertEqual(len(merges), 1)
+        self.assertIn("--ff-only", merges[0])
+        self.assertNotIn(["merge", "--abort"], calls)
+
+    def test_a_dirty_refusal_of_the_real_merge_defers_too(self):
+        # diverged: ff-only is "not possible" (128), then the real merge is the
+        # one git refuses over the dirt (rc 2 in git 2.43)
+        diverged = "fatal: Not possible to fast-forward, aborting.\n"
+        run, calls = self._fake(merge_rcs=[128, 2], merge_stderr=diverged)
+        # the fake hands every failing merge the same stderr; give the second
+        # one the dirty text by swapping it in after the first call
+        real_run = run
+
+        def run2(argv, **kw):
+            cp = real_run(argv, **kw)
+            if argv[1] == "merge" and "--no-edit" in argv:
+                cp = subprocess.CompletedProcess(argv, cp.returncode, "", self._DIRTY)
+            return cp
+
+        out = self._pull(run2)
+        self.assertIn("hq-host pull: dirty — deferring pull (Todo/items/a.md)", out)
+        self.assertEqual(len([c for c in calls if c[0] == "merge"]), 2)
+        self.assertNotIn(["merge", "--abort"], calls)
+        self.assertEqual(len([c for c in calls if c[0] == "fetch"]), 1)
+
+    def test_a_failed_merge_without_merge_head_is_not_aborted(self):
+        # No MERGE_HEAD means git never started the merge, so `merge --abort`
+        # can only fail ("There is no merge to abort", log line 74483).
+        run, calls = self._fake(merge_rcs=[1] * 6, merge_head=False,
+                                merge_stderr="fatal: refusing to merge unrelated histories")
+        out = self._pull(run)
+        self.assertNotIn(["merge", "--abort"], calls)
+        self.assertNotIn("merge --abort failed", out)
+        self.assertIn("hq-host pull: non-fatal", out.strip().splitlines()[-1])
+
+    def test_git_runs_in_the_c_locale(self):
+        # the dirty refusal is recognised by its English text
+        run, calls = self._fake(merge_rcs=[1, 0])
+        self._pull(run)
+        merge_kws = [kw for c, kw in zip(calls, run.kws) if c[0] == "merge"]
+        self.assertTrue(merge_kws)
+        for kw in merge_kws:
+            self.assertEqual(kw["env"]["LC_ALL"], "C")
+
+
+def _rgit(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+
+@contextlib.contextmanager
+def _vault_lock_held_elsewhere(root):
+    """Hold `root`'s vault git lock through a separate open file description —
+    the way another daemon (a sync, a mailbox send) holds it."""
+    path = vault_git_lock.lock_path(root)
+    assert path is not None, f"{root} resolves no lock — nothing would be held"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield path
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+class PullMainRealGitTest(unittest.TestCase):
+    """`_pull_main` against real repos — a live checkout, a bare origin, and a
+    second clone that pushes. What a dirty overlap does to the tree, and
+    whether the lock keeps git out, only real git can show."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.origin = self.tmp / "origin.git"
+        _rgit(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.origin))
+        self.repo = self.tmp / "live"
+        self.repo.mkdir()
+        _rgit(self.repo, "init", "-q", "-b", "main")
+        _rgit(self.repo, "config", "user.email", "t@t")
+        _rgit(self.repo, "config", "user.name", "t")
+        _rgit(self.repo, "remote", "add", "origin", str(self.origin))
+        self._write(self.repo, "Todo/items/a.md", "v1\n")
+        self._write(self.repo, "seed", "x\n")
+        _rgit(self.repo, "add", "-A")
+        _rgit(self.repo, "commit", "-qm", "seed")
+        _rgit(self.repo, "push", "-q", "origin", "main")
+        self.other = self.tmp / "other"
+        _rgit(self.tmp, "clone", "-q", str(self.origin), str(self.other))
+        _rgit(self.other, "config", "user.email", "t@t")
+        _rgit(self.other, "config", "user.name", "t")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _write(repo, rel, text):
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    def _read(self, rel):
+        return (self.repo / rel).read_text(encoding="utf-8")
+
+    def _head(self):
+        return _rgit(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def _advance(self, rel, text):
+        """The other host commits and pushes; returns its new sha."""
+        self._write(self.other, rel, text)
+        _rgit(self.other, "add", "-A")
+        _rgit(self.other, "commit", "-qm", f"other host: {rel}")
+        _rgit(self.other, "push", "-q", "origin", "main")
+        return _rgit(self.other, "rev-parse", "HEAD").stdout.strip()
+
+    def _pull(self, **kw):
+        calls = []
+
+        def rec(argv, **k):
+            calls.append(list(argv[1:]))
+            return subprocess.run(argv, **k)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _pull_main(self.repo, _run=rec, _sleep=lambda *_a: None, **kw)
+        return buf.getvalue(), calls
+
+    def _no_merge_state(self):
+        for ref in ("MERGE_HEAD", "MERGE_AUTOSTASH"):
+            self.assertNotEqual(
+                _rgit(self.repo, "rev-parse", "-q", "--verify", ref).returncode, 0,
+                f"{ref} left behind")
+
+    def test_a_dirty_overlap_is_deferred_with_the_tree_untouched(self):
+        self._advance("Todo/items/a.md", "v2 from the other host\n")
+        self._write(self.repo, "Todo/items/a.md", "local edit\n")    # unstaged
+        head = self._head()
+
+        out, calls = self._pull()
+
+        self.assertIn("hq-host pull: dirty — deferring pull (Todo/items/a.md)", out)
+        # with --autostash the fast-forward would have landed (and the edit
+        # gone into a stash): an unmoved HEAD is the proof nothing was stashed
+        self.assertEqual(self._head(), head)
+        self.assertEqual(self._read("Todo/items/a.md"), "local edit\n")
+        self._no_merge_state()
+        self.assertEqual(_rgit(self.repo, "stash", "list").stdout, "")
+        self.assertNotIn(["merge", "--abort"], calls)
+
+    def test_the_lock_held_elsewhere_means_no_git_then_a_normal_pull(self):
+        theirs = self._advance("Todo/items/b.md", "new\n")
+        head = self._head()
+        with _vault_lock_held_elsewhere(self.repo), \
+             mock.patch.object(orch_mod, "PULL_LOCK_TIMEOUT_S", 0.2):
+            out, calls = self._pull()
+        self.assertEqual(calls, [])                   # not even the HEAD check
+        self.assertIn("hq-host pull: vault git lock busy", out)
+        self.assertEqual(self._head(), head)
+
+        _pull_main(self.repo)                         # released; production seams
+        self.assertEqual(self._head(), theirs)
+
+    def test_a_diverged_dirty_overlap_is_deferred_too(self):
+        self._advance("Todo/items/a.md", "v2\n")
+        self._write(self.repo, "Worker/x.json", "{}")
+        _rgit(self.repo, "add", "-A")
+        _rgit(self.repo, "commit", "-qm", "local, not yet pushed")
+        self._write(self.repo, "Todo/items/a.md", "local edit\n")
+        head = self._head()
+
+        out, calls = self._pull()
+
+        self.assertIn("hq-host pull: dirty — deferring pull (Todo/items/a.md)", out)
+        self.assertEqual(self._head(), head)
+        self.assertEqual(self._read("Todo/items/a.md"), "local edit\n")
+        self._no_merge_state()
+        self.assertNotIn(["merge", "--abort"], calls)
+        self.assertEqual(len([c for c in calls if c[0] == "merge"]), 2)
+
+    def test_an_untracked_overlap_is_deferred(self):
+        self._advance("Todo/items/new.md", "theirs\n")
+        self._write(self.repo, "Todo/items/new.md", "mine, untracked\n")
+        head = self._head()
+
+        out, _calls = self._pull()
+
+        self.assertIn("hq-host pull: dirty — deferring pull (Todo/items/new.md)", out)
+        self.assertEqual(self._head(), head)
+        self.assertEqual(self._read("Todo/items/new.md"), "mine, untracked\n")
+
+    def test_non_overlapping_dirt_survives_the_fast_forward(self):
+        # the steady state: Todo/items or Memory dirty on disk, origin moved
+        # elsewhere — git fast-forwards around the dirt without any stash
+        theirs = self._advance("seed", "y\n")
+        self._write(self.repo, "Todo/items/a.md", "local edit\n")
+
+        out, _calls = self._pull()
+
+        self.assertEqual(out, "")
+        self.assertEqual(self._head(), theirs)
+        self.assertEqual(self._read("Todo/items/a.md"), "local edit\n")
+        self.assertEqual(_rgit(self.repo, "stash", "list").stdout, "")
+
+    def test_a_configured_merge_autostash_is_overridden(self):
+        _rgit(self.repo, "config", "merge.autoStash", "true")
+        self._advance("Todo/items/a.md", "v2\n")
+        self._write(self.repo, "Todo/items/a.md", "local edit\n")
+        head = self._head()
+
+        out, _calls = self._pull()
+
+        self.assertIn("hq-host pull: dirty — deferring pull", out)
+        self.assertEqual(self._head(), head)
+        self.assertEqual(self._read("Todo/items/a.md"), "local edit\n")
+        self.assertEqual(_rgit(self.repo, "stash", "list").stdout, "")
+
+    @pytest.mark.real_vault_git
+    def test_the_auto_entry_point_pulls_under_the_lock(self):
+        # The production path, not the function alone: `orchestrator auto` →
+        # _main → _pull_main(base) → the lock. conftest no-ops
+        # orch_mod._pull_main unless a test is marked real_vault_git; the very
+        # next line of _main, _check_divergence, raises so the tick stops
+        # before the lease and any dispatch.
+        class _StopTick(Exception):
+            pass
+
+        theirs = self._advance("Todo/items/b.md", "new\n")
+        head = self._head()
+        with mock.patch.dict(os.environ, {"MACP_VAULT_ROOT": str(self.repo)}), \
+             mock.patch.object(orch_mod, "_check_divergence", side_effect=_StopTick), \
+             mock.patch.object(orch_mod, "PULL_LOCK_TIMEOUT_S", 0.2):
+            buf = io.StringIO()
+            with _vault_lock_held_elsewhere(self.repo), \
+                 contextlib.redirect_stdout(buf), \
+                 self.assertRaises(_StopTick):
+                orch_mod._main(["auto"])
+            self.assertIn("hq-host pull: vault git lock busy", buf.getvalue())
+            self.assertEqual(self._head(), head)       # no git ran
+
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaises(_StopTick):
+                orch_mod._main(["auto"])               # released
+        self.assertEqual(self._head(), theirs)
 
 
 class CheckDivergenceTest(unittest.TestCase):
