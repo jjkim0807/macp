@@ -168,7 +168,12 @@ def _org_uuid() -> str | None:
     env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if env_dir:
         candidates.append(Path(env_dir) / ".claude.json")
-    candidates += [Path.home() / ".claude" / ".claude.json", Path.home() / ".claude.json"]
+    try:
+        from .macp.accounts import legacy_config_dir
+        candidates.append(Path(legacy_config_dir()) / ".claude.json")
+    except Exception:
+        pass
+    candidates.append(Path.home() / ".claude.json")
     for p in candidates:
         try:
             org = (json.loads(p.read_text(encoding="utf-8")).get("oauthAccount") or {}).get(
