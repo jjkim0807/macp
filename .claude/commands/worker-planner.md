@@ -408,6 +408,19 @@ then sit in `awaiting_human`). Write `auto_merge: true` unless the task genuinel
 review or `host_rules` in `Worker/planner_policy.yaml` says otherwise for that repo.
 Safety acceptance criteria still get Verify Step 8b.
 
+### Human-gated blocked tasks (`human_gate`)
+When you create a `worker_mode: blocked` task wired with `depends_on:` whose work
+must wait for a PERSON to look even after every dependency is done — e.g. a leaf
+that touches real-account / deploy / hard-to-reverse state, or one the user asked
+to approve before it runs — add `human_gate: true` to its frontmatter. `task_deps`
+auto-activation flips a blocked+deps-done task to `on_unblock` (default `auto`) and
+dispatches it; `human_gate: true` makes it SKIP that flip, so the task stays
+blocked until a human flips it by hand. Use this (not `auto_activate: false`) when
+you still want the dependency chain to track the task, just never to auto-run it.
+Default is false — only write the field on a task that genuinely needs the gate.
+(2026-10-12 incident: a delegate PR closed `done` out from under a reviewer let the
+deps-done auto-flip activate a leaf the author had gated on a human.)
+
 ### Subtask validation
 - Each subtask is a 20-60 minute actionable chunk
 - Use verb + object form (an action verb and what it acts on)

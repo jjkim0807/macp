@@ -40,6 +40,21 @@ After edits:
      and overlaps sibling tasks).
 4. Commit on `worker/<slug>` with message: `chore(delegate): <slug> — <short description>`.
 
+## 사람 확인 게이트 (`human_gate`) — 네가 blocked 후속 태스크를 만들 때
+
+이 태스크 안에서 **후속 blocked 태스크**를 만들고(예: `worker_mode: blocked` +
+`depends_on: [<이 태스크 slug>]`), 그 후속이 **선행이 전부 done이 되어도 사람이 한 번
+확인한 뒤에 돌아야** 한다면, 그 후속 frontmatter에 `human_gate: true`를 넣어라.
+
+- `task_deps`의 자동 활성화(deps 전부 done → `worker_mode`를 `on_unblock`으로 flip)는
+  `human_gate: true`인 태스크를 **건너뛴다**. 사람이 직접 flip하기 전까지 blocked로 남는다.
+- 이것이 없으면, 선행이 done이 되는 순간 후속이 자동 디스패치된다 — 사람이 실계좌·배포·
+  되돌리기 어려운 변경 등을 먼저 봐야 하는 경우에 위험하다 (2026-10-12 사고: 미머지 PR이
+  성급히 done으로 닫혀 하류가 자동으로 풀렸다).
+- `human_gate`는 `on_unblock`과 독립이다. 사람이 flip한 **뒤**의 모드는 여전히 `on_unblock`
+  (기본 `auto`)으로 정한다. `human_gate`는 "자동으로 flip할지 말지"만 통제한다.
+- 값에 인라인 주석을 붙여도 된다(`human_gate: true  # 사람이 먼저 확인`) — 파서가 떼고 읽는다.
+
 ## Hard rules
 
 - Never run `rm -rf`, `git push --force`, `git reset --hard`, `git checkout -- .`, or any `--no-verify` flag.
