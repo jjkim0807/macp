@@ -2877,6 +2877,18 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
         seen = self._run_main("0")
         self.assertEqual(seen["state"], (False, 0.0, False))
 
+    def test_tick_disconnect_grace_45s(self):
+        """Web: one failed poll is not "disconnected" — only 45 s after the last
+        success (at once on 401 or before any success). Parity doc contract."""
+        t = M._HTML_TEMPLATE
+        self.assertIn("DISCONNECT_AFTER_MS=45000", t)
+        self.assertIn("lastOk=Date.now()", t)
+        self.assertIn("Date.now()-lastOk>DISCONNECT_AFTER_MS", t)
+        self.assertIn("!lastOk||", t)
+        self.assertIn("r.status===401", t)
+        self.assertNotIn("catch(e){const hs=$('hstate')", t)
+        self.assertIn("tick();setInterval(tick,3000);", t)
+
     def test_status_refresh_env_parsing(self):
         with mock.patch.dict(os.environ, {}):
             os.environ.pop("MACP_DASHBOARD_STATUS_REFRESH_S", None)
@@ -2904,8 +2916,11 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # [작업 재개] button (`agentModeBadge`/`agentModeBtn`/`setAgentMode`, five new
 # i18n keys), its `.amode` CSS and one delegated click line
 # (desktop-worker-3-game-mode-engine); the rest of the page is byte-identical.
-_KO_HTML_SHA256 = "a19f8c8e67c186ca6da7f23675e3cd4dc3e064467b242cc907393d022dd99940"
-_KO_HTML_LEN = 46049
+# 2026-11-17: +432 bytes = tick()'s 45 s disconnect grace (DISCONNECT_AFTER_MS /
+# lastOk / showDisconnected / 401 branch, macp-dashboard-status-background-refresh);
+# no new i18n key; the rest of the page is byte-identical.
+_KO_HTML_SHA256 = "7607063afc672173f3007cd171d0ba819239f7ab33809731be03cb673cbb2df8"
+_KO_HTML_LEN = 46481
 _HANGUL = re.compile("[가-힣]")
 
 

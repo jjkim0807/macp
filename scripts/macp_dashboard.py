@@ -2542,9 +2542,16 @@ function mount(){
   mounted=true;
 }
 
+// One failed poll is not "disconnected": show it only 45 s after the last success,
+// at once if nothing ever succeeded or on 401 (same rule as the app; parity doc).
+const DISCONNECT_AFTER_MS=45000;let lastOk=0;
+function showDisconnected(){const hs=$('hstate');hs.textContent='@@dash.js.disconnected@@';hs.style.color='var(--red)'}
 async function tick(){
-  try{const r=await fetch('/api/status');last=await r.json();if(!mounted)mount();update(last)}
-  catch(e){const hs=$('hstate');hs.textContent='@@dash.js.disconnected@@';hs.style.color='var(--red)'}
+  try{const r=await fetch('/api/status');
+    if(r.status===401){showDisconnected();return}
+    if(!r.ok)throw new Error('http '+r.status);
+    last=await r.json();lastOk=Date.now();if(!mounted)mount();update(last)}
+  catch(e){if(!lastOk||Date.now()-lastOk>DISCONNECT_AFTER_MS)showDisconnected()}
 }
 tick();setInterval(tick,3000);
 </script></body></html>"""
