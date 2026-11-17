@@ -96,3 +96,22 @@ class PlanDeclaresOversizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanFrontmatterVerdictTest(unittest.TestCase):
+    """The plan's own `declares_oversize:` key wins over the prose scan (2026-11-17)."""
+
+    BODY = "# Plan\n\nThe phase 1 unit tests go green and the existing rescope tests stay green.\n"
+
+    def test_explicit_no_overrides_a_prose_hit(self):
+        self.assertTrue(rescope.plan_declares_oversize(self.BODY))  # the false positive
+        plan = "---\nstage: plan\ndeclares_oversize: no\n---\n" + self.BODY
+        self.assertFalse(rescope.plan_declares_oversize(plan))
+
+    def test_explicit_yes_is_honoured(self):
+        plan = "---\nstage: plan\ndeclares_oversize: yes\n---\n# Plan\n\nFits fine.\n"
+        self.assertTrue(rescope.plan_declares_oversize(plan))
+
+    def test_key_outside_frontmatter_is_ignored(self):
+        plan = "# Plan\n\ndeclares_oversize: no\n\nThis task exceeds a single implement stage.\n"
+        self.assertTrue(rescope.plan_declares_oversize(plan))
