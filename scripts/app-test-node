@@ -14,6 +14,15 @@
 #
 # Screenshots land in ./app-test-shots/<pkg>-<ts>.png. A spot preemption stops the VM
 # (termination action STOP); `start` again and retry once.
+#
+# APP_TEST_NODE_MODE=local: the same subcommands against an emulator on THIS host (a
+# remote runner with capability `device`, e.g. a MacBook). "ssh" runs the command
+# locally with HOME=$APP_TEST_LOCAL_HOME (default ~/.macp-app-test-node, where
+# `android` links to $ANDROID_HOME), so node-side `~/android/...` and `~/under-test.apk`
+# paths work unchanged; push/pull become cp; start checks the SDK; stop kills the
+# emulator. GRADLE_USER_HOME / ANDROID_USER_HOME / ANDROID_AVD_HOME keep pointing at
+# the real home so builds reuse the Gradle cache and the AVD is found. The local host
+# needs `emulator`, `platform-tools`, a build-tools with aapt2 and an AVD named api30.
 set -euo pipefail
 G=${GCLOUD:-/snap/bin/gcloud}
 NODE=${APP_TEST_NODE:-macp-app-test}
@@ -30,6 +39,51 @@ ACTIVITY=${APP_TEST_ACTIVITY:-}
 
 _ssh() { "$G" compute ssh "$NODE" --zone "$ZONE" --internal-ip --quiet --command "$1"; }
 _scp() { "$G" compute scp "$@" --zone "$ZONE" --internal-ip --quiet; }
+# Node-side emulator launch line for `$1` (AVD name), fire-and-forget.
+_emu_launch() {
+  printf '%s' 'export ANDROID_SDK_ROOT=~/android
+        setsid sg kvm -c "~/android/emulator/emulator -avd '"$1"' -no-window -no-audio -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect" </dev/null >~/emu.log 2>&1 &
+        disown'
+}
+
+LOCAL=0
+if [ "${APP_TEST_NODE_MODE:-}" = local ]; then
+  LOCAL=1
+  REAL_HOME=$HOME
+  NODE_HOME=${APP_TEST_LOCAL_HOME:-$HOME/.macp-app-test-node}
+  SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
+  mkdir -p "$NODE_HOME"
+  ln -sfn "$SDK" "$NODE_HOME/android"
+  _ssh() {
+    HOME="$NODE_HOME" \
+    GRADLE_USER_HOME="${GRADLE_USER_HOME:-$REAL_HOME/.gradle}" \
+    ANDROID_USER_HOME="${ANDROID_USER_HOME:-$REAL_HOME/.android}" \
+    ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$REAL_HOME/.android/avd}" \
+      bash -c "$1"
+  }
+  # "<node>:<path>" → a path under NODE_HOME (`~/x` and `x` both mean NODE_HOME/x).
+  _local_path() {
+    local r=${1#*:}
+    case "$r" in
+      "~/"*) r=${r#"~/"} ;;
+      "~") r= ;;
+    esac
+    case "$r" in /*) printf '%s' "$r" ;; *) printf '%s' "$NODE_HOME/$r" ;; esac
+  }
+  _scp() {
+    local src=$1 dst=$2
+    case "$src" in "$NODE:"*) src=$(_local_path "$src") ;; esac
+    case "$dst" in "$NODE:"*) dst=$(_local_path "$dst") ;; esac
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+  }
+  # setsid / sg kvm do not exist on macOS; nohup + disown detaches the same way.
+  _emu_launch() {
+    printf '%s' 'export ANDROID_SDK_ROOT=~/android
+        nohup ~/android/emulator/emulator -avd '"$1"' -no-window -no-audio -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect </dev/null >~/emu.log 2>&1 &
+        disown'
+  }
+fi
 
 # A cold boot can keep an ssh channel open for 40s+; a transient drop (rc 255)
 # on any single short call should not fail the whole `shot`. Retry once.
@@ -39,10 +93,26 @@ _scp_retry() { _scp "$@" || _scp "$@"; }
 cmd=${1:-}; shift || true
 case "$cmd" in
   start)
+    if [ "$LOCAL" = 1 ]; then
+      for b in emulator/emulator platform-tools/adb; do
+        [ -x "$NODE_HOME/android/$b" ] || { echo "local node: missing $SDK/$b" >&2; exit 1; }
+      done
+      ls "$NODE_HOME"/android/build-tools/*/aapt2 >/dev/null 2>&1 || { echo "local node: no build-tools aapt2" >&2; exit 1; }
+      echo "local node ready"; exit 0
+    fi
     "$G" compute instances start "$NODE" --zone "$ZONE" --quiet
     for _ in $(seq 1 30); do _ssh true 2>/dev/null && { echo "ssh ready"; exit 0; }; sleep 5; done
     echo "ssh not ready after 150s" >&2; exit 1 ;;
   stop)
+    if [ "$LOCAL" = 1 ]; then
+      "$NODE_HOME/android/platform-tools/adb" emu kill >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do
+        pgrep -f "$NODE_HOME/android/emulator/" >/dev/null 2>&1 || pgrep -f "qemu-system.*-avd" >/dev/null 2>&1 || exit 0
+        sleep 1
+      done
+      pkill -f "qemu-system.*-avd" 2>/dev/null || true
+      exit 0
+    fi
     "$G" compute instances stop "$NODE" --zone "$ZONE" --quiet ;;
   ssh)
     _ssh "$1" ;;
@@ -57,9 +127,7 @@ case "$cmd" in
       # terminal and the fds are fully redirected, so this call returns as
       # soon as the fork happens — it does not hold the channel open while
       # the emulator boots.
-      _ssh_retry 'export ANDROID_SDK_ROOT=~/android
-        setsid sg kvm -c "~/android/emulator/emulator -avd api30 -no-window -no-audio -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect" </dev/null >~/emu.log 2>&1 &
-        disown'
+      _ssh_retry "$(_emu_launch api30)"
       t0=$(date +%s)
       until [ "$boot" = 1 ]; do
         sleep "$POLL_INTERVAL"
@@ -104,9 +172,7 @@ case "$cmd" in
     boot=$(_ssh_retry 'export ANDROID_SDK_ROOT=~/android
       ~/android/platform-tools/adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r"') || boot=0
     if [ "$boot" != 1 ]; then
-      _ssh_retry 'export ANDROID_SDK_ROOT=~/android
-        setsid sg kvm -c "~/android/emulator/emulator -avd '"$avd"' -no-window -no-audio -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect" </dev/null >~/emu.log 2>&1 &
-        disown'
+      _ssh_retry "$(_emu_launch "$avd")"
       t0=$(date +%s)
       until [ "$boot" = 1 ]; do
         sleep "$POLL_INTERVAL"
