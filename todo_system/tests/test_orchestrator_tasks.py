@@ -236,6 +236,32 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
         self.assertTrue(Orchestrator._can_run_concurrently("a", got["a"], "b", got["b"]))
         self.assertFalse(Orchestrator._can_run_concurrently("a", got["a"], "c", got["c"]))
 
+    def test_max_turns_reaches_stage_argv(self):
+        # End-to-end seam: a task's `max_turns:` must reach `claude --max-turns`
+        # for the staged pipeline. Before 2026-11-17 the loader dropped it, so a
+        # task written with `max_turns: 150` still ran plan 40 / verify 50
+        # (dripcoffee-dial-1 failed twice on those caps).
+        from todo_system.orchestrator import stages
+        big = self._md("big.md", "---\nmax_turns: 150\n---\n# b\n")
+        bad = self._md("bad.md", "---\nmax_turns: lots\n---\n# x\n")
+        zero = self._md("zero.md", "---\nmax_turns: 0\n---\n# z\n")
+        got = self._load([_row("big", big), _row("bad", bad), _row("zero", zero)])
+        self.assertEqual(got["big"]["max_turns"], 150)
+        self.assertNotIn("max_turns", got["bad"])
+        self.assertNotIn("max_turns", got["zero"])
+
+        def turns(stage, payload):
+            argv = stages.build_stage_argv(
+                stage, task_id="t", run_id="r", run_dir=self.tmp, branch="worker/t",
+                max_turns=payload.get("max_turns"))
+            return int(argv[argv.index("--max-turns") + 1])
+
+        self.assertEqual(turns("verify", got["big"]), 150)
+        self.assertEqual(turns("plan", got["big"]), 150)
+        # raises, never lowers: implement keeps its 200
+        self.assertEqual(turns("implement", got["big"]), 200)
+        self.assertEqual(turns("verify", got["bad"]), stages.STAGE_MAX_TURNS["verify"])
+
     def test_reads_each_md_once(self):
         # Every md-sourced field and the drift guard share one parse per task.
         # Before the refactor each read_task_* re-parsed: 7 per task, 14 here.

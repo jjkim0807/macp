@@ -1318,6 +1318,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                             branch=branch, repo=repo_url, working_dir=working_dir,
                             auto_merge=auto_merge, project_context=project_ctx,
                             allowed_tools=payload.get("allowed_tools"), tier=tier,
+                            max_turns=payload.get("max_turns"),
                             retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
                             account=backend_acct, cwd=stage_cwd, env=stage_env_run,
                             timeout=stage_timeout, progress=progress)

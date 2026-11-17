@@ -406,6 +406,17 @@ STAGE_MAX_TURNS = {
     "verify": 50, "report": 40, "delegate": 200, "quick": 120,
     "discover": 120,
 }
+
+
+def stage_max_turns(stage: str, task_max_turns: int | None = None) -> int:
+    """The `--max-turns` for one stage. A task's `max_turns:` raises the stage
+    default but never lowers it: the field exists for big tasks whose plan or
+    verify (gradle suites, emulator runs) outgrow 40/50 turns, and a value
+    written with implement in mind must not starve implement's 200."""
+    base = STAGE_MAX_TURNS[stage]
+    return max(base, task_max_turns) if task_max_turns else base
+
+
 STAGE_ARTIFACT = {
     "research": "requirements.md",
     "plan": "implementation_plan.md",
@@ -562,7 +573,8 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      worker_root: Path | None = None,
                      project_context: str = "", retry_context: str = "",
                      allowed_tools: str | None = None,
-                     tier: str | None = None) -> list[str]:
+                     tier: str | None = None,
+                     max_turns: int | None = None) -> list[str]:
     """Reproduce worker.build_stage_command: stage prompt + run metadata, with
     the stage's tool whitelist and turn budget. `tier` is the task's model tier
     (model_select.classify_tier); None means the heavy ladder."""
@@ -687,7 +699,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     full = prompt + "".join(meta)
     argv = ["claude", "-p", full,
             "--model", stage_model(stage, tier), "--effort", stage_effort(stage, tier),
-            "--max-turns", str(STAGE_MAX_TURNS[stage])]
+            "--max-turns", str(stage_max_turns(stage, max_turns))]
     if mcp_on:
         # --mcp-config is variadic like --allowed-tools, so a --flag must follow
         # it; --strict-mcp-config is that flag (why strict: BROWSER_MCP_SERVER_NAME).
