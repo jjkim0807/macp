@@ -322,6 +322,21 @@ def _plan_sentences(text: str) -> list[str]:
     return out
 
 
+_FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.S)
+_VERDICT_RE = re.compile(r"^declares_oversize:\s*[\"']?(yes|no|true|false)[\"']?\s*$", re.M | re.I)
+
+
+def _frontmatter_verdict(text: str) -> bool | None:
+    """`declares_oversize:` from the plan's leading frontmatter, or None."""
+    m = _FM_RE.match(text)
+    if not m:
+        return None
+    v = _VERDICT_RE.search(m.group(1))
+    if not v:
+        return None
+    return v.group(1).lower() in ("yes", "true")
+
+
 def plan_declares_oversize(text: str) -> bool:
     """Does an implementation plan DECLARE that the task is too big for one
     Implement stage — a pure function (no I/O).
@@ -340,6 +355,13 @@ def plan_declares_oversize(text: str) -> bool:
     re-scoping."""
     if not text:
         return False
+    # An explicit verdict in the plan's frontmatter wins (worker-plan writes
+    # `declares_oversize: no|yes`). 2026-11-17: a plan for this very feature said
+    # "the existing rescope tests stay green" and was parked as oversize while its
+    # frontmatter said `declares_oversize: no`.
+    verdict = _frontmatter_verdict(text)
+    if verdict is not None:
+        return verdict
     for sentence in _plan_sentences(text):
         if _PLAN_NEGATION_RE.search(sentence) or _PLAN_CONDITIONAL_RE.search(sentence):
             continue

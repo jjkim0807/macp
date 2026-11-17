@@ -26,6 +26,7 @@ stage: plan
 run_id: <run-id>
 slug: <slug>
 generated: <ISO timestamp>
+declares_oversize: no
 ---
 
 # Implementation Plan — <task title>
@@ -81,6 +82,7 @@ One paragraph: if Implement fails halfway, what state is the branch in, and how 
 - Do not spawn subagents or call other slash commands.
 - Every "Files" entry is a real path that exists or is to be created.
 - Size the plan for one Implement stage: all phases run in a single subprocess with the stage time cap above, committing after each phase. Keep phases small enough that a cut-off run still leaves whole phases committed.
+- `declares_oversize:` in the frontmatter is your size verdict and the engine reads it first: `no` when the plan fits one Implement stage, `yes` when it does not (then say why and how to split in the body). Only an absent key falls back to scanning the prose.
 
 ## After writing
 
