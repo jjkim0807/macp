@@ -206,10 +206,12 @@ class PullMainTest(unittest.TestCase):
         # pure-behind (the common case): a fetch then a --ff-only merge, and it
         # stops there — no merge-commit fallback, and no rebasing under a HEAD
         # the sync daemon may be moving. (Was a single `pull --rebase`.)
+        # --no-autostash since 2026-11-17: an autostash reset the tree to an old
+        # HEAD and was never re-applied, and the stale disk got committed.
         calls, run = self._recording_run()
         orch_mod._pull_main(Path("."), _run=run, _sleep=lambda *_a: None)
         self.assertEqual(calls[1], ["git", "fetch", "origin", "main"])
-        self.assertEqual(calls[2], ["git", "merge", "--ff-only", "--autostash",
+        self.assertEqual(calls[2], ["git", "merge", "--ff-only", "--no-autostash",
                                     "FETCH_HEAD"])
         self.assertEqual(len(calls), 3)
 

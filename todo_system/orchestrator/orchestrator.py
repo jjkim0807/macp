@@ -24,6 +24,7 @@ from typing import NamedTuple
 
 from . import agent_mode, human, message as m, stages
 from .. import i18n, kakao_format, not_before as _nb, paths
+from ..vault_git_lock import vault_git_lock
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
     ACCEPTED, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS, REJECTED,
@@ -3578,6 +3579,41 @@ def auto_unblock(db: Path, items_dir: Path, *, _apply=None, _import=None) -> lis
     return flips
 
 
+# How long a tick's `_pull_main` waits for the vault git lock before it skips
+# the pull. A holder is one git sequence (a sync, a mailbox push), so a wait
+# this long means something is wedged; the next tick pulls. Read at call time.
+PULL_LOCK_TIMEOUT_S = 30.0
+
+# What git prints when it refuses to START a merge because the working tree is
+# in the way — a tracked local edit or an untracked file the merge would
+# overwrite or remove. Parsed under LC_ALL=C (see `_pull_main`).
+_MERGE_REFUSED_DIRTY = (
+    "would be overwritten by merge",
+    "would be removed by merge",
+    "would lose untracked files",
+)
+
+
+def _merge_refused_dirty(cp) -> bool:
+    """Whether a failed merge was git refusing to start over local changes."""
+    if cp.returncode == 0:
+        return False
+    text = f"{cp.stderr or ''}\n{cp.stdout or ''}"
+    return any(s in text for s in _MERGE_REFUSED_DIRTY)
+
+
+def _refused_paths(cp, limit: int = 3) -> str:
+    """The paths git lists (tab-indented) under a dirty refusal, at most
+    `limit` of them and a count of the rest."""
+    text = f"{cp.stderr or ''}\n{cp.stdout or ''}"
+    paths = [ln.strip() for ln in text.splitlines()
+             if ln.startswith("\t") and ln.strip()]
+    shown = ", ".join(paths[:limit])
+    if len(paths) > limit:
+        shown += f" (+{len(paths) - limit} more)"
+    return shown
+
+
 def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None:
     """Best-effort catch-up of local main to origin before a tick, race-hardened.
 
@@ -3597,59 +3633,95 @@ def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None
     times to ride out a concurrent ref move. Any residual failure (offline, a
     real conflict, no git) is one UNtruncated log line, never fatal to the tick.
     `_run`/`_sleep` are test seams; tests inject fakes so no real pull executes.
+
+    2026-11-17 changed three things. `merge --autostash` stashed the dirty
+    tree, reset it to the HEAD of that moment, and — when the merge and then
+    its abort failed — never re-applied the stash; a second later this host's
+    sync committed the stale disk as a revert nobody made (30f97a346). So:
+
+      * the whole sequence — HEAD check, fetch, merge, abort — runs under the
+        vault git lock (vault_git_lock.py) that sync_vault_state and the git
+        mailbox take too. Busy past PULL_LOCK_TIMEOUT_S: no git, one line;
+      * no merge autostashes. `--no-autostash` also beats a `merge.autoStash`
+        config. When local edits overlap the incoming change git refuses
+        before touching anything; that is one `dirty — deferring pull` line
+        and no retry — the dirt is still there a second later — and the next
+        sync commits the edit, after which the pull is clean;
+      * `merge --abort` runs only when a merge actually started (MERGE_HEAD
+        exists). A merge git refused up front leaves nothing to abort, and
+        aborting it anyway is how log line 74483 read "There is no merge to
+        abort".
     """
+    import os
+
     run = _run or subprocess.run
     sleep = _sleep or time.sleep
+    # The refusal text is parsed (_merge_refused_dirty), so pin git to its
+    # untranslated messages: a host locale must not turn a dirty refusal into
+    # an unrecognised failure.
+    env = {**os.environ, "LC_ALL": "C"}
 
     def git(*args: str):
         return run(["git", *args], cwd=root, capture_output=True,
-                   text=True, timeout=120)
+                   text=True, timeout=120, env=env)
+
+    def deferred(cp) -> bool:
+        if not _merge_refused_dirty(cp):
+            return False
+        print(f"hq-host pull: dirty — deferring pull ({_refused_paths(cp)})")
+        return True
 
     try:
-        head = git("rev-parse", "--abbrev-ref", "HEAD")
-        if head.returncode != 0 or head.stdout.strip() != "main":
-            return
-        detail = ""
-        for i in range(attempts):
-            fetched = git("fetch", "origin", "main")
-            if fetched.returncode != 0:
-                detail = (fetched.stderr or fetched.stdout or "").strip()
+        with vault_git_lock(root, PULL_LOCK_TIMEOUT_S) as held:
+            if not held:
+                print("hq-host pull: vault git lock busy — skipping this tick")
+                return
+            head = git("rev-parse", "--abbrev-ref", "HEAD")
+            if head.returncode != 0 or head.stdout.strip() != "main":
+                return
+            detail = ""
+            for i in range(attempts):
+                fetched = git("fetch", "origin", "main")
+                if fetched.returncode != 0:
+                    detail = (fetched.stderr or fetched.stdout or "").strip()
+                    if i + 1 < attempts:
+                        sleep(1)
+                    continue
+                # Pure-behind (the common case) fast-forwards and stays linear.
+                ff = git("merge", "--ff-only", "--no-autostash", "FETCH_HEAD")
+                if ff.returncode == 0 or deferred(ff):
+                    return
+                # ff-only refused: a genuine local-ahead divergence (make a merge
+                # commit — sync pushes it next tick) or the ref moved under us.
+                merged = git("merge", "--no-edit", "--no-autostash", "FETCH_HEAD")
+                if merged.returncode == 0 or deferred(merged):
+                    return
+                # Neither landed this round: never leave the tree mid-merge, wait
+                # a beat for the concurrent writer to settle, then try the whole
+                # round again. A persistent (non-race) failure falls out of the
+                # loop below.
+                #
+                # The abort's rc used to be discarded, so an abort that FAILED
+                # left MERGE_HEAD standing with nothing in the log — and a
+                # surviving MERGE_HEAD is what let the next `chore: sync vault
+                # state` commit inherit the merge and publish stale working-tree
+                # bytes as its resolution (36655ee53, 2026-11-09; two task md
+                # files lost). Not retried and nothing is reset: this is the tree
+                # stages check out into, so forcing it from a tick is a
+                # destructive guess. One line, plus sync_vault_state's own
+                # refusal to commit mid-merge, is the safe pair.
+                if git("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+                    aborted = git("merge", "--abort")
+                    if aborted.returncode != 0:
+                        detail = (aborted.stderr or aborted.stdout or "").strip()
+                        print(f"hq-host pull: merge --abort failed "
+                              f"({aborted.returncode}) — MERGE_HEAD may survive "
+                              f"into the next sync: {detail}")
+                detail = (merged.stderr or merged.stdout
+                          or ff.stderr or ff.stdout or "").strip()
                 if i + 1 < attempts:
                     sleep(1)
-                continue
-            # Pure-behind (the common case) fast-forwards and stays linear.
-            ff = git("merge", "--ff-only", "--autostash", "FETCH_HEAD")
-            if ff.returncode == 0:
-                return
-            # ff-only refused: a genuine local-ahead divergence (make a merge
-            # commit — sync pushes it next tick) or the ref moved under us.
-            merged = git("merge", "--no-edit", "--autostash", "FETCH_HEAD")
-            if merged.returncode == 0:
-                return
-            # Neither landed this round: never leave the tree mid-merge, wait a
-            # beat for the concurrent writer to settle, then try the whole round
-            # again. A persistent (non-race) failure falls out of the loop below.
-            #
-            # The abort's rc used to be discarded, so an abort that FAILED left
-            # MERGE_HEAD standing with nothing in the log — and a surviving
-            # MERGE_HEAD is what let the next `chore: sync vault state` commit
-            # inherit the merge and publish stale working-tree bytes as its
-            # resolution (36655ee53, 2026-11-09; two task md files lost). Not
-            # retried and nothing is reset: this is the tree stages check out
-            # into, so forcing it from a tick is a destructive guess. One line,
-            # plus sync_vault_state's own refusal to commit mid-merge, is the
-            # safe pair.
-            aborted = git("merge", "--abort")
-            if aborted.returncode != 0:
-                detail = (aborted.stderr or aborted.stdout or "").strip()
-                print(f"hq-host pull: merge --abort failed "
-                      f"({aborted.returncode}) — MERGE_HEAD may survive into the "
-                      f"next sync: {detail}")
-            detail = (merged.stderr or merged.stdout
-                      or ff.stderr or ff.stdout or "").strip()
-            if i + 1 < attempts:
-                sleep(1)
-        print(f"hq-host pull: non-fatal — {detail}")
+            print(f"hq-host pull: non-fatal — {detail}")
     except Exception as e:
         print(f"hq-host pull: non-fatal — {e}")
 

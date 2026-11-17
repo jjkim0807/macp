@@ -135,27 +135,46 @@ class VaultGitLockTest(unittest.TestCase):
     def test_non_repo_and_missing_root_fail_open(self):
         plain = self.tmp / "plain"
         plain.mkdir()
-        for root in (plain, Path("/nonexistent/x")):
-            with self.subTest(root=root):
-                self.assertIsNone(vgl.lock_path(root))
-                out, err = io.StringIO(), io.StringIO()
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    with vgl.vault_git_lock(root, 0.2) as held:
-                        self.assertTrue(held)
-                self.assertEqual(out.getvalue() + err.getvalue(), "")
+        # A ceiling keeps git from walking up into whatever repository might
+        # enclose the tmp dir on some host (a stray /tmp/.git exists on one).
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.tmp)}):
+            for root in (plain, Path("/nonexistent/x")):
+                with self.subTest(root=root):
+                    self.assertIsNone(vgl.lock_path(root))
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        with vgl.vault_git_lock(root, 0.2) as held:
+                            self.assertTrue(held)
+                    self.assertEqual(out.getvalue() + err.getvalue(), "")
         self.assertEqual(list(plain.iterdir()), [])  # no lock file littered there
 
-    def test_no_git_is_spawned_outside_a_repository(self):
-        # Callers' fakes count their git calls exactly (and some tests patch the
-        # global subprocess.run): outside a repository the lock must not add one.
-        plain = self.tmp / "plain"
-        plain.mkdir()
-        with mock.patch.dict(os.environ, {"GIT_DIR": ""}), \
-             mock.patch.object(vgl.subprocess, "run",
-                               side_effect=AssertionError("git spawned")):
-            self.assertIsNone(vgl.lock_path(plain))
-            with vgl.vault_git_lock(plain, 0) as held:
+    def test_an_unresolvable_lock_fails_open(self):
+        # no git on PATH, or git failing: run unlocked rather than not at all
+        for boom in (FileNotFoundError("git"),
+                     subprocess.TimeoutExpired(["git"], 10)):
+            with self.subTest(boom=type(boom).__name__), \
+                 mock.patch.object(vgl, "_resolve_run", side_effect=boom):
+                self.assertIsNone(vgl.lock_path(self.repo))
+                with vgl.vault_git_lock(self.repo, 0) as held:
+                    self.assertTrue(held)
+
+    def test_resolving_the_lock_bypasses_a_patched_subprocess_run(self):
+        # Callers' tests count their git sequence exactly — through an injected
+        # `_run`, or by replacing the global subprocess.run — and the lock is
+        # not part of that sequence, so neither may ever see its rev-parse.
+        seen = []
+
+        def recorder(*args, **kwargs):
+            seen.append(args)
+            return subprocess.CompletedProcess(args, 1, "", "")
+
+        with mock.patch.object(subprocess, "run", side_effect=recorder):
+            path = vgl.lock_path(self.repo)
+            with vgl.vault_git_lock(self.repo, 0) as held:
                 self.assertTrue(held)
+        self.assertEqual(seen, [])
+        self.assertIsNotNone(path)
+        self.assertTrue(os.path.samefile(path.parent, self.repo / ".git"))
 
     def test_a_waiter_gets_the_lock_when_the_holder_releases(self):
         # AC6's "or waits": a holder that finishes inside the timeout is waited

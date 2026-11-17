@@ -63,36 +63,27 @@ LOCK_FILENAME = "macp-vault-git.lock"
 # lock: a wedged git must not wedge the tick that asked. Read at call time.
 RESOLVE_TIMEOUT_S = 10.0
 
-
-def _in_a_work_tree(root: Path) -> bool:
-    """Whether `root` can be inside a repository at all, without spawning git.
-
-    A `.git` entry (a directory, or the file a linked worktree has) at or above
-    `root`, or a ``GIT_DIR`` in the environment. Outside a repository the
-    answer comes from the filesystem alone, so a root that is a plain directory
-    costs no subprocess and never reaches a test's fake ``subprocess.run``.
-    """
-    if os.environ.get("GIT_DIR"):
-        return True
-    return any((d / ".git").exists() for d in (root, *root.parents))
+# The lock's own git runs through this reference, bound at import — not through
+# a caller's `_run` / `_git` seam, and not through `subprocess.run` looked up at
+# call time. The lock is not part of the sequence it guards, and callers' tests
+# count that sequence's git calls exactly, by injecting a fake or by replacing
+# the global `subprocess.run`. Tests of this module patch `_resolve_run` itself.
+_resolve_run = subprocess.run
 
 
 def lock_path(root) -> Path | None:
     """``<git-common-dir>/macp-vault-git.lock`` for the repository holding
     `root`, or None when there is none to lock: `root` is not a directory, it
-    is not inside a repository, or git cannot say. Never raises.
-
-    Runs git itself rather than through any caller's `_run` / `_git` seam: the
-    lock is not part of the sequence it guards, and the fakes those seams take
-    count that sequence's calls exactly.
+    is not inside a repository git will work in, or git cannot say. Never
+    raises.
     """
     try:
         root = Path(root)
-        if not root.is_dir() or not _in_a_work_tree(root.resolve()):
+        if not root.is_dir():
             return None
-        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=root,
-                           capture_output=True, text=True,
-                           timeout=RESOLVE_TIMEOUT_S)
+        r = _resolve_run(["git", "rev-parse", "--git-common-dir"], cwd=root,
+                         capture_output=True, text=True,
+                         timeout=RESOLVE_TIMEOUT_S)
         out = (r.stdout or "").strip()
         if r.returncode != 0 or not out:
             return None
