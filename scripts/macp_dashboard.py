@@ -2542,9 +2542,16 @@ function mount(){
   mounted=true;
 }
 
+// One failed poll is not "disconnected": show it only 45 s after the last success,
+// at once if nothing ever succeeded or on 401 (same rule as the app; parity doc).
+const DISCONNECT_AFTER_MS=45000;let lastOk=0;
+function showDisconnected(){const hs=$('hstate');hs.textContent='@@dash.js.disconnected@@';hs.style.color='var(--red)'}
 async function tick(){
-  try{const r=await fetch('/api/status');last=await r.json();if(!mounted)mount();update(last)}
-  catch(e){const hs=$('hstate');hs.textContent='@@dash.js.disconnected@@';hs.style.color='var(--red)'}
+  try{const r=await fetch('/api/status');
+    if(r.status===401){showDisconnected();return}
+    if(!r.ok)throw new Error('http '+r.status);
+    last=await r.json();lastOk=Date.now();if(!mounted)mount();update(last)}
+  catch(e){if(!lastOk||Date.now()-lastOk>DISCONNECT_AFTER_MS)showDisconnected()}
 }
 tick();setInterval(tick,3000);
 </script></body></html>"""
@@ -2852,6 +2859,43 @@ def wait_ingest_alerts(timeout: float = 5.0) -> bool:
 
 
 STATUS_TTL_S = float(os.environ.get("MACP_DASHBOARD_STATUS_TTL", "2.0") or 2.0)
+# main() precomputes the /api/status body every N seconds in a background thread
+# (see _StatusCache). <= 0 turns that off (plain TTL single-flight, as serve()).
+DEFAULT_STATUS_REFRESH_S = 5.0
+
+
+def _status_refresh_s() -> float:
+    """MACP_DASHBOARD_STATUS_REFRESH_S, read at call time. Empty or unparseable
+    falls back to DEFAULT_STATUS_REFRESH_S; <= 0 means background refresh is off."""
+    raw = os.environ.get("MACP_DASHBOARD_STATUS_REFRESH_S", "").strip()
+    if not raw:
+        return DEFAULT_STATUS_REFRESH_S
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_STATUS_REFRESH_S
+
+
+def _compute_status_body() -> bytes:
+    """The serialised /api/status body (collect_status looked up at call time)."""
+    return json.dumps(collect_status()).encode("utf-8")
+
+
+def _with_freshness(body: bytes, generated_at: str | None, at: float) -> bytes:
+    """`body` with top-level `generated_at` (when the compute finished, local ISO)
+    and `age_s` (seconds since then, at request time) spliced in. The body is
+    cached pre-serialised, so this appends to the bytes instead of re-parsing
+    them. Unchanged when there is no timestamp or the body is not a JSON object."""
+    if generated_at is None:
+        return body
+    head = body.rstrip()
+    if not head.endswith(b"}"):
+        return body
+    extra = json.dumps({"generated_at": generated_at,
+                        "age_s": max(0.0, round(time.monotonic() - at, 1))}).encode("utf-8")
+    inner = head[:-1]
+    sep = b"" if inner.rstrip().endswith(b"{") else b", "
+    return inner + sep + extra[1:]
 
 
 def _registry_mode_agents() -> list:
@@ -2884,7 +2928,17 @@ class _StatusCache:
     Now at most ONE compute runs at a time per server. A request that finds a body
     younger than `ttl` gets it immediately; one that arrives while a compute is in
     flight waits for that compute instead of starting another. If the compute
-    raises, waiters are released and the next request retries."""
+    raises, waiters are released and the next request retries.
+
+    Background mode (start_background; main() only): even single-flight, a
+    request that lands after the TTL still waits for a whole compute, and on
+    2026-11-17 that was 3-21 s per compute under load — long enough for the app's
+    8 s timeout to show "disconnected". So a daemon thread recomputes every
+    `interval` seconds and a request returns whatever body is there, whatever its
+    age, without waiting. Only before the first body exists does a request wait
+    (on the thread's compute — never a second one). A failed refresh logs one
+    line, keeps the last good body and retries next cycle; invalidate() wakes the
+    thread so a write shows up at once instead of after up to one interval."""
 
     def __init__(self, ttl: float = STATUS_TTL_S, wait_s: float = 60.0):
         self.ttl = ttl
@@ -2892,19 +2946,34 @@ class _StatusCache:
         self._cv = threading.Condition(threading.Lock())
         self._body: bytes | None = None
         self._at = 0.0
+        self._gen_at: str | None = None
         self._busy = False
+        self.interval = 0.0
+        self._bg: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._kick = threading.Event()
+
+    @property
+    def background(self) -> bool:
+        return self._bg is not None
 
     def get(self, compute) -> bytes:
+        return self.get_entry(compute)[0]
+
+    def get_entry(self, compute) -> tuple[bytes, float, str | None]:
+        """(body, monotonic time it was computed, generated_at ISO or None)."""
         with self._cv:
             while True:
-                if self._body is not None and time.monotonic() - self._at < self.ttl:
-                    return self._body
+                if self._body is not None and (
+                        self._bg is not None or time.monotonic() - self._at < self.ttl):
+                    return self._body, self._at, self._gen_at
                 if not self._busy:
                     self._busy = True
                     break
                 woke = self._cv.wait(timeout=self.wait_s)
                 if not woke and self._body is not None:
-                    return self._body          # compute is stuck: serve the last good body
+                    # compute is stuck: serve the last good body
+                    return self._body, self._at, self._gen_at
         try:
             body = compute()
         except BaseException:
@@ -2914,13 +2983,78 @@ class _StatusCache:
             raise
         with self._cv:
             self._body, self._at, self._busy = body, time.monotonic(), False
+            self._gen_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            at, gen = self._at, self._gen_at
             self._cv.notify_all()
-        return body
+        return body, at, gen
 
     def invalidate(self) -> None:
-        """Make the next get() recompute (a write just changed what it shows)."""
+        """Make the next get() recompute (a write just changed what it shows);
+        in background mode, wake the refresh thread to recompute now."""
         with self._cv:
             self._at = 0.0
+        self._kick.set()
+
+    def _refresh_once(self, compute, owned: bool) -> None:
+        with self._cv:
+            if not owned:
+                if self._busy:
+                    return                     # a request-path compute is in flight
+                self._busy = True
+        try:
+            body = compute()
+        except Exception as e:
+            logger.warning("status refresh failed err=%s", type(e).__name__)
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
+            return
+        except BaseException:
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
+            raise
+        with self._cv:
+            self._body, self._at, self._busy = body, time.monotonic(), False
+            self._gen_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            self._cv.notify_all()
+
+    def _loop(self, compute, owned: bool) -> None:
+        while not self._stop.is_set():
+            try:
+                self._refresh_once(compute, owned)
+            except Exception as e:             # never let the thread die
+                logger.warning("status refresh loop error err=%s", type(e).__name__)
+            owned = False
+            self._kick.wait(self.interval)
+            self._kick.clear()
+
+    def start_background(self, compute, interval: float) -> threading.Thread:
+        """Recompute the body every `interval` s in a daemon thread. The first
+        compute is claimed synchronously (busy flag) so a request that arrives
+        before the thread runs waits for it instead of starting its own."""
+        if self._bg is not None:
+            raise RuntimeError("status background refresh already started")
+        self.interval = float(interval)
+        self._stop.clear()
+        self._kick.clear()
+        with self._cv:
+            owned = self._body is None and not self._busy
+            if owned:
+                self._busy = True
+        t = threading.Thread(target=self._loop, args=(compute, owned),
+                             name="macp-status-refresh", daemon=True)
+        self._bg = t
+        t.start()
+        return t
+
+    def stop_background(self, timeout: float = 5.0) -> None:
+        t = self._bg
+        if t is None:
+            return
+        self._stop.set()
+        self._kick.set()
+        t.join(timeout)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3070,8 +3204,10 @@ class Handler(BaseHTTPRequestHandler):
         if extra is None:
             return
         if urlparse(self.path).path == "/api/status":
-            body = self._status_cache.get(
-                lambda: json.dumps(collect_status()).encode("utf-8"))
+            cache = self._status_cache
+            body, at, gen = cache.get_entry(_compute_status_body)
+            if cache.background:
+                body = _with_freshness(body, gen, at)
             self._reply(200, body, "application/json", extra)
         elif urlparse(self.path).path == "/api/task":
             slug = (parse_qs(urlparse(self.path).query).get("slug") or [""])[0]
@@ -3281,6 +3417,16 @@ def serve(host: str, port: int, token: str | None,
     return ThreadingHTTPServer((host, port), handler)
 
 
+def start_status_refresh(srv: ThreadingHTTPServer, interval: float) -> bool:
+    """Start `srv`'s /api/status background refresh (main() only — servers built
+    by serve() alone, e.g. in tests, keep the TTL single-flight). False when
+    `interval` <= 0 (disabled)."""
+    if interval <= 0:
+        return False
+    srv.RequestHandlerClass._status_cache.start_background(_compute_status_body, interval)
+    return True
+
+
 def main() -> int:
     # Record auth failures to the service journal (audit trail for exposed fronts).
     logging.basicConfig(level=logging.INFO,
@@ -3298,6 +3444,11 @@ def main() -> int:
     srv = serve(args.host, args.port,
                 os.environ.get("MACP_DASHBOARD_TOKEN", "").strip(),
                 public_exposure=public)
+    refresh_s = _status_refresh_s()
+    if start_status_refresh(srv, refresh_s):
+        logger.info("status background refresh interval_s=%s", refresh_s)
+    else:
+        logger.info("status background refresh disabled")
     url = f"http://{args.host}:{args.port}/"
     print(f"MaestroACP dashboard → {url}  (Ctrl-C to stop)")
     if not args.no_open:
@@ -3309,6 +3460,8 @@ def main() -> int:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        srv.RequestHandlerClass._status_cache.stop_background(timeout=1.0)
     return 0
 
 
