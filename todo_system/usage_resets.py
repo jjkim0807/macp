@@ -173,7 +173,6 @@ def _org_uuid() -> str | None:
         candidates.append(Path(legacy_config_dir()) / ".claude.json")
     except Exception:
         pass
-    candidates.append(Path.home() / ".claude.json")
     for p in candidates:
         try:
             org = (json.loads(p.read_text(encoding="utf-8")).get("oauthAccount") or {}).get(
