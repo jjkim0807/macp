@@ -314,6 +314,41 @@ class SyncVaultStateTest(unittest.TestCase):
         self.assertIn("Worker/assignments/t.json",
                       _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
 
+    def test_the_maintenance_entry_point_syncs_under_the_lock(self):
+        # The production path, not the function alone: `worker maintenance` →
+        # cmd_maintenance() → sync_vault_state() → the lock. The two steps ahead
+        # of the sync are stubbed (they read the live vault's items), and the
+        # step right after it raises a BaseException sentinel — cmd_maintenance
+        # catches Exception per step, not BaseException — so the tick stops
+        # before anything that touches this host.
+        class _Stop(BaseException):
+            pass
+
+        self._write("Worker/assignments/t.json")
+        head = _git(self.repo, "rev-parse", "HEAD").stdout
+
+        def maintenance_tick():
+            buf = io.StringIO()
+            with mock.patch.object(worker, "IS_REMOTE_HOST", False), \
+                 mock.patch.object(worker, "autoclose_stale_reviews_local", return_value=0), \
+                 mock.patch.object(worker, "sweep_remote_completed_runs", return_value=0), \
+                 mock.patch.object(worker, "rotate_logs", side_effect=_Stop), \
+                 mock.patch.object(worker, "VAULT_SYNC_LOCK_TIMEOUT_S", 0.2), \
+                 contextlib.redirect_stdout(buf), \
+                 self.assertRaises(_Stop):
+                worker.main(["maintenance"])
+            return buf.getvalue()
+
+        with _lock_held_elsewhere(self.repo):
+            out = maintenance_tick()
+        self.assertIn("vault-sync: vault git lock busy", out)
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD").stdout, head)
+
+        out = maintenance_tick()                          # released
+        self.assertIn("vault-sync: 1 file(s) committed", out)
+        self.assertIn("Worker/assignments/t.json",
+                      _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
+
     # --- stale-revert guard ---------------------------------------------------
     # 2026-11-17: a tick's `merge --autostash` reset the working tree to the HEAD
     # of that moment and never re-applied its stash, so HEAD held a person's

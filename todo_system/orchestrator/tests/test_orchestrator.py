@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from todo_system import usage_guard, vault_git_lock, worker
 from todo_system.orchestrator import orchestrator as orch_mod
 from todo_system.orchestrator import assignment as A
@@ -3875,6 +3877,34 @@ class PullMainRealGitTest(unittest.TestCase):
         self.assertEqual(self._head(), head)
         self.assertEqual(self._read("Todo/items/a.md"), "local edit\n")
         self.assertEqual(_rgit(self.repo, "stash", "list").stdout, "")
+
+    @pytest.mark.real_vault_git
+    def test_the_auto_entry_point_pulls_under_the_lock(self):
+        # The production path, not the function alone: `orchestrator auto` →
+        # _main → _pull_main(base) → the lock. conftest no-ops
+        # orch_mod._pull_main unless a test is marked real_vault_git; the very
+        # next line of _main, _check_divergence, raises so the tick stops
+        # before the lease and any dispatch.
+        class _StopTick(Exception):
+            pass
+
+        theirs = self._advance("Todo/items/b.md", "new\n")
+        head = self._head()
+        with mock.patch.dict(os.environ, {"MACP_VAULT_ROOT": str(self.repo)}), \
+             mock.patch.object(orch_mod, "_check_divergence", side_effect=_StopTick), \
+             mock.patch.object(orch_mod, "PULL_LOCK_TIMEOUT_S", 0.2):
+            buf = io.StringIO()
+            with _vault_lock_held_elsewhere(self.repo), \
+                 contextlib.redirect_stdout(buf), \
+                 self.assertRaises(_StopTick):
+                orch_mod._main(["auto"])
+            self.assertIn("hq-host pull: vault git lock busy", buf.getvalue())
+            self.assertEqual(self._head(), head)       # no git ran
+
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaises(_StopTick):
+                orch_mod._main(["auto"])               # released
+        self.assertEqual(self._head(), theirs)
 
 
 class CheckDivergenceTest(unittest.TestCase):
