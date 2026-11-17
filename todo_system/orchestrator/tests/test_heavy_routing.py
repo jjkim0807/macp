@@ -34,6 +34,7 @@ from todo_system.orchestrator.orchestrator import (
     Orchestrator,
     Task,
     is_heavy,
+    needs_device,
 )
 from todo_system.orchestrator.registry import Agent, Registry
 from todo_system.orchestrator.runner import ExecOutcome, Runner, StagedExecutor
@@ -814,3 +815,117 @@ class BusyHeartbeatTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NeedsDeviceTableTest(unittest.TestCase):
+    def test_table(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        app = tmp / "app-repo"
+        (app / "app").mkdir(parents=True)
+        (app / "gradlew").write_text("", encoding="utf-8")
+        server = tmp / "server-repo"
+        (server / "src").mkdir(parents=True)
+        (server / "gradlew").write_text("", encoding="utf-8")
+        kmp = tmp / "kmp-repo"
+        (kmp / "composeApp").mkdir(parents=True)
+        (kmp / "gradlew").write_text("", encoding="utf-8")
+        nogradle = tmp / "py-repo"
+        (nogradle / "app").mkdir(parents=True)
+        r = {"repo": REPO}
+        cases = [
+            # (payload, repo_dir, app_paths, expected)
+            ({**r, "heavy_signals": ["emulator"]}, server, ("app/",), True),
+            ({**r, "heavy_signals": ["screen_check"]}, None, ("app/",), True),
+            ({**r, "emulator": True}, server, ("app/",), True),
+            ({"heavy": True}, None, ("app/",), False),            # vault task
+            ({"long_job": "x"}, None, ("app/",), False),          # vault long job
+            ({**r, "long_job": "x"}, None, ("app/",), True),      # clone unknown
+            ({**r}, tmp / "missing", ("app/",), True),            # not cloned yet
+            ({**r}, app, ("app/",), True),                        # app module
+            ({**r}, server, ("app/",), False),                    # Gradle server
+            ({**r}, kmp, ("app/",), False),                       # default paths
+            ({**r}, kmp, ("composeApp/",), True),                 # widened by config
+            ({**r}, nogradle, ("app/",), False),                  # not an app repo
+            # screen_check: false never reaches the payload; even if it did, an
+            # app diff would still get the runner's check, so it is no exemption.
+            ({**r, "screen_check": False}, app, ("app/",), True),
+        ]
+        for payload, repo_dir, paths, want in cases:
+            with self.subTest(payload=payload, repo_dir=repo_dir, paths=paths):
+                self.assertIs(needs_device(payload, repo_dir, paths), want)
+
+
+class DeviceGateTickTest(_Base):
+    """Through Orchestrator.tick: a task that may need a device check only goes to
+    a heavy remote that also advertises `device`."""
+
+    DEVICE_REMOTE = "device-remote"
+
+    def _with_device_remote(self) -> None:
+        self.reg = Registry([
+            Agent(id=DEFAULT, kind="ai-local", projects=["*"], mailbox=self.uri),
+            Agent(id=REMOTE, kind="ai-remote", projects=[], capabilities=["heavy"],
+                  concurrency=1, mailbox=self.uri),
+            Agent(id=self.DEVICE_REMOTE, kind="ai-remote", projects=[],
+                  capabilities=["heavy", "device"], concurrency=1, mailbox=self.uri),
+        ])
+        self.orch = Orchestrator(self.mb, self.reg, self.ledger,
+                                 notify=lambda *a, **k: None, default_uri=self.uri)
+
+    def _app_module(self) -> None:
+        (self.clone / "app").mkdir()
+
+    def test_app_repo_task_stays_home_without_a_device_remote(self):   # ①
+        self._app_module()
+        self.seen(REMOTE, 60)
+        res = _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(len(res["dispatched"]), 1)
+        self.assertEqual(self.inbox(REMOTE), [])
+        [env] = self.inbox(DEFAULT)
+        self.assertEqual(env.type, m.TASK_ASSIGN)
+        self.assertEqual(self.ledger.load("app-build").agent_id, DEFAULT)
+
+    def test_app_repo_task_goes_to_a_device_remote(self):              # ②
+        self._app_module()
+        self._with_device_remote()
+        self.seen(REMOTE, 60)
+        self.seen(self.DEVICE_REMOTE, 60)
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(self.inbox(DEFAULT), [])
+        [env] = self.inbox(self.DEVICE_REMOTE)
+        self.assertEqual(env.type, m.TASK_ASSIGN)
+        self.assertEqual(self.ledger.load("app-build").agent_id, self.DEVICE_REMOTE)
+
+    def test_gradle_server_repo_goes_to_a_plain_heavy_remote(self):    # ③
+        self.seen(REMOTE, 60)                     # clone has gradlew, no app/
+        _tick(self.orch, [self.heavy_task()])
+        [env] = self.inbox(REMOTE)
+        self.assertEqual(env.type, m.TASK_ASSIGN)
+        self.assertEqual(self.inbox(DEFAULT), [])
+
+    def test_screen_check_off_still_counts_as_device(self):            # ④
+        # The opt-out never reaches the payload (and the runner would check an app
+        # diff anyway), so the app-repo task still stays home.
+        self._app_module()
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task(screen_check=False)])
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(len(self.inbox(DEFAULT)), 1)
+
+    def test_emulator_task_without_app_dir_stays_home(self):           # ⑤
+        self.seen(REMOTE, 60)
+        _tick(self.orch, [self.heavy_task(heavy_signals=["emulator"])])
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(len(self.inbox(DEFAULT)), 1)
+
+    def test_device_remote_offline_falls_back_home(self):
+        self._app_module()
+        self._with_device_remote()
+        self.seen(REMOTE, 60)                     # only the non-device one online
+        _tick(self.orch, [self.heavy_task()])
+        self.assertEqual(self.inbox(REMOTE), [])
+        self.assertEqual(self.inbox(self.DEVICE_REMOTE), [])
+        self.assertEqual(len(self.inbox(DEFAULT)), 1)
+
