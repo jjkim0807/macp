@@ -112,6 +112,9 @@ def state_path() -> Path:
 
 
 # -- state (one stamp: the throttled skip notice) ------------------------------
+# (A missing sqlite-vec is no longer a skip — embed_vault falls back to the
+# pure-Python table — so the throttle now only covers embed_vault's
+# skipped_reason.)
 
 def _read_state() -> dict:
     state = {"last_skip_notice_ts": 0.0}
@@ -161,7 +164,8 @@ def _cooling(now: float, last: float, window: float) -> bool:
 
 
 def _skip_notice(reason: str, now: float) -> str | None:
-    """The throttled "no sqlite-vec" line, or None while still cooling."""
+    """The throttled "embed skipped" line (embedder backend unavailable, vector
+    dim mismatch — embed_vault's ``skipped_reason``), or None while still cooling."""
     state = _read_state()
     if _cooling(now, state["last_skip_notice_ts"], SKIP_NOTICE_COOLDOWN_S):
         return None
@@ -169,7 +173,7 @@ def _skip_notice(reason: str, now: float) -> str | None:
     # Stamped BEFORE returning, so a caller that dies mid-print cannot turn the
     # notice into one line per tick (maintenance_disk's rule).
     err = _write_state(state)
-    line = f"embed-tick: sqlite-vec 없음 — 건너뜀 ({reason})"[:TEXT_LIMIT]
+    line = f"embed-tick: 임베딩 건너뜀 ({reason})"[:TEXT_LIMIT]
     return f"{line}; {err}" if err else line
 
 
@@ -184,18 +188,20 @@ def embed_tick(*, now: float | None = None) -> str | None:
             return None
         t = _now() if now is None else now
         con = gm.init_relations_db(db_path())
-        # Cheap guard FIRST. embed_vault walks and hashes the whole corpus
-        # (~4,000 docs) before it discovers the extension is missing, and on a
-        # host without sqlite-vec that work is thrown away every five minutes.
-        try:
-            gm._load_sqlite_vec(con)
-        except gm.EmbeddingsUnavailable as exc:
-            return _skip_notice(str(exc), t)
+        # No sqlite-vec probe here: without the extension embed_vault falls back
+        # to the pure-Python table (gm.PY_VEC_TABLE, #147) by itself, and a probe
+        # that skipped would leave that table stale forever.
         # Incremental by construction: plan_embedding's content-hash diff IS the
         # "skip unchanged docs" behaviour, so nothing is reimplemented here.
         # embed_vault prints its own success line; swallow it so the tick gets
-        # exactly one line (ours) rather than two.
-        with contextlib.redirect_stdout(io.StringIO()):
+        # exactly one line (ours) rather than two. Its stderr is swallowed too:
+        # the only stderr write on that path is the once-per-PROCESS "using the
+        # pure-Python fallback" notice, and every tick is a fresh process, so it
+        # would be one stray line every five minutes — breaking "silent when
+        # nothing changed". Real failures still come back as skipped_reason or
+        # an exception, both of which become our one line.
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
             res = gm.embed_vault(con, vault_root=vault_root())
         if res.skipped_reason:
             return _skip_notice(res.skipped_reason, t)
