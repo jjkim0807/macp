@@ -131,7 +131,7 @@ A task with no `worker_mode` belongs to you.
 | `depends_on` | `[slug, …]`. Upstream tasks that must be `done` first. Pair with `worker_mode: blocked` |
 | `on_unblock` | the mode to flip to when every dependency is done (default `auto`) |
 | `auto_activate` | `false` opts out of the automatic flip |
-| `human_gate` | `true` means a person must look first, even with every dependency done |
+| `human_gate` | `true` means a person must look first, even with every dependency done. It also stops the automatic split of a task that is too big for one stage |
 | `not_before` | earliest start, `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` |
 | `parent` | `"[[parent-slug]]"`. When every child is done, the parent closes |
 
