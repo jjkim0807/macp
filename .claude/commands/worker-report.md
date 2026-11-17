@@ -249,14 +249,14 @@ If `gh` is not available, skip PR creation. If `overall_status: fail`, still pus
 
 Capture the PR URL from `gh pr create` stdout. If you got one, update `report.md` frontmatter `pr_url` accordingly (re-Write the file).
 
-### 4b. Rebase a later concurrent PR before merge (concurrency on — `max_parallel_per_repo` ≥ 2)
+### 4b. Check a later concurrent PR against the moved trunk before merge (concurrency on — `max_parallel_per_repo` ≥ 2)
 
 Same-repo runs now dispatch concurrently (the per-repo cap defaults to 2). Two
 such runs can reach this stage around the same tick, and whichever merges first
 moves `origin/main` out from under the other. The branch for *this* run was based
 on `origin/main` as it was when the run started, so immediately **before** the
-merge step in §5 you must check whether the trunk has moved and, if so, rebase —
-otherwise the merge either conflicts or lands against a stale base.
+merge step in §5 you must check whether the trunk has moved and, if so, whether
+it collides with this branch.
 
 Do this right before §5's `gh pr merge`, from the repo the branch lives in
 (`<working_dir>` for an external repo task, the vault root for a vault task):
@@ -268,25 +268,27 @@ git fetch origin
 git rev-list --count worker/<slug>..origin/main
 ```
 
-- **Count is 0** (trunk did not move, or this branch already contains it): no
-  rebase needed — proceed to §5.
-- **Count > 0**: rebase this branch onto the moved trunk, then **re-run the local
-  gates** (the same commands the Verify stage ran — `uv run … pytest -q`, ruff,
-  and any standing gate scripts) and merge in §5 **only if they still pass**:
+- **Count is 0** (trunk did not move, or this branch already contains it):
+  proceed to §5.
+- **Count > 0**: check whether the moved trunk collides with this branch — this
+  stage has only git/gh, so it cannot re-run the Verify gates, and it does not
+  need to rewrite the branch:
   ```bash
-  git rebase origin/main
+  git merge-tree --write-tree origin/main worker/<slug> >/dev/null; echo "rc=$?"
   ```
+  - **rc=0** (merges cleanly): proceed to §5. `gh pr merge --squash` lands the
+    change on the current trunk; the Verify verdict for this diff still stands.
+    Do NOT hold the PR just because the gates were not re-run — that stalls every
+    concurrent pair (2026-11-17: macp-dashboard-status-background-refresh was
+    parked for exactly this). Do NOT rebase or force-push.
+  - **rc=1** (conflict): treat it as the rebase conflict below.
+  - any other rc (e.g. a bad ref): `merged: no` + `worker_mode_recommendation: auto`.
 
 **A rebase CONFLICT must never be auto-resolved.** The overlap judge
 (`touches` disjointness) decided these two runs did not collide; a conflict means
 that judgement was wrong ("겹침 오판"), and reconciling the two changes is a human
-decision, not a mechanical one. On conflict:
-
-```bash
-git rebase --abort
-```
-
-Then **do not merge the PR**. Leave the ready PR open and record the conflict:
+decision, not a mechanical one. On conflict, **do not merge the PR**. Leave the ready PR open and record the conflict
+(no `git rebase` is needed to detect it — the `merge-tree` rc=1 above is the signal):
 
 1. In `report.md` frontmatter, set `merged: no` **and** add the line:
    ```
@@ -295,13 +297,13 @@ Then **do not merge the PR**. Leave the ready PR open and record the conflict:
    (The runner reads this marker and parks the task `awaiting_human` with the
    fixed note "동시 실행 충돌 — 겹침 오판". The reason string is owned by the
    runner, not by your prose — you only raise the flag.)
-2. In `## 사람이 검토해야 할 부분`, list the conflicting files (`git diff --name-only
-   --diff-filter=U` captured before the abort, if you ran it) and one line on what
-   each change wanted, so the human can reconcile without re-deriving it.
+2. In `## 사람이 검토해야 할 부분`, list the conflicting files
+   (`git merge-tree --write-tree --name-only origin/main worker/<slug>` prints them
+   after the tree id) and one line on what each change wanted, so the human can
+   reconcile without re-deriving it.
 
 **Never** `git push --force` to resolve this, and **never** push to `origin/main`.
-A clean rebase that then fails the re-run gates is an ordinary merge failure
-(`merged: no` + `worker_mode_recommendation: auto`), **not** a `rebase_conflict`.
+
 
 ### 5. Auto-merge (only when `auto_merge: true`)
 
