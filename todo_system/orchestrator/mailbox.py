@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from abc import ABC
 from pathlib import Path
 from typing import Iterable
 
+from ..vault_git_lock import vault_git_lock
 from .atomic_io import atomic_write_json
 from .message import Envelope
 from .stages import GIT_TIMEOUT_RC, _git_stream
@@ -43,6 +45,12 @@ DEFAULT_ROOT = "Worker/agents"
 GIT_TIMEOUT_LOCAL_S = 180       # add / commit / diff / remote / rebase --abort
 GIT_TIMEOUT_NETWORK_S = 300     # pull / push / fetch
 _NETWORK_SUBCOMMANDS = frozenset({"pull", "push", "fetch"})
+
+# How long a receive()/send() waits for the vault git lock (vault_git_lock.py)
+# before it skips its pull or its commit+push. Shorter than the tick-level
+# waits: the runner polls receive() often, and a skipped send leaves its file on
+# disk for the next vault sync to commit. Read at call time so tests can shrink it.
+GIT_LOCK_TIMEOUT_S = 15.0
 
 # An acked file that ack() deleted is remembered as a tombstone {msg_id: acked_at}.
 # The deletion is never committed by the reader, so any git operation that restores
@@ -235,6 +243,13 @@ class GitMailbox(Mailbox):
     are best-effort and no-op when there is no `origin` (so it also works on a
     fresh local repo, e.g. in tests). Every git call is wall-clock bounded; a
     timeout comes back as rc 124 (`GIT_TIMEOUT_RC`), not an exception.
+
+    Both run under the vault git lock (vault_git_lock.py), the one the
+    orchestrator's `_pull_main` and the worker's `sync_vault_state` hold too —
+    taken in the two hooks only. `_pull` and `_commit_push` stay unlocked on
+    purpose: `_commit_push` retries a rejected push through `_pull`, and the
+    lock is not re-entrant, so a `_pull` that locked would wait on its own
+    caller until the timeout.
     """
 
     def __init__(self, root: Path, branch: str = "main"):
@@ -354,11 +369,24 @@ class GitMailbox(Mailbox):
             self._pull()
 
     # -- hooks ------------------------------------------------------------
+    # The vault git lock is taken here and only here (see the class docstring):
+    # these two hooks are the only way into _pull/_commit_push outside tests.
+    # Busy lines go to stderr so the mailbox CLI's stdout stays its own output.
     def _before_receive(self, agent_id: str) -> None:
-        self._pull()
+        with vault_git_lock(self.repo_dir, GIT_LOCK_TIMEOUT_S) as held:
+            if not held:
+                print("mailbox: vault git lock busy — skipping pull, "
+                      "reading local inbox state", file=sys.stderr)
+                return
+            self._pull()
 
     def _after_send(self, msg: Envelope, path: Path) -> None:
-        self._commit_push(path)
+        with vault_git_lock(self.repo_dir, GIT_LOCK_TIMEOUT_S) as held:
+            if not held:
+                print(f"mailbox: vault git lock busy — {path.name} left on disk "
+                      "for the next vault sync", file=sys.stderr)
+                return
+            self._commit_push(path)
 
 
 # ---------------------------------------------------------------------------

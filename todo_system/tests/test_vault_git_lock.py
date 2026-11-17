@@ -24,6 +24,9 @@ from pathlib import Path
 from unittest import mock
 
 from todo_system import vault_git_lock as vgl
+from todo_system.orchestrator import mailbox as mailbox_mod
+from todo_system.orchestrator import message as m
+from todo_system.orchestrator.mailbox import GitMailbox
 
 
 def _git(repo, *args):
@@ -217,6 +220,90 @@ class VaultGitLockTest(unittest.TestCase):
         # the kernel released it with the process — nothing stale to clean up
         with vgl.vault_git_lock(self.repo, 5) as held:
             self.assertTrue(held)
+
+
+class GitMailboxLockTest(unittest.TestCase):
+    """The git mailbox takes the vault git lock in its two hooks — and only
+    there. Two clones of a bare origin, the same shape as test_mailbox.py's
+    GitMailboxTest (which stays as it is)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.bare = self.tmp / "remote.git"
+        _git(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.bare))
+        self.hostA = self._clone("A")
+        self.hostB = self._clone("B")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _clone(self, name):
+        d = self.tmp / name
+        _git(self.tmp, "clone", "-q", str(self.bare), str(d))
+        _git(d, "config", "user.email", "t@t")
+        _git(d, "config", "user.name", "t")
+        (d / "Worker" / "agents").mkdir(parents=True, exist_ok=True)
+        (d / "Worker" / "agents" / ".gitkeep").touch()
+        _git(d, "add", "-A")
+        if _git(d, "commit", "-qm", "init").returncode == 0:   # first clone seeds main
+            _git(d, "push", "-q", "-u", "origin", "main")
+        return d
+
+    def _mb(self, host):
+        return GitMailbox(host / "Worker" / "agents")
+
+    def _on_origin(self, path):
+        return (f"Worker/agents/x/inbox/{path.name}"
+                in _git(self.bare, "ls-tree", "-r", "--name-only", "main").stdout)
+
+    def test_a_rejected_push_retries_through_pull_without_relocking(self):
+        # B publishes first, so A's first push is rejected and _commit_push
+        # retries through _pull — inside A's _after_send, which already holds
+        # the lock. A _pull that locked too would wait out the timeout on its
+        # own caller, skip, and A's message would never leave A.
+        mbA, mbB = self._mb(self.hostA), self._mb(self.hostB)
+        mbB.send(m.Envelope(to="x", type=m.PING))
+        err = io.StringIO()
+        with mock.patch.object(mailbox_mod, "GIT_LOCK_TIMEOUT_S", 0.5), \
+             mock.patch.object(mbA, "_pull", wraps=mbA._pull) as pull, \
+             contextlib.redirect_stderr(err):
+            path = mbA.send(m.Envelope(to="x", type=m.PING))
+        self.assertGreaterEqual(pull.call_count, 1, "the push was never rejected — "
+                                "the retry path this test is about did not run")
+        self.assertNotIn("lock busy", err.getvalue())
+        self.assertTrue(self._on_origin(path))
+
+    def test_receive_skips_the_pull_while_the_lock_is_held(self):
+        mbA, mbB = self._mb(self.hostA), self._mb(self.hostB)
+        sent = mbA.send(m.Envelope(to="x", type=m.PING))
+        self.assertTrue(self._on_origin(sent))
+        err = io.StringIO()
+        with _lock_held_elsewhere(self.hostB), \
+             mock.patch.object(mailbox_mod, "GIT_LOCK_TIMEOUT_S", 0.2), \
+             mock.patch.object(mbB, "_git", wraps=mbB._git) as git, \
+             contextlib.redirect_stderr(err):
+            got = mbB.receive("x")
+        self.assertEqual(got, [])                     # local state: not pulled yet
+        self.assertEqual(git.call_count, 0)           # no git ran at all
+        self.assertIn("mailbox: vault git lock busy — skipping pull", err.getvalue())
+
+        got = mbB.receive("x")                        # released
+        self.assertEqual([e.msg_id for e in got], [sent.stem])
+
+    def test_send_while_the_lock_is_held_leaves_the_file_for_the_next_sync(self):
+        mbA = self._mb(self.hostA)
+        err = io.StringIO()
+        with _lock_held_elsewhere(self.hostA), \
+             mock.patch.object(mailbox_mod, "GIT_LOCK_TIMEOUT_S", 0.2), \
+             contextlib.redirect_stderr(err):
+            path = mbA.send(m.Envelope(to="x", type=m.PING))
+        self.assertTrue(path.exists())
+        self.assertIn(f"{path.name} left on disk for the next vault sync", err.getvalue())
+        # untracked under Worker/ — exactly what sync_vault_state's `add -A
+        # Worker` commits on its next tick
+        self.assertIn("?? Worker/agents/x/",
+                      _git(self.hostA, "status", "--porcelain").stdout)
+        self.assertFalse(self._on_origin(path))
 
 
 if __name__ == "__main__":
