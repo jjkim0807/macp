@@ -27,8 +27,8 @@ from .. import i18n, kakao_format, not_before as _nb, paths
 from ..vault_git_lock import vault_git_lock
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
-    ACCEPTED, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS, REJECTED,
-    Assignment, Ledger,
+    ACCEPTED, AWAITING_HUMAN, BATCH_READY, DISPATCHED, DONE, FAILED, IN_PROGRESS,
+    REJECTED, Assignment, Ledger, is_batch_return_pending,
 )
 from .lease import Lease
 
@@ -151,6 +151,13 @@ _CLOSED_UNMERGED = "closed-unmerged-alerted"
 # the task. Like the two parks above it is benign (not a defect), so it is NOT in
 # FAILURE_ALERT_KINDS. Mirrors rescope.ALERT_RESCOPE_PENDING (wire format).
 ALERT_RESCOPE_PENDING = "rescope-pending"
+# ALERT_BATCH_GATE_FAILED: the repo's shared full gate failed for a batch of
+# quick-verified tasks (batch verify, batch_gate.py) and each was sent back to an
+# individual full verify. Wired by the integration-gate leaf, which runs that
+# gate; declared here with the other framings because the string is wire format.
+# Not in FAILURE_ALERT_KINDS: which task broke the batch is not known yet, so a
+# benign close of one of them is not a false alarm.
+ALERT_BATCH_GATE_FAILED = "batch-gate-failed"
 FAILURE_ALERT_KINDS = frozenset({ALERT_FAILURE_SUSPECTED, ALERT_QUARANTINE})
 
 # The same task re-parking on the same gate re-fires _notify_review every time
@@ -759,6 +766,15 @@ class Orchestrator:
             return None
         if g.kind in ("poll", "capacity", "cooldown"):
             return None
+        # Batch verify: a row the batch gate sent back to an individual full
+        # verify carries `verify_full` (and the reason) on its payload. `task`
+        # was rebuilt from the task md, which knows nothing of that, so the marks
+        # are copied onto the new payload here — the new ledger row and the
+        # envelope are both built from it below — or the next run would be
+        # batched again. A new Task: the caller's object is left alone.
+        carry = self._batch_carry(existing)
+        if carry:
+            task = Task(task.slug, {**(task.payload or {}), **carry})
         agent, fallback = self._route_decision(task.slug, task.payload, existing)
         if agent is None:
             return None
@@ -815,6 +831,21 @@ class Orchestrator:
         self.ledger.save(a)
         return a
 
+    @staticmethod
+    def _batch_carry(existing: Assignment | None) -> dict:
+        """The batch-return marks (batch_gate.CARRY_KEYS) on a task's previous
+        ledger row, for dispatch() to copy onto the next payload. `{}` when there
+        is no row, the row has none, or anything about it is unreadable — a
+        dispatch must never fail over a mark."""
+        try:
+            from . import batch_gate
+            payload = getattr(existing, "payload", None)
+            if not isinstance(payload, dict):
+                return {}
+            return {k: payload[k] for k in batch_gate.CARRY_KEYS if k in payload}
+        except Exception:  # noqa: BLE001 - fail-open: dispatch as before
+            return {}
+
     def _task_md_closed(self, task: Task) -> str | None:
         """The closed status (done/cancelled/canceled) the payload's own task md
         states, else None. Every send passes dispatch(), including callers that
@@ -866,7 +897,10 @@ class Orchestrator:
             # is no evidence about the task at all. Counting that as a failure
             # would let a busy sibling quarantine a perfectly healthy task.
             checkout_busy = getattr(existing, "checkout_busy", False)
-            deferred = job_running or checkout_busy
+            # Ditto a row the batch gate sent back to an individual full verify:
+            # its run PASSED the quick verify, so nothing failed. It waits the
+            # flat poll interval and re-dispatches with no refail and no poison.
+            deferred = job_running or checkout_busy or is_batch_return_pending(existing)
             if not (capacity or deferred) \
                     and existing.refail_count >= self.poison_threshold \
                     and not existing.kind.startswith("human"):
@@ -1284,6 +1318,14 @@ class Orchestrator:
                                             if (msg.payload or {}).get("timed_out") else 0)
                     if msg.type == m.NEEDS_INPUT:
                         a.state = AWAITING_HUMAN  # AI asked for a human decision
+                    elif msg.type == m.RESULT and self._batch_result(a, msg):
+                        # Batch verify: the row is now batch_ready (waiting for the
+                        # integration gate) or was sent back to an individual full
+                        # verify. Neither needs a person, so nothing is alerted and
+                        # the review park below is skipped. A RESULT that carries
+                        # no batch key — or one that cannot be honoured — answers
+                        # False and falls through to that park unchanged.
+                        pass
                     elif msg.type == m.RESULT:
                         if (msg.payload or {}).get("review_required"):
                             a.state = AWAITING_HUMAN      # PR opened, not merged —
@@ -1370,6 +1412,44 @@ class Orchestrator:
                           f"(expected {a.corr_id}, got {msg.corr_id})")
             self.mb.ack(m.ORCHESTRATOR, msg)
         return updated
+
+    def _batch_result(self, a: Assignment, msg: m.Envelope) -> bool:
+        """Apply a batch-verified run's RESULT to its ledger row. True if it did.
+
+        The runner marks such a RESULT one of two ways (batch_gate.RESULT_*):
+
+        * `batch_ready` — the quick verify passed and a ready PR is open. The row
+          moves to BATCH_READY with the PR and the judged sha, and waits for the
+          repo's integration gate. If the RESULT lacks a PR url, a repo or the
+          sha, the row is left alone and this answers False.
+        * `batch_return` — the run cannot wait for the gate (reason given). The
+          row goes back to the queue as a deferral: FAILED + `batch-returned`,
+          `verify_full` on its payload, no refail.
+
+        collect() calls this for RESULT replies only, after apply_reply moved the
+        row to DONE; a True answer overwrites that state before the row is saved.
+        False — no batch key, an incomplete one, or any error — leaves the reply
+        to the ordinary RESULT handling: the runner also set `review_required`,
+        so the PR parks for a human instead of the task closing unmerged."""
+        try:
+            from . import batch_gate
+            payload = msg.payload or {}
+            if payload.get(batch_gate.RESULT_READY):
+                if not batch_gate.mark_ready(a, payload, now_iso=m.now_iso()):
+                    return False
+                print(f"[orchestrator] {a.task_id}: batch_ready — quick verify passed, "
+                      "waiting for the integration gate")
+                return True
+            reason = payload.get(batch_gate.RESULT_RETURN)
+            if reason:
+                batch_gate.mark_returned(a, str(reason), now_iso=m.now_iso())
+                print(f"[orchestrator] {a.task_id}: batch return ({reason}) — "
+                      "re-dispatching for an individual full verify")
+                return True
+        except Exception as e:  # noqa: BLE001 - fall back to the review park
+            print(f"[orchestrator] {getattr(a, 'task_id', '?')}: batch result not "
+                  f"applied ({type(e).__name__}) — handled as an ordinary RESULT")
+        return False
 
     def _no_pr_artifact_hint(self, a: Assignment, p: dict) -> str:
         """Point at the artifact this run actually produced. The payload's
@@ -3310,6 +3390,88 @@ class Orchestrator:
             print(f"[orchestrator] rescope sweep skipped (fail-open): {e}")
             return []
 
+    def reconcile_batch_gate(self, now: float | None = None) -> dict:
+        """Tend the rows waiting for a repo's integration gate (BATCH_READY).
+
+        Batch verify (batch_gate.py) parks a quick-verified run's PR here until
+        the repo's full gate has run once for several tasks. This is the
+        SAFETY-NET half of that sweep: building the integration branch, running
+        the gate and merging are the integration-gate leaf's and not here yet, so
+        `started` and `merged` are always empty. What this guarantees meanwhile is
+        that no row waits forever. Per row, first match wins:
+
+          1. the task md is already closed (a human merged and closed it) → the
+             row is tidied to DONE, the same close reconcile_split_parents does;
+          2. the repo no longer has a batch gate (config removed or switched off)
+             → back to an individual full verify (`not-enabled`);
+          3. the row has waited EXPIRE_S since it became ready, or its ready time
+             cannot be read → back to a full verify (`expired`) with ONE digest
+             alert (event key `batch-expired:<slug>`).
+
+        A sent-back row is a deferral, not a failure (batch_gate.mark_returned):
+        FAILED + `batch-returned`, re-dispatched after the flat poll cooldown with
+        `verify_full` on its payload and no refail.
+
+        Returns {"started", "merged", "returned", "closed"} — lists of slugs.
+        Runs on EVERY tick, so with no BATCH_READY row (every host until a vault
+        registers a repo) it does nothing beyond reading the ledger: no config
+        read, no output. Never raises into tick(): per-row isolation plus an
+        outer net, like the other sweeps."""
+        out: dict = {"started": [], "merged": [], "returned": [], "closed": []}
+        try:
+            rows = [a for a in self.ledger.all() if a.state == BATCH_READY]
+            if not rows:
+                return out
+            from . import batch_gate
+            now = now if now is not None else dt.datetime.now().timestamp()
+            # ledger.root is Worker/assignments -> the vault root is two up.
+            # Read through the module attribute: that is the seam the test suite
+            # guards against a live vault's config.
+            cfg = batch_gate.load_config(Path(self.ledger.root).parent.parent)
+            skips = _SkipTally("reconcile_batch_gate")
+            for a in rows:
+                try:
+                    payload = a.payload if isinstance(a.payload, dict) else {}
+                    if self._task_md_closed(Task(a.task_id, payload)):
+                        self._close_split_parent_row(
+                            a, "reconciled: todo already closed — ledger tidied",
+                            "reconciled-ledger-tidy")
+                        out["closed"].append(a.task_id)
+                        print(f"[orchestrator] batch gate: {a.task_id} closed — "
+                              "todo already closed")
+                        continue
+                    reason = None
+                    if batch_gate.repo_gate(cfg, payload.get("repo")) is None:
+                        reason = batch_gate.RETURN_NOT_ENABLED
+                    else:
+                        record = payload.get(batch_gate.KEY_BATCH)
+                        ready_ts = record.get("ready_ts") if isinstance(record, dict) else None
+                        if now - _parse_ts(ready_ts) >= batch_gate.EXPIRE_S:
+                            reason = batch_gate.RETURN_EXPIRED
+                    if reason is None:
+                        continue                 # still waiting for its gate
+                    batch_gate.mark_returned(a, reason, now_iso=m.now_iso())
+                    self.ledger.save(a)
+                    out["returned"].append(a.task_id)
+                    print(f"[orchestrator] batch gate: {a.task_id} returned to an "
+                          f"individual full verify ({reason})")
+                    if reason == batch_gate.RETURN_EXPIRED:
+                        # Digest, not immediate: the task re-dispatches by itself,
+                        # so there is nothing for a person to do. The per-slug
+                        # event key keeps it to one notice per task.
+                        self._notify_routed(
+                            f"⌛ 묶음 검증 대기 만료: {self._task_title(a.task_id)} — "
+                            f"{batch_gate.EXPIRE_S // 3600}시간 안에 통합 게이트가 돌지 "
+                            "않아 개별 전체 Verify로 되돌렸습니다",
+                            None, level=kakao_format.LEVEL_DIGEST,
+                            event_key=f"batch-expired:{a.task_id}")
+                except Exception as e:  # noqa: BLE001 — per-row isolation
+                    skips.record(getattr(a, "task_id", "?") or "?", e)
+            skips.flush()
+        except Exception as e:  # noqa: BLE001 — never raise into tick()
+            print(f"[orchestrator] batch gate sweep skipped (fail-open): {e}")
+        return out
+
     def reconcile_merge_holds(self) -> list[str]:
         """Release UI-unseen auto-merge holds whose device check has since passed
         for the held sha (macp#131). Returns the slugs it released. Fail-open.
@@ -3454,6 +3616,11 @@ class Orchestrator:
         # hand-split parent once its children are all done and tidies the parked
         # ledger row; fail-open, never raises into the tick.
         split_parents = self.reconcile_split_parents()
+        # AFTER collect, so a RESULT that just made a row batch_ready is seen in
+        # the same tick, and BEFORE reconcile_merged, so a row this sweep tidies
+        # to DONE is skipped by that sweep's state guard (no double close). With
+        # no batch_ready row it only reads the ledger. Fail-open; never raises.
+        batch_gate_res = self.reconcile_batch_gate(now)  # quick-verified PRs -> gate / back to full verify
         # BEFORE reconcile_merged (same reason as reconcile_split_parents): a
         # released UI-merge hold marks its row DONE, so reconcile_merged's state
         # guard then skips it (no double close). Fail-open; never raises into tick.
@@ -3479,6 +3646,7 @@ class Orchestrator:
                 "resumed": resumed,
                 "rescoped": rescoped,
                 "split_parents": split_parents,
+                "batch_gate": batch_gate_res,
                 "merge_released": merge_released,
                 "parents": parents,
                 "human_ready": human_ready,
