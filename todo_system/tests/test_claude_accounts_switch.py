@@ -628,6 +628,71 @@ def test_active_401_marks_auth(iso, monkeypatch):
     assert not iso.state.exists()
 
 
+@pytest.mark.real_usage_fetch
+def test_stale_interactive_401_retries_with_automation_token(iso, monkeypatch):
+    """Through ug.check with the REAL _fetch_usage: the interactive credential
+    401s but the account's automation token (what stages use) works → usage is
+    read with it and the account is NOT marked unavailable (2026-11-17 MacBook)."""
+    from todo_system import usage_guard as ug
+
+    _ug_profile(iso, monkeypatch)
+    calls = []
+
+    def fake_request(token):
+        calls.append(token)
+        if token == "stale-interactive":
+            raise urllib.error.HTTPError(ug.USAGE_URL, 401, "Unauthorized", {}, None)
+        return _usage()
+
+    monkeypatch.setattr(ug, "_read_token", lambda: "stale-interactive")
+    monkeypatch.setattr(ug, "_automation_token", lambda: "automation-ok")
+    monkeypatch.setattr(ug, "_request_usage", fake_request)
+    d = ug.check(force=True, now=NOW)
+    assert d["allowed"] is True and "paused" not in d
+    assert calls == ["stale-interactive", "automation-ok"]
+    assert not iso.state.exists()                      # nothing marked
+    assert _ug_state(iso)["error"] is None
+
+    # the automation token 401s too → a real lost login: marked, as before
+    calls.clear()
+    monkeypatch.setattr(ug, "_automation_token", lambda: "automation-dead")
+    monkeypatch.setattr(ug, "_request_usage", lambda t: (_ for _ in ()).throw(
+        urllib.error.HTTPError(ug.USAGE_URL, 401, "Unauthorized", {}, None)))
+    ug.check(force=True, now=NOW + 1)
+    assert _state(iso)["unavailable"]["school"]["reason"] == "auth"
+
+
+@pytest.mark.real_usage_fetch
+def test_fetch_usage_fallback_only_on_401_with_a_different_token(monkeypatch):
+    from todo_system import usage_guard as ug
+
+    def req(token):
+        if token == "a":
+            raise err
+        return {"ok": token}
+
+    monkeypatch.setattr(ug, "_read_token", lambda: "a")
+    monkeypatch.setattr(ug, "_request_usage", req)
+    # 429 on the primary: no retry, the 429 propagates
+    err = urllib.error.HTTPError(ug.USAGE_URL, 429, "Too Many", {}, None)
+    monkeypatch.setattr(ug, "_automation_token", lambda: "b")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        ug._fetch_usage()
+    assert e.value.code == 429
+    # 401 and no automation token → the 401 propagates
+    err = urllib.error.HTTPError(ug.USAGE_URL, 401, "Unauthorized", {}, None)
+    monkeypatch.setattr(ug, "_automation_token", lambda: None)
+    with pytest.raises(urllib.error.HTTPError):
+        ug._fetch_usage()
+    # 401 and the automation token IS the primary token → no pointless retry
+    monkeypatch.setattr(ug, "_automation_token", lambda: "a")
+    with pytest.raises(urllib.error.HTTPError):
+        ug._fetch_usage()
+    # 401 and a different automation token → its usage
+    monkeypatch.setattr(ug, "_automation_token", lambda: "b")
+    assert ug._fetch_usage() == {"ok": "b"}
+
+
 def test_refresh_inactive_accounts_ttl_lock_backoff(iso, monkeypatch):
     fcntl = pytest.importorskip("fcntl")
     from todo_system import usage_guard as ug

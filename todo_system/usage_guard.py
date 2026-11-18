@@ -247,8 +247,33 @@ def _read_token_from(path: Path, keychain: bool) -> str | None:
 
 def _fetch_usage() -> dict:
     """One GET against the oauth usage endpoint as the active account. Raises
-    on any failure. The no-argument seam every caller and test patches."""
-    return _request_usage(_read_token())
+    on any failure. The no-argument seam every caller and test patches.
+
+    A 401 on the interactive credential (Keychain / `.credentials.json`) is
+    retried ONCE with the account's automation token, when there is one and it
+    differs: stages authenticate with that token (claude_auth.claude_env), so a
+    stale interactive login must not lock the account. Seen 2026-11-17 on a
+    remote MacBook runner: its Keychain token went stale (401) while the
+    automation token was valid, and the sticky auth mark paused all its work.
+    The retry's own failure is what propagates (a 401 there still marks)."""
+    try:
+        return _request_usage(_read_token())
+    except Exception as exc:
+        if not _is_http_401(exc):
+            raise
+        alt = _automation_token()
+        if not alt or alt == _read_token():
+            raise
+        return _request_usage(alt)
+
+
+def _automation_token() -> str | None:
+    """The active account's automation token (claude_auth), or None. Never raises."""
+    try:
+        from . import claude_auth
+        return claude_auth.read_automation_token(strict=False)
+    except Exception:
+        return None
 
 
 def _fetch_usage_for(acct) -> dict:
