@@ -541,6 +541,12 @@ def _eval_window(name: str, info: dict | None, window_s: float,
     elapsed_pct = 100.0 * (1.0 - remaining / window_s)
     out.update({"utilization": util, "resets_at": resets_at,
                 "elapsed_pct": round(elapsed_pct, 1)})
+    if resets:
+        # A full limit reset queued for auto-claim zeroes this window, so run on
+        # to the wall cap (98) instead of discarding the last ~10% (2026-11-18).
+        from . import usage_resets as _ur
+        hard_cap = _ur.effective_weekly_cap(hard_cap, resets, resets_at, now)
+        out["hard_cap"] = hard_cap
     if util >= hard_cap:
         until, why = resets_at, "until reset"
         if resets and resets.get("autoclaim"):
@@ -649,7 +655,7 @@ def hold_kind(decision: dict | None) -> str | None:
                 kinds.add("hard_cap")
             elif name not in ("session", "weekly") or util is None:
                 kinds.add("unknown")
-            elif float(util) >= cfg[f"{name}_hard_cap"]:
+            elif float(util) >= float(w.get("hard_cap") or cfg[f"{name}_hard_cap"]):
                 kinds.add("hard_cap")
             else:
                 kinds.add("pace")
@@ -679,7 +685,7 @@ def window_slack(w: dict, cfg: dict | None = None) -> float | None:
     base = w.get("pace_line")              # set when limit-reset grants widen the week
     if base is None:
         base = float(w["elapsed_pct"]) + cfg[f"{name}_allowance"]
-    line = min(float(base), cfg[f"{name}_hard_cap"])
+    line = min(float(base), float(w.get("hard_cap") or cfg[f"{name}_hard_cap"]))
     return max(line - float(w["utilization"]), 0.0)
 
 
