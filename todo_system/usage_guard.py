@@ -156,6 +156,12 @@ def _cfg() -> dict:
         # unused (2026-10-12); its own pace/hard-cap gate already stops runaway
         # use, so the step only needs to taper fan-out near that line.
         "session_parallel_step": f("USAGE_GUARD_SESSION_PARALLEL_STEP", 8.0),
+        # In-flight brake (2026-11-18): the gates above only stop NEW runs, so 2–3
+        # heavy runs already in flight rode a 5h window from 58% to 100% after
+        # the hold. At this session utilization an in-flight run does not START
+        # its next Claude stage (runner `_wait_for_session_headroom`); the 20pp
+        # left covers stages already running plus the human. 0 disables.
+        "session_stage_cap": f("USAGE_GUARD_SESSION_STAGE_CAP", 80.0),
         "weekly_parallel_step": f("USAGE_GUARD_WEEKLY_PARALLEL_STEP", 5.0),
         # Opt-in minimum-progress mode (orchestrator `_min_progress_dispatch`):
         # during a *pace* hold with nothing live, still dispatch the single top
@@ -164,6 +170,45 @@ def _cfg() -> dict:
         "min_progress": os.environ.get("USAGE_GUARD_MIN_PROGRESS", "0").strip().lower()
                         in ("1", "true", "yes", "on"),
     }
+
+
+def session_admission_cap(cfg: dict | None = None) -> float:
+    """The session cap NEW runs are admitted under: the hard cap, lowered to the
+    in-flight stage cap when that is on — a run admitted above the stage cap
+    would only park before its first stage. Pure."""
+    cfg = cfg or _cfg()
+    stage_cap = cfg.get("session_stage_cap") or 0
+    return min(cfg["session_hard_cap"], stage_cap) if stage_cap > 0 else cfg["session_hard_cap"]
+
+
+def stage_gate(decision: dict | None = None, now: float | None = None) -> tuple[str, float] | None:
+    """(reason, until) when an in-flight run should NOT start its next Claude
+    stage, else None.
+
+    Only the 5h session window: its utilization at/over `session_stage_cap`
+    (default 80) holds the next stage until that window resets (≤ 5h, so a
+    waiting run never sits for days). The weekly window keeps the existing
+    admission gate only. `decision` defaults to `check()`. Never raises —
+    any doubt answers None (proceed), the guard's fail-open rule."""
+    try:
+        cfg = _cfg()
+        cap = cfg["session_stage_cap"]
+        if cap <= 0:
+            return None
+        now = time.time() if now is None else now
+        d = decision if decision is not None else check()
+        for w in d.get("windows") or []:
+            if w.get("name") != "session":
+                continue
+            util, resets_at = w.get("utilization"), w.get("resets_at")
+            if util is None or resets_at is None or float(resets_at) <= now:
+                return None
+            if float(util) >= cap:
+                return (f"session {float(util):.0f}% >= stage cap {cap:.0f}%",
+                        float(resets_at))
+        return None
+    except Exception:
+        return None
 
 
 def min_progress_enabled() -> bool:
@@ -628,7 +673,7 @@ def evaluate(usage: dict, now: float | None = None, resets: dict | None = None) 
     cfg = _cfg()
     windows = [
         _eval_window("session", usage.get("five_hour"), SESSION_WINDOW_S,
-                     cfg["session_hard_cap"], cfg["session_allowance"], now),
+                     session_admission_cap(cfg), cfg["session_allowance"], now),
         _eval_window("weekly", usage.get("seven_day"), WEEKLY_WINDOW_S,
                      cfg["weekly_hard_cap"], cfg["weekly_allowance"], now,
                      resets=resets),
@@ -680,7 +725,9 @@ def hold_kind(decision: dict | None) -> str | None:
                 kinds.add("hard_cap")
             elif name not in ("session", "weekly") or util is None:
                 kinds.add("unknown")
-            elif float(util) >= float(w.get("hard_cap") or cfg[f"{name}_hard_cap"]):
+            elif float(util) >= float(w.get("hard_cap") or (
+                    session_admission_cap(cfg) if name == "session"
+                    else cfg[f"{name}_hard_cap"])):
                 kinds.add("hard_cap")
             else:
                 kinds.add("pace")
@@ -710,7 +757,9 @@ def window_slack(w: dict, cfg: dict | None = None) -> float | None:
     base = w.get("pace_line")              # set when limit-reset grants widen the week
     if base is None:
         base = float(w["elapsed_pct"]) + cfg[f"{name}_allowance"]
-    line = min(float(base), float(w.get("hard_cap") or cfg[f"{name}_hard_cap"]))
+    cap = w.get("hard_cap") or (session_admission_cap(cfg) if name == "session"
+                                else cfg[f"{name}_hard_cap"])
+    line = min(float(base), float(cap))
     return max(line - float(w["utilization"]), 0.0)
 
 

@@ -1266,6 +1266,15 @@ class StagedExecutor(ClaudeCodeExecutor):
                         {"branch": branch, "run_dir": str(run_dir), "stages": completed,
                          "capability_gate": {"backend": backend.name,
                                              "stage": stage, "missing": missing_caps}})
+                if backend is claude_backend and not _wait_for_session_headroom(
+                        stage, payload, progress):
+                    cancelled = True
+                    progress(f"cancelled by orchestrator while paused before stage "
+                             f"{stage} — stopping, nothing pushed")
+                    return ExecOutcome(
+                        False, "cancelled by orchestrator (rerouted) — not pushed",
+                        {"cancelled": True, "branch": branch, "run_dir": str(run_dir),
+                         "stages": completed, "repo": repo_url})
                 if backend is solar_backend:
                     # Solar (upstage) single-stage path — an in-engine read/write/
                     # finish tool loop, NOT `claude -p`. No argv, no subprocess, no
@@ -1945,6 +1954,61 @@ def _cancel_requested_now() -> bool:
         return bool(check())
     except Exception:
         return False
+
+
+# In-flight brake (2026-11-18): before an in-flight run starts its next Claude
+# stage, wait while the 5h session window is at/over the stage cap
+# (usage_guard.stage_gate). The admission gates only stop NEW runs; runs already
+# in flight used to ride the window to 100%.
+STAGE_GATE_ENV = "RUNNER_STAGE_USAGE_GATE"          # "0" disables
+STAGE_GATE_POLL_S = 60.0
+STAGE_GATE_PROGRESS_S = 600.0                        # < the stale-reap bound
+STAGE_GATE_MAX_S = 5.5 * 3600                        # one 5h window + slack
+
+
+def _wait_for_session_headroom(stage: str, payload: dict, progress, *, gate=None,
+                               sleep=time.sleep, clock=time.time) -> bool:
+    """Block before `stage` while the session window is at its stage cap.
+    Returns False when the orchestrator cancelled the run during the wait (the
+    caller stops at this boundary), else True (go). `bypass_guard: true` tasks
+    and RUNNER_STAGE_USAGE_GATE=0 never wait. Emits a PROGRESS line every
+    STAGE_GATE_PROGRESS_S so the waiting run is not reaped as stale. Bounded by
+    STAGE_GATE_MAX_S and by the window's own reset; never raises."""
+    try:
+        if os.environ.get(STAGE_GATE_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+            return True
+        if (payload or {}).get("bypass_guard"):
+            return True
+        if gate is None:
+            from todo_system import usage_guard
+            gate = usage_guard.stage_gate
+        start = clock()
+        last_note = None
+        while True:
+            hold = gate()
+            if not hold:
+                if last_note is not None:
+                    progress(f"usage: session headroom back — starting stage {stage}")
+                return True
+            reason, until = hold
+            now = clock()
+            if now - start >= STAGE_GATE_MAX_S or now >= until + 120:
+                progress(f"usage: still held before stage {stage} after "
+                         f"{int((now - start) // 60)} min ({reason}) — proceeding")
+                return True
+            if last_note is None or now - last_note >= STAGE_GATE_PROGRESS_S:
+                try:
+                    eta = dt.datetime.fromtimestamp(until).astimezone().strftime("%H:%M")
+                except (ValueError, OverflowError, OSError):
+                    eta = "?"
+                progress(f"usage: pausing before stage {stage} — {reason}; "
+                         f"resumes after the 5h window resets (~{eta})")
+                last_note = now
+            if _cancel_requested_now():
+                return False
+            sleep(STAGE_GATE_POLL_S)
+    except Exception:
+        return True
 
 
 def _busy_heartbeat_interval() -> float:
