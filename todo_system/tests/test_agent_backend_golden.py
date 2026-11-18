@@ -239,3 +239,81 @@ def test_mcp_config_json_names_server_and_run_id_owner(monkeypatch, tmp_path):
     srv = cfg["mcpServers"][stages.BROWSER_MCP_SERVER_NAME]
     assert srv["env"][stages.BROWSER_OWNER_ENV] == "RID"
     assert srv["args"] and srv["args"][0].endswith("server.mjs")
+
+
+# ---------------------------------------------------------------------------
+# Batch verify (batch_mode / batch_hint): two metadata lines, nothing else.
+# ---------------------------------------------------------------------------
+
+_BATCH_STAGES = _STAGES + ("report",)
+_QUICK_MARK = "Verify mode: QUICK"
+_BATCH_MARK = "**Batch gate**"
+_HINT = "HINT-SENTINEL"
+
+
+@pytest.mark.parametrize("stage", _BATCH_STAGES)
+def test_default_prompt_has_no_batch_lines(monkeypatch, tmp_path, stage):
+    # Every run that is not batch-verified: neither line, in any stage.
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv(stage, wr)[2]
+    assert _QUICK_MARK not in full
+    assert _BATCH_MARK not in full
+
+
+@pytest.mark.parametrize("stage", _BATCH_STAGES)
+def test_batch_mode_touches_only_the_verify_and_report_prompts(monkeypatch, tmp_path, stage):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    plain = _argv(stage, wr)
+    batched = _argv(stage, wr, batch_mode=stages.BATCH_QUICK, batch_hint=_HINT)
+    if stage == "verify":
+        assert _QUICK_MARK in batched[2]
+        assert _HINT in batched[2]
+        assert _BATCH_MARK not in batched[2]
+        assert "origin/<default>...worker/slug" in batched[2]      # this run's branch
+    elif stage == "report":
+        assert _BATCH_MARK in batched[2]
+        assert _QUICK_MARK not in batched[2]
+        assert _HINT not in batched[2]         # the hint belongs to verify only
+    else:
+        assert batched[2] == plain[2]          # byte-identical prompt
+    # the flag skeleton never moves: the mode only ever adds prompt text
+    assert _normalise(batched) == _normalise(plain)
+
+
+@pytest.mark.parametrize("stage", ("verify", "report"))
+def test_batch_line_is_added_inside_the_metadata_block(monkeypatch, tmp_path, stage):
+    # Appended to the run metadata, so the stage prompt itself passes through
+    # verbatim and the line outranks it (it comes later).
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    plain = _argv(stage, wr)[2]
+    batched = _argv(stage, wr, batch_mode=stages.BATCH_QUICK)[2]
+    head = "# Run metadata (injected by orchestrator)"
+    assert batched.startswith(plain)           # no context/retry block here: pure append
+    assert batched.index(head) < batched.index(
+        _QUICK_MARK if stage == "verify" else _BATCH_MARK)
+    assert batched.endswith("\n")
+
+
+def test_batch_line_comes_before_project_memory(monkeypatch, tmp_path):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv("verify", wr, batch_mode=stages.BATCH_QUICK,
+                 project_context="PROJECT-MEMORY-SENTINEL")[2]
+    assert full.index(_QUICK_MARK) < full.index("PROJECT-MEMORY-SENTINEL")
+
+
+def test_verify_line_without_a_hint_ends_at_its_own_sentence(monkeypatch, tmp_path):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv("verify", wr, batch_mode=stages.BATCH_QUICK)[2]
+    assert full.endswith("Write `confidence: medium` at most.\n")
+
+
+@pytest.mark.parametrize("stage", _BATCH_STAGES)
+def test_hint_without_a_mode_is_ignored(monkeypatch, tmp_path, stage):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    assert _argv(stage, wr, batch_mode=None, batch_hint=_HINT)[2] == _argv(stage, wr)[2]
+
+
+@pytest.mark.parametrize("stage", ("verify", "report"))
+def test_an_unknown_batch_mode_adds_nothing(monkeypatch, tmp_path, stage):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    assert _argv(stage, wr, batch_mode="full", batch_hint=_HINT)[2] == _argv(stage, wr)[2]

@@ -145,6 +145,18 @@ on a test, class or method. Limits: a spawned process sees only the env
 redirect, not the fetch or git block, and a test that reloads either module
 (``importlib.reload``) gets the real functions back for the rest of that test.
 
+The batch-gate config (``orchestrator/batch_gate.py``) — every
+``StagedExecutor._execute`` reads ``<vault>/.macp/batch_gate.json`` to decide
+whether the run verifies in QUICK mode, and the orchestrator's sweep reads it
+for waiting rows. A worker stage tests a worktree with ``MACP_VAULT_ROOT`` naming
+the live vault, so once that vault registers a repo, an ``_execute`` test whose
+fake repo happens to share its name would take the batch path.
+``_batch_gate_config_isolated`` wraps ``batch_gate.load_config``: a call for a
+real root (the vault, this checkout) answers ``{}``, a call for any other root —
+a test's own tmp vault — runs the real function. It works only because
+production reads the config as ``batch_gate.load_config(...)``, through the
+module attribute; ``from .batch_gate import load_config`` would bypass it.
+
 Two shared, non-autouse fixtures live here too, so both suites see one copy:
 ``combined_layout`` (a throwaway engine checkout that is also the vault) and
 ``install_engine_at`` (points ``paths.__file__`` into such a tree).
@@ -174,7 +186,15 @@ from todo_system import (
     usage_guard,
     worker,
 )
-from todo_system.orchestrator import disk_guard, human, mailbox, metrics, worktree_sweep
+from todo_system.orchestrator import (
+    batch_gate,
+    disk_guard,
+    human,
+    mailbox,
+    metrics,
+    stages,
+    worktree_sweep,
+)
 from todo_system.orchestrator import orchestrator as _orch_mod
 
 # (module, attribute) of every real runtime file a test is known to reach. Read
@@ -402,6 +422,12 @@ _REAL_UG_STATE_PATH = usage_guard._state_path
 _REAL_UG_STATE_DIR = os.path.realpath(usage_guard.ROOT / "Worker" / "_state" / "usage_guard")
 _REAL_PULL_MAIN = _orch_mod._pull_main
 _REAL_CHECK_DIVERGENCE = _orch_mod._check_divergence
+# The batch-gate config reader and the roots whose config no test may read: the
+# vault each module resolved (MACP_VAULT_ROOT can name the live one) and this
+# checkout. Captured at import, like the seams above.
+_REAL_BATCH_LOAD_CONFIG = batch_gate.load_config
+_REAL_BATCH_ROOTS = frozenset(
+    os.path.realpath(root) for root in (stages._VAULT_DATA_ROOT, _REPO_ROOT, worker.ROOT))
 
 
 class RealUsageFetchBlocked(RuntimeError):
@@ -599,6 +625,22 @@ def _auto_side_effects_isolated(request, tmp_path_factory, monkeypatch):
         monkeypatch.setattr(_orch_mod, "_check_divergence", _guarded_check_divergence)
 
 
+@pytest.fixture(autouse=True)
+def _batch_gate_config_isolated(monkeypatch):
+    # See the module docstring. A real root answers {} (feature off); any other
+    # root, a test's own tmp vault included, reads through the real function.
+    def _guarded(vault_root, *args, **kwargs):
+        try:
+            real_root = os.path.realpath(vault_root) in _REAL_BATCH_ROOTS
+        except (TypeError, ValueError):
+            real_root = False               # not a path: the real reader answers {}
+        if real_root:
+            return {}
+        return _REAL_BATCH_LOAD_CONFIG(vault_root, *args, **kwargs)
+
+    monkeypatch.setattr(batch_gate, "load_config", _guarded)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _real_runtime_untouched():
     """Fail the run on any tripwire record, or on a real queue.lock / todo.db
@@ -655,6 +697,16 @@ def real_auto_side_effects():
         "ug_state_dir": _REAL_UG_STATE_DIR,
         "pull_main": _REAL_PULL_MAIN,
         "check_divergence": _REAL_CHECK_DIVERGENCE,
+    })
+
+
+@pytest.fixture
+def real_batch_gate_config():
+    """The unguarded batch-gate config reader and the real roots (realpaths) the
+    guard answers ``{}`` for."""
+    return types.MappingProxyType({
+        "load_config": _REAL_BATCH_LOAD_CONFIG,
+        "roots": _REAL_BATCH_ROOTS,
     })
 
 

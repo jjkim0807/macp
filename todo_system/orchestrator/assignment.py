@@ -23,6 +23,16 @@ FAILED = "failed"
 REJECTED = "rejected"
 AWAITING_HUMAN = "awaiting_human"   # human parked, or AI escalated for input
 NEEDS_INPUT = "needs_input"
+# The run passed a QUICK verify and opened a ready PR; the repo's full gate has
+# not run on it yet (batch verify, batch_gate.py). Deliberately in NONE of the
+# three groups the orchestration logic branches on:
+#   * not in TERMINAL — so Orchestrator._ledger_gate answers "busy" and the task
+#     is never dispatched again while it waits;
+#   * not in-flight (orchestrator._IN_FLIGHT) — it owns no checkout and the
+#     stale reaper must not fail it for being quiet;
+#   * not AWAITING_HUMAN — nobody owes an answer, so it is never re-nudged.
+# Lands in the git-tracked assignment JSON: treat the string as wire format.
+BATCH_READY = "batch_ready"
 
 TERMINAL = frozenset({DONE, FAILED, REJECTED})
 
@@ -31,8 +41,10 @@ TERMINAL = frozenset({DONE, FAILED, REJECTED})
 # started: a live sibling owned the checkout) or `job_running` (a detached
 # long_job is still going) is a wait, not a failure: the orchestrator already
 # treats it that way (no refail, flat poll cooldown, never poisons). A row a
-# scheduled resume just re-queued (is_resume_pending) is waiting too. Every
-# user-facing view must say so too, or a healthy task reads as broken.
+# scheduled resume just re-queued (is_resume_pending) is waiting too, and so is
+# one the batch gate sent back to an individual full verify
+# (is_batch_return_pending). Every user-facing view must say so too, or a
+# healthy task reads as broken.
 DEFERRED = "deferred"
 
 
@@ -61,14 +73,36 @@ def is_resume_pending(row) -> bool:
     return isinstance(last, dict) and last.get("type") == RESUMED_SCHEDULED
 
 
+# History type batch_gate.mark_returned leaves on a row it sends back to an
+# individual full verify. Wire format (git-tracked assignment JSON).
+BATCH_RETURNED = "batch-returned"
+
+
+def is_batch_return_pending(row) -> bool:
+    """True for a FAILED row the batch gate has just sent back to an individual
+    full verify (batch_gate.mark_returned). Same shape as is_resume_pending: the
+    row reuses FAILED so the ordinary re-dispatch path picks it up, and the last
+    history entry stays `batch-returned` until that dispatch replaces the row.
+    Nothing failed — the run passed its quick verify — so the orchestrator treats
+    the row as a deferral (no refail, flat poll cooldown, never poisons)."""
+    if _field(row, "state") != FAILED:
+        return False
+    history = _field(row, "history")
+    if not isinstance(history, list) or not history:
+        return False
+    last = history[-1]
+    return isinstance(last, dict) and last.get("type") == BATCH_RETURNED
+
+
 def is_deferred(row) -> bool:
     """True for a ledger row (Assignment or its JSON dict) that is only WAITING:
-    stored FAILED but flagged `checkout_busy` or `job_running`, or queued again
-    by a scheduled resume. Only FAILED — a REJECTED row is a real refusal, and
-    the runner never sets these flags on a REJECT."""
+    stored FAILED but flagged `checkout_busy` or `job_running`, queued again by
+    a scheduled resume, or sent back from the batch gate to an individual full
+    verify. Only FAILED — a REJECTED row is a real refusal, and the runner never
+    sets these flags on a REJECT."""
     return (_field(row, "state") == FAILED
             and bool(_field(row, "checkout_busy") or _field(row, "job_running")
-                     or is_resume_pending(row)))
+                     or is_resume_pending(row) or is_batch_return_pending(row)))
 
 
 def display_state(row) -> str:
