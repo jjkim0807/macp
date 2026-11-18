@@ -141,6 +141,11 @@ ALERT_UI_MERGE_HOLD = "ui-merge-hold"           # high-confidence app-UI change,
 # park-once guard, sibling to _MERGED_BUT_BLOCKED. Also wire format (git-tracked
 # assignment JSON): never re-spell it.
 _CLOSED_UNMERGED = "closed-unmerged-alerted"
+# Progress-Log suffix collect() leaves when it closes a task because the runner
+# found the worker branch's work already in the default branch (superseded.py,
+# reason `merged`). User-facing and written into git-tracked task markdown, like
+# the no-op close note: treat it as wire format.
+_SUPERSEDED_MD_NOTE = "superseded: 브랜치 변경이 이미 기본 브랜치에 반영됨"
 # ALERT_TIMEOUT_PARK is deliberately NOT in FAILURE_ALERT_KINDS: like ALERT_BLOCKED
 # it is a legitimate park (the task is too big for one stage, work is safe on
 # origin), not a suspected code defect, so reconcile_merged must not log a benign
@@ -1316,7 +1321,19 @@ class Orchestrator:
                     elif msg.type == m.FAIL:
                         a.timeout_streak = (a.timeout_streak + 1
                                             if (msg.payload or {}).get("timed_out") else 0)
-                    if msg.type == m.NEEDS_INPUT:
+                    sup = self._superseded_reason(a, msg)
+                    if sup:
+                        # The task is already over (its md was closed by a person,
+                        # or the runner found the branch's work in the default
+                        # branch): close the row quietly. No park, no alert, no
+                        # retry. Every branch below is untouched for any other
+                        # reply.
+                        try:
+                            self._close_superseded(a, sup)
+                        except Exception as e:  # noqa: BLE001 - never break collect
+                            print(f"[orchestrator] {a.task_id}: superseded close "
+                                  f"failed ({type(e).__name__}: {e})")
+                    elif msg.type == m.NEEDS_INPUT:
                         a.state = AWAITING_HUMAN  # AI asked for a human decision
                     elif msg.type == m.RESULT and self._batch_result(a, msg):
                         # Batch verify: the row is now batch_ready (waiting for the
@@ -1450,6 +1467,115 @@ class Orchestrator:
             print(f"[orchestrator] {getattr(a, 'task_id', '?')}: batch result not "
                   f"applied ({type(e).__name__}) — handled as an ordinary RESULT")
         return False
+
+    def _superseded_reason(self, a: Assignment, msg: m.Envelope) -> str:
+        """Why this reply's outcome is dropped without a park, an alert or a
+        retry (a superseded.REASON_*), else "".
+
+        Two ways to a reason:
+
+        * the runner said so. Its RESULT carries `superseded: <reason>`
+          (StagedExecutor._superseded_exit): it stopped at a stage boundary
+          because the task md was closed or the branch's work was already in
+          the default branch.
+        * this host's own md says the task is closed, and the reply is one of
+          the three that page a person: a `review_required` RESULT, a FAIL that
+          names a blocker ("선행 조건 미충족"), or a second consecutive stage
+          timeout. On 2026-11-18 two tasks that had already been merged and
+          closed by hand produced exactly the last two alerts.
+
+        The md is read ONLY for those three shapes. ACCEPT / PROGRESS, an
+        ordinary success and a plain FAIL never reach the read and take the
+        branches below untouched; a plain FAIL on a closed task is already
+        handled by `_retry`'s own guard (`retry-skipped-closed`). Git is never
+        probed here: collect() is on the 5-minute tick, and a row a remote
+        runner worked has no checkout on this host.
+
+        Fail-open: anything unreadable answers "" and the reply is routed
+        exactly as before. Human rows are never touched."""
+        try:
+            from . import superseded
+            if not superseded.enabled() or a.kind.startswith("human"):
+                return ""
+            p = msg.payload or {}
+            if msg.type == m.RESULT:
+                reported = superseded.normalize_reason(p.get(superseded.RESULT_KEY))
+                if reported:
+                    return reported
+                if not p.get("review_required"):
+                    return ""       # an ordinary success closes exactly as before
+            elif msg.type == m.FAIL:
+                if not (getattr(a, "blocked_on", "")
+                        or (a.timed_out and a.timeout_streak >= 2)):
+                    return ""       # plain failure: _retry's own closed-task guard
+            else:
+                return ""
+            # ledger.root is Worker/assignments -> the vault root is two up.
+            status = superseded.md_closed_status(
+                a.payload, Path(self.ledger.root).parent.parent)
+            return superseded.judge(status, None).reason
+        except Exception:  # noqa: BLE001 - fail-open: route the reply as before
+            return ""
+
+    def _close_superseded(self, a: Assignment, reason: str) -> None:
+        """Close the row of a superseded task, quietly. collect() saves it.
+
+        What happens to the task md depends on what THIS host reads in it:
+
+        * closed here: the md is left byte-for-byte alone. A person closed it,
+          so `cancelled` must not be rewritten to `done`, no box is ticked and
+          nothing fans out downstream. Only the ledger row moves to DONE, with
+          the closed bytes as close evidence (the `retry-skipped-closed` shape:
+          no open md can match them, so a later reopen is respected).
+        * not closed, reason `merged`: the runner measured the branch's work in
+          the default branch, so the task is closed the way reconcile_merged
+          closes a merged PR (`_close_with_evidence`), with a Progress-Log line
+          saying why.
+        * not closed, any other reason: the runner claims the md is closed and
+          this host does not see it (its copy of the vault is behind, or the
+          task was reopened in between). A task is never closed on hearsay:
+          the row goes back to FAILED and the ordinary re-dispatch path picks
+          it up, where dispatch() re-reads the md. Still no alert.
+
+        Every mutation of `a` sits after the last call that can raise, so an
+        exception here leaves the row as apply_reply left it."""
+        from . import superseded, tasks
+        vault_root = Path(self.ledger.root).parent.parent
+        closed = superseded.md_closed_status(a.payload, vault_root)
+        if not closed and reason != superseded.REASON_MERGED:
+            a.state = FAILED
+            a.updated_ts = m.now_iso()
+            a.last_note = ("superseded reported, but the task md is not closed "
+                           "here — requeued")
+            a.history.append({"ts": m.now_iso(), "type": superseded.HISTORY_UNCONFIRMED,
+                              "from": "orchestrator", "reason": reason})
+            print(f"[orchestrator] {a.task_id}: superseded ({reason}) reported, but "
+                  "the task md is not closed here — requeued, no alert")
+            return
+        if closed:
+            md = superseded.task_md_path(a.payload, vault_root)
+            if md is not None and md.stem == a.task_id:
+                fingerprint = tasks.md_fingerprint(a.task_id, items_dir=md.parent)
+            else:
+                fingerprint = tasks.md_fingerprint(a.task_id)
+            note = (f"superseded: task md already {closed} — run outcome dropped, "
+                    "no alert")
+        else:
+            fingerprint = None      # stamped by _close_with_evidence, before its write
+            self._close_with_evidence(a, note=_SUPERSEDED_MD_NOTE)
+            note = "superseded: branch work already merged — task closed"
+        if fingerprint is not None:
+            a.close_fingerprint = fingerprint
+        a.state = DONE
+        a.updated_ts = m.now_iso()
+        a.last_note = note[:200]
+        # Clear the deferral flags with the state, as reconcile_merged does: a
+        # row closed here gets no further runner reply that would reset them.
+        a.job_running = False
+        a.checkout_busy = False
+        a.history.append({"ts": m.now_iso(), "type": superseded.HISTORY_TYPE,
+                          "from": "orchestrator", "reason": reason})
+        print(f"[orchestrator] {a.task_id}: superseded ({reason}) — closed, no alert")
 
     def _no_pr_artifact_hint(self, a: Assignment, p: dict) -> str:
         """Point at the artifact this run actually produced. The payload's
