@@ -159,6 +159,16 @@ but only when every `acceptance_criteria` item maps to exactly one Phase by its 
 `§N` key (local-gate items go to every subtask). Anything less clear-cut, and any task
 with `auto_merge: false` or `human_gate: true`, stays parked for a person.
 
+A plan can also state its split itself, as one fenced `rescope` block in
+`implementation_plan.md`: for each subtask its slug, the Phases it covers, its
+acceptance criteria and its `touches`, and optionally a title, an outcome, a model tier
+and estimates. When the block is there the engine uses it as written — no `§N` keys
+needed — and never falls back to the heading-based split: a block it cannot use
+(invalid JSON, fewer than 2 or more than 5 subtasks, Phases not covered exactly once
+and in order, an unsafe slug or path) leaves the task parked for a person, and the
+same `auto_merge` / `human_gate` guards apply. Each subtask then gets its own
+`touches` and model tier instead of the parent's.
+
 ## Keeping the queue full
 
 When there is nothing dispatchable, the **planner** tick (`scripts/planner_tick.sh`,
