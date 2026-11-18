@@ -269,7 +269,7 @@ def pacing_inputs(usage: dict | None, now: float | None = None) -> dict | None:
     claimed = claimed_in_window(resets_at, state) if resets_at else 0
     if available <= 0 and claimed <= 0:
         return None
-    return {"available": available, "claimed": claimed}
+    return {"available": available, "claimed": claimed, "autoclaim": autoclaim_enabled()}
 
 
 def weekly_line(elapsed_pct: float, allowance: float, available: int, claimed: int) -> float:
@@ -277,6 +277,26 @@ def weekly_line(elapsed_pct: float, allowance: float, available: int, claimed: i
     (1 + available + claimed) windows of budget over the week. Pure."""
     mult = 1 + max(0, available) + max(0, claimed)
     return elapsed_pct * mult - 100.0 * max(0, claimed) + allowance
+
+
+def hard_cap_release_at(util: float, resets_at: float, window_s: float, allowance: float,
+                        available: int, claimed: int) -> float | None:
+    """When a weekly hard-cap hold is expected to lift through an auto-claimed
+    full reset, or None (no grant, or the claim would land too close to the
+    weekly reset to be made — `plan_claim` refuses inside CLAIM_MIN_HOURS_TO_RESET).
+
+    The claim happens once the widened pace line reaches `util`; the reset
+    brings the window back to ~0%, and dispatch resumes when the line with one
+    more grant claimed is back above 0 — that later point is the release. Pure."""
+    if available <= 0:
+        return None
+    mult = 1 + available + claimed
+    claim_pct = (util + 100.0 * claimed - allowance) / mult
+    claim_at = resets_at - window_s * (1.0 - claim_pct / 100.0)
+    if resets_at - claim_at < CLAIM_MIN_HOURS_TO_RESET * 3600.0:
+        return None
+    release_pct = (100.0 * (claimed + 1) - allowance) / mult
+    return max(claim_at, resets_at - window_s * (1.0 - release_pct / 100.0))
 
 
 # ---------------------------------------------------------------------------
