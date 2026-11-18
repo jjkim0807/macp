@@ -131,7 +131,7 @@ def test_plan_claim_model_grant_when_model_exhausted():
 def test_maybe_claim_records_and_counts_claimed(state_dir, monkeypatch):
     monkeypatch.setattr(U, "get_snapshot", lambda **kw: {})
     calls = []
-    usage = _usage(95.0, hours_to_reset=7 * 24 * 0.5)
+    usage = _usage(98.0, hours_to_reset=7 * 24 * 0.5)
     out = R.maybe_claim(usage, now=NOW, fetch=lambda: _st(FULL),
                         claim=lambda gid: calls.append(gid) or {
                             "result": "reset", "resets_left": 0,
@@ -211,7 +211,7 @@ def test_evaluate_hard_cap_eta_uses_autoclaimed_reset():
     now = 1_000_000_000.0
     W = 7 * 86400.0
     resets_at = now + W * 0.66            # elapsed 34%
-    usage = {"seven_day": {"utilization": 95.0, "resets_at": _iso(resets_at)},
+    usage = {"seven_day": {"utilization": 99.0, "resets_at": _iso(resets_at)},
              "five_hour": {"utilization": 2.0, "resets_at": _iso(now + 3600)}}
     plain = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0})
     assert plain["blocked_until"] == pytest.approx(resets_at, abs=1)   # no autoclaim -> reset
@@ -219,3 +219,49 @@ def test_evaluate_hard_cap_eta_uses_autoclaimed_reset():
     assert auto["blocked_until"] == pytest.approx(resets_at - W * 0.56, abs=1)
     assert "auto-claimed limit reset" in auto["reason"]
     assert "hard cap" in auto["reason"]   # hold kind classification keys on this
+
+
+# -- wall cap: use the window up to 98% before the claim (2026-11-18) ----------
+
+def test_wall_cap_raises_weekly_cap_only_with_a_claimable_grant():
+    from todo_system import usage_guard as G
+    now = 1_000_000_000.0
+    W = 7 * 86400.0
+    resets_at = now + W * 0.5            # elapsed 50%: widened line 112 > 95
+    usage = {"seven_day": {"utilization": 95.0, "resets_at": _iso(resets_at)},
+             "five_hour": {"utilization": 2.0, "resets_at": _iso(now + 3600)}}
+    on = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0, "autoclaim": True})
+    assert on["allowed"], on["reason"]
+    wk = [w for w in on["windows"] if w["name"] == "weekly"][0]
+    assert wk["hard_cap"] == 98.0
+    assert G.window_slack(wk) == pytest.approx(3.0)        # min(112, 98) - 95
+    off = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0})
+    assert not off["allowed"] and "hard cap 90%" in off["reason"]
+    none_left = G.evaluate(usage, now=now, resets={"available": 0, "claimed": 1, "autoclaim": True})
+    assert not none_left["allowed"]
+    at_wall = dict(usage, seven_day={"utilization": 98.0, "resets_at": _iso(resets_at)})
+    d = G.evaluate(at_wall, now=now, resets={"available": 1, "claimed": 0, "autoclaim": True})
+    assert not d["allowed"] and "hard cap 98%" in d["reason"]
+    assert G.hold_kind(d) == "hard_cap"
+
+
+def test_wall_cap_not_applied_when_claim_no_longer_allowed():
+    from todo_system import usage_guard as G
+    now = 1_000_000_000.0
+    usage = {"seven_day": {"utilization": 95.0, "resets_at": _iso(now + 3 * 3600)},
+             "five_hour": {"utilization": 2.0, "resets_at": _iso(now + 3600)}}
+    d = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0, "autoclaim": True})
+    assert not d["allowed"] and "hard cap 90%" in d["reason"]
+
+
+def test_claim_waits_for_the_wall_cap(state_dir, monkeypatch):
+    monkeypatch.setattr(U, "get_snapshot", lambda **kw: {})
+    calls = []
+    def claim(gid):
+        calls.append(gid)
+        return {"result": "reset", "resets_left": 0, "cleared": ["five_hour", "seven_day"]}
+    below = _usage(95.0, hours_to_reset=7 * 24 * 0.5)
+    assert R.maybe_claim(below, now=NOW, fetch=lambda: _st(FULL), claim=claim) is None
+    at_wall = _usage(98.0, hours_to_reset=7 * 24 * 0.5)
+    out = R.maybe_claim(at_wall, now=NOW, fetch=lambda: _st(FULL), claim=claim)
+    assert calls == ["full-reset-2611"] and out["result"] == "reset"
