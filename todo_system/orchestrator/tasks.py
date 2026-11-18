@@ -14,6 +14,7 @@ import sqlite3
 from pathlib import Path
 
 from .. import not_before as nb_gate
+from . import batch_gate
 from . import repos
 from .orchestrator import Task
 from .statuses import CLOSED_STATUSES as CLOSED_STATUSES
@@ -201,6 +202,14 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         signals = [k for k in ("emulator", "screen_check") if _fm_bool(fm.get(k))]
         if signals:
             payload["heavy_signals"] = signals
+        # Batch verify opt-in / opt-out (batch_gate.eligible, read by the runner's
+        # _batch_plan). Like `heavy` it carries both True and False — False is the
+        # explicit "always verify this one alone" — and is absent when the
+        # frontmatter does not say, so the tier decides and every other task
+        # keeps a byte-identical payload.
+        verify_batch = _fm_bool(fm.get(batch_gate.KEY_VERIFY_BATCH))
+        if verify_batch is not None:
+            payload[batch_gate.KEY_VERIFY_BATCH] = verify_batch
         if repos.task_bypass_guard_from_fm(fm):
             payload["bypass_guard"] = True   # run despite a cost hold; see tick()
         tools = repos.task_allowed_tools_from_fm(fm)

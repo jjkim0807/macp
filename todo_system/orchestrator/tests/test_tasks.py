@@ -207,6 +207,40 @@ class LoadDispatchableTest(unittest.TestCase):
         slugs = {t.slug for t in tasks.load_dispatchable(self.db)}
         self.assertIn("nostatus", slugs)
 
+    def test_verify_batch_reaches_payload_and_eligibility(self):
+        # A frontmatter field is dead unless it reaches the payload AND its
+        # consumer reads it there, so this goes md -> load_dispatchable ->
+        # batch_gate.eligible in one test. Every md names its tier so the result
+        # never leans on the classifier's default.
+        from todo_system.orchestrator import batch_gate, model_select
+
+        base = ('status: open\nworker_mode: auto\n'
+                'repo: "https://example.test/acme/batchrepo.git"\n')
+        self._insert_md("vb-heavy-on", base + "model_tier: heavy\nverify_batch: true")
+        self._insert_md("vb-standard-off", base + "model_tier: standard\nverify_batch: false")
+        self._insert_md("vb-light-unset", base + "model_tier: light")
+        self._insert_md("vb-heavy-unset", base + "model_tier: heavy")
+        by_slug = {t.slug: t.payload for t in tasks.load_dispatchable(self.db)}
+
+        # true and false both travel; an md that does not say adds no key at all
+        self.assertIs(by_slug["vb-heavy-on"]["verify_batch"], True)
+        self.assertIs(by_slug["vb-standard-off"]["verify_batch"], False)
+        self.assertNotIn("verify_batch", by_slug["vb-light-unset"])
+        self.assertNotIn("verify_batch", by_slug["vb-heavy-unset"])
+        self.assertNotIn("verify_batch", by_slug["t-auto"])     # no md at all
+
+        def batched(slug: str) -> bool:
+            payload = by_slug[slug]
+            ok, _why = batch_gate.eligible(
+                payload, tier=model_select.classify_tier(payload)[0],
+                gate={"full_gate": [["true"]]}, five_stage=True, auto_merge=True)
+            return ok
+
+        self.assertTrue(batched("vb-heavy-on"))        # opt-in beats the heavy tier
+        self.assertFalse(batched("vb-standard-off"))   # opt-out beats a batchable tier
+        self.assertTrue(batched("vb-light-unset"))     # the tier decides: light is in
+        self.assertFalse(batched("vb-heavy-unset"))    # the tier decides: heavy is out
+
 
 class MarkDoneTest(unittest.TestCase):
     """Closing a task must land in BOTH the markdown and todo.db.
