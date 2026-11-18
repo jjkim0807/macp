@@ -514,8 +514,8 @@ def test_parallel_slots_step_env_override(monkeypatch):
 def test_window_slack_matches_hand_computed_line():
     d = ug.evaluate(_usage(session_util=10.0, weekly_util=30.0), NOW)
     by_name = {w["name"]: w for w in d["windows"]}
-    # session: 1h left of 5h -> 80% elapsed; min(80 + 30, 90) = 90; 90 - 10 = 80
-    assert ug.window_slack(by_name["session"]) == pytest.approx(80.0)
+    # session: 1h left of 5h -> 80% elapsed; min(80 + 30, 80 stage cap) = 80; 80 - 10 = 70
+    assert ug.window_slack(by_name["session"]) == pytest.approx(70.0)
     # weekly: 3d left of 7d -> 57.1% elapsed; 57.1 + 12 = 69.1; 69.1 - 30 = 39.1
     assert ug.window_slack(by_name["weekly"]) == pytest.approx(39.1)
     # past the line -> floored at 0, never negative
@@ -690,3 +690,46 @@ def test_check_persists_release_eta(tmp_path, monkeypatch):
     state = json.loads((tmp_path / "latest.json").read_text())
     assert state["decision"]["release_eta"] == d["release_eta"]
     assert state["decision"]["release_eta"] == ug._iso_utc(d["blocked_until"])
+
+
+# ---------------------------------------------------------------------------
+# in-flight brake: session stage cap (2026-11-18 — 5h window ridden to 100%)
+# ---------------------------------------------------------------------------
+
+
+def _session_usage(util, now, resets_in=3600.0):
+    def iso(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat()
+    return {"five_hour": {"utilization": util, "resets_at": iso(now + resets_in)},
+            "seven_day": {"utilization": 10.0, "resets_at": iso(now + 3 * 86400)}}
+
+
+def test_session_line_is_the_stage_cap(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("USAGE_GUARD_"):
+            monkeypatch.delenv(k, raising=False)
+    now = 1_000_000_000.0
+    # 4h into the 5h window: pace line 80+30 -> the cap decides
+    d = ug.evaluate(_session_usage(81.0, now, resets_in=3600.0), now=now)
+    assert not d["allowed"] and "hard cap 80%" in d["reason"]
+    assert ug.hold_kind(d) == "hard_cap"
+    ok = ug.evaluate(_session_usage(75.0, now, resets_in=3600.0), now=now)
+    assert ok["allowed"]
+    s = [w for w in ok["windows"] if w["name"] == "session"][0]
+    assert ug.window_slack(s) == pytest.approx(5.0)
+    monkeypatch.setenv("USAGE_GUARD_SESSION_STAGE_CAP", "0")
+    assert ug.evaluate(_session_usage(81.0, now, resets_in=3600.0), now=now)["allowed"]
+
+
+def test_stage_gate_holds_until_session_reset(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("USAGE_GUARD_"):
+            monkeypatch.delenv(k, raising=False)
+    now = 1_000_000_000.0
+    held = ug.evaluate(_session_usage(85.0, now, resets_in=1800.0), now=now)
+    reason, until = ug.stage_gate(held, now=now)
+    assert "stage cap 80%" in reason and until == pytest.approx(now + 1800.0, abs=1)
+    assert ug.stage_gate(ug.evaluate(_session_usage(70.0, now), now=now), now=now) is None
+    assert ug.stage_gate({"windows": []}, now=now) is None          # no evidence -> go
+    monkeypatch.setenv("USAGE_GUARD_SESSION_STAGE_CAP", "0")
+    assert ug.stage_gate(held, now=now) is None

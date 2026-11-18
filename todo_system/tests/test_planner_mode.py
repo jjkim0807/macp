@@ -134,8 +134,11 @@ def test_only_one_window_is_normal():
     assert mode == "normal" and "weekly" in reason
 
 
-def test_session_slack_threshold_is_one_parallel_step():
+def test_session_slack_threshold_is_one_parallel_step(monkeypatch):
     # line 90: util 83 -> slack 7 < 8; util 82 -> slack 8 == 8 passes
+    # (stage cap off: it would lower the session line to 80 — pinned separately
+    # in test_usage_guard.test_session_line_is_the_stage_cap)
+    monkeypatch.setenv("USAGE_GUARD_SESSION_STAGE_CAP", "0")
     mode, reason = pm.planner_aggressiveness(_headroom(session_util=83.0), 0, 0, env={})
     assert mode == "normal" and reason.startswith("session slack")
     assert pm.planner_aggressiveness(_headroom(session_util=82.0), 0, 0, env={})[0] == "aggressive"
