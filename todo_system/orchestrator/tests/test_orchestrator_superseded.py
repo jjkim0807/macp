@@ -30,6 +30,7 @@ from unittest import mock
 from todo_system import cli
 from todo_system.orchestrator import assignment as A
 from todo_system.orchestrator import message as m
+from todo_system.orchestrator import orchestrator as orch_mod
 from todo_system.orchestrator import superseded as sup
 from todo_system.orchestrator import tasks
 from todo_system.orchestrator.assignment import Assignment, Ledger
@@ -41,9 +42,14 @@ from todo_system.orchestrator.orchestrator import (
     ALERT_UI_MERGE_HOLD,
     Orchestrator,
     Task,
-    _SUPERSEDED_MD_NOTE,
 )
 from todo_system.orchestrator.registry import Agent, Registry
+
+# Only names that predate the superseded gate are imported above, so this file
+# still collects against an orchestrator.py without it: the RED control then
+# shows which tests the gate turns green, test by test, instead of one
+# collection error. The gate's own constant is read through `orch_mod` inside
+# the one test that needs it.
 
 SLUG = "sup-task"
 TASK_PATH = f"Todo/items/{SLUG}.md"
@@ -291,7 +297,10 @@ class RunnerReportedTest(_Fixture):
         self.assertEqual(tasks.task_status(SLUG), "done")
         text = self.md.read_text(encoding="utf-8")
         [trace] = [ln for ln in text.splitlines() if tasks.CLOSE_TRACE in ln]
-        self.assertIn(_SUPERSEDED_MD_NOTE, trace)
+        # Written into git-tracked task markdown: the wording is wire format.
+        self.assertEqual(orch_mod._SUPERSEDED_MD_NOTE,
+                         "superseded: 브랜치 변경이 이미 기본 브랜치에 반영됨")
+        self.assertTrue(trace.endswith(f"— {orch_mod._SUPERSEDED_MD_NOTE}"), trace)
         self.assertIn("- [x] step one", text)
         # Evidence for reconcile_closed is the md as it was BEFORE this close.
         self.assertEqual(a.close_fingerprint,
@@ -383,7 +392,7 @@ class FailOpenTest(_Fixture):
         self.assertEqual(a.state, A.DONE)
         self.assertNotIn(sup.HISTORY_TYPE, self._history_types(a))
         self.assertEqual(tasks.task_status(SLUG), "done")
-        self.assertNotIn(_SUPERSEDED_MD_NOTE, self.md.read_text(encoding="utf-8"))
+        self.assertNotIn("superseded", self.md.read_text(encoding="utf-8"))
 
     def test_a_failing_close_does_not_break_collect_or_alert(self):
         self._second_timeout_on_a_closed_md()
@@ -438,7 +447,7 @@ class UntouchedRepliesTest(_Fixture):
         self.assertEqual(a.state, A.DONE)
         self.assertNotIn(sup.HISTORY_TYPE, self._history_types(a))
         self.assertEqual(tasks.task_status(SLUG), "done")
-        self.assertNotIn(_SUPERSEDED_MD_NOTE, self.md.read_text(encoding="utf-8"))
+        self.assertNotIn("superseded", self.md.read_text(encoding="utf-8"))
 
     def test_plain_failure_retries_as_before_without_reading_the_md(self):
         self._write_md("open")
