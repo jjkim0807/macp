@@ -458,7 +458,11 @@ class GitWiringTest(_HarnessMixin, _GitFixture):
     def test_control_unmerged_branch_runs_all_five_stages(self):
         out, mk = self._run()
         self._assert_ran_to_the_end(out, mk)
-        # Probed for real, after implement only, and every answer was "not landed".
+
+    def test_unmerged_branch_is_probed_only_once_implement_is_done(self):
+        # Probed for real (so the control above is a measured "not landed", not
+        # a probe that never ran), never before implement has finished.
+        self._run()
         self.assertTrue(self.probes)
         for ran, answer in self.probes:
             self.assertIn("implement", ran)

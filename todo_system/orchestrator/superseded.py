@@ -62,6 +62,10 @@ Known limits
 * A merge that lands while verify or report is running is not seen until the
   next boundary; if that stage fails first and the md is still open, the old
   park and alert paths run as before.
+* The md is trusted as written, whoever wrote it. A stage that closed its own
+  task md in the middle of a multi-stage pipeline would stop its own run the
+  same way a person's close does. No stage prompt asks for that (delegate
+  edits its task file, but it is a single stage with no boundary after it).
 """
 
 from __future__ import annotations

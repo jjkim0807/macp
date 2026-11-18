@@ -1537,8 +1537,8 @@ class Orchestrator:
           the row goes back to FAILED and the ordinary re-dispatch path picks
           it up, where dispatch() re-reads the md. Still no alert.
 
-        Every mutation of `a` sits after the last call that can raise, so an
-        exception here leaves the row as apply_reply left it."""
+        The state change sits after the last call that can raise, so an
+        exception here leaves the row in the state apply_reply gave it."""
         from . import superseded, tasks
         vault_root = Path(self.ledger.root).parent.parent
         closed = superseded.md_closed_status(a.payload, vault_root)
