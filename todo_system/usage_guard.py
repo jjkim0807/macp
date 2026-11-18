@@ -542,10 +542,19 @@ def _eval_window(name: str, info: dict | None, window_s: float,
     out.update({"utilization": util, "resets_at": resets_at,
                 "elapsed_pct": round(elapsed_pct, 1)})
     if util >= hard_cap:
+        until, why = resets_at, "until reset"
+        if resets and resets.get("autoclaim"):
+            # An auto-claimed limit reset lifts this hold before the window
+            # resets; report that time so the dashboard ETA is not the reset.
+            from . import usage_resets as _ur
+            eta = _ur.hard_cap_release_at(util, resets_at, window_s, allowance,
+                                          int(resets.get("available") or 0),
+                                          int(resets.get("claimed") or 0))
+            if eta is not None and eta < resets_at:
+                until, why = max(eta, now), "until an auto-claimed limit reset"
         out.update({
-            "blocked": True, "blocked_until": resets_at,
-            "reason": f"{name} {util:.0f}% >= hard cap {hard_cap:.0f}% "
-                      f"(until reset)",
+            "blocked": True, "blocked_until": until,
+            "reason": f"{name} {util:.0f}% >= hard cap {hard_cap:.0f}% ({why})",
         })
         return out
     if resets:

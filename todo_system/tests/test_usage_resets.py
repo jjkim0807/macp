@@ -184,3 +184,38 @@ def test_orchestrator_usage_hold_calls_maybe_claim(monkeypatch, tmp_path):
             mock.patch.object(U, "check", return_value={"allowed": True}):
         assert orch.usage_hold() is None
     assert seen == [usage]
+
+
+# -- hard-cap hold ETA with an auto-claimed reset (2026-11-18) ---------------
+
+def test_hard_cap_release_is_the_post_claim_pace_point():
+    from todo_system import usage_resets as R
+    W = 7 * 86400.0
+    resets_at = 1_000_000_000.0
+    # 1 full reset, none claimed, allowance 12: claim at elapsed 41.5%,
+    # post-reset (util ~0) pace line 2e-88 >= 0 at elapsed 44% -> release.
+    eta = R.hard_cap_release_at(95.0, resets_at, W, 12.0, 1, 0)
+    assert abs(eta - (resets_at - W * 0.56)) < 1.0
+    assert R.hard_cap_release_at(95.0, resets_at, W, 12.0, 0, 0) is None
+
+
+def test_hard_cap_release_none_when_claim_lands_too_close_to_reset():
+    from todo_system import usage_resets as R
+    W = 7 * 86400.0
+    # util 99 with allowance 0 -> claim at 99.5% elapsed = 0.84h before reset < 6h
+    assert R.hard_cap_release_at(199.0, 1e9, W, 0.0, 1, 0) is None
+
+
+def test_evaluate_hard_cap_eta_uses_autoclaimed_reset():
+    from todo_system import usage_guard as G
+    now = 1_000_000_000.0
+    W = 7 * 86400.0
+    resets_at = now + W * 0.66            # elapsed 34%
+    usage = {"seven_day": {"utilization": 95.0, "resets_at": _iso(resets_at)},
+             "five_hour": {"utilization": 2.0, "resets_at": _iso(now + 3600)}}
+    plain = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0})
+    assert plain["blocked_until"] == pytest.approx(resets_at, abs=1)   # no autoclaim -> reset
+    auto = G.evaluate(usage, now=now, resets={"available": 1, "claimed": 0, "autoclaim": True})
+    assert auto["blocked_until"] == pytest.approx(resets_at - W * 0.56, abs=1)
+    assert "auto-claimed limit reset" in auto["reason"]
+    assert "hard cap" in auto["reason"]   # hold kind classification keys on this
