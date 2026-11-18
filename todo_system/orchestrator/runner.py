@@ -33,6 +33,7 @@ from ..kakao_format import compose_alert
 from .. import paths
 from .. import worker as _worker
 from . import background
+from . import batch_gate
 from . import beta_publish
 from . import claims as claims_mod
 from . import disk_guard
@@ -61,6 +62,11 @@ RunStartFn = Callable[[str, Path], None]
 # per minute forever; once per minute is plenty to notice a merge. The flag this
 # feeds is sticky, so the TTL only ever delays a True, never re-opens one.
 _CODE_CHECK_TTL = 60.0
+
+# The summary suffix of a proven no-op close (stages.no_op_run). One literal for
+# the two places that close one: the landed gate, and a batch-verified run whose
+# report opened no PR because there was nothing to change.
+_NO_OP_MERGE_NOTE = " — no-op — 변경할 것 없음(점검으로 충족)"
 
 
 @dataclass
@@ -314,6 +320,39 @@ class StagedExecutor(ClaudeCodeExecutor):
             return classify_tier(payload or {})
         except Exception as e:   # pragma: no cover — defensive
             return stages.DEFAULT_STAGE_TIER, f"classify failed: {e!r}"
+
+    def _batch_plan(self, payload: dict, tier: str, repo, repo_url,
+                    auto_merge: bool, progress: ProgressFn) -> tuple[bool, str]:
+        """(verify this run in QUICK mode?, the hint appended to the verify line).
+
+        Batch verify (batch_gate.py): a light task in a repo with a batch gate
+        configured checks only what it changed and leaves the repo's full gate to
+        one shared run. A repo with no gate entry — every repo until the vault
+        registers one — answers (False, "") with no progress line, so its runs
+        are untouched. A registered repo's run logs one line either way, naming
+        the rule that decided.
+
+        Runs on the start path of every run, so it fails open like the other
+        guards there: any error is (False, ""), the ordinary full verify. The
+        config is read through the module attribute (`batch_gate.load_config`)
+        on purpose — that is the seam the test suite guards."""
+        try:
+            if not repo_url:
+                return False, ""
+            gate = batch_gate.repo_gate(
+                batch_gate.load_config(stages._VAULT_DATA_ROOT), repo_url)
+            if gate is None:
+                return False, ""
+            five_stage = tuple(self._pipeline_for(payload)) == tuple(stages.STAGES_AUTO)
+            ok, why = batch_gate.eligible(
+                payload, tier=tier, gate=gate, five_stage=five_stage,
+                auto_merge=auto_merge,
+                remote_marked=batch_gate.remote_marked(gate, repo))
+            hint = batch_gate.verify_hint(gate, stages.default_branch(repo)) if ok else ""
+            progress(f"batch verify: {'quick' if ok else 'off'} ({why})")
+            return ok, hint
+        except Exception:           # noqa: BLE001 — advisory on the start path, fail open
+            return False, ""
 
     @staticmethod
     def _account_env(msg: m.Envelope, repo: Path | None, *,
@@ -1163,6 +1202,12 @@ class StagedExecutor(ClaudeCodeExecutor):
         tier, tier_reason = self._model_tier_for(payload)
         progress(f"model tier: {tier} ({tier_reason})")
         stages.record_model_tier(run_dir, tier, tier_reason)
+        # Batch verify, decided once per run beside the tier it reads: True only
+        # for an eligible task in a repo with a batch gate configured. False —
+        # every other run — changes nothing below: no extra stage kwargs, no
+        # extra RESULT keys, and for an unregistered repo no progress line.
+        batch_quick, batch_hint = self._batch_plan(
+            payload, tier, repo, repo_url, auto_merge, progress)
         # Size the per-stage subprocess timeout to the task tier — a heavy task
         # legitimately needs longer than the historical flat 3600. The class
         # constant stays a FLOOR so nothing ever gets less than before. The
@@ -1217,6 +1262,14 @@ class StagedExecutor(ClaudeCodeExecutor):
         ui_merge_hold = False
         ui_merge_hold_sha = ""
         ui_merge_hold_reason = ""
+        # Batch verify outcome, set by the verify-stage block of a `batch_quick`
+        # run and read after the loop. Exactly one of the two ends up set:
+        # `batch_hold` (quick verify passed — wait for the integration gate, with
+        # the judged sha) or `batch_return` (a batch_gate.RETURN_* reason — go
+        # back to an individual full verify). Declared here like the hold above.
+        batch_hold = False
+        batch_return = ""
+        batch_head_sha = ""
         # Set when the orchestrator CANCELs this run (it rerouted the task to
         # another agent): the loop stops at the next stage boundary and NOTHING is
         # pushed — no checkpoint, no report stage (no PR), no delegate publish.
@@ -1311,6 +1364,14 @@ class StagedExecutor(ClaudeCodeExecutor):
                     stage_env_run = (stages.with_emulator_owner(
                         stage, stages.with_browser_owner(stage, stage_env, run_id), run_id)
                         if is_claude else stage_env)
+                    # Batch verify: only the verify and report stages of a
+                    # batch-verified run get the QUICK instruction, and only on
+                    # the claude backend (the one whose prompt carries it). Empty
+                    # otherwise, so every other call keeps its exact keyword set.
+                    batch_kw = ({"batch_mode": stages.BATCH_QUICK,
+                                 "batch_hint": batch_hint}
+                                if batch_quick and is_claude
+                                and stage in ("verify", "report") else {})
                     stage_started = time.monotonic()
                     try:
                         r = backend.run_stage(
@@ -1321,7 +1382,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                             max_turns=payload.get("max_turns"),
                             retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
                             account=backend_acct, cwd=stage_cwd, env=stage_env_run,
-                            timeout=stage_timeout, progress=progress)
+                            timeout=stage_timeout, progress=progress, **batch_kw)
                     except subprocess.TimeoutExpired as e:
                         # The stage cap fired. BEFORE this catch, TimeoutExpired escaped
                         # the whole try/finally: the finally's restore_main walked HEAD
@@ -1611,7 +1672,38 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # NOT auto-merge (auto_merge:false / review) follows its own
                     # review path untouched — holding it here would later auto-merge
                     # a PR the user explicitly chose to gate (reconcile_merge_holds).
-                    if stage == "verify" and auto_merge and not ui_merge_hold \
+                    #
+                    # Batch verify comes first and replaces that guard for its
+                    # runs: this verify ran in QUICK mode, so THIS run never
+                    # merges (auto_merge goes False; the report stage opens a
+                    # ready PR and the landed gate below is skipped). Then either
+                    # the tree waits for the integration gate (`batch_hold`, with
+                    # the sha it was judged at), or the task goes straight back to
+                    # an individual full verify (`batch_return`): the quick verdict
+                    # was not PASS, a device run the task asked for left no
+                    # evidence, the UI confidence guard would have fired, or the
+                    # sha is unreadable. No confidence downgrade and no merge-hold
+                    # record on this path — a returned task is re-verified in full.
+                    if stage == "verify" and batch_quick:
+                        auto_merge = False
+                        if verdict != "PASS":
+                            batch_return = batch_gate.RETURN_QUICK_NOT_PASS
+                        else:
+                            fires = self._ui_merge_hold_fires(
+                                repo, repo_url, payload, run_dir, branch, text, progress)
+                            sha = self._head_sha(repo)
+                            if not batch_gate.device_ok(
+                                    payload, ui_hold=fires,
+                                    device_pass=screen_check.has_device_pass(run_dir)):
+                                batch_return = batch_gate.RETURN_NO_DEVICE
+                            elif not sha:
+                                batch_return = batch_gate.RETURN_NO_HEAD_SHA
+                            else:
+                                batch_hold, batch_head_sha = True, sha
+                        progress("batch verify: hold for the integration gate"
+                                 if batch_hold else
+                                 f"batch verify: return to full verify ({batch_return})")
+                    elif stage == "verify" and auto_merge and not ui_merge_hold \
                             and self._ui_merge_hold_fires(
                                 repo, repo_url, payload, run_dir, branch, text, progress):
                         ui_merge_hold = True
@@ -1659,7 +1751,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                     if stages.no_op_run(run_dir, last_stage, branch, repo):
                         review = False
                         no_op_close = True
-                        merge_note = " — no-op — 변경할 것 없음(점검으로 충족)"
+                        merge_note = _NO_OP_MERGE_NOTE
                     else:
                         review = True
                         # Three causes, one park — but they need different notes.
@@ -1710,6 +1802,30 @@ class StagedExecutor(ClaudeCodeExecutor):
                 except Exception:
                     pass
             pr_url = stages.parse_report_pr_url(report_txt)
+            # Batch verify: settle the outcome the verify-stage block chose, now
+            # that the report has run. `auto_merge` went False there, so the
+            # landed gate above was skipped and nothing was merged. A hold needs
+            # the PR the integration gate will merge: with none, a PROVEN no-op
+            # (same proof as the landed gate — `no_op: true` AND a 0-commit
+            # branch) closes exactly as it does there, and anything else goes
+            # back to an individual full verify. Both outcomes set
+            # review_required so an orchestrator that predates batch verify parks
+            # the PR for a human instead of closing the task unmerged; the
+            # current one reads the batch keys below first and alerts nobody.
+            if batch_hold and not pr_url:
+                batch_hold = False
+                if stages.no_op_run(run_dir, completed[-1] if completed else "report",
+                                    branch, repo):
+                    review, no_op_close, merge_note = False, True, _NO_OP_MERGE_NOTE
+                else:
+                    batch_return = batch_gate.RETURN_NO_PR
+            if batch_hold:
+                review = True
+                merge_note = (" — 묶음 검증 대기 (quick Verify 통과; 통합 게이트 뒤 머지, "
+                              "PR은 ready)")
+            elif batch_return:
+                review = True
+                merge_note = f" — 묶음 제외 → 개별 전체 Verify로 복귀 ({batch_return})"
             # UI-unseen merge hold (macp#131): the confidence guard fired above, so
             # the report stage opened a READY PR (auto_merge was forced False, the
             # landed gate skipped). Park the task for review and schedule a
@@ -1740,6 +1856,16 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # merges by hand as "merged but still blocked" instead of closing.
                 extra["ui_merge_hold"] = True
                 extra["ui_merge_hold_reason"] = ui_merge_hold_reason
+            if batch_hold:
+                # The orchestrator's RESULT path (collect → _batch_result) reads
+                # these BEFORE review_required: the row becomes batch_ready with
+                # the sha this quick verify judged, and nobody is alerted.
+                extra[batch_gate.RESULT_READY] = True
+                extra[batch_gate.KEY_BATCH] = {"head_sha": batch_head_sha}
+            elif batch_return:
+                # ...or goes back to the queue for an individual full verify,
+                # with no refail and `verify_full` on its next payload.
+                extra[batch_gate.RESULT_RETURN] = batch_return
             if no_op_close:
                 # review_required is already False for a no-op; this tells the
                 # orchestrator's RESULT close path to stamp the Progress-Log note.

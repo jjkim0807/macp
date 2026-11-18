@@ -172,6 +172,66 @@ def test_backend_satisfies_the_protocol():
     assert isinstance(ab.ClaudeAgentBackend(), ab.AgentBackend)
 
 
+# ---- ClaudeAgentBackend: batch verify keywords (batch_mode / batch_hint) ----
+
+def _record_build_kwargs(monkeypatch) -> list[dict]:
+    """Replace build_stage_argv with a recorder of the keywords it is handed, and
+    the subprocess with a stub, so the test sees the exact call the backend makes."""
+    seen: list[dict] = []
+
+    def fake_build(stage, **kw):
+        seen.append({"stage": stage, **kw})
+        return ["true"]
+
+    monkeypatch.setattr(stages, "build_stage_argv", fake_build)
+    monkeypatch.setattr(stages, "run_stage_subprocess",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    return seen
+
+
+@pytest.mark.parametrize("stage", ["research", "implement", "verify", "report"])
+def test_run_stage_without_batch_mode_keeps_the_keyword_set(monkeypatch, stage):
+    # A run that is not batch-verified must reach build_stage_argv with exactly
+    # the keywords it always had — not even a `batch_mode=None`.
+    seen = _record_build_kwargs(monkeypatch)
+    b = ab.ClaudeAgentBackend()
+    b.run_stage(stage, **_KW)
+    b.run_stage(stage, batch_mode=None, batch_hint="H", **_KW)    # a hint alone is dropped
+    b.run_stage(stage, batch_mode="", **_KW)
+    assert len(seen) == 3
+    for call in seen:
+        assert "batch_mode" not in call
+        assert "batch_hint" not in call
+    assert set(seen[0]) == {
+        "stage", "task_id", "run_id", "run_dir", "branch", "repo", "working_dir",
+        "auto_merge", "worker_root", "project_context", "retry_context",
+        "allowed_tools", "tier", "max_turns"}
+
+
+@pytest.mark.parametrize("stage", ["verify", "report"])
+def test_run_stage_forwards_batch_mode_and_hint(monkeypatch, stage):
+    seen = _record_build_kwargs(monkeypatch)
+    ab.ClaudeAgentBackend().run_stage(
+        stage, batch_mode=stages.BATCH_QUICK, batch_hint="H", **_KW)
+    assert seen[0]["batch_mode"] == stages.BATCH_QUICK == "quick"
+    assert seen[0]["batch_hint"] == "H"
+
+
+def test_run_stage_batch_mode_reaches_the_real_prompt(fixed, monkeypatch):
+    # Not a recorder this time: the real builder, so the keyword is shown to
+    # arrive under the name build_stage_argv actually reads.
+    captured = {}
+    monkeypatch.setattr(stages, "run_stage_subprocess",
+                        lambda argv, **kw: captured.setdefault("argv", argv) and
+                        subprocess.CompletedProcess(argv, 0, "", ""))
+    ab.ClaudeAgentBackend().run_stage(
+        "verify", worker_root=fixed, batch_mode=stages.BATCH_QUICK,
+        batch_hint="HINT-SENTINEL", **_KW)
+    prompt = captured["argv"][2]
+    assert "Verify mode: QUICK" in prompt
+    assert "HINT-SENTINEL" in prompt
+
+
 # ---- GeminiAgentBackend: usage wiring + meta blocks ----
 
 _GEM_JSON_HANDLE = ["gemini", "--yolo", "-p", "PROMPT", "--output-format", "json"]
