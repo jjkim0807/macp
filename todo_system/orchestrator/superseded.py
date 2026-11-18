@@ -234,11 +234,18 @@ def md_closed_status(payload: dict | None, vault_root: Path | str | None) -> str
 
 
 def _git(repo: Path, *args: str, timeout: float = GIT_TIMEOUT_LOCAL_S):
-    """One git command in `repo`; None if it could not be run at all."""
+    """One git command in `repo`; None if it could not be run at all.
+
+    Never interactive and never a writer of the checkout: no stdin, no
+    credential prompt on the terminal (a fetch that needs one fails at once
+    instead of sitting out the timeout), and no optional locks, so `status`
+    does not rewrite the index of a worktree it is only looking at."""
     try:
         return _run(["git", "-C", str(repo), *args], capture_output=True, text=True,
                     encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
-                    timeout=timeout)
+                    timeout=timeout,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                         "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.SubprocessError):
         return None
 

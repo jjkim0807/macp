@@ -588,6 +588,10 @@ class BranchLandedFailOpenTest(_GitFixture):
             self.assertIs(kw.get("stdin"), subprocess.DEVNULL)
             self.assertIn(kw.get("timeout"),
                           (sup.GIT_TIMEOUT_LOCAL_S, sup.GIT_TIMEOUT_FETCH_S))
+            # No credential prompt, no index refresh; the rest of the env is kept.
+            self.assertEqual(kw["env"]["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(kw["env"]["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertEqual(kw["env"].get("PATH"), os.environ.get("PATH"))
         verbs = [argv[3] for argv, _ in seen]
         # Nothing that moves HEAD, the index, the working tree or a local branch.
         self.assertFalse(
