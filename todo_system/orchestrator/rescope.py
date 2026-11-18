@@ -456,6 +456,24 @@ def _unquote(v) -> str:
     return s
 
 
+def _spec_tier(spec: dict) -> str:
+    """A sub-task's own `model_tier` when it is one the classifier knows
+    (lowercased), else "" — the child then inherits the parent's."""
+    v = spec.get("model_tier")
+    v = v.strip().lower() if isinstance(v, str) else ""
+    return v if v in _PLAN_SPLIT_TIERS else ""
+
+
+def _spec_touches(spec: dict) -> list[str] | None:
+    """A sub-task's own `touches` when it is a non-empty list of non-empty
+    strings, else None — the child then inherits the parent's."""
+    raw = spec.get("touches")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out = [_unquote(t) if isinstance(t, str) else "" for t in raw]
+    return out if all(out) else None
+
+
 def _render_scalar(key: str, v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"      # yaml True → `true` (frontmatter convention)
@@ -592,10 +610,18 @@ def build_subtask_markdown(spec: dict, *, parent_slug: str, parent_fm: dict,
             continue
         content = set_(content, k, _render_scalar(k, v))
 
+    tier = _spec_tier(spec)              # a child's own valid tier wins over the inherited one
+    if tier:
+        content = set_(content, "model_tier", tier)
+
     # `touches` must be a YAML block list (docs/tasks.md; a string is a validate
     # ERROR), so it is copied only from a real list — a child then overlaps its
-    # siblings on the dispatcher exactly as the parent did.
-    touches = parent_fm.get("touches")
+    # siblings on the dispatcher exactly as the parent did. A child's own list
+    # wins (a plan-authored split gives each child its real write scope); a child
+    # without a usable one gets the parent's, as before.
+    touches = _spec_touches(spec)
+    if touches is None:
+        touches = parent_fm.get("touches")
     if isinstance(touches, list):
         globs = [_unquote(t) for t in touches if t is not None]
         globs = [g for g in globs if g]
@@ -865,6 +891,12 @@ def execute_rescope(ledger, vault_root, notify, *, items_dir=None, templates_dir
 # criterion without a key must be a local-gate item, which every child gets.
 # Anything else (no single `## Phases` section, a numbering gap, a key in 0 or
 # 2+ Phases, fewer than two groups, …) builds nothing: no file, today's ⛔.
+#
+# A plan may instead state its split itself, in a fenced `rescope` block (the
+# "Plan-authored split" section below). `write_plan_rescope` looks for that block
+# first, and the Phase-heading builder here runs only for a plan with no block:
+# a block the engine cannot use is never replaced by a split the plan did not
+# write.
 
 _PLAN_FILENAME = "implementation_plan.md"
 _REQUIREMENTS_FILENAME = "requirements.md"
@@ -883,6 +915,10 @@ _MAX_KEY_SPAN = 50
 _TICK_SPAN_RE = re.compile(r"`[^`\n]+`")
 _LEAF_IF_THEN = ("계획서 단계가 이 leaf 범위를 넘으면 → 범위 안의 절만 쓰고 나머지는 "
                  "자리표시로 남겨 머지한다(다시 한 스테이지 초과로 파킹하지 않는다)")
+_LEAF_SCOPE_NOTE = ("다른 Phase 범위는 건드리지 않는다 — 이미 머지된 앞 하위의 결과는 "
+                    "고치지 않고, 뒤 Phase의 절은 자리표시로 남긴다")
+_LEAF_CLOSING_NOTE = ("각 하위는 자기 Phase 범위만 머지한다 — 범위 밖 절은 자리표시로 남기고, "
+                      "이미 머지된 앞 하위의 결과는 고치지 않는다.")
 _RUN_REF_MAX = 200
 
 
@@ -1007,6 +1043,85 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
+# -- what the two plan-stage builders share: one child, and the document around them --
+
+
+def _plan_refs(run_id: str) -> tuple[str, str]:
+    """Vault-relative paths of a run's plan and requirements."""
+    return (f"Worker/runs/{run_id}/{_PLAN_FILENAME}",
+            f"Worker/runs/{run_id}/{_REQUIREMENTS_FILENAME}")
+
+
+def _phase_label(group) -> str:
+    return "·".join(str(n) for n in group)
+
+
+def _parent_estimates(parent_fm: dict) -> dict:
+    """The parent's `estimate_p50` / `estimate_p90`, where it states them."""
+    out = {}
+    for k in ("estimate_p50", "estimate_p90"):
+        v = str(parent_fm.get(k) or "").strip()
+        if v and v != "-":
+            out[k] = v
+    return out
+
+
+def _phase_leaf(parent_slug: str, run_id: str, base_title: str, group: list[int],
+                title_of: dict, *, slug: str, acceptance_criteria: list, tail: str = "",
+                if_then: str = _LEAF_IF_THEN, scope_note: str = _LEAF_SCOPE_NOTE) -> dict:
+    """One child of a plan-stage split, described by the contiguous Phase group
+    it covers: a title and an outcome that name those Phases (`tail`, when given,
+    is appended to the outcome), a next_action that points at the parent run's
+    plan and requirements, and the spec and steps the child md is rendered from."""
+    plan_ref, req_ref = _plan_refs(run_id)
+    label = _phase_label(group)
+    names = " / ".join(title_of[n] or f"Phase {n}" for n in group)
+    outcome = (f"부모 {parent_slug} 계획서 Phase {label}({_clip(names, 160)}) 범위가 머지돼 "
+               "이 하위의 acceptance_criteria가 충족된다")
+    return {
+        "slug": slug,
+        "title": _clip(f"{base_title} — Phase {label}: {names}", 200),
+        "outcome": f"{outcome} — {tail}" if tail else outcome,
+        "acceptance_criteria": list(acceptance_criteria),
+        "next_action": (f"{plan_ref}의 부모 계획서 Phase {label}과 {req_ref}를 읽고 "
+                        "그 단계만 수행한다(이미 머지된 앞 부분은 고치지 않는다)"),
+        "if_then": if_then,
+        "spec": {
+            "goal": f"부모 계획서 Phase {label}({_clip(names, 160)})만 수행한다",
+            "scope_note": scope_note,
+        },
+        "steps": [f"Phase {n}: {title_of[n]}" if title_of[n] else f"Phase {n}" for n in group],
+    }
+
+
+def _split_doc(parent_slug: str, run_id: str, parent_fm: dict, n_phases: int,
+               groups: list, subs: list, *, source: str, reason: str,
+               closing_note: str = _LEAF_CLOSING_NOTE) -> dict:
+    """The schema-v1 document around a plan-stage split's children. Its design
+    notes carry what a child must not re-derive: where the plan and requirements
+    are, which Phases went to which child, the parent's outcome, and the one rule
+    every child follows (`closing_note`)."""
+    plan_ref, req_ref = _plan_refs(run_id)
+    mapping = ", ".join(f"Phase {_phase_label(g)} → {s['slug']}" for g, s in zip(groups, subs))
+    notes = [
+        f"계획서: {plan_ref} · 요구사항: {req_ref} — 설계를 다시 도출하지 말고 이 둘을 따른다.",
+        f"분할: 계획서 Phase {n_phases}개 → 하위 {len(subs)}개 ({mapping})",
+    ]
+    outcome = _unquote(parent_fm.get("outcome") or "")
+    if outcome and outcome != "-":
+        notes.append(f"부모 outcome: {_clip(outcome, 400)}")
+    notes.append(closing_note)
+    return {
+        "version": RESCOPE_SCHEMA_VERSION,
+        "parent_slug": parent_slug,
+        "source": source,
+        "reason": reason,
+        "run_ref": plan_ref,
+        "design_notes": notes,
+        "subtasks": subs,
+    }
+
+
 def rescope_from_plan_phases(plan_text, parent_fm, *, parent_slug, run_id,
                              parent_title: str = "") -> dict | None:
     """Build a schema-v1 split plan from a plan's `### Phase N:` headings — a
@@ -1059,67 +1174,335 @@ def rescope_from_plan_phases(plan_text, parent_fm, *, parent_slug, run_id,
         return None
 
     title_of = dict(phases)
-    plan_ref = f"Worker/runs/{rid}/{_PLAN_FILENAME}"
-    req_ref = f"Worker/runs/{rid}/{_REQUIREMENTS_FILENAME}"
     base = _clip(str(parent_title or "").strip() or slug, 120)
     gate_acs = [acs[i] for i in gates]
     touches = parent_fm.get("touches")
     files = [g for g in (_unquote(t) for t in touches if t is not None) if g] \
         if isinstance(touches, list) else []
-    estimates = {}
-    for k in ("estimate_p50", "estimate_p90"):
-        v = str(parent_fm.get(k) or "").strip()
-        if v and v != "-":
-            estimates[k] = v
+    estimates = _parent_estimates(parent_fm)
     subs: list[dict] = []
     for pos, g in enumerate(groups):
-        label = "·".join(str(n) for n in g)
-        names = " / ".join(title_of[n] or f"Phase {n}" for n in g)
         tail = ("앞 하위가 머지한 부분은 고치지 않는다" if pos == len(groups) - 1
                 else "범위 밖 절은 자리표시로 남기고 다음 하위가 채운다")
-        sub = {
-            "slug": f"{slug}-p{g[0]}" if len(g) == 1 else f"{slug}-p{g[0]}-{g[-1]}",
-            "title": _clip(f"{base} — Phase {label}: {names}", 200),
-            "outcome": (f"부모 {slug} 계획서 Phase {label}({_clip(names, 160)}) 범위가 머지돼 "
-                        f"이 하위의 acceptance_criteria가 충족된다 — {tail}"),
-            "acceptance_criteria": ([acs[i] for i in sorted(i for n in g for i in owned[n])]
-                                    + gate_acs),
-            "next_action": (f"{plan_ref}의 부모 계획서 Phase {label}과 {req_ref}를 읽고 "
-                            "그 단계만 수행한다(이미 머지된 앞 부분은 고치지 않는다)"),
-            "if_then": _LEAF_IF_THEN,
-            "spec": {
-                "goal": f"부모 계획서 Phase {label}({_clip(names, 160)})만 수행한다",
-                "scope_note": ("다른 Phase 범위는 건드리지 않는다 — 이미 머지된 앞 하위의 결과는 "
-                               "고치지 않고, 뒤 Phase의 절은 자리표시로 남긴다"),
-            },
-            "steps": [f"Phase {n}: {title_of[n]}" if title_of[n] else f"Phase {n}" for n in g],
-            **estimates,
-        }
+        sub = _phase_leaf(
+            slug, rid, base, g, title_of,
+            slug=f"{slug}-p{g[0]}" if len(g) == 1 else f"{slug}-p{g[0]}-{g[-1]}",
+            acceptance_criteria=([acs[i] for i in sorted(i for n in g for i in owned[n])]
+                                 + gate_acs),
+            tail=tail)
+        sub.update(estimates)
         if files:
             sub["files"] = list(files)
         subs.append(sub)
 
-    mapping = ", ".join(f"Phase {'·'.join(str(n) for n in g)} → {s['slug']}"
-                        for g, s in zip(groups, subs))
-    notes = [
-        f"계획서: {plan_ref} · 요구사항: {req_ref} — 설계를 다시 도출하지 말고 이 둘을 따른다.",
-        f"분할: 계획서 Phase {len(phases)}개 → 하위 {len(subs)}개 ({mapping})",
-    ]
-    outcome = _unquote(parent_fm.get("outcome") or "")
-    if outcome and outcome != "-":
-        notes.append(f"부모 outcome: {_clip(outcome, 400)}")
-    notes.append("각 하위는 자기 Phase 범위만 머지한다 — 범위 밖 절은 자리표시로 남기고, "
-                 "이미 머지된 앞 하위의 결과는 고치지 않는다.")
-    return {
-        "version": RESCOPE_SCHEMA_VERSION,
-        "parent_slug": slug,
-        "source": "plan-phases",
-        "reason": (f"plan stage declared the task larger than one Implement stage — split at "
-                   f"the plan's Phase boundaries ({len(phases)} phases → {len(subs)} subtasks)"),
-        "run_ref": plan_ref,
-        "design_notes": notes,
-        "subtasks": subs,
-    }
+    return _split_doc(
+        slug, rid, parent_fm, len(phases), groups, subs, source="plan-phases",
+        reason=(f"plan stage declared the task larger than one Implement stage — split at "
+                f"the plan's Phase boundaries ({len(phases)} phases → {len(subs)} subtasks)"))
+
+
+# ---------------------------------------------------------------------------
+# Plan-authored split — the plan states its own split in a `rescope` block
+# ---------------------------------------------------------------------------
+#
+# The Phase-heading builder above needs every parent criterion to start with a
+# `§N` key. A code task's criteria rarely do (2026-11-18: eight Phases, six
+# keyless criteria, and a three-way split the plan spelled out as a table — which
+# then had to be applied by hand). So the Plan stage may state the split itself,
+# as ONE fenced block whose info string is `rescope`:
+#
+#     ```rescope
+#     {"subtasks": [
+#       {"slug": "task-1-first", "phases": [1, 2],
+#        "acceptance_criteria": ["..."], "touches": ["path/file.py", "dir/**"]},
+#       {"slug": "task-2-second", "phases": [3], "depends_on": ["task-1-first"],
+#        "acceptance_criteria": ["..."], "touches": ["docs/page.md"]}
+#     ]}
+#     ```
+#
+# Per sub-task `slug`, `phases`, `acceptance_criteria` and `touches` are
+# required; `title`, `outcome`, `model_tier`, `estimate_p50`, `estimate_p90` and
+# `depends_on` are optional. Block order IS the serial chain, so `depends_on`
+# may only repeat it. `next_action`, `if_then`, `spec`, `steps` and `files` are
+# written by the engine; any other key is ignored.
+#
+# The block is used as written or not at all. A plan that has one never reaches
+# the Phase-heading builder: a block the engine cannot use (invalid JSON, fewer
+# than two or more than five sub-tasks, Phases not covered exactly once and in
+# order, an unsafe slug or path, …) builds nothing — no file, today's ⛔ — so the
+# engine never runs a split the plan did not write.
+
+PLAN_SPLIT_FENCE = "rescope"
+_SPLIT_SOURCE = "plan-split-block"
+_SPLIT_BLOCK_MAX_CHARS = 64_000
+_SPLIT_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_SPLIT_SLUG_MAX = 80
+_SPLIT_PATH_MAX = 200
+# `30m` / `2h` / `1h30m` / `1d` — model_select.estimate_minutes' grammar, less seconds.
+_SPLIT_ESTIMATE_RE = re.compile(r"(?:\d+(?:\.\d+)?[dhm])+")
+# = model_select.TIERS, mirrored as strings for engine isolation (a test pins the two).
+_PLAN_SPLIT_TIERS = ("heavy", "standard", "light")
+_SPLIT_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
+_SPLIT_WHY_MAX = 200
+# The block path's wording. A Phase of a code task has no document sections to
+# leave as placeholders, so these do not borrow the leaf sentences above.
+_SPLIT_IF_THEN = ("워커가 잡으면 → {plan_ref}의 Phase {label}과 {req_ref}를 읽고 그 Phase만 "
+                  "수행한다(설계는 계획서를 따르고 다시 도출하지 않는다). 범위 밖 Phase는 건드리지 "
+                  "않고, 한 스테이지에 다 안 들어가면 끝낸 Phase까지 커밋하고 남은 Phase를 run.log에 "
+                  "적는다(다시 한 스테이지 초과로 파킹하지 않는다)")
+_SPLIT_SCOPE_NOTE = ("다른 Phase 범위는 건드리지 않는다 — 이미 머지된 앞 하위의 결과는 "
+                     "고치지 않고, 뒤 Phase의 일은 뒤 하위에 남긴다")
+_SPLIT_CLOSING_NOTE = ("각 하위는 자기 Phase 범위만 머지한다 — 범위 밖 Phase는 건드리지 않고, "
+                       "이미 머지된 앞 하위의 결과는 고치지 않는다.")
+
+
+def find_plan_split_blocks(text) -> list[str]:
+    """Bodies of the plan's top-level fenced blocks whose info string starts
+    with `rescope` (any case) — a pure function. Frontmatter is skipped; a fence
+    inside a longer fence (an example quoted in the plan) is not top-level; a
+    block that is never closed still counts, so a plan that tried to state a
+    split is never mistaken for one that did not."""
+    if not isinstance(text, str) or not text.strip():
+        return []
+    fm = _FM_RE.match(text)
+    blocks: list[str] = []
+    char, size, body = "", 0, None      # the open fence; body is a list only inside a split block
+    for line in (text[fm.end():] if fm else text).splitlines():
+        stripped = line.strip()
+        if char:
+            if len(stripped) >= size and set(stripped) == {char}:
+                if body is not None:
+                    blocks.append("\n".join(body))
+                char, size, body = "", 0, None
+            elif body is not None:
+                body.append(line)
+            continue
+        m = _SPLIT_FENCE_OPEN_RE.match(line)
+        if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
+            continue                     # not a fence (a code span that starts the line)
+        char, size = m.group(1)[0], len(m.group(1))
+        info = m.group(2).split()
+        body = [] if info and info[0].lower() == PLAN_SPLIT_FENCE else None
+    if char and body is not None:
+        blocks.append("\n".join(body))
+    return blocks
+
+
+def _unprintable(ch: str) -> bool:
+    """A character a task md's YAML frontmatter cannot carry in a quoted scalar:
+    a C0 / C1 control, DEL, a lone surrogate, or one of the two noncharacters
+    that end the basic plane."""
+    n = ord(ch)
+    return n < 0x20 or 0x7F <= n <= 0x9F or 0xD800 <= n <= 0xDFFF or n in (0xFFFE, 0xFFFF)
+
+
+def _split_text(v) -> str:
+    """A block's text value on one line (whitespace runs collapsed). "" when it
+    is not a string, is blank, or holds a character the task md cannot carry."""
+    if not isinstance(v, str):
+        return ""
+    s = " ".join(v.split())
+    return "" if any(_unprintable(ch) for ch in s) else s
+
+
+def _split_estimate(v) -> str:
+    """A block's estimate as `30m` / `2h` / `1h30m` / `1d` (lowercased, inner
+    spaces dropped), or "" when it is anything else."""
+    if not isinstance(v, str):
+        return ""
+    s = "".join(v.split()).lower()
+    return s if _SPLIT_ESTIMATE_RE.fullmatch(s) else ""
+
+
+def _reaches_guardrail(path: str) -> bool:
+    """Could this path or glob cover a human-owned guardrail file: it names one,
+    or its literal prefix (the text before the first wildcard) is a prefix of
+    one (`.claude/**`, `Worker/**`, `**/*.md`, or the bare directory `Worker`).
+    Every glob that can match such a file starts with a prefix of its path, so
+    none of them passes; a few harmless paths are refused with them."""
+    cut = min([i for i in (path.find(c) for c in "*?[") if i != -1] or [len(path)])
+    return any(gp in path or gp.startswith(path[:cut]) for gp in _GUARDRAIL_PATHS)
+
+
+def _split_touches(raw) -> tuple[list[str] | None, str]:
+    """A block child's `touches` as `(paths, "")`: a non-empty list of
+    repo-relative paths or globs, one per entry, duplicates dropped. `(None,
+    why)` when any entry is unusable — the whole list is refused, never trimmed."""
+    if not isinstance(raw, list) or not raw:
+        return None, "must be a non-empty list of repo-relative paths or globs"
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return None, "every entry must be a string"
+        p = item.strip()
+        while p.startswith("./"):
+            p = p[2:]
+        shown = _clip(" ".join(p.split()), 60)
+        if not p:
+            return None, "an entry is empty"
+        if len(p) > _SPLIT_PATH_MAX or any(c in p for c in "\\\n\r\t"):
+            return None, f"not a plain one-line path: {shown}"
+        if p.startswith(("/", "~")) or ".." in p.split("/"):
+            return None, f"must stay inside the repo: {shown}"
+        if "{" in p or "}" in p:
+            return None, f"list each path on its own (no {{a,b}} braces): {shown}"
+        if _reaches_guardrail(p):
+            return None, f"reaches a human-owned guardrail file: {shown}"
+        if p not in out:
+            out.append(p)
+    return out, ""
+
+
+def _refuse(why: str) -> tuple[None, str]:
+    """`(None, why)` with the reason on one clipped line (it goes to the run log)."""
+    return None, _clip(" ".join(str(why).split()), _SPLIT_WHY_MAX)
+
+
+def rescope_from_split_block(blocks, plan_text, parent_fm, *, parent_slug, run_id,
+                             parent_title: str = "") -> tuple[dict | None, str]:
+    """Build a schema-v1 split plan from the plan's own `rescope` block — a
+    **pure function** (no I/O) that never raises. `blocks` is what
+    `find_plan_split_blocks` returned. Answers `(plan, "")`, or `(None, why)`
+    with the first defect it found; the caller then writes nothing.
+
+    Checked in this order: exactly one block; its size; a JSON object with a
+    `subtasks` list of 2..5; the plan's Phases readable and the parent / run
+    names plain; then each sub-task (see the section comment above for the
+    fields); and last that the `phases` lists, read in block order, are exactly
+    the plan's Phases 1..n — one comparison that refuses a gap, an overlap, a
+    reordering and a non-contiguous group alike.
+
+    A child keeps the block's criteria as written (the engine adds no gate line:
+    the plan repeats it where it applies) and its `touches`, which also become
+    its `files`, so `can_auto_rescope`'s guardrail scan sees the real write
+    scope. Title and outcome are the block's or derived from the Phase headings;
+    estimates are the block's or the parent's; a `model_tier` is carried only
+    when the block gives one (the generator otherwise inherits the parent's)."""
+    if not isinstance(blocks, list) or not blocks:
+        return _refuse("the plan has no rescope block")
+    if len(blocks) != 1:
+        return _refuse(f"{len(blocks)} rescope blocks — a plan carries exactly one")
+    body = blocks[0]
+    if not isinstance(body, str):
+        return _refuse("the rescope block is not text")
+    if len(body) > _SPLIT_BLOCK_MAX_CHARS:
+        return _refuse(f"the rescope block is longer than {_SPLIT_BLOCK_MAX_CHARS} characters")
+    try:
+        doc = json.loads(body)
+    except (ValueError, RecursionError) as e:
+        return _refuse(f"the rescope block is not valid JSON ({_clip(str(e), 80)})")
+    raw = doc.get("subtasks") if isinstance(doc, dict) else None
+    if not isinstance(raw, list):
+        return _refuse('the rescope block must be a JSON object with a "subtasks" list')
+    if not (_MIN_SUBTASKS <= len(raw) <= _MAX_SUBTASKS):
+        return _refuse(f"{len(raw)} subtasks — a split has {_MIN_SUBTASKS} to {_MAX_SUBTASKS}")
+    phases = parse_plan_phases(plan_text)
+    if phases is None:
+        return _refuse("the plan's Phases section cannot be read as Phase 1..n")
+    if not isinstance(parent_fm, dict):
+        return _refuse("the parent frontmatter is unreadable")
+    slug = str(parent_slug or "").strip()
+    rid = str(run_id or "").strip()
+    if not slug or not rid or slug.startswith(".") or any(c in slug + rid for c in "/\\\n"):
+        return _refuse("the parent slug or the run id is not a plain name")
+
+    seen: list[str] = []
+    cover: list[int] = []
+    children: list[dict] = []
+    for i, s in enumerate(raw):
+        at = f"subtask #{i}"
+        if not isinstance(s, dict):
+            return _refuse(f"{at} is not an object")
+        child = s.get("slug")
+        if not (isinstance(child, str) and len(child) <= _SPLIT_SLUG_MAX
+                and _SPLIT_SLUG_RE.fullmatch(child)):
+            return _refuse(f"{at} slug must be kebab-case (a-z, 0-9, single hyphens, "
+                           f"at most {_SPLIT_SLUG_MAX} characters)")
+        if child == slug:
+            return _refuse(f"{at} slug is the parent's own ({child})")
+        if child in seen:
+            return _refuse(f"{at} slug repeats an earlier subtask ({child})")
+        group = s.get("phases")
+        if not (isinstance(group, list) and group
+                and all(isinstance(n, int) and not isinstance(n, bool) for n in group)):
+            return _refuse(f"{at} phases must be a non-empty list of Phase numbers")
+        want = seen[-1:]                 # block order is the chain: [] first, then [previous]
+        deps = s.get("depends_on")
+        if deps is not None and deps != want:
+            return _refuse(f"{at} depends_on must be {json.dumps(want)} or left out — "
+                           "subtasks run in block order")
+        acs_raw = s.get("acceptance_criteria")
+        acs = [_split_text(x) for x in acs_raw] if isinstance(acs_raw, list) else []
+        if not acs or not all(acs):
+            return _refuse(f"{at} acceptance_criteria must be a non-empty list of "
+                           "non-blank strings")
+        touches, why = _split_touches(s.get("touches"))
+        if touches is None:
+            return _refuse(f"{at} touches: {why}")
+        tier = s.get("model_tier")
+        if tier is not None:
+            tier = tier.strip().lower() if isinstance(tier, str) else ""
+            if tier not in _PLAN_SPLIT_TIERS:
+                return _refuse(f"{at} model_tier must be one of "
+                               f"{'|'.join(_PLAN_SPLIT_TIERS)}")
+        estimates: dict[str, str] = {}
+        for k in ("estimate_p50", "estimate_p90"):
+            if s.get(k) is None:
+                continue
+            estimates[k] = _split_estimate(s[k])
+            if not estimates[k]:
+                return _refuse(f"{at} {k} must look like 30m, 2h, 1h30m or 1d")
+        texts: dict[str, str] = {}
+        for k in ("title", "outcome"):
+            if s.get(k) is None:
+                continue
+            texts[k] = _split_text(s[k])
+            if not texts[k]:
+                return _refuse(f"{at} {k} must be a non-blank string")
+        if any(gp in text for gp in _GUARDRAIL_PATHS for text in (*acs, *texts.values())):
+            return _refuse(f"{at} names a human-owned guardrail file")
+        seen.append(child)
+        cover.extend(group)
+        children.append({"slug": child, "phases": list(group), "acceptance_criteria": acs,
+                         "touches": touches, "tier": tier or "", "estimates": estimates,
+                         "texts": texts})
+
+    n = len(phases)
+    if cover != list(range(1, n + 1)):
+        return _refuse(f"the subtasks' phases, in block order, must be exactly Phase 1 to {n} "
+                       f"of the plan — each once, none left out (got "
+                       f"{', '.join(str(k) for k in cover)})")
+
+    title_of = dict(phases)
+    plan_ref, req_ref = _plan_refs(rid)
+    base = _clip(str(parent_title or "").strip() or slug, 120)
+    inherited = _parent_estimates(parent_fm)
+    subs: list[dict] = []
+    for c in children:
+        sub = _phase_leaf(
+            slug, rid, base, c["phases"], title_of, slug=c["slug"],
+            acceptance_criteria=c["acceptance_criteria"],
+            if_then=_SPLIT_IF_THEN.format(plan_ref=plan_ref, req_ref=req_ref,
+                                          label=_phase_label(c["phases"])),
+            scope_note=_SPLIT_SCOPE_NOTE)
+        if "title" in c["texts"]:
+            sub["title"] = _clip(c["texts"]["title"], 200)
+        if "outcome" in c["texts"]:
+            sub["outcome"] = c["texts"]["outcome"]
+        sub.update({**inherited, **c["estimates"]})
+        sub["files"] = list(c["touches"])
+        sub["touches"] = list(c["touches"])
+        sub["phases"] = list(c["phases"])
+        if c["tier"]:
+            sub["model_tier"] = c["tier"]
+        subs.append(sub)
+
+    plan = _split_doc(
+        slug, rid, parent_fm, n, [c["phases"] for c in children], subs, source=_SPLIT_SOURCE,
+        reason=(f"plan stage declared the task larger than one Implement stage — split by "
+                f"the plan's own rescope block ({n} phases → {len(subs)} subtasks)"),
+        closing_note=_SPLIT_CLOSING_NOTE)
+    return plan, ""
 
 
 def _plan_run_ref(plan) -> str:
@@ -1165,14 +1548,18 @@ def write_plan_rescope(run_dir, *, parent_slug: str, items_dir) -> str:
     `implementation_plan.md` and the parent task md in `items_dir`. Returns one
     line for the runner's progress log and **never raises**.
 
+    The plan's own `rescope` block comes first (`rescope_from_split_block`): when
+    the plan has one, that split is written or nothing is. Only a plan with no
+    block at all is split along its Phase headings (`rescope_from_plan_phases`).
+
     Fail-closed at every step: an existing rescope.json is never replaced, and
-    nothing is written when the plan or the parent md is unreadable, the split is
-    not unambiguous (`rescope_from_plan_phases` → None), `can_auto_rescope`
-    denies it, or a child md of the same name already exists (`generate_subtasks`
-    would otherwise chain that unrelated file in as a child). No file means the
-    park stays today's ⛔ to a human. The parent frontmatter is read with
-    `repos._frontmatter`, the parser collect() and `execute_rescope` judge it
-    with, so all three see the same dict."""
+    nothing is written when the plan or the parent md is unreadable, the block is
+    unusable, the Phase split is not unambiguous (`rescope_from_plan_phases` →
+    None), `can_auto_rescope` denies it, or a child md of the same name already
+    exists (`generate_subtasks` would otherwise chain that unrelated file in as a
+    child). No file means the park stays today's ⛔ to a human. The parent
+    frontmatter is read with `repos._frontmatter`, the parser collect() and
+    `execute_rescope` judge it with, so all three see the same dict."""
     try:
         rd = Path(run_dir)
         items = Path(items_dir)
@@ -1185,11 +1572,22 @@ def write_plan_rescope(run_dir, *, parent_slug: str, items_dir) -> str:
         parent_fm = repos._frontmatter(parent_path)
         if not parent_fm:
             return "no split: parent task md unreadable"
-        plan = rescope_from_plan_phases(
-            plan_text, parent_fm, parent_slug=parent_slug, run_id=rd.name,
-            parent_title=_md_title(parent_path.read_text(encoding="utf-8")))
-        if plan is None:
-            return "no split: plan Phases do not map the parent's criteria unambiguously"
+        title = _md_title(parent_path.read_text(encoding="utf-8"))
+        blocks = find_plan_split_blocks(plan_text)
+        if blocks:
+            # The plan's own split is used as written. An unusable block is never
+            # replaced by a Phase-heading split the plan did not ask for.
+            plan, why = rescope_from_split_block(
+                blocks, plan_text, parent_fm, parent_slug=parent_slug, run_id=rd.name,
+                parent_title=title)
+            if plan is None:
+                return f"no split: plan rescope block unusable — {why}"
+        else:
+            plan = rescope_from_plan_phases(
+                plan_text, parent_fm, parent_slug=parent_slug, run_id=rd.name,
+                parent_title=title)
+            if plan is None:
+                return "no split: plan Phases do not map the parent's criteria unambiguously"
         decision = can_auto_rescope(plan, parent_fm)
         if not decision.allow:
             return f"no split: {decision.reason}"

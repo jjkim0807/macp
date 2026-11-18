@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from todo_system import cli, paths
+from todo_system import cli, paths, worker
 from todo_system import task_validate as _task_validate
 from todo_system.orchestrator import model_select, repos, rescope
 from todo_system.orchestrator.tests import test_plan_rescope as phase_path
@@ -572,6 +572,15 @@ _BLOCK_FAIL_CLOSED = [
     ("title-a-number", _bad(_set(0, "title", 5)), {}),
     ("outcome-empty", _bad(_set(0, "outcome", "")), {}),
     ("outcome-a-list", _bad(_set(0, "outcome", ["완료"])), {}),
+    ("title-control-character", _bad(_set(0, "title", "제목\x07")), {}),
+    # -- text that names a human-owned guardrail file (the write scope may hide it)
+    ("criteria-name-a-guardrail-file",
+     _bad(_set(1, "acceptance_criteria",
+               ["기준", "`.claude/commands/worker-planner.md`에 규칙을 더한다"])), {}),
+    ("outcome-names-a-guardrail-file",
+     _bad(_set(1, "outcome", "Worker/planner_policy.yaml 의 한도를 올린다")), {}),
+    ("title-names-a-guardrail-file",
+     _bad(_set(1, "title", "Worker/planner_policy.yaml 손보기")), {}),
     # -- the plan and the parent
     ("plan-phase-unnumbered", _unnumbered_phase, {}),
     ("plan-without-phases", lambda: "# Plan\n\n" + block(), {}),
@@ -858,10 +867,11 @@ def test_1118_children_markdown(tmp_path, templates):
         assert _errors(p) == []
 
     rescope.flip_parent_to_bundle(parent_path, CHILDREN)
-    bundle = repos._frontmatter(parent_path)
+    # read with the line parser: to a YAML reader a bare `off` is the boolean false
+    bundle = worker.parse_frontmatter(parent_path.read_text(encoding="utf-8"))[0]
     assert bundle["worker_mode"] == "off"
-    assert str(bundle["auto_rescoped"]).lower() == "true"
-    assert str(bundle["is_parent"]).lower() == "true"
+    assert bundle["auto_rescoped"] == "true"
+    assert bundle["is_parent"] == "true"
     assert "자동 분할 → 하위 3개" in parent_path.read_text(encoding="utf-8")
 
 

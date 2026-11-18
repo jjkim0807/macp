@@ -402,10 +402,10 @@ def test_1118_plan_block_splits_through_the_tick(vault, tmp_path, monkeypatch):
     assert [fm["model_tier"] for fm in fms] == ["heavy", "heavy", "standard"]
 
     parent_text = (items / f"{PARENT}.md").read_text(encoding="utf-8")
-    pfm = repos._frontmatter(items / f"{PARENT}.md")
+    pfm = worker.parse_frontmatter(parent_text)[0]     # line parser: YAML reads `off` as false
     assert pfm["worker_mode"] == "off"
-    assert str(pfm["auto_rescoped"]).lower() == "true"
-    assert str(pfm["is_parent"]).lower() == "true"
+    assert pfm["auto_rescoped"] == "true"
+    assert pfm["is_parent"] == "true"
     assert "자동 분할 → 하위 3개" in parent_text
 
     # 4. the alert: one 🔀 digest through the routing gate, and no ⛔ anywhere
@@ -449,7 +449,7 @@ def test_1118_plan_without_block_still_reaches_a_human(vault, tmp_path, monkeypa
     assert row.last_alert_kind == ALERT_BLOCKED
     assert len(sent) == 1 and sent[0][0].splitlines()[0].startswith("⛔")
     assert sorted(p.name for p in items.glob("*.md")) == [f"{PARENT}.md"]
-    assert repos._frontmatter(items / f"{PARENT}.md")["worker_mode"] == "auto"
+    assert (items / f"{PARENT}.md").read_text(encoding="utf-8") == PARENT_MD   # untouched
 
 
 def test_unusable_block_reaches_a_human_even_when_phase_keys_map(vault, tmp_path):
