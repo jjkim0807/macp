@@ -46,6 +46,7 @@ from . import rescope
 from . import screen_check
 from . import agent_backend
 from . import stages
+from . import superseded as superseded_mod
 from . import worktree_sweep
 from .assignment import DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
@@ -913,6 +914,66 @@ class StagedExecutor(ClaudeCodeExecutor):
             return False
         return True
 
+    def _superseded_exit(self, payload: dict, *, repo, repo_url, branch: str,
+                         run_dir: Path, completed: list[str], progress: ProgressFn,
+                         where: str) -> ExecOutcome | None:
+        """End the run quietly when its task no longer needs it (superseded.py).
+
+        Returns the run's outcome when the task md is closed, or when the worker
+        branch's work is already in the default branch; None means "carry on",
+        which is also the answer to anything that could not be read.
+
+        The outcome is a SUCCESS on purpose (`ok=True`, so `Runner.handle` replies
+        RESULT) carrying `superseded: <reason>` and `review_required: False`. The
+        orchestrator's collect() reads that key first and closes the ledger row
+        without a park or an alert. A FAIL would re-dispatch the task, and no
+        reply at all would leave the row in flight (holding its checkout) until
+        the stale reaper failed it. An orchestrator that predates the key closes
+        it as an ordinary success, which is the safer misreading of the two.
+
+        The md is read at every call. Git is probed only for an external repo
+        once `implement` is among the completed stages: before that, "the branch
+        is already in the default branch" cannot tell a stale re-dispatch from
+        "part of this was merged by hand, carry on" (superseded.py, module
+        docstring). A vault task's worker branch carries sync commits and is cut
+        from a local `main`, so it gets the md half only.
+
+        `agent` is deliberately not a parameter: nothing here needs it, and the
+        _execute suites pass a bare Mock for it. Never raises."""
+        try:
+            verdict = superseded_mod.check_run(
+                payload, vault_root=stages._VAULT_DATA_ROOT,
+                repo_dir=repo if repo_url else None, branch=branch,
+                probe_git=bool(repo_url) and "implement" in completed)
+            if not verdict.superseded:
+                return None
+            note = superseded_mod.note(verdict.reason, verdict.detail)
+            outcome = ExecOutcome(
+                True, f"{note} — stopped {where}, nothing pushed",
+                {superseded_mod.RESULT_KEY: verdict.reason, "review_required": False,
+                 "branch": branch, "run_dir": str(run_dir),
+                 "stages": list(completed), "repo": repo_url})
+        except Exception:       # noqa: BLE001 — advisory on the stage path, fail open
+            return None
+        # The verdict stands from here on. The three records below are each
+        # best-effort: failing to write one must not send a finished task back
+        # into its next stage.
+        try:
+            progress(f"{note} ({where}) — stopping, nothing pushed")
+        except Exception:       # noqa: BLE001
+            pass
+        try:
+            with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                f.write(f"\n=== superseded ({where}) ===\n{note}\n")
+        except Exception:       # noqa: BLE001
+            pass
+        try:
+            stages._update_progress(run_dir, superseded={
+                "reason": verdict.reason, "detail": verdict.detail, "where": where})
+        except Exception:       # noqa: BLE001
+            pass
+        return outcome
+
     def _execute(self, msg: m.Envelope, agent: Agent, progress: ProgressFn,
                  on_run_start: RunStartFn | None = None,
                  sink: dict | None = None) -> ExecOutcome:
@@ -1275,6 +1336,13 @@ class StagedExecutor(ClaudeCodeExecutor):
         # pushed — no checkpoint, no report stage (no PR), no delegate publish.
         # Before the `try` so the `finally` never sees it unbound.
         cancelled = False
+        # Set when the task turned out to be superseded (superseded.py: its md was
+        # closed, or the branch's work is already in the default branch). The
+        # same contract as CANCEL: the loop stops at that boundary and NOTHING
+        # is pushed — no checkpoint, no report stage (no PR), no delegate
+        # publish. Unlike CANCEL the run does reply (RESULT + `superseded`), so
+        # the orchestrator can close the row. Before the `try` for the `finally`.
+        superseded_reason = ""
         try:
             for stage in self._pipeline_for(payload):
                 if _cancel_requested_now():
@@ -1289,6 +1357,19 @@ class StagedExecutor(ClaudeCodeExecutor):
                     completed.append(stage)
                     stages.record_stage(run_dir, stage)
                     continue
+                # Is the task already over? Asked before every stage that would
+                # actually run (an inherited one costs nothing, so it is skipped
+                # above first). Until 2026-11-18 a run re-read neither the task md
+                # nor the default branch between stages, so a task a person had
+                # merged and closed by hand still got its verify and report, and
+                # the park / timeout alerts that came out of them.
+                out = self._superseded_exit(
+                    payload, repo=repo, repo_url=repo_url, branch=branch,
+                    run_dir=run_dir, completed=completed, progress=progress,
+                    where=f"before stage {stage}")
+                if out is not None:
+                    superseded_reason = out.payload[superseded_mod.RESULT_KEY]
+                    return out
                 progress(f"stage {stage} …")
                 # Re-touch per stage. This is what justifies a stale cutoff of
                 # 90 minutes rather than one sized to a whole 5-stage pipeline:
@@ -1328,6 +1409,21 @@ class StagedExecutor(ClaudeCodeExecutor):
                         False, "cancelled by orchestrator (rerouted) — not pushed",
                         {"cancelled": True, "branch": branch, "run_dir": str(run_dir),
                          "stages": completed, "repo": repo_url})
+                if backend is claude_backend:
+                    # Ask again after the usage pause: that wait can last a whole
+                    # 5h window, which is plenty of time for a person to merge and
+                    # close the task. Unconditional rather than "only if the wait
+                    # really blocked": telling the two apart would mean timing the
+                    # call or wrapping its progress callback, and when nothing
+                    # blocked the repeat costs one md read (plus one more fetch
+                    # once implement is done).
+                    out = self._superseded_exit(
+                        payload, repo=repo, repo_url=repo_url, branch=branch,
+                        run_dir=run_dir, completed=completed, progress=progress,
+                        where=f"after the usage pause, before stage {stage}")
+                    if out is not None:
+                        superseded_reason = out.payload[superseded_mod.RESULT_KEY]
+                        return out
                 if backend is solar_backend:
                     # Solar (upstage) single-stage path — an in-engine read/write/
                     # finish tool loop, NOT `claude -p`. No argv, no subprocess, no
@@ -1588,6 +1684,26 @@ class StagedExecutor(ClaudeCodeExecutor):
                             progress("checkpoint skipped — cancelled")
                             cp = {}
                         else:
+                            # Superseded check BEFORE the checkpoint push and
+                            # AFTER the rescue above. Before the push: once a
+                            # squash merge has deleted origin/<branch>, pushing
+                            # the branch re-creates it, the duplicate-PR shape
+                            # (defect B) the timeout and capacity paths skip
+                            # `report` for. After the rescue: leftover
+                            # uncommitted work must be a commit first, or "all
+                            # this branch has is already in the default branch"
+                            # would be judged on a tree missing part of the
+                            # work. This is also the first boundary with
+                            # `implement` in `completed`, so the first one that
+                            # probes git.
+                            out = self._superseded_exit(
+                                payload, repo=repo, repo_url=repo_url, branch=branch,
+                                run_dir=run_dir, completed=completed,
+                                progress=progress,
+                                where="after implement, before the checkpoint push")
+                            if out is not None:
+                                superseded_reason = out.payload[superseded_mod.RESULT_KEY]
+                                return out
                             cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"implement checkpoint: {cp['note']}")
@@ -1918,7 +2034,9 @@ class StagedExecutor(ClaudeCodeExecutor):
                     progress("publish: skipped — cancelled by orchestrator")
                 except Exception:  # noqa: BLE001 - this block may not raise
                     pass
-            if is_vault_delegate and not cancelled:
+            # Superseded is the same contract as cancelled: the task is over, so
+            # this run's branch must not become a PR (let alone be merged).
+            if is_vault_delegate and not cancelled and not superseded_reason:
                 try:
                     # auto_merge:true delegate is merged like every other lane (the
                     # Report stage's server-side squash); auto_merge:false opens the
