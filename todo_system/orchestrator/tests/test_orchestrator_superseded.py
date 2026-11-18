@@ -11,8 +11,8 @@ Every suppression test has a control built from the same fixture with the md
 left open, in which the park and the alert really go out. Without that pair a
 suppression test would also pass on a fixture that could never alert.
 
-The two tests named `existing_sweep` pin behaviour that already existed before
-the superseded gate (dispatch()'s md guard, reconcile_split_parents). They are
+The tests named `existing_sweep` pin behaviour that already existed before the
+superseded gate (dispatch()'s md guard, reconcile_split_parents). They are
 green without the new code and are not evidence for it.
 """
 
@@ -491,9 +491,8 @@ class UntouchedRepliesTest(_Fixture):
         self.assertEqual(len(self.sent), 1)
 
 
-class ExistingSweepTest(_Fixture):
-    """Behaviour that predates the superseded gate, pinned through a real tick().
-    Green without the new code: NOT evidence for it."""
+class _TickFixture(_Fixture):
+    """A real tick() with only the live-machine sweeps stubbed (_TICK_STUBS)."""
 
     def _tick(self, task_list):
         with contextlib.ExitStack() as st:
@@ -510,6 +509,11 @@ class ExistingSweepTest(_Fixture):
 
     def _task(self) -> Task:
         return Task(SLUG, {"task_path": TASK_PATH, "summary": "x"})
+
+
+class ExistingSweepTest(_TickFixture):
+    """Behaviour that predates the superseded gate, pinned through a real tick().
+    Green without the new code: NOT evidence for it."""
 
     def test_existing_sweep_failed_row_with_done_md_is_closed_not_redispatched(self):
         self._write_md("done")
@@ -551,7 +555,7 @@ class ExistingSweepTest(_Fixture):
         self.assertEqual(self._assigns(), [])
 
 
-class TickEndToEndTest(ExistingSweepTest):
+class TickEndToEndTest(_TickFixture):
     """The new gate through a real tick(): the alert must not go out BEFORE the
     sweeps tidy the row (collect runs ahead of reconcile_split_parents)."""
 
