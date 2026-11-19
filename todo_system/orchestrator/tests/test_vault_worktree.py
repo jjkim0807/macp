@@ -282,6 +282,76 @@ def test_branch_prep_on_the_worktree_continues_a_pushed_branch(vault, tmp_path):
     assert _head_ref(vault) == MAIN_REF
 
 
+# --- what the stages are told ---------------------------------------------------------
+
+WT = "/w/vault.wt/t"                 # a vault worktree by shape; nothing reads the disk
+OVERRIDE = 'overrides every "vault root" git step'
+
+
+def _prompt(stage, **kw) -> str:
+    """The prompt text `build_stage_argv` builds (argv[2]) for a vault-ish run."""
+    base = dict(task_id="t", run_id="R", run_dir=Path("/v/Worker/runs/R"),
+                branch="worker/t")
+    base.update(kw)
+    return stages.build_stage_argv(stage, **base)[2]
+
+
+def _metadata(prompt: str) -> str:
+    return prompt.split("# Run metadata (injected by orchestrator)", 1)[1]
+
+
+@pytest.mark.parametrize("stage", stages.VAULT_WORKTREE_WRITE_STAGES)
+def test_a_stage_that_changes_the_branch_is_pointed_at_the_worktree(stage):
+    meta = _metadata(_prompt(stage, working_dir=WT))
+    assert f"- working_dir: `{WT}`\n" in meta
+    assert OVERRIDE in meta
+    assert f"`git -C {WT} …`" in meta
+    assert f"`git -C {WT} branch --show-current` does" in meta
+    assert "follow the EXTERNAL-repo steps" in meta
+    assert "never run `git checkout`" in meta
+    assert "removes the worktree" in meta
+    # the PR is the report/quick stage's to open and merge; a delegate's is the runner's
+    assert ("--repo <owner/repo>" in meta) == (stage in stages.VAULT_WORKTREE_GH_STAGES)
+    assert ("Running the project's build/tests" in meta) == (
+        stage in stages.VAULT_WORKTREE_CHECK_STAGES)
+    assert "External repo task" not in meta
+
+
+@pytest.mark.parametrize("stage", ["research", "plan"])
+def test_a_read_only_stage_is_told_where_the_branch_is_and_to_write_nothing_there(stage):
+    meta = _metadata(_prompt(stage, working_dir=WT))
+    assert f"- working_dir: `{WT}`\n" in meta
+    assert f"This stage writes nothing under `{WT}`" in meta
+    assert OVERRIDE not in meta
+    assert "git commit" not in meta
+
+
+def test_a_stage_with_no_branch_work_gets_only_the_working_dir_line():
+    with_wt = _metadata(_prompt("discover", working_dir=WT))
+    without = _metadata(_prompt("discover"))
+    assert with_wt.replace(f"- working_dir: `{WT}`\n", "", 1) == without
+
+
+@pytest.mark.parametrize("stage", sorted(stages.STAGE_ARTIFACT))
+def test_a_vault_run_without_a_worktree_gets_the_prompt_it_always_got(stage):
+    """`working_dir` alone opens nothing: only the worktree SHAPE does. The vault
+    root — what the runner passed before, and still passes for a discover run —
+    leaves the prompt as it is with no `working_dir` at all."""
+    plain = _prompt(stage)
+    assert _prompt(stage, working_dir="/v") == plain
+    assert _prompt(stage, working_dir="/v/vault.wt") == plain       # the parent, not a leaf
+    assert "working_dir" not in _metadata(plain)
+
+
+def test_an_external_repo_task_never_gets_the_vault_block():
+    """Even when the checkout's path has the vault worktree's shape — a repo
+    literally named `vault` keeps its run worktrees under `vault.wt/` too."""
+    meta = _metadata(_prompt("implement", repo="https://h/o/vault.git", working_dir=WT))
+    assert "- **External repo task**" in meta
+    assert "Vault task" not in meta
+    assert meta.count("Running the project's build/tests") == 1
+
+
 # --- the suite-wide isolation ---------------------------------------------------------
 
 

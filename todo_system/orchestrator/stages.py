@@ -621,6 +621,108 @@ def plan_split_hint(task_id: str) -> str:
         "fence, so the plan carries exactly one.\n")
 
 
+def _build_tests_hint(working_dir: str) -> str:
+    """The run-metadata line on running a checkout's own build/tests.
+
+    The stage runs with cwd = vault root, and the whitelist entry is the literal
+    `Bash(./gradlew:*)`: `<wd>/gradlew -p <wd>` does not match it and is denied,
+    and `cd <wd> && ./gradlew` is a refused construct. A standalone `cd` persists
+    across Bash calls — Verify found that on its own; Implement, told "git -C
+    rather than cd", never tried it and committed a Robolectric test it had not
+    run once (edge-to-edge-insets-pairent, 2026-09-25)."""
+    return (
+        f"- **Running the project's build/tests**: issue `cd {working_dir}` "
+        "as its own Bash call (no `&&`), then run `./gradlew …` / `npm …` "
+        "etc. in later calls — the cwd persists. The absolute form "
+        f"`{working_dir}/gradlew` is denied. Keep using `git -C` for git.\n")
+
+
+# Stages of a vault task that change its branch: they get the full worktree rule.
+# research/plan only read; every other stage gets the bare `working_dir` line.
+VAULT_WORKTREE_WRITE_STAGES = ("implement", "verify", "report", "quick", "delegate")
+# The ones among them that run the checkout's own checks, and the ones that
+# open and merge the PR themselves (a delegate run's PR is the runner's).
+VAULT_WORKTREE_CHECK_STAGES = ("implement", "verify", "quick")
+VAULT_WORKTREE_GH_STAGES = ("report", "quick")
+
+
+def _is_vault_worktree(working_dir: str | None) -> bool:
+    """Whether `working_dir` is a vault task's worktree (`repos.is_vault_worktree`,
+    a path-shape check). Any failure reads as "no": the prompt builder must not
+    acquire a way to fail."""
+    try:
+        from . import repos
+        return bool(working_dir) and repos.is_vault_worktree(working_dir)
+    except Exception:       # noqa: BLE001
+        return False
+
+
+def vault_worktree_meta(stage: str, working_dir: str, branch: str) -> list[str]:
+    """Run-metadata lines for a VAULT task whose branch lives in a linked worktree
+    of the vault (`repos.ensure_vault_worktree`) instead of the live checkout.
+
+    The stage prompts were written for a run that owned the live vault: "you are
+    at the vault root", "`git checkout -b worker/<slug>`", "push from the vault
+    root". They live under `.claude/**`, which a headless stage cannot edit, and
+    every one of them already branches on "is there a `working_dir` in the run
+    metadata" for an external repo. So the rule rides here, after the prompt,
+    where it wins: a `working_dir`, and for the stages that change the branch an
+    explicit statement that the worktree is where the branch is.
+
+    It is belt and braces with git itself: the worktree holds `worker/<slug>`, so
+    the prompts' `git checkout worker/<slug>` at the vault root is refused, and
+    the runner checks the live HEAD after every stage."""
+    wd = working_dir
+    lines = [f"- working_dir: `{wd}`\n"]
+    if stage in ("research", "plan"):
+        lines.append(
+            f"- **Vault task — its branch lives in a separate worktree**: `{wd}` is "
+            f"a linked worktree of the vault with `{branch}` checked out; the vault "
+            "root (this stage's cwd) stays on its default branch. Tracked files as "
+            "the branch has them — including the commits of an earlier attempt — "
+            f"are under `{wd}`; gitignored files and changes not committed yet are "
+            f"only under the vault root. This stage writes nothing under `{wd}`.\n")
+        return lines
+    if stage not in VAULT_WORKTREE_WRITE_STAGES:
+        return lines
+    lines.append(
+        "- **Vault task — its branch lives in a separate worktree (authoritative; "
+        "overrides every \"vault root\" git step in the prompt above)**: the runner "
+        f"already created `{wd}` as a linked worktree of the vault with `{branch}` "
+        "checked out. The vault root — this stage's cwd — stays on its default "
+        "branch for the whole run, so `git branch --show-current` there does NOT "
+        f"print `{branch}`; `git -C {wd} branch --show-current` does. Where the "
+        "prompt separates a vault task from an external-repo task, follow the "
+        "EXTERNAL-repo steps with this `working_dir`.\n"
+        f"  - Edit tracked files only under `{wd}/…` (absolute paths) and run every "
+        f"branch git command — the setup checks too — as `git -C {wd} …`. At the "
+        "vault root never run `git checkout`, `git switch`, `git commit`, `git add`, "
+        "`git stash`, `git merge`, `git rebase` or `git reset`; skip any prompt step "
+        f"that creates or switches to `{branch}` there (git refuses it anyway: the "
+        "worktree holds the branch).\n"
+        "  - Run artifacts do not move: `run_dir`, everything under `Worker/runs/`, "
+        "and `Memory/episodes/…` are written under the vault root. Gitignored files "
+        "and changes not committed yet exist only under the vault root: read them "
+        "there, and when a tracked file you are about to edit is missing or older "
+        f"under `{wd}`, copy its current content to the same relative path under "
+        f"`{wd}` first.\n"
+        "  - A command that locates the vault by itself (for example `uv run python "
+        "-m todo_system.cli …`) acts on the vault root, not on the worktree.\n")
+    if stage in VAULT_WORKTREE_GH_STAGES:
+        lines.append(
+            f"  - `gh`: run it from inside the worktree (`cd {wd}` as its own Bash "
+            "call) and pass `--repo <owner/repo>` to `gh pr merge` (`gh repo view "
+            "--json nameWithOwner --jq .nameWithOwner` prints it). Without `--repo`, "
+            "gh merges and then fails trying to switch this worktree to the default "
+            "branch, so the command exits non-zero for a PR that did merge.\n")
+    lines.append(
+        "  - When the run ends the runner commits whatever is still uncommitted "
+        f"under `{wd}` onto `{branch}` and removes the worktree.\n")
+    if stage in VAULT_WORKTREE_CHECK_STAGES:
+        lines.append(_build_tests_hint(wd))
+    return lines
+
+
 def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      branch: str, repo: str | None = None,
                      working_dir: str | None = None, auto_merge: bool = False,
@@ -637,7 +739,9 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     (BATCH_QUICK) adds the batch-verify instruction to the verify and report
     stages, with `batch_hint` appended to the verify one; None — every run that
     is not batch-verified — leaves the prompt byte-identical. The plan stage's
-    metadata always ends with `plan_split_hint`."""
+    metadata always ends with `plan_split_hint`. A vault task (no `repo`) whose
+    `working_dir` is its worktree (`repos.is_vault_worktree`) gets
+    `vault_worktree_meta`; any other `working_dir` without a `repo` adds nothing."""
     prompt = strip_frontmatter(load_stage_prompt(stage))
     mcp_server = browser_mcp_server(stage)
     mcp_on = mcp_server is not None
@@ -731,20 +835,14 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         meta.append(f"- repo: `{repo}`\n")
         if working_dir:
             meta.append(f"- working_dir: `{working_dir}`\n")
-            # The stage runs with cwd = vault root, and the whitelist entry is the
-            # literal `Bash(./gradlew:*)`: `<wd>/gradlew -p <wd>` does not match it
-            # and is denied, and `cd <wd> && ./gradlew` is a refused construct.
-            # A standalone `cd` persists across Bash calls — Verify found that on
-            # its own; Implement, told "git -C rather than cd", never tried it and
-            # committed a Robolectric test it had not run once
-            # (edge-to-edge-insets-pairent, 2026-09-25).
-            meta.append(
-                f"- **Running the project's build/tests**: issue `cd {working_dir}` "
-                "as its own Bash call (no `&&`), then run `./gradlew …` / `npm …` "
-                "etc. in later calls — the cwd persists. The absolute form "
-                f"`{working_dir}/gradlew` is denied. Keep using `git -C` for git.\n")
+            meta.append(_build_tests_hint(working_dir))
         meta.append("- **External repo task**: Implement/Verify operate on the "
                     "checkout; vault run_dir artifacts are read-only references.\n")
+    elif _is_vault_worktree(working_dir):
+        # A vault task (no `repo`) whose branch is in a linked worktree of the
+        # vault. Only that shape opens this arm: with no `working_dir`, or one
+        # that is the vault root itself, the prompt is what it always was.
+        meta.extend(vault_worktree_meta(stage, working_dir, branch))
     if batch_mode == BATCH_QUICK and stage == "verify":
         # Batch verify (batch_gate.py): this run checks only what it changed and
         # the repo's full gate runs once, later, for several tasks together. On
@@ -1547,16 +1645,26 @@ def prepare_external_branch(repo_dir: Path, branch: str,
 def prepare_vault_branch(repo_dir: Path, branch: str,
                          progress: Callable[[str], None] | None = None,
                          ) -> subprocess.CompletedProcess:
-    """Put the LIVE vault checkout on `branch`, creating it when it does not exist.
+    """Put a vault task's worktree on `branch`, creating it when it does not exist.
+
+    `repo_dir` is the run's linked worktree of the vault
+    (`repos.ensure_vault_worktree`), NOT the live vault checkout. It used to be
+    the live checkout: this function switched the vault a person works in onto
+    `worker/<slug>` and the run kept it there, so everything committed in the
+    vault meanwhile — by a person, the planner, the sync daemon — rode the worker
+    branch (2026-11-17). The body did not have to change for the move, because
+    every step already acts on `repo_dir` alone; what changed is which directory
+    the runner hands it.
 
     Deliberately NOT `prepare_external_branch` with a flag. That function opens by
     hard-resetting onto origin's default branch and deleting every untracked file,
-    which is correct for a throwaway ~/Worker clone and catastrophic here:
-    `repo_dir` is the vault the human works in, and it holds gitignored live state
-    (`Todo/items/`, `Worker/runs/`) plus whatever they have half-written. Neither
-    of those two destructive steps may ever appear in this function — that is the
-    entire reason it is a separate function, so any future edit that "unifies" the
-    two has to delete this paragraph first.
+    which is correct for a throwaway ~/Worker clone and wrong for anything cut from
+    the vault: a retry may be handed a worktree that still holds the previous
+    attempt's uncommitted work, and this function is also the one a caller could
+    still point at the vault itself. Neither of those two destructive steps may
+    ever appear in this function — that is the entire reason it is a separate
+    function, so any future edit that "unifies" the two has to delete this
+    paragraph first.
 
     Without this, a vault run had no branch prep at all: `_execute`'s prep lived
     inside `if repo_url:` with no `else:`, so the only thing that ever created
@@ -1567,9 +1675,11 @@ def prepare_vault_branch(repo_dir: Path, branch: str,
     attempt already pushed `origin/<branch>`, continue from it so the next push
     fast-forwards — re-cutting from local HEAD would build a lineage that can
     never be pushed (force-push is forbidden), the retry deadlock. Otherwise base
-    is None, meaning current HEAD: `restore_main` has just put HEAD on the default
-    branch, and the live vault's local default legitimately carries sync commits
-    that were never pushed, so HEAD is a truer base here than `origin/<default>`.
+    is None, meaning current HEAD — the worktree's detached HEAD, which is the
+    vault's LOCAL default branch as it was when the worktree was cut. That local
+    branch legitimately carries commits that were never pushed (sync commits, the
+    task file a person just committed), so it is a truer base here than
+    `origin/<default>`.
 
     Returns the final checkout's CompletedProcess carrying three attributes, in
     the idiom `prepare_external_branch` already uses. `base`: what the branch was
