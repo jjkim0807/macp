@@ -15,6 +15,7 @@ import json
 import sqlite3
 import unittest
 
+from todo_system import i18n
 from todo_system.tests.test_macp_dashboard import M, _install_status_fixture
 
 REPO = "https://example.test/acme/app.git"
@@ -115,3 +116,52 @@ class NoBatchStatusTest(unittest.TestCase):
         self.assertEqual(set(d), _PRE_BATCH_KEYS | {"batch_ready"})
         for r in d["recent"]:
             self.assertIs(r["batch_ready"], False)
+
+
+_NEW_KEYS = ("dash.html.batch_ready", "dash.js.st_batch_ready", "dash.cmt.batch_ready")
+
+
+class BatchPageTest(unittest.TestCase):
+    """The page the server actually serves: render_html(lang)."""
+
+    def test_ko_page_has_batch_card(self):
+        page = M.render_html("ko")
+        for needle in ('id="c-batch"', 'id="cnt-batch"', 'id="batch"',
+                       "묶음 검증 대기", "묶음 대기", "batch_ready:'b-def'",
+                       "fill('batch',bq,batchRow,", "d.batch_ready||[]",
+                       "$('c-batch').hidden=!bq.length"):
+            self.assertIn(needle, page)
+        self.assertNotIn("@@", page)
+        # the card is hidden until there is a row
+        self.assertIn('<section class="card" id="c-batch" hidden>', page)
+
+    def test_en_page_has_batch_card(self):
+        page = M.render_html("en")
+        self.assertIn('id="c-batch"', page)
+        self.assertIn("Batch verify queue", page)
+        self.assertIn("batch wait", page)
+        self.assertNotIn("묶음", page)
+        self.assertNotIn("@@", page)
+
+    def test_card_sits_between_active_and_queue(self):
+        page = M.render_html("ko")
+        i_active = page.index('id="c-active"')
+        i_batch = page.index('id="c-batch"')
+        i_queue = page.index('id="c-queue"')
+        self.assertLess(i_active, i_batch)
+        self.assertLess(i_batch, i_queue)
+
+    def test_badge_relabels_only_batch_ready(self):
+        page = M.render_html("ko")
+        self.assertIn("const BL={batch_ready:'묶음 대기'};", page)
+        self.assertIn("${esc(BL[s]||s)}", page)
+        self.assertIn("deferred:'b-def',batch_ready:'b-def',in_progress:'b-run'", page)
+
+    def test_i18n_keys_in_both_languages(self):
+        ko, en = i18n.DASHBOARD["ko"], i18n.DASHBOARD["en"]
+        self.assertEqual(set(ko), set(en))
+        for k in _NEW_KEYS:
+            self.assertIn(k, ko)
+            self.assertIn(k, en)
+            self.assertNotIn("--", en[k])     # rendered inside an HTML comment
+            self.assertNotIn("--", ko[k])

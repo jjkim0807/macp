@@ -2130,6 +2130,12 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
     <button class="more" data-sec="active" hidden>@@dash.html.more@@</button>
   </section>
 
+  <!-- @@dash.cmt.batch_ready@@ -->
+  <section class="card" id="c-batch" hidden>
+    <h2>📦 @@dash.html.batch_ready@@ <span class="cnt" id="cnt-batch">0</span></h2>
+    <div class="list" id="batch"></div>
+  </section>
+
   <!-- @@dash.cmt.queue@@ -->
   <section class="card" id="c-queue">
     <details id="d-queue">
@@ -2201,7 +2207,8 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
 const $=id=>document.getElementById(id);
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const esca=s=>(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(s)}</span>`};
+const BL={batch_ready:'@@dash.js.st_batch_ready@@'};
+const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',batch_ready:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(BL[s]||s)}</span>`};
 function pcolor(s){let h=0;for(const c of(s||''))h=(h*31+c.charCodeAt(0))>>>0;return h%360}
 function copyBtn(id){return `<button class="cp" data-cp="${esca(id)}" title="@@dash.js.copy_id@@ ${esca(id)}">⧉ id</button>`}
 function pchip(p){if(!p)return '';const h=pcolor(p);return `<span class="pchip" style="color:hsl(${h},65%,74%);border-color:hsl(${h},35%,44%)" title="@@dash.js.project@@ ${esca(p)}">${esc(p)}</span>`}
@@ -2225,6 +2232,7 @@ const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
 const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
+const batchRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
 const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(dn*100/t):0,st=PST[r.status];
   return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="@@dash.js.last_activity@@ ${esca(r.last_activity)} @@dash.js.latest_of@@">${esc(r.last_age)}@@dash.js.ago@@</span> `:''}<span class="pbar" title="${dn}/${t}@@dash.js.done@@"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
@@ -2450,6 +2458,12 @@ function update(d){
   foldFill('active','active',shownA,activeRow,'@@dash.js.no_active@@');
   const abtn=document.querySelector('.more[data-sec="active"]');
   if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'@@dash.js.less@@':`@@dash.html.more@@ (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
+
+  // @@dash.html.batch_ready@@: hidden when empty; `|| []` keeps an older server (no batch_ready key) working.
+  const bq=d.batch_ready||[];
+  $('cnt-batch').textContent=bq.length;
+  $('c-batch').hidden=!bq.length;
+  fill('batch',bq,batchRow,'@@dash.js.none@@');
 
   // @@dash.html.queue@@: server order as-is, no group folding (the order is the information).
   const q=d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
