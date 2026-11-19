@@ -573,6 +573,54 @@ def argv_session_id(argv) -> str | None:
         return None
 
 
+def plan_split_hint(task_id: str) -> str:
+    """The plan stage's metadata line on stating a split the engine can run: the
+    fenced `rescope` block that `rescope.rescope_from_split_block` reads when a
+    plan declares the task oversize. The example is built with `json.dumps`, so
+    it is valid JSON whatever the task id, and a golden test feeds it to the real
+    parser — the prompt and the reader cannot drift apart. This module does not
+    import rescope; the fence name is spelled out."""
+    criteria = ["<criterion>", "<the local-gate criterion>"]
+    first = {"slug": f"{task_id}-1-first-part", "phases": [1, 2],
+             "acceptance_criteria": criteria,
+             "touches": ["path/to/file.py", "docs/page.md"]}
+    second = {"slug": f"{task_id}-2-second-part", "phases": [3],
+              "depends_on": [first["slug"]],
+              "title": "<short title>",
+              "outcome": "<one line: what closes this sub-task>",
+              "model_tier": "standard", "estimate_p50": "1h", "estimate_p90": "2h",
+              "acceptance_criteria": criteria,
+              "touches": ["path/to/other.py"]}
+    example = ('  {"subtasks": [\n    ' + json.dumps(first, ensure_ascii=False) + ",\n    "
+               + json.dumps(second, ensure_ascii=False) + "\n  ]}\n")
+    return (
+        "- **Oversize plan → machine-readable split**: only when you write "
+        "`declares_oversize: yes`, ALSO put exactly ONE fenced block whose info string "
+        "is `rescope` into implementation_plan.md. The engine creates the sub-tasks "
+        "from it and chains them without a person; with no block, or with one it "
+        "cannot use, the task parks for a human (the block is used as written or not "
+        "at all). It is strict JSON — double quotes, no comments, no trailing commas:\n"
+        "  ```rescope\n" + example + "  ```\n"
+        "  - 2–5 sub-tasks, in merge order: each later one starts when the one before "
+        "it is done.\n"
+        "  - `phases` are this plan's `### Phase N` numbers: every Phase in exactly one "
+        "sub-task, in order, none left out.\n"
+        "  - `slug` is new and kebab-case (a-z, 0-9, hyphens; at most 80 characters), "
+        "is not this task's own, and has no existing `Todo/items/<slug>.md` — "
+        f"`{task_id}-<n>-<what>` is a safe pattern.\n"
+        "  - `acceptance_criteria` are complete for each sub-task and copied as written, "
+        "so repeat the local-gate criterion in every one.\n"
+        "  - `touches` lists every repo-relative path or `dir/**` glob the sub-task "
+        "will change, one per entry: no `{a,b}` braces, no absolute paths.\n"
+        "  - `title`, `outcome`, `model_tier` (heavy|standard|light), `estimate_p50` and "
+        "`estimate_p90` are optional — derived from the Phase headings or inherited "
+        "from this task when left out. `depends_on` is optional too and may only name "
+        "the sub-task right before it.\n"
+        "  - Keep the prose explanation of the split as well: a person reads that, the "
+        "engine reads only the block. Quote any example of the block inside a longer "
+        "fence, so the plan carries exactly one.\n")
+
+
 def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      branch: str, repo: str | None = None,
                      working_dir: str | None = None, auto_merge: bool = False,
@@ -588,7 +636,8 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     (model_select.classify_tier); None means the heavy ladder. `batch_mode`
     (BATCH_QUICK) adds the batch-verify instruction to the verify and report
     stages, with `batch_hint` appended to the verify one; None — every run that
-    is not batch-verified — leaves the prompt byte-identical."""
+    is not batch-verified — leaves the prompt byte-identical. The plan stage's
+    metadata always ends with `plan_split_hint`."""
     prompt = strip_frontmatter(load_stage_prompt(stage))
     mcp_server = browser_mcp_server(stage)
     mcp_on = mcp_server is not None
@@ -731,6 +780,12 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "gate passes, or by a later run of this task after an individual full "
             "Verify. Unless there is another reason, write `없음` under `사람이 "
             "검토해야 할 부분`.\n")
+    if stage == "plan":
+        # How an oversize plan states a split the engine can run without a person
+        # (rescope.rescope_from_split_block). On the metadata for the same reason
+        # as the BROWSER line above: worker-plan.md lives under .claude/**, which
+        # a headless stage cannot edit — and here it takes effect on merge.
+        meta.append(plan_split_hint(task_id))
     if project_context:
         meta.append("\n## Project memory (.macp/memory — accumulated context)\n\n"
                     + project_context + "\n")

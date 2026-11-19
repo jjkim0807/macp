@@ -1,0 +1,90 @@
+{
+  "subtasks": [
+    {
+      "slug": "example-batch-verify-1-quick-verify-state",
+      "title": "macp 묶음 검증 ① — verify_batch 배선·quick Verify·batch_ready 상태",
+      "phases": [
+        1,
+        2,
+        3
+      ],
+      "depends_on": [],
+      "model_tier": "heavy",
+      "estimate_p50": "2h",
+      "estimate_p90": "4h",
+      "outcome": "`verify_batch` frontmatter가 payload까지 배선되고, 묶음 대상 태스크는 Verify가 quick(대상 테스트+컴파일)만 하고 `batch_ready`로 머지 보류되며, 복귀 행은 개별 전체 Verify로 재디스패치된다 — 볼트 `.macp/batch_gate.json` 없으면 동작 불변. `uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용",
+      "acceptance_criteria": [
+        "단위 테스트: 대상 판정(light/standard·verify_batch true/false·emulator 조건·auto_merge false·미등록 리포·원격 게이트 표시 리포 제외), RESULT→batch_ready 전이, 복귀 행은 refail 증가·poison 없이 재디스패치되고 다음 payload에 `verify_full`이 실린다",
+        "`verify_batch` frontmatter가 payload까지 실제로 전달된다(tasks.py 배선 테스트: md → load_dispatchable → batch_gate.eligible)",
+        "러너 경로 테스트(`StagedExecutor._execute`): 묶음 대상이면 verify·report 스테이지에 quick/batch 지시가 실리고 RESULT payload에 `batch_ready`·`review_required`가 실린다. 새 코드의 호출 위치를 verify.md에 적는다",
+        "기존 개별 Verify 경로(heavy 태스크·verify_batch: false·설정 없는 리포)는 바뀌지 않는다 — 기존 테스트 green",
+        "`uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용"
+      ],
+      "touches": [
+        "todo_system/orchestrator/tasks.py",
+        "todo_system/orchestrator/assignment.py",
+        "todo_system/orchestrator/batch_gate.py",
+        "todo_system/orchestrator/stages.py",
+        "todo_system/orchestrator/agent_backend.py",
+        "todo_system/orchestrator/runner.py",
+        "todo_system/orchestrator/orchestrator.py",
+        "docs/tasks.md"
+      ]
+    },
+    {
+      "slug": "example-batch-verify-2-integration-gate",
+      "title": "macp 묶음 검증 ② — 통합 브랜치·게이트 1회·차례 머지·실패 복귀",
+      "phases": [
+        4,
+        5,
+        6
+      ],
+      "depends_on": [
+        "example-batch-verify-1-quick-verify-state"
+      ],
+      "model_tier": "heavy",
+      "estimate_p50": "3h",
+      "estimate_p90": "5h",
+      "outcome": "오케스트레이터 틱이 batch_ready 2개 이상(또는 30분)이면 최신 main 위 로컬 통합 브랜치에 합쳐 리포 전체 게이트를 한 번 돌리고, 통과하면 순서대로 squash 머지, 실패·충돌이면 개별 Verify로 복귀시키고 한 번 알린다 — `uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용",
+      "acceptance_criteria": [
+        "단위 테스트: 통합 게이트 트리거(2개 이상 또는 30분), 충돌 브랜치 제외, 통과 시 순서대로 머지·md done, 실패 시 각 태스크 개별 Verify로 복귀 + 알림 1회, main이 움직이면 잡 재시작(상한을 넘으면 복귀)",
+        "통합 테스트(가짜 git 리포 + 가짜 게이트 명령): 브랜치 3개(그중 1개는 충돌)를 batch_ready로 두고 `Orchestrator.tick()`을 돌리면 통합 브랜치에 2개가 합쳐져 게이트 1회 실행 → 2개 PR 머지 호출 순서·인자 확인, 충돌 1개는 개별 Verify 대기열로. 새 코드의 호출 위치를 verify.md에 적는다",
+        "게이트 실행은 gradle 동시 빌드 상한 계산에 들어간다(상한이면 시작을 미루고, 실행 중이면 디스패치 쪽 계산에 +1) — 테스트",
+        "설정 없는 호스트의 틱은 잡 파일·로그 줄·git 호출을 만들지 않는다 — 기존 테스트 green",
+        "`uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용"
+      ],
+      "touches": [
+        "todo_system/orchestrator/batch_gate.py",
+        "todo_system/orchestrator/orchestrator.py",
+        "todo_system/orchestrator/runner.py",
+        "todo_system/i18n.py"
+      ]
+    },
+    {
+      "slug": "example-batch-verify-3-dashboard",
+      "title": "macp 묶음 검증 ③ — '묶음 검증 대기' 대시보드·문서",
+      "phases": [
+        7,
+        8
+      ],
+      "depends_on": [
+        "example-batch-verify-2-integration-gate"
+      ],
+      "model_tier": "standard",
+      "estimate_p50": "1h",
+      "estimate_p90": "2h",
+      "outcome": "대시보드(웹·Orchestrator.md·`/api/status`)에 '묶음 검증 대기'가 같은 필드로 보이고 docs/batch-verify.md가 생긴다 — `uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용",
+      "acceptance_criteria": [
+        "대시보드에 '묶음 검증 대기' 상태가 웹·앱 같은 필드로 보인다: `/api/status`의 `batch_ready[]`, 행의 `state: batch_ready`·`batch_ready: true`, 웹 카드, Orchestrator.md 섹션(테스트)",
+        "묶음 행이 없으면 기존 렌더 출력과 같고, i18n ko·en 키가 같다",
+        "`uv run --with ruff ruff check .` + `uv run --with pytest python -m pytest -q` + `check_engine_isolation.sh` + 볼트 `ops/check_public_identifiers.sh --export`(AUDIT_ROOT=worktree) 로컬 green, run.log 인용"
+      ],
+      "touches": [
+        "todo_system/orchestrator/dashboard.py",
+        "scripts/macp_dashboard.py",
+        "todo_system/i18n.py",
+        "docs/batch-verify.md"
+      ]
+    }
+  ]
+}

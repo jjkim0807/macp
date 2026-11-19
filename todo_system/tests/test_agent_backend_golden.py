@@ -42,6 +42,7 @@ from pathlib import Path
 import pytest
 
 from todo_system.orchestrator import stages
+from todo_system.orchestrator import rescope
 
 # Representative stages: the read-only pair, the richest write stage, verify's
 # fallback-runner set, the two single-stage lanes.
@@ -317,3 +318,70 @@ def test_hint_without_a_mode_is_ignored(monkeypatch, tmp_path, stage):
 def test_an_unknown_batch_mode_adds_nothing(monkeypatch, tmp_path, stage):
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
     assert _argv(stage, wr, batch_mode="full", batch_hint=_HINT)[2] == _argv(stage, wr)[2]
+
+
+# ---------------------------------------------------------------------------
+# Plan stage: the machine-readable split block (rescope.rescope_from_split_block)
+# is documented on the metadata, because a headless stage cannot edit the
+# worker-plan.md prompt under .claude/**.
+# ---------------------------------------------------------------------------
+
+# The hint's own heading. Not the bare phrase "machine-readable split": the
+# implement and verify prompts already use that for the rescope.json they write.
+_SPLIT_MARK = "**Oversize plan → machine-readable split**"
+_THREE_PHASE_PLAN = (
+    "# Implementation Plan\n\n## Phases\n\n### Phase 1: first\n\n### Phase 2: second\n\n"
+    "### Phase 3: third\n\n## Rollback plan\n\nDelete the branch.\n")
+
+
+def test_plan_prompt_split_example_is_what_the_engine_parses(monkeypatch, tmp_path):
+    # The example a Plan agent is shown is fed to the engine's own reader and
+    # builder, so the prompt and the parser cannot drift apart.
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv("plan", wr)[2]
+    assert _SPLIT_MARK in full
+    blocks = rescope.find_plan_split_blocks(full)
+    assert len(blocks) == 1                    # one example, and it reads as top-level
+    example = json.loads(blocks[0])["subtasks"]
+    assert set(example[0]) == {"slug", "phases", "acceptance_criteria", "touches"}
+    # ... and the second one shows every optional key the rules name
+    assert set(example[1]) == set(example[0]) | {
+        "depends_on", "title", "outcome", "model_tier", "estimate_p50", "estimate_p90"}
+
+    plan, why = rescope.rescope_from_split_block(
+        blocks, _THREE_PHASE_PLAN, {"auto_merge": True}, parent_slug="slug", run_id="RID")
+    assert plan is not None, why
+    assert [s["slug"] for s in plan["subtasks"]] == ["slug-1-first-part", "slug-2-second-part"]
+    assert [s["phases"] for s in plan["subtasks"]] == [[1, 2], [3]]
+    assert rescope.can_auto_rescope(plan, {"auto_merge": True}).allow
+
+
+def test_split_hint_names_every_key_the_builder_reads(monkeypatch, tmp_path):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv("plan", wr)[2]
+    hint = full[full.index(_SPLIT_MARK):]
+    for key in ("declares_oversize: yes", "`rescope`", "`slug`", "`phases`",
+                "`acceptance_criteria`", "`touches`", "`depends_on`", "`title`",
+                "`outcome`", "`model_tier`", "heavy|standard|light", "Todo/items/"):
+        assert key in hint, key
+    assert hint.endswith("\n")
+
+
+@pytest.mark.parametrize("stage", [s for s in _BATCH_STAGES if s != "plan"])
+def test_split_hint_is_plan_only(monkeypatch, tmp_path, stage):
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    full = _argv(stage, wr)[2]
+    assert _SPLIT_MARK not in full
+    assert "```rescope" not in full
+
+
+def test_split_hint_sits_in_the_metadata_block(monkeypatch, tmp_path):
+    # Appended to the run metadata: the stage prompt passes through verbatim, the
+    # hint comes after it (so it outranks it) and before the project memory.
+    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    prompt = stages.strip_frontmatter(stages.load_stage_prompt("plan"))
+    full = _argv("plan", wr, project_context="PROJECT-MEMORY-SENTINEL")[2]
+    assert full.startswith(prompt)
+    assert _SPLIT_MARK not in prompt
+    head = "# Run metadata (injected by orchestrator)"
+    assert full.index(head) < full.index(_SPLIT_MARK) < full.index("PROJECT-MEMORY-SENTINEL")
