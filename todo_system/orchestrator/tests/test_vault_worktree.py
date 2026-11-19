@@ -746,6 +746,38 @@ def test_an_external_repo_run_never_touches_the_vault_worktree(live, vault, tmp_
     assert seen["kw"]["working_dir"] == str(clone)
 
 
+def test_restoring_a_checkout_that_is_already_on_main_runs_no_checkout(vault):
+    """What `restore_main` finds on every healthy run now. A plain `checkout main`
+    that fails for a moment falls back to `checkout -f`, which would delete this
+    edit to "restore" a branch the checkout never left."""
+    (vault / "main.txt").write_text("a person's uncommitted edit", encoding="utf-8")
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def spy(argv, *a, **kw):
+        calls.append(list(argv))
+        if "checkout" in argv:          # the transient failure: index.lock is held
+            return subprocess.CompletedProcess(argv, 128, "", "fatal: index.lock exists")
+        return real_run(argv, *a, **kw)
+
+    with mock.patch("subprocess.run", side_effect=spy):
+        assert stages.restore_main(vault) is True
+
+    assert not [c for c in calls if "checkout" in c]
+    assert (vault / "main.txt").read_text(encoding="utf-8") == "a person's uncommitted edit"
+    assert _head_ref(vault) == MAIN_REF
+
+
+def test_restoring_from_another_branch_still_checks_main_out(vault):
+    _git(vault, "checkout", "-b", "worker/x")
+    assert stages.restore_main(vault) is True
+    assert _head_ref(vault) == MAIN_REF
+    # a detached HEAD is not "already on main" either
+    _git(vault, "checkout", "--detach")
+    assert stages.restore_main(vault) is True
+    assert _head_ref(vault) == MAIN_REF
+
+
 def test_origin_as_a_gh_repo_argument(vault):
     assert StagedExecutor._origin_repo_arg(vault) is None      # a path remote
     _git(vault, "remote", "set-url", "origin", URL)

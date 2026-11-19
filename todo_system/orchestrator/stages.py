@@ -3060,7 +3060,19 @@ def restore_main(repo_dir: Path, main: str = "main") -> bool:
     re-applied after a successful one. Preservation is best-effort (the helpers
     never raise) so it can never convert this finally-called function into a raise;
     scoping to the two runtime prefixes leaves `-f`'s job of forcing past every
-    OTHER dirty file untouched."""
+    OTHER dirty file untouched.
+
+    Already on `main` → True with no checkout at all. Since vault tasks run in a
+    worktree of their own the runner never moves the live vault's HEAD, so that
+    is what every call finds on a healthy run — and a `checkout main` that is a
+    no-op in effect is still a command that can fail for a moment (another
+    process holding `index.lock`). Its fallback is `checkout -f`, which would
+    then throw away a person's uncommitted edits to restore a branch the checkout
+    was already on. `current_branch` answers "" for a detached HEAD or a git
+    failure, so anything it cannot positively identify as `main` takes the
+    checkout path exactly as before."""
+    if current_branch(repo_dir) == main:
+        return True
     snap = snapshot_tracked_runtime(repo_dir)
     r = subprocess.run(["git", "-C", str(repo_dir), "checkout", main],
                        capture_output=True, text=True, encoding="utf-8", errors="replace",
