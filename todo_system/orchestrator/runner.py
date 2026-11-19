@@ -729,6 +729,199 @@ class StagedExecutor(ClaudeCodeExecutor):
         except Exception:      # noqa: BLE001 — advisory guard, fail open
             return None
 
+    # --- vault tasks: the branch lives in a linked worktree, never in the live vault ---
+    #
+    # A task with no `repo:` works on the vault repository. Until 2026-11-19 the
+    # runner checked `worker/<slug>` out IN the live vault and kept it there for
+    # the whole pipeline. The live vault is also where a person, the planner and
+    # the sync daemon commit, so their commits landed on the worker branch and
+    # left the working tree when the run switched back (2026-11-17: one discover
+    # run, 24 minutes, eight commits off the default branch). The helpers below
+    # give the run `<worker root>/vault.wt/<slug>` instead. None of them takes
+    # `agent` — the _execute suites pass a bare Mock for it — and none raises.
+
+    @staticmethod
+    def _is_worktree(path) -> bool:
+        """Whether `path` still is a git worktree: its `.git` entry exists.
+
+        Asked before every git call the runner makes against a vault task's
+        worktree once the stages have had it — rescue, publish, removal, and the
+        live-HEAD watch that goes with it. A stage, a person or a cleanup can have
+        taken the directory away by then, and `git -C <a path that is not a
+        worktree>` does not fail: it walks up and answers for whatever repository
+        encloses the path. Filesystem only; never raises."""
+        try:
+            return (Path(path) / ".git").exists()
+        except Exception:       # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _vault_head() -> str:
+        """The ref the LIVE vault's HEAD points at (`refs/heads/main`), or "" when
+        it is detached or cannot be read. Read-only; never raises."""
+        try:
+            r = stages._git(stages._VAULT_DATA_ROOT, "symbolic-ref", "-q", "HEAD")
+            return (r.stdout or "").strip() if getattr(r, "returncode", 1) == 0 else ""
+        except Exception:       # noqa: BLE001 — a watch that cannot read watches nothing
+            return ""
+
+    @staticmethod
+    def _origin_repo_arg(checkout) -> str | None:
+        """`origin`'s URL as a `gh --repo` argument, or None when there is no
+        origin or it is not a URL (a path remote: every temp-repo test).
+
+        `gh pr merge --delete-branch` without `--repo` also cleans up LOCALLY:
+        it switches the checkout to the default branch and deletes the local
+        branch. In a linked worktree that switch is refused — the vault holds the
+        default branch — so gh exits non-zero for a PR that did merge. With
+        `--repo` gh acts on the server only. Never raises."""
+        try:
+            r = stages._git(checkout, "remote", "get-url", "origin")
+            url = (r.stdout or "").strip() if getattr(r, "returncode", 1) == 0 else ""
+        except Exception:       # noqa: BLE001
+            return None
+        return url if ("://" in url or url.startswith("git@")) else None
+
+    def _rescue_vault_worktree(self, wt, slug: str, progress: ProgressFn,
+                               what: str = "vault worktree") -> None:
+        """Commit whatever a vault task's worktree still holds uncommitted onto
+        the branch it is on. A local commit only — nothing is pushed here.
+
+        The worktree is removed when the run ends, and a removal deletes what was
+        never committed, so this runs first on EVERY way out (success, a failed
+        stage, a timeout, a cancel). Onto the worktree's CURRENT branch rather
+        than a name passed in: if a stage moved the worktree to another branch,
+        that is where its work is. `rescue_uncommitted` refuses the default branch
+        and a detached HEAD by itself. Never raises."""
+        try:
+            if not self._is_worktree(wt):
+                return
+            cur = stages.current_branch(wt)
+            if not cur:
+                return
+            rsc = stages.rescue_uncommitted(wt, cur, slug)
+            if rsc.get("committed"):
+                progress(f"{what}: {rsc['note']}")
+        except Exception as e:      # noqa: BLE001 — finally-called; never mask the outcome
+            try:
+                progress(f"{what}: rescue skipped ({type(e).__name__})")
+            except Exception:       # noqa: BLE001
+                pass
+
+    def _remove_vault_worktree(self, wt, progress: ProgressFn,
+                               what: str = "vault worktree") -> bool:
+        """Remove a vault task's worktree; True when the path no longer is one.
+
+        Only a CLEAN worktree is removed. `git worktree remove --force` deletes
+        uncommitted files, so one that is still dirty after the rescue above —
+        the commit was refused, or HEAD is detached and there is no branch to
+        commit to — is left standing and named instead: its content is the only
+        copy. The same task's next run meets it again (`_prepare_vault_worktree`)
+        and fails loudly until someone has looked. The `worker/<slug>` ref is not
+        touched either way; the commits live on it. Never raises."""
+        try:
+            if not self._is_worktree(wt):
+                return True
+            st = stages._git(wt, "status", "--porcelain")
+            if getattr(st, "returncode", 1) != 0 or (st.stdout or "").strip():
+                progress(f"{what} kept — it still has uncommitted changes that could "
+                         f"not be committed: {wt}")
+                return False
+            return bool(stages.remove_worktree(stages._VAULT_DATA_ROOT, wt,
+                                               progress=progress))
+        except Exception as e:      # noqa: BLE001 — finally-called; never mask the outcome
+            try:
+                progress(f"{what}: removal skipped ({type(e).__name__})")
+            except Exception:       # noqa: BLE001
+                pass
+            return False
+
+    def _prepare_vault_worktree(self, msg: m.Envelope, branch: str,
+                                progress: ProgressFn,
+                                sink: dict) -> tuple[Path | None, str | None]:
+        """Give a vault task its own worktree with `branch` checked out in it.
+
+        Returns `(worktree, None)`, or `(None, problem)` — and a problem FAILS the
+        run. That is deliberate and the opposite of the advisory guards above: with
+        no worktree the stages would have nowhere to commit but the live vault's
+        default branch, which is the 2026-08-24 failure `prepare_vault_branch` was
+        written to end. The live vault's HEAD, index and working tree are not
+        touched by anything in here.
+
+        A worktree already at the path is what a run that died before its
+        `finally` left behind: its leftovers are committed and it is removed, so
+        this run starts from a clean tree. `sink` receives `orphaned_commits`
+        BEFORE the failure verdict, for the reason given at the external call
+        site: a failed checkout is when the dropped commits most need naming."""
+        root = stages._VAULT_DATA_ROOT
+        try:
+            wt = repos.vault_worktree_path(msg.task_id)
+            if self._is_worktree(wt):
+                self._rescue_vault_worktree(wt, msg.task_id, progress,
+                                            what="leftover vault worktree")
+                if not self._remove_vault_worktree(wt, progress,
+                                                   what="leftover vault worktree"):
+                    return None, (f"a leftover vault worktree is in the way and "
+                                  f"could not be removed: {wt}")
+            prep_log: list[str] = []
+            wt = repos.ensure_vault_worktree(root, msg.task_id, log=prep_log,
+                                             branch=branch)
+            if wt is None:
+                reason = prep_log[-1] if prep_log else ""
+                return None, ("could not prepare vault worktree"
+                              + (f": {reason}" if reason else ""))
+            if Path(wt).resolve() == Path(root).resolve():
+                # Cannot happen by construction; if it ever does, the next line
+                # would be a `checkout -B` in the live vault — the very thing
+                # this whole path exists to never do.
+                return None, ("vault worktree resolved to the live vault checkout "
+                              "itself — refusing to prepare a branch there")
+            vp = stages.prepare_vault_branch(wt, branch, progress=progress)
+            if getattr(vp, "orphaned_commits", None):
+                sink["orphaned_commits"] = vp.orphaned_commits
+            if vp.problem:
+                # Nothing has run in it yet, so there is nothing to rescue; do not
+                # leave a branch-less tree behind for the retry to trip over.
+                self._remove_vault_worktree(wt, progress)
+                # Loud, not silent. The bug being closed is a run that carried on
+                # with no branch of its own and let every stage commit to main.
+                return None, f"could not prepare vault branch {branch}: {vp.problem}"
+            return Path(wt), None
+        except Exception as e:      # noqa: BLE001 — a FAIL outcome, never a crash
+            return None, f"vault worktree prep errored ({type(e).__name__})"
+
+    def _vault_head_guard(self, before: str, stage: str, run_dir: Path,
+                          progress: ProgressFn) -> None:
+        """After a stage: is the live vault's HEAD still where it was before the
+        stages started? If not, say so where it will be read and put it back.
+
+        The stage prompts still carry "create / switch to the worker branch" lines
+        from when the run owned the live checkout, and the run metadata overriding
+        them is only text — a prompt line silently not taking effect is how the
+        2026-08-24 incident happened. Git refuses the common case by itself (the
+        worktree holds `worker/<slug>`, so it cannot be checked out twice); this
+        covers the rest, at every stage boundary instead of only at the end.
+
+        The run's outcome is NOT changed: from here a stage's stray checkout and a
+        person switching branches in their own vault look the same. Both empty
+        reads (detached, unreadable) are left to the `finally`'s restore. Never
+        raises."""
+        try:
+            now = self._vault_head()
+            if not before or not now or now == before:
+                return
+            restored = stages.restore_main(
+                stages._VAULT_DATA_ROOT, main=before.removeprefix("refs/heads/"))
+            note = (f"live vault HEAD moved during stage {stage}: {before} -> {now} "
+                    f"— {'restored' if restored else 'could NOT be restored'}")
+            progress(note)
+            with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                f.write(f"\n=== live vault HEAD moved ({stage}) ===\n{note}\n")
+            stages._update_progress(run_dir, live_head_moved={
+                "stage": stage, "from": before, "to": now, "restored": bool(restored)})
+        except Exception:       # noqa: BLE001 — a watch must never fail the run
+            pass
+
     def execute(self, msg: m.Envelope, agent: Agent, progress: ProgressFn,
                 on_run_start: RunStartFn | None = None) -> ExecOutcome:
         """Thin wrapper over `_execute` whose only job is to make sure a loss
@@ -1027,10 +1220,19 @@ class StagedExecutor(ClaudeCodeExecutor):
         repo_url = payload.get("repo")
         review, auto_merge = self._merge_decision(payload)   # honors auto_merge:false gate
         # Execution model mirrors the legacy worker: run claude with cwd=VAULT
-        # (the trusted workspace) and reach the code via --add-dir; external
-        # repos are cloned under ~/Worker, vault tasks work in the vault. This
-        # avoids the untrusted-worktree trust wall that would ignore
-        # --allowed-tools and burn the turn budget.
+        # (the trusted workspace) and reach the code via --add-dir. External
+        # repos are cloned under ~/Worker; a vault task works in a linked
+        # worktree of the vault under that same root (`vault_wt`, set at branch
+        # prep below), never in the live vault checkout. cwd stays the vault
+        # either way: it avoids the untrusted-worktree trust wall that would
+        # ignore --allowed-tools and burn the turn budget.
+        #
+        # For a vault task `repo` below stays the LIVE vault for the whole run. It
+        # is what anchors the account, the project memory, the gradle registry and
+        # the disk guard's exclusion — none of which a worktree has (they hang off
+        # gitignored config). Only what the stages are handed (`working_dir`) and
+        # the branch's own git (rescue, publish, merge) move to the worktree.
+        vault_wt: Path | None = None
         if repo_url:
             prep_log: list[str] = []
             # Per-RUN worktree, not the shared clone: every run of the same repo
@@ -1108,11 +1310,17 @@ class StagedExecutor(ClaudeCodeExecutor):
         # `git checkout` there, so start from main and ALWAYS restore main in a
         # finally — never leave the live vault (and its daemons) on a task
         # branch. BOTH paths pre-create their branch here — external via
-        # prepare_external_branch, vault via prepare_vault_branch — and the vault
-        # one is abandoned on restore, its work living on the branch / PR. It used
-        # to be that only external repos got one and the vault's was left to a
-        # prompt line in worker-implement.md, which silently did not run
-        # (2026-08-24, 2/2) and let the stages commit straight onto main.
+        # prepare_external_branch, vault via prepare_vault_branch — each in the
+        # run's OWN worktree. It used to be that only external repos got one and
+        # the vault's was left to a prompt line in worker-implement.md, which
+        # silently did not run (2026-08-24, 2/2) and let the stages commit
+        # straight onto main; then the runner made it — in the live vault, which
+        # moved the live HEAD for the whole run (2026-11-17). Since the vault
+        # task's branch moved to a worktree, nothing the runner does moves the
+        # live HEAD, so the hold and the lease below have nothing left to race
+        # in the normal case. They are kept as they are: a stage can still stray
+        # (the head watch after each stage covers that), and removing them is a
+        # separate change.
         # …but never over a sibling run that is still using that working tree.
         # This guard is on the START path ONLY. The `finally` restore below is a
         # different act — it cleans up after OUR run — and stays unconditional,
@@ -1128,11 +1336,15 @@ class StagedExecutor(ClaudeCodeExecutor):
             return ExecOutcome(False, reason,
                                {"branch": branch, "checkout_busy": True,
                                 "held_by": held_by})
-        # Serialize the live vault's HEAD-moving branch prep against the planner
-        # tick's claude call. The planner commits what it writes (CLAUDE.md §10.1);
-        # without this, its self-commit can land on `worker/<slug>` after
-        # prepare_vault_branch's `checkout -B` moves HEAD there, to be orphaned by
-        # the next sibling's prep (observed ed395e1b). The planner holds the SAME
+        # Serialize the vault task's branch prep against the planner tick's claude
+        # call. (Kept from when that prep moved the live HEAD; it now happens in a
+        # worktree and moves nothing here, so the race below can no longer occur
+        # through the runner. The lease is cheap and the planner still takes it,
+        # so it stays until both sides drop it together.) The planner commits
+        # what it writes (CLAUDE.md §10.1); without this, its self-commit could
+        # land on `worker/<slug>` after prepare_vault_branch's `checkout -B` moved
+        # HEAD there, to be orphaned by the next sibling's prep (observed
+        # ed395e1b). The planner holds the SAME
         # `Worker/checkout.lock` across its call (planner_tick.sh), so a held lease
         # here means it (or a sibling's prep) is mid-flight → DEFER without touching
         # HEAD, reusing the `checkout_busy` deferral (no refail, flat cooldown,
@@ -1207,32 +1419,38 @@ class StagedExecutor(ClaudeCodeExecutor):
                         {"branch": branch, "long_job_stash": job_snapshot["dir"]})
                 progress(f"long job output restored: {len(job_snapshot['files'])} file(s)")
         else:
-            # The vault needs its branch made here for the same reason the clone
-            # does — left to a stage prompt, it silently did not happen. A
-            # SEPARATE function, not the one above with a flag: that one opens
-            # with `reset --hard` + `clean -fd`, which is right for a throwaway
-            # clone and would delete the human's uncommitted work in here.
-            vp = stages.prepare_vault_branch(stages._VAULT_DATA_ROOT, branch,
-                                             progress=progress)
-            # Branch prep is done — HEAD has stopped moving, so free the checkout
-            # lease NOW (before the stages run and before any early return below):
-            # the planner waits only this window, not the whole pipeline. The
-            # branch pin in worker-planner.md, not this lease, covers a planner
-            # that starts while the stages hold HEAD on worker/<slug>.
+            # The vault task needs its branch made here for the same reason the
+            # clone does — left to a stage prompt, it silently did not happen —
+            # and made in a worktree of its own, so the live vault's HEAD stays
+            # where it is (_prepare_vault_worktree). A discover run gets neither:
+            # it commits nothing by design (its two outputs are a run artifact
+            # and an episode file the sync daemon commits on the default branch),
+            # so a branch would only be something to move HEAD onto. It was a
+            # discover run that held the live checkout on 2026-11-17.
+            vault_problem: str | None = None
+            if (payload.get("worker_mode") or "").lower() != "discover":
+                vault_wt, vault_problem = self._prepare_vault_worktree(
+                    msg, branch, progress, sink)
+            # Branch prep is done, so free the checkout lease NOW (before the
+            # stages run and before the early return below): the planner waits
+            # only this window, not the whole pipeline.
             if checkout_lease is not None:
                 checkout_lease.release()
                 checkout_lease = None
-            # Capture BEFORE the failure check, same reason as the external side:
-            # the rewind already happened, and a failed checkout is exactly when
-            # the commits are most orphaned and the run has least to say about it.
-            if getattr(vp, "orphaned_commits", None):
-                sink["orphaned_commits"] = vp.orphaned_commits
-            if vp.problem:
-                # Loud, not silent. The bug being closed is a run that carried on
-                # with HEAD still on main and let every stage commit there.
-                return ExecOutcome(
-                    False, f"could not prepare vault branch {branch}: {vp.problem}",
-                    {"branch": branch})
+            if vault_problem:
+                return ExecOutcome(False, vault_problem, {"branch": branch})
+            if vault_wt is not None:
+                # From here the stages are handed the worktree. `repo` stays the
+                # live vault (see the note where it is set).
+                working_dir = str(vault_wt)
+        # The live vault's HEAD as the stages find it, for the watch after each
+        # stage (_vault_head_guard). Vault tasks only — an external run's path is
+        # left exactly as it was — and only when there is a real checkout to
+        # watch for: a discover run (no worktree at all) or a worktree that is
+        # one. "" arms nothing.
+        vault_live_head = ""
+        if not repo_url and (vault_wt is None or self._is_worktree(vault_wt)):
+            vault_live_head = self._vault_head()
         run_id = f"{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}-{msg.task_id}"
         run_dir = stages.RUNS_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -1635,6 +1853,10 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # 60s idle timeout, so a daemon rarely survives the gap between two
                 # stages anyway — and a frozen runner costs incomparably more.
                 _stop_build_daemons(repo, progress)
+                # Vault task: the stage is over — is the live vault's HEAD still
+                # where the stages found it? (Unarmed, "", for every external run.)
+                if vault_live_head:
+                    self._vault_head_guard(vault_live_head, stage, run_dir, progress)
                 # invalidate runs ahead of (and rc-blind of) the capacity gate: a
                 # dead *model* is worth re-probing whatever the exit code, and it
                 # reads stderr too (run.log keeps only stdout, but _probe sees both).
@@ -1771,6 +1993,23 @@ class StagedExecutor(ClaudeCodeExecutor):
                             progress(f"implement checkpoint: {cp['note']}")
                     except Exception as e:      # noqa: BLE001 — best-effort, fail open
                         progress(f"implement checkpoint skipped ({type(e).__name__})")
+                elif stage == "implement" and vault_wt is not None \
+                        and self._is_worktree(vault_wt):
+                    # The vault task's half of the WIP rescue above, in its
+                    # worktree: an implement that went green but did not commit
+                    # must not hand Verify a dirty tree and a branch that is
+                    # missing the work. The commit only — no checkpoint
+                    # push: publishing a vault branch from every failed run is a
+                    # separate decision, and the run's last act commits whatever
+                    # is still left before the worktree goes (see the `finally`).
+                    try:
+                        rescued = stages.rescue_uncommitted(vault_wt, branch, msg.task_id)
+                        if rescued.get("committed"):
+                            with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                                f.write(f"\n=== implement WIP rescue ===\n{rescued['note']}\n")
+                            progress(f"implement rescue: {rescued['note']}")
+                    except Exception as e:      # noqa: BLE001 — best-effort, fail open
+                        progress(f"implement rescue skipped ({type(e).__name__})")
                 if stage == "plan" and rescope.plan_declares_oversize(
                         artifact.read_text(encoding="utf-8")):
                     # The plan DECLARES the task too big for one Implement stage
@@ -2068,11 +2307,19 @@ class StagedExecutor(ClaudeCodeExecutor):
             return ExecOutcome(True, f"staged pipeline complete ({len(completed)} stages){merge_note}",
                                extra)
         finally:
+            # FIRST act for a vault task: commit whatever its worktree still holds
+            # uncommitted, on every way out. The worktree is removed at the end of
+            # this block, and a removal deletes what was never committed. Ahead of
+            # the delegate publish below, so the push carries it; done for a
+            # cancelled or superseded run too — it is a local commit, not a push.
+            # Like everything in this block it neither returns nor raises.
+            if vault_wt is not None:
+                self._rescue_vault_worktree(vault_wt, msg.task_id, progress)
             # A delegate run's output lives ONLY on `worker/<slug>`: it is a single
-            # stage with no report stage behind it to push, and the restore below
-            # then walks HEAD back to main and abandons the branch. Three runs'
-            # work was lost that way. worker-delegate.md's ":43 Never push." rule
-            # is about the AGENT and stays true — this is the runner pushing.
+            # stage with no report stage behind it to push, and nothing else ever
+            # looks at that branch again once this run's worktree is gone. Three
+            # runs' work was lost that way. worker-delegate.md's ":43 Never push."
+            # rule is about the AGENT and stays true — this is the runner pushing.
             #
             # In the `finally` rather than beside the success `return`, because the
             # decisive case is the 60-minute stage timeout: `TimeoutExpired`
@@ -2084,8 +2331,10 @@ class StagedExecutor(ClaudeCodeExecutor):
             # original exception (or override the real outcome) on the way out.
             # Gated on delegate + vault deliberately. `auto`/`quick` have their own
             # merge semantics (report stage, landed gate), and an external delegate
-            # task's branch lives in the ~/Worker clone, not here.
-            is_vault_delegate = (not repo_url and
+            # task's branch lives in the ~/Worker clone, not here. And on the
+            # run's worktree: that is where the branch is, and the push, the PR
+            # and the merge all run from it — never from the live vault.
+            is_vault_delegate = (not repo_url and vault_wt is not None and
                                  (payload.get("worker_mode") or "").lower() == "delegate")
             if is_vault_delegate and (cancelled or _cancel_requested_now()):
                 # Rerouted away: the task runs elsewhere now, so this run's
@@ -2116,7 +2365,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                         if want_merge else
                         "**Not auto-merged** — a human reviews and merges.")
                     pub = stages.publish_branch(
-                        stages._VAULT_DATA_ROOT, branch, body=body, progress=progress)
+                        vault_wt, branch, body=body, progress=progress)
                     if pub.get("note"):
                         progress(f"publish: {pub['note']}")
                     if pub.get("pr_url"):
@@ -2126,11 +2375,27 @@ class StagedExecutor(ClaudeCodeExecutor):
                         # to attach it to. `execute` merges the sink on the way out.
                         sink["pr_url"] = pub["pr_url"]
                     if want_merge and pub.get("pr_url"):
-                        mp = stages.merge_pr(stages._VAULT_DATA_ROOT, branch,
+                        # `--repo` keeps gh on the server: without it gh also
+                        # tidies up locally and, inside a worktree, fails AFTER
+                        # the merge (_origin_repo_arg). Read only off a real
+                        # worktree; None leaves the argv as it always was.
+                        live_wt = self._is_worktree(vault_wt)
+                        gh_repo = self._origin_repo_arg(vault_wt) if live_wt else None
+                        mp = stages.merge_pr(vault_wt, branch, repo=gh_repo,
                                              progress=progress)
                         if mp.get("note"):
                             progress(f"merge: {mp['note']}")
-                        if not mp.get("merged"):
+                        merged = bool(mp.get("merged"))
+                        if not merged and live_wt and stages.gh_pr_state(
+                                branch, repo=gh_repo, cwd=vault_wt) == "MERGED":
+                            # rc != 0 but GitHub says the PR is merged: the local
+                            # tidy-up is what failed. Parking a merged task for a
+                            # human is the false alarm; believe the server. Any
+                            # other answer, None included, still parks below.
+                            merged = True
+                            progress("merge: gh exited non-zero but the PR is "
+                                     "MERGED — treated as merged")
+                        if not merged:
                             # Not confirmed merged (md-only conflict, perm, no gh).
                             # Park — closing `done` on a still-open PR is the very
                             # bug this fixes. Same out-of-band sink channel; this
@@ -2143,6 +2408,11 @@ class StagedExecutor(ClaudeCodeExecutor):
                                 f"({mp.get('note') or 'merge not confirmed'})")[:200]
                 except Exception as e:      # noqa: BLE001 — courtesy step, fail open
                     progress(f"publish: skipped ({type(e).__name__})")
+            # The runner no longer moves the live vault's HEAD, so on a healthy run
+            # this finds it on the default branch and does nothing (restore_main
+            # returns without a checkout when it is already there). It stays as the
+            # backstop for the one way it can still be elsewhere — a stage that
+            # checked something out in its cwd — and stays unconditional.
             stages.restore_main(stages._VAULT_DATA_ROOT)  # vault back to main, always
             # The external repo is no longer a shared clone parked on the task
             # branch, so there is nothing to `restore_main` here anymore — it is a
@@ -2175,6 +2445,16 @@ class StagedExecutor(ClaudeCodeExecutor):
             if repo_url and repo is not None and run_ok:
                 if stages.remove_worktree(repos.local_path(repo_url), repo, progress=progress):
                     worktree_sweep.remove_registry(Path(repo).name, progress=progress)
+            # A VAULT task's worktree goes on every way out, not only on success.
+            # Unlike the external one it is not evidence a retry reuses: its work
+            # is on `worker/<slug>` (the rescue at the top of this block committed
+            # what was not), a retry cuts a fresh one, and nothing else would ever
+            # reap it — worktree_sweep only knows `<repo>.wt` beside a clone. Only
+            # a worktree that is still dirty is left standing
+            # (_remove_vault_worktree). After the publish above, which pushes from
+            # it, and after the restore, so nothing in this block still needs it.
+            if vault_wt is not None:
+                self._remove_vault_worktree(vault_wt, progress)
 
 
 def make_executor(mode: str) -> Executor:
@@ -2198,9 +2478,12 @@ def _checkout_key(payload: dict | None, slug: str | None = None) -> str:
     """Checkout/busy key for the runner's parallel poll. External repos key on
     the *per-run worktree* (slug): same-repo runs live in distinct
     `<repo>.wt/<slug>` worktrees (repos.ensure_worktree) so they share no
-    checkout and may run together. The vault is one live checkout, so every
-    vault run keys on "<vault>" regardless of slug and stays serial. Equal keys
-    must never run together.
+    checkout and may run together. Every vault run keys on "<vault>" regardless
+    of slug and stays serial. That used to be forced — a vault run owned the one
+    live checkout — and since vault runs got worktrees of their own
+    (repos.ensure_vault_worktree) it is a choice: their stages still run with the
+    live vault as cwd and write run artifacts, the ledger and episodes there.
+    Equal keys must never run together.
 
     This is deliberately NOT the same as Orchestrator._checkout_key, which stays
     repo-URL keyed because its key is the grouping basis for the cap
