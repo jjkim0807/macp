@@ -3530,6 +3530,39 @@ class Orchestrator:
             print(f"[orchestrator] project stall tick skipped (fail-open): {e}")
             return []
 
+    def _server_deploy_watch_tick(self) -> list[str]:
+        """Alert ONCE when a merged server change is not running in production.
+
+        server_deploy_watch.run_once finds, per repo in
+        ``<vault>/.macp/server_deploy_watch.json``, the newest origin/<default>
+        commit touching the server paths, reads the running image tag with the
+        configured READ-ONLY command, and alerts when production has been behind
+        longer than the grace period (per repo + per commit, clears itself). It
+        NEVER deploys — the deploy command only appears in the alert text, since
+        deploys need the owner's approval for several apps. The 10-min min-poll
+        and the state file live inside run_once. With no config file we return
+        before importing, so a bare checkout's tick (and every tmp-vault tick
+        test) does no work. Fail-open: a watch problem must never stall a tick.
+        Returns the repos alerted this call. See
+        todo_system.orchestrator.server_deploy_watch."""
+        try:
+            # ledger.root is Worker/assignments -> the vault root is two up.
+            vault_root = Path(self.ledger.root).parent.parent
+            if not (vault_root / ".macp" / "server_deploy_watch.json").exists():
+                return []                         # not configured → silent, no import per tick
+            from . import server_deploy_watch
+            return server_deploy_watch.run_once(
+                vault_root=vault_root,
+                # A user-facing outage the owner must act on → default (immediate)
+                # tier; the state file is the real per-commit throttle.
+                notify=lambda msg, *, event_key: self._notify_routed(
+                    msg, None, event_key=event_key),
+                progress=lambda s: print(f"[orchestrator] {s}"),
+            )
+        except Exception as e:
+            print(f"[orchestrator] server deploy watch tick skipped (fail-open): {e}")
+            return []
+
     def reconcile_resumes(self) -> list[str]:
         """Consume conditional deferred-resume reservations (`cli resume`).
 
@@ -3968,6 +4001,7 @@ class Orchestrator:
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
+        self._server_deploy_watch_tick()       # merged server change not in production → one alert (fail-open, 10-min throttle)
         nudged = self.renudge_due(now)
         return {"rerouted": rerouted,
                 "reaped": reaped, "dispatched": dispatched, "updated": updated,

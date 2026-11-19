@@ -431,3 +431,174 @@ def test_one_repo_failure_does_not_stop_others(tmp_path):
 
     rec = Recorder()
     assert _go(vault, wr, run, rec, NOW) == ["app"]
+
+
+# ---------------------------------------------------------------------------
+# tick level — the real Orchestrator.tick() path
+# ---------------------------------------------------------------------------
+
+def _orch(tmp_path):
+    from todo_system.orchestrator.assignment import Ledger
+    from todo_system.orchestrator.mailbox import FileMailbox
+    from todo_system.orchestrator.orchestrator import Orchestrator
+    from todo_system.orchestrator.registry import Registry
+    ledger = Ledger(tmp_path / "Worker" / "assignments")   # vault_root == tmp_path
+    return Orchestrator(FileMailbox(tmp_path / "agents"), Registry([]), ledger,
+                        notify=lambda *a, **k: None)
+
+
+def _tick_vault(tmp_path, monkeypatch, fake):
+    (tmp_path / ".macp").mkdir()
+    sdw.config_path(tmp_path).write_text(json.dumps({"repos": {"app": {
+        "server_paths": ["server/**"], "tag_cmd": TAG_CMD, "deploy_cmd": DEPLOY}}}),
+        encoding="utf-8")
+    wr = tmp_path / "clones"
+    (wr / "app" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(sdw, "_default_worker_root", lambda: wr)
+    monkeypatch.setattr(sdw, "_run", fake)
+
+
+def _real_now_behind_repo():
+    now = dt.datetime.now()
+
+    def ct(minutes):
+        return int((now - dt.timedelta(minutes=minutes)).timestamp())
+
+    return FakeRepo([(C1, ct(600), "server: base", True),
+                     (C2, ct(300), "app: ui", False),
+                     (C3, ct(120), "server: fix crash", True)],
+                    tag=f"<registry>/app/server:{C1[:7]}")
+
+
+def _undeployed_calls(routed):
+    return [c for c in routed.call_args_list
+            if str(c.kwargs.get("event_key", "")).startswith("server-undeployed:")]
+
+
+def test_tick_sends_one_alert_through_notify_routed(tmp_path, monkeypatch):
+    from unittest import mock
+    from todo_system.orchestrator.tests.test_orchestrator import _hermetic_tick
+    fake = _real_now_behind_repo()
+    _tick_vault(tmp_path, monkeypatch, fake)
+    orch = _orch(tmp_path)
+    with mock.patch.object(orch, "_notify_routed") as routed:
+        out = _hermetic_tick(orch, [])
+        assert isinstance(out, dict)
+        calls = _undeployed_calls(routed)
+        assert len(calls) == 1
+        msg = calls[0].args[0]
+        assert "app" in msg and f"{C3[:7]} server: fix crash" in msg
+        assert f"~/.config/app/deploy.sh {C3[:7]}" in msg
+        # past the min-poll throttle: same undeployed commit → no second alert
+        sp = sdw.state_path(tmp_path)
+        st = json.loads(sp.read_text())
+        st["last_check_ts"] = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat()
+        sp.write_text(json.dumps(st))
+        n_calls = len(fake.calls)
+        _hermetic_tick(orch, [])
+        assert len(fake.calls) > n_calls                     # it did check again
+        assert len(_undeployed_calls(routed)) == 1
+
+
+def test_tick_is_fail_open_when_the_watch_raises(tmp_path, monkeypatch):
+    from unittest import mock
+    from todo_system.orchestrator.tests.test_orchestrator import _hermetic_tick
+    fake = _real_now_behind_repo()
+    fake.raise_on_git = RuntimeError("boom")
+    _tick_vault(tmp_path, monkeypatch, fake)
+    orch = _orch(tmp_path)
+
+    def explode(*a, **k):
+        raise RuntimeError("load failed")
+
+    with mock.patch.object(orch, "_notify_routed") as routed:
+        assert isinstance(_hermetic_tick(orch, []), dict)     # per-repo isolation
+        monkeypatch.setattr(sdw, "load_state", explode)
+        assert orch._server_deploy_watch_tick() == []          # wrapper isolation
+        assert isinstance(_hermetic_tick(orch, []), dict)
+        assert not [c for c in routed.call_args_list
+                    if str(c.kwargs.get("event_key", "")).startswith("server-")]
+
+
+def test_tick_without_config_is_silent(tmp_path, monkeypatch):
+    from todo_system.orchestrator.tests.test_orchestrator import _hermetic_tick
+    fake = _real_now_behind_repo()
+    monkeypatch.setattr(sdw, "_run", fake)
+    orch = _orch(tmp_path)
+    assert orch._server_deploy_watch_tick() == []
+    _hermetic_tick(orch, [])
+    assert fake.calls == []
+    assert not sdw.state_path(tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# real git — catches argv shapes (pathspec magic, ^{commit}) a fake would accept
+# ---------------------------------------------------------------------------
+
+def _git(cwd, *args, when=None):
+    import os
+    env = dict(os.environ)
+    if when is not None:
+        stamp = f"{int(when.timestamp())} +0000"
+        env.update(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
+    r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main",
+                        *args], cwd=cwd, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _commit(seed, rel, msg, when):
+    f = seed / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(msg, encoding="utf-8")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", msg, when=when)
+    return _git(seed, "rev-parse", "HEAD")
+
+
+def test_real_git_behind_then_cleared(tmp_path):
+    import shutil
+    import sys
+    if shutil.which("git") is None:
+        pytest.skip("git not installed")
+    now = dt.datetime.now().replace(microsecond=0)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", "-q", str(origin), str(seed))
+    c1 = _commit(seed, "server/a.py", "server: base", now - dt.timedelta(hours=10))
+    _git(seed, "push", "-q", "origin", "main")
+    wr = tmp_path / "worker"
+    wr.mkdir()
+    _git(wr, "clone", "-q", str(origin), "app")              # runner checkout: only c1
+    c2 = _commit(seed, "app/x.kt", "app: ui", now - dt.timedelta(hours=3))
+    c3 = _commit(seed, "server/sub/b.py", "server: fix crash", now - dt.timedelta(hours=2))
+    _git(seed, "push", "-q", "origin", "main")
+
+    tagfile = tmp_path / "tag.txt"
+    tagfile.write_text(f"<registry>/app/server:{c1[:7]}\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    (vault / ".macp").mkdir(parents=True)
+    tag_cmd = [sys.executable, "-c", "import sys;print(open(sys.argv[1]).read())", str(tagfile)]
+    sdw.config_path(vault).write_text(json.dumps({"repos": {"app": {
+        "server_paths": ["server/**"], "tag_cmd": tag_cmd, "deploy_cmd": DEPLOY}}}),
+        encoding="utf-8")
+    head_before = _git(wr / "app", "rev-parse", "HEAD")
+
+    rec = Recorder()
+    assert sdw.run_once(vault, notify=rec, now=now, worker_root=wr,
+                        progress=lambda s: None) == ["app"]
+    assert len(rec.sent) == 1
+    msg = rec.sent[0][0]
+    assert f"{c3[:7]} server: fix crash" in msg and c2[:7] not in msg
+    assert f"deploy.sh {c3[:7]}" in msg
+    assert _git(wr / "app", "rev-parse", "HEAD") == head_before   # checkout untouched
+
+    c4 = _commit(seed, "docs/readme.md", "docs: readme", now - dt.timedelta(minutes=5))
+    _git(seed, "push", "-q", "origin", "main")
+    tagfile.write_text(f"<registry>/app/server:{c4[:7]}\n", encoding="utf-8")
+    assert sdw.run_once(vault, notify=rec, now=now + dt.timedelta(minutes=11), worker_root=wr,
+                        progress=lambda s: None) == []
+    assert len(rec.sent) == 1
+    assert "alerted_sha" not in json.loads(sdw.state_path(vault).read_text())["repos"]["app"]
