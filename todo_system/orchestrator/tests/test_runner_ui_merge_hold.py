@@ -540,6 +540,12 @@ class ReconcileMergeHoldsTest(unittest.TestCase):
         clock = mock.patch.object(merge_hold, "_now", return_value=NOW)
         clock.start()
         self.addCleanup(clock.stop)
+        # The sweep now asks gh for the PR state first; these cases are about an
+        # OPEN PR, so never reach the real gh (test_merge_hold_pr_state.py covers
+        # MERGED / CLOSED / unknown).
+        gh = mock.patch.object(stages, "gh_pr_state", return_value="OPEN")
+        gh.start()
+        self.addCleanup(gh.stop)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
