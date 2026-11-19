@@ -599,6 +599,126 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
         return []
 
 
+# ---------------------------------------------------------------------------
+# Done human blocks → trimmed to the real completion time (2026-11-19)
+# ---------------------------------------------------------------------------
+# A human task with a timed block used to lose its event the moment its md
+# went `status: done` (the stale-event cleanup deleted it), so the calendar
+# kept no record of when the work actually happened. Now the todo import
+# stamps `completed: "YYYY-MM-DD HH:MM"` on the open→done transition
+# (:func:`record_completion_transition`) and the sync re-shapes the event to
+# end at that time, titles it `✅ …`, and swaps its private `todo_slug` for
+# `todo_done_slug` — so the cleanup, the calendar→md pull and the overdue mover
+# all leave it alone. Done events are deleted `MACP_CALENDAR_DONE_KEEP_DAYS`
+# (default 30) after completion.
+#
+# A done task that is reopened keeps its ✅ event as history until it ages
+# out; the reopened task simply gets a fresh `todo_slug` event beside it.
+
+DONE_MIN = dt.timedelta(minutes=15)
+DONE_KEEP_DAYS_DEFAULT = 30
+_DONE_MARK = "✅"
+
+
+def _now_local() -> dt.datetime:
+    """Local wall-clock now (naive, minute precision) for the done-block code.
+    One seam so tests can pin it; older code keeps its own clocks."""
+    return dt.datetime.now(_event_tzinfo()).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def _parse_completed(raw: str | None) -> dt.datetime | None:
+    """A `completed:` value (`YYYY-MM-DD HH:MM`, `T` or 1-digit hour ok) as a
+    naive local datetime, or None for empty / `-` / junk."""
+    if not raw:
+        return None
+    m = re.match(r"\s*['\"]?(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})", str(raw))
+    if not m:
+        return None
+    try:
+        d = dt.date.fromisoformat(m.group(1))
+        return dt.datetime(d.year, d.month, d.day, int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _fmt_completed(t: dt.datetime) -> str:
+    return t.strftime("%Y-%m-%d %H:%M")
+
+
+def done_block_window(start: dt.datetime, end: dt.datetime,
+                      completed: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+    """The (start, end) a done block's event takes, on naive local datetimes.
+
+    Rules (``c`` = completion, ``[s, e]`` = the planned block):
+
+    1. ``s <= c <= e`` (finished inside the block): ``[s, max(c, s + 15m)]``.
+    2. ``c > e`` on the block's start day (ran over): ``[s, c]``.
+    3. Otherwise (before the block, or another day): the block keeps its
+       length (at least 15m) and moves to end at ``c``.
+
+    Every rule keeps at least 15 minutes. Pure — unit-tested.
+    """
+    if start <= completed <= end:
+        return start, max(completed, start + DONE_MIN)
+    if completed > end and completed.date() == start.date():
+        return start, completed
+    length = max(end - start, DONE_MIN)
+    return completed - length, completed
+
+
+def _done_title(title: str) -> str:
+    """`✅ <title>` with exactly one mark, whatever the title already had."""
+    return f"{_DONE_MARK} " + re.sub(rf"^(?:\s|{_DONE_MARK})+", "", title or "")
+
+
+def _done_keep_days() -> int:
+    """`MACP_CALENDAR_DONE_KEEP_DAYS` (default 30; junk or < 1 → 30)."""
+    try:
+        n = int(os.environ.get("MACP_CALENDAR_DONE_KEEP_DAYS", "").strip())
+    except ValueError:
+        return DONE_KEEP_DAYS_DEFAULT
+    return n if n >= 1 else DONE_KEEP_DAYS_DEFAULT
+
+
+def _timed_when(t: dt.datetime) -> dict[str, str]:
+    """A naive local datetime as an event start/end (same shape as
+    :func:`_event_window`'s timed form)."""
+    d = {"dateTime": t.isoformat()}
+    tz = _event_timezone()
+    if tz:
+        d["timeZone"] = tz
+    return d
+
+
+def _event_end_local(ev: dict) -> dt.datetime | None:
+    end = ev.get("end") or {}
+    if end.get("dateTime"):
+        try:
+            t = dt.datetime.fromisoformat(str(end["dateTime"]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if t.tzinfo is not None:
+            t = t.astimezone(_event_tzinfo()).replace(tzinfo=None)
+        return t
+    if end.get("date"):
+        try:
+            d = dt.date.fromisoformat(str(end["date"]))
+        except ValueError:
+            return None
+        return dt.datetime(d.year, d.month, d.day)
+    return None
+
+
+def _done_event_expired(ev: dict, now: dt.datetime, keep_days: int) -> bool:
+    """A done event is past its keep window: measured from private
+    `macp_completed`, else (a hand-detached event) from the event's end."""
+    priv = (ev.get("extendedProperties") or {}).get("private") or {}
+    ref = _parse_completed(priv.get("macp_completed")) or _event_end_local(ev)
+    if ref is None:
+        return False
+    return now - ref > dt.timedelta(days=keep_days)
+
+
 # (tag, calendarId) — one `--calendar-route TAG=CALENDAR_ID` flag.
 CalendarRoute = tuple[str, str]
 
