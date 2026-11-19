@@ -109,6 +109,55 @@ drives an AVD named `api30` on that host instead of the GCE node. The host needs
 `emulator`, `platform-tools`, a build-tools with `aapt2` and the AVD; `app-test-node start`
 checks the first three.
 
+### The emulator node's lifecycle (`.macp/remote_gate.json`)
+
+Without `APP_TEST_NODE_MODE=local`, `scripts/app-test-node start|stop` (and so screen check,
+`macp-emulator` and beta smoke) run the engine helper
+`python -m todo_system.orchestrator.remote_gate node-up|node-down`, which follows
+`node_mode` in the vault's `.macp/remote_gate.json` — the same config and code the remote
+test gate uses:
+
+| `node_mode` | `start` | `stop` | between runs |
+|---|---|---|---|
+| `start-stop` (default) | `instances start` | `instances stop` | the stopped VM and its disk (billed) |
+| `create-delete` | reuse a running VM, start a stopped one, else **create** from the image | **delete** (an absent VM is ok) | only the image |
+
+`create-delete` always passes `--max-run-duration=<per_run_vm_ttl_min>` with termination
+action `DELETE`, so a leaked VM deletes itself, and a spot preemption deletes the VM too
+(`start` then creates a fresh one). Its create spec comes only from the config; each key is
+optional and its flag is omitted when absent:
+
+| key | gcloud flag |
+|---|---|
+| `image_family` (preferred) / `image` | `--image-family` / `--image` |
+| `image_project` | `--image-project` |
+| `spot: true` | `--provisioning-model=SPOT` |
+| `nested_virtualization: true` | `--enable-nested-virtualization` (the emulator needs KVM) |
+| `boot_disk_gb`, `boot_disk_type` | `--boot-disk-size=<n>GB`, `--boot-disk-type` |
+| `network`, `subnet`, `tags`, `labels` | the same-named flags |
+| `no_service_account: true` / `service_account`, `scopes` | `--no-service-account --no-scopes` / `--service-account`, `--scopes` |
+| `no_address: true` | `--no-address` |
+
+The helper runs on `APP_TEST_PYTHON` (default `python3`; the engine passes its own
+interpreter) and needs the vault root (`MACP_VAULT_ROOT`). If it cannot run at all — no
+`remote_gate.json`, or the engine fails to import — the script warns and falls back to a
+direct `gcloud instances start|stop`. `APP_TEST_SSH_WAIT` (default 300 s) bounds the wait
+for ssh after `start`; a create restores the disk from the image and boots slower than a
+start. A fresh VM also starts with the image's Gradle cache and AVD `/data`, so the first
+build on it is slower and no device state carries over between runs.
+
+**Refreshing the image** after changing the SDK, AVD or system packages:
+
+1. `scripts/app-test-node start`, make the change over `scripts/app-test-node ssh`, then
+   `ssh 'sudo sync'`. Finish within `per_run_vm_ttl_min` — the VM deletes itself after it.
+2. `gcloud compute instances stop <node> --zone <zone>` — stop, not delete.
+3. `gcloud compute images create <family>-$(date +%Y%m%d) --source-disk <node>
+   --source-disk-zone <zone> --family <family> --storage-location <region>`
+4. `gcloud compute instances delete <node> --zone <zone> --quiet` (the boot disk goes with it).
+5. Optionally delete the previous image (`gcloud compute images list --filter=family=<family>`).
+
+New creates take the newest image in the family, so the config does not change.
+
 The rules, the reroute reasons (`accept-timeout`, `agent-stale`, `rejected`) and what a
 remote does on `CANCEL` are in [Running 24/7 → Heavy tasks on a stronger
 machine](running.md#heavy-tasks-on-a-stronger-machine).

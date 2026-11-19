@@ -203,13 +203,7 @@ def _cmd_stop(*, run, node_script, remote_cfg) -> int:
         return EXIT_USAGE
     ns = node_script if node_script is not None else beta_smoke._NODE_SCRIPT
     cfg = remote_cfg if remote_cfg is not None else remote_gate.load_remote_config()
-    env = dict(os.environ)
-    node = (cfg or {}).get("node")
-    zone = (cfg or {}).get("zone")
-    if node:
-        env["APP_TEST_NODE"] = str(node)
-    if zone:
-        env["APP_TEST_ZONE"] = str(zone)
+    env = remote_gate.node_script_env(cfg)
     r = beta_smoke._node(run, ns, "stop", env=env, timeout=beta_smoke._STOP_TIMEOUT_S)
     rc = getattr(r, "returncode", None)
     print(json.dumps({"ok": rc == 0, "kind": None if rc == 0 else "node",
