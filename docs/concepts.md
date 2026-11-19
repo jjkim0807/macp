@@ -206,7 +206,9 @@ uv run --project ~/macp python -m todo_system.orchestrator.human reply \
 Statuses: `done`, `progress`, `needs-input`, `accept`, `reject`. To change a parked
 task's instructions, edit its markdown, commit, and run
 `cli resume <slug> --after-commit <sha>`. The task is dispatched again once the vault
-contains that commit.
+contains that commit. If a vault sync rebase rewrites that commit's sha, the
+reservation still resolves: the same patch (by `git patch-id`) in HEAD's history counts.
+Reservations made before this was added (no stored patch-id) keep the strict ancestor check.
 
 ## Engine and vault
 

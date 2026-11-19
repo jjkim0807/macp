@@ -18,6 +18,15 @@ Reservation records live in `Worker/_state/pending_resumes/<slug>.json`.
 committing a reservation pinned to "how far has this checkout's HEAD gotten"
 would let another host consume someone else's condition.
 
+**Surviving a rebased commit.** The vault sync daemon runs `pull --rebase
+origin main`, which rewrites a local commit not yet pushed to a new sha
+(2026-11-17: `6d70667aa` became `0cd391875`, and the reservation waited until
+it expired). So `schedule()` also stores the commit's `git patch-id --stable`
+(+ its committer date and changed paths), and when the old sha is not an
+ancestor of HEAD the sweep looks for the same patch in HEAD's history since that
+date (`find_rewritten()`). Records written before this — no `patch_id` — keep
+the strict ancestor check and make no extra git call.
+
 Design constraints:
 
 - **stdlib only.** This code runs on the orchestrator's tick path, and the
@@ -154,9 +163,14 @@ def evaluate(record: dict, *, branch: str | None, head_contains: bool | None,
 
 def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = None,
              expire_hours: float = DEFAULT_EXPIRE_HOURS, note: str = "",
-             now: dt.datetime | None = None) -> Path:
+             now: dt.datetime | None = None, _run=None) -> Path:
     """Write a reservation record. A reservation that can't be accepted is
     rejected with `ResumeError`.
+
+    With `after_commit`, the record also carries the commit's signature
+    (`commit_signature()`: `patch_id`/`commit_ts`/`paths`) when it can be
+    captured, so the sweep still recognizes the commit after a vault sync
+    rebase rewrites its sha. A failed capture never refuses the reservation.
 
     **Both** `Todo/items/<slug>.md` and `Worker/assignments/<slug>.json`
     must exist: if only the md exists, there's nothing to resume (it has
@@ -187,6 +201,8 @@ def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = No
         "expires_ts": _iso(when + dt.timedelta(hours=expire_hours)),
         "note": note or "",
     }
+    if record["after_commit"]:
+        record.update(commit_signature(root, record["after_commit"], _run))
     path = record_path(root, slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n",
@@ -194,10 +210,102 @@ def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = No
     return path
 
 
-def _git(root: Path, args: list[str], _run=None, *, timeout: float = 30):
+def _git(root: Path, args: list[str], _run=None, *, timeout: float = 30,
+         input: str | None = None):
     run = _run or subprocess.run
-    return run(["git", *args], cwd=root, capture_output=True, text=True,
-               timeout=timeout)
+    kwargs = {"cwd": root, "capture_output": True, "text": True, "timeout": timeout}
+    if input is not None:
+        # Only passed when needed, so `_run` fakes that predate stdin keep working.
+        kwargs["input"] = input
+    return run(["git", *args], **kwargs)
+
+
+# The ONE diff rendering both sides of the patch-id comparison use. The stored
+# patch-id (schedule) and the search (consume) must render diffs byte-for-byte
+# alike or equal patches get different ids — so neither side builds its own flags.
+_LOG_PATCH_FLAGS = ["-p", "--no-color", "--no-ext-diff", "--no-textconv",
+                    "--no-renames", "--no-decorate", "--no-show-signature",
+                    "--no-merges"]
+
+# `paths` narrows the fallback search; a commit touching more files than this
+# does not narrow anything worth the record size, so the key is omitted.
+_MAX_SIGNATURE_PATHS = 100
+
+# The fallback search walks at most this many commits of HEAD's history.
+_SEARCH_MAX_COUNT = 1000
+
+# Lower-bound slack for the fallback search (clock skew between hosts).
+_SEARCH_SLACK = dt.timedelta(hours=1)
+
+
+def _patch_ids(root: Path, log_args: list[str], _run=None, *,
+               timeout: float = 30) -> list[tuple[str, str]] | None:
+    """`git log <log_args>` piped into `git patch-id --stable`.
+
+    Returns `(patch_id, commit)` pairs, or None on any exception / non-zero rc.
+    """
+    try:
+        log = _git(root, ["log", *log_args], _run, timeout=timeout)
+        if getattr(log, "returncode", 1) != 0:
+            return None
+        pid = _git(root, ["patch-id", "--stable"], _run, timeout=timeout,
+                   input=log.stdout or "")
+        if getattr(pid, "returncode", 1) != 0:
+            return None
+    except Exception:
+        return None
+    pairs: list[tuple[str, str]] = []
+    for line in (pid.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            pairs.append((parts[0], parts[1]))
+    return pairs
+
+
+def commit_signature(root: str | Path, sha: str, _run=None) -> dict:
+    """What `schedule()` stores so a rebased commit can still be recognized.
+
+    Returns `{"patch_id", "commit_ts"[, "paths"]}` or `{}` — **never raises**, so a
+    reservation is never refused because the signature could not be captured
+    (the record then simply keeps the strict ancestor check).
+
+    - Captured only when `root` itself is the git toplevel: a tmp vault that
+      happens to sit inside some other checkout must not pick up that repo's
+      commit by the same abbreviated sha.
+    - A merge or empty commit yields no single patch-id → `{}` (old behaviour).
+    """
+    try:
+        root = Path(root)
+        sha = (sha or "").strip()
+        if not sha:
+            return {}
+        top = _git(root, ["rev-parse", "--show-toplevel"], _run)
+        if getattr(top, "returncode", 1) != 0:
+            return {}
+        if Path((top.stdout or "").strip()).resolve() != root.resolve():
+            return {}
+        full_p = _git(root, ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], _run)
+        if getattr(full_p, "returncode", 1) != 0:
+            return {}
+        full = (full_p.stdout or "").strip()
+        if not full:
+            return {}
+        pairs = _patch_ids(root, ["-1", *_LOG_PATCH_FLAGS, full], _run)
+        if not pairs or len(pairs) != 1 or pairs[0][1] != full:
+            return {}
+        sig: dict = {"patch_id": pairs[0][0]}
+        ts = _git(root, ["show", "-s", "--format=%cI", full], _run)
+        if getattr(ts, "returncode", 1) != 0 or not (ts.stdout or "").strip():
+            return {}
+        sig["commit_ts"] = ts.stdout.strip()
+        names = _git(root, ["show", "--format=", "--name-only", "--no-renames", full], _run)
+        if getattr(names, "returncode", 1) == 0:
+            paths = sorted({p for p in (names.stdout or "").splitlines() if p.strip()})
+            if 0 < len(paths) <= _MAX_SIGNATURE_PATHS:
+                sig["paths"] = paths
+        return sig
+    except Exception:
+        return {}
 
 
 def current_branch(root: str | Path, _run=None) -> str | None:
@@ -237,6 +345,47 @@ def head_contains(root: str | Path, sha: str, _run=None) -> bool | None:
     if rc == 1:
         return False
     return None
+
+
+def find_rewritten(root: str | Path, record: dict, _run=None) -> tuple[bool | None, str]:
+    """Look for the reserved commit's patch under a new sha in HEAD's history.
+
+    `(True, new_full_sha)` — a commit with the stored `patch_id` that is not the
+    old sha is in HEAD's history; `(False, "")` — git answered and nothing
+    matched; `(None, "")` — can't tell (no `patch_id`, unparseable dates, any git
+    error or timeout). Only `True` may count as "contains"; the other two keep
+    the reservation waiting. **Never raises.**
+
+    The walk starts at the original commit's committer date (`commit_ts`, else
+    the reservation's `created_ts`) minus `_SEARCH_SLACK`: a rebase stamps the
+    rewritten commit with the rebase time, which is never earlier, so this also
+    covers an old sha handed to `schedule()` after the rebase already happened.
+    """
+    try:
+        target = str(record.get("patch_id") or "").strip()
+        old = str(record.get("after_commit") or "").strip()
+        if not target or not old:
+            return None, ""
+        tz = _now().tzinfo
+        lower = (_parse_ts(record.get("commit_ts"), tz=tz)
+                 or _parse_ts(record.get("created_ts"), tz=tz))
+        if lower is None:
+            return None, ""
+        args = [*_LOG_PATCH_FLAGS, f"--since={_iso(lower - _SEARCH_SLACK)}",
+                f"--max-count={_SEARCH_MAX_COUNT}", "HEAD"]
+        paths = record.get("paths")
+        if (isinstance(paths, list) and paths
+                and all(isinstance(p, str) and p for p in paths)):
+            args += ["--", *paths]
+        pairs = _patch_ids(Path(root), args, _run, timeout=60)
+        if pairs is None:
+            return None, ""
+        for patch_id, commit in pairs:
+            if patch_id == target and not commit.startswith(old):
+                return True, commit
+        return False, ""
+    except Exception:
+        return None, ""
 
 
 def load_records(vault_root: str | Path) -> tuple[list[tuple[Path, dict]],
@@ -338,6 +487,14 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
     `collect()` even after being resumed — a known limitation, written down
     in `Worker/README.md`.
 
+    **Rebase fallback.** On main, when `after_commit` is not (or can't be told
+    to be) an ancestor of HEAD and the record carries a `patch_id`,
+    `find_rewritten()` searches HEAD's history for the same patch under a new
+    sha; a match counts as "contains", logs `rebased: <old> → <new>`, and a
+    RESUME then records `rebased_to` in the history entry. Old records without
+    `patch_id` → no extra git call, exactly the previous behaviour. Expiry and
+    the missing-ledger-row check still run before any git call.
+
     `notify(msg, event_key=...)` is optional. It's called **after** the
     ledger save, so a notification failure never undoes the resume, and the
     call itself swallows its own errors.
@@ -357,16 +514,27 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                 slug = str(record.get("slug") or path.stem)
                 a = ledger.load(slug)
                 sha = str(record.get("after_commit") or "")
+                rebased_to = ""
                 if is_expired(record, moment):
                     verdict = EXPIRED
                 elif a is None:
                     # No ledger row means there's nothing to resume — discard the reservation only.
                     verdict = STALE
                 else:
+                    branch = current_branch(root, _run)
+                    contains = head_contains(root, sha, _run) if sha else None
+                    if (branch == "main" and sha and contains is not True
+                            and record.get("patch_id")):
+                        # The sync rebase may have rewritten the sha — same patch counts.
+                        found, new_sha = find_rewritten(root, record, _run)
+                        if found is True:
+                            contains = True
+                            rebased_to = new_sha
+                            emit(f"{slug}: rebased: {sha} → {new_sha}")
                     verdict = evaluate(
                         record,
-                        branch=current_branch(root, _run),
-                        head_contains=head_contains(root, sha, _run) if sha else None,
+                        branch=branch,
+                        head_contains=contains,
                         state=a.state,
                         now=moment,
                     )
@@ -383,19 +551,24 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                     a.state = FAILED
                     a.blocked_on = ""
                     a.updated_ts = _iso(moment - dt.timedelta(seconds=backdate_s))
+                    suffix = f" (rebased → {rebased_to[:12]})" if rebased_to else ""
                     a.last_note = (
-                        f"예약 재개: 볼트 main이 {sha or 'HEAD'}를 반영 — 재디스패치")[:200]
-                    a.history.append({"ts": _iso(moment), "type": RESUMED_SCHEDULED,
-                                      "from": "orchestrator", "after_commit": sha,
-                                      "note": str(record.get("note") or "")})
+                        f"예약 재개: 볼트 main이 {sha or 'HEAD'}를 반영{suffix} "
+                        f"— 재디스패치")[:200]
+                    entry = {"ts": _iso(moment), "type": RESUMED_SCHEDULED,
+                             "from": "orchestrator", "after_commit": sha,
+                             "note": str(record.get("note") or "")}
+                    if rebased_to:
+                        entry["rebased_to"] = rebased_to
+                    a.history.append(entry)
                     ledger.save(a)
                     path.unlink(missing_ok=True)
                     resumed.append(slug)
                     emit(f"{slug}: 조건 충족 — refail=0/state=failed/blocked_on='' "
                          f"+ updated_ts -{backdate_s:.0f}s, 예약 소비 "
-                         f"(after_commit={sha or '-'})")
+                         f"(after_commit={sha or '-'}{suffix})")
                     _notify(notify, f"♻️ 예약 재개: {slug} — 볼트 main이 "
-                                    f"{sha or 'HEAD'}를 반영해 재디스패치합니다",
+                                    f"{sha or 'HEAD'}{suffix}를 반영해 재디스패치합니다",
                             f"resume:{slug}", emit)
                 elif verdict == STALE:
                     # Leave the assignment alone. Someone already resumed it, or it's done.

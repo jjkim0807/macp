@@ -25,6 +25,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -869,6 +870,293 @@ class CliResumeTest(VaultFixture):
         parsed = cli.build_parser().parse_args(["resume", "s"])
         self.assertEqual(parsed.expire_hours, resume.DEFAULT_EXPIRE_HOURS)
         self.assertIsNone(parsed.after_commit)
+
+
+# --- surviving a sync rebase (real git) -------------------------------------
+#
+# The vault sync daemon's `pull --rebase origin main` rewrites a local commit to
+# a new sha (2026-11-17: the reservation waited on the old sha until it expired).
+# These tests run REAL git in a tmp repo, through the `_run` seam — the module's
+# `subprocess` is never patched — with global/system config switched off so the
+# host's git config (hooks, signing, identity) cannot leak in.
+
+_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _real_git_run(argv, **kwargs):
+    """The production `subprocess.run`, isolated from the host's git config."""
+    return subprocess.run(argv, env=_GIT_ENV, **kwargs)
+
+
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class RealGitRepoFixture(VaultFixture):
+    """`VaultFixture` whose root is also a git repo on `main` with one base commit."""
+
+    SLUG = "lowturnover"
+
+    def setUp(self):
+        super().setUp()
+        self.logs: list[str] = []
+        self.alerts: list[tuple[str, str]] = []
+        self.git("init", "-q")
+        self.git("symbolic-ref", "HEAD", "refs/heads/main")
+        self.git("config", "user.name", "macp-test")
+        self.git("config", "user.email", "test@example.com")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "core.hooksPath", os.devnull)
+        self.commit("README.md", "base\n", "base")
+
+    def git(self, *args) -> str:
+        p = _real_git_run(["git", *args], cwd=self.root, capture_output=True,
+                          text=True, timeout=60)
+        if p.returncode != 0:
+            raise AssertionError(f"git {' '.join(args)} failed: {p.stderr}")
+        return p.stdout.strip()
+
+    def commit(self, rel: str, text: str, msg: str) -> str:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        self.git("add", "--", rel)
+        self.git("commit", "-q", "-m", msg)
+        return self.git("rev-parse", "HEAD")
+
+    @property
+    def md_rel(self) -> str:
+        return f"Todo/items/{self.SLUG}.md"
+
+    def task_commit(self) -> tuple[str, str]:
+        """Seed task + assignment; commit the md (base), then edit it (X). Returns (base, X)."""
+        self.seed(self.SLUG)
+        text = (self.root / self.md_rel).read_text(encoding="utf-8")
+        base = self.commit(self.md_rel, text, "add task")
+        x = self.commit(self.md_rel, text + "\nlong_job: collect\n", "attach long_job")
+        return base, x
+
+    def rebase_onto_upstream(self, base: str) -> str:
+        """What `pull --rebase` does: an upstream commit lands under the local X.
+        Returns the rewritten HEAD sha (X')."""
+        self.git("checkout", "-q", "-b", "upstream", base)
+        self.commit("Notes/other.md", "from the other host\n", "upstream change")
+        self.git("checkout", "-q", "main")
+        self.git("rebase", "-q", "upstream")
+        return self.git("rev-parse", "HEAD")
+
+    def reserve(self, sha: str) -> Path:
+        return resume.schedule(self.root, self.SLUG, after_commit=sha, now=NOW,
+                               _run=_real_git_run)
+
+    def record(self) -> dict:
+        return json.loads(resume.record_path(self.root, self.SLUG)
+                          .read_text(encoding="utf-8"))
+
+    def notify(self, msg, *, event_key):
+        self.alerts.append((msg, event_key))
+
+    def consume(self, **kwargs):
+        kwargs.setdefault("_run", _real_git_run)
+        return resume.consume(self.ledger, self.root, backdate_s=1860.0, now=NOW,
+                              notify=self.notify, log=self.logs.append, **kwargs)
+
+
+class ScheduleSignatureTest(RealGitRepoFixture):
+    def test_schedule_records_patch_id_in_real_repo(self):
+        _, x = self.task_commit()
+        self.reserve(x[:9])
+        rec = self.record()
+        self.assertEqual(rec["after_commit"], x[:9], "사람이 넘긴 sha는 그대로 둔다")
+        self.assertRegex(rec["patch_id"], r"^[0-9a-f]{40}$")
+        self.assertTrue(dt.datetime.fromisoformat(rec["commit_ts"]).tzinfo)
+        self.assertEqual(rec["paths"], [self.md_rel])
+
+    def test_merge_commit_gets_no_patch_id(self):
+        base, _ = self.task_commit()
+        self.git("checkout", "-q", "-b", "side", base)
+        self.commit("Notes/side.md", "side\n", "side")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "merge side", "side")
+        self.reserve(self.git("rev-parse", "HEAD"))
+        self.assertNotIn("patch_id", self.record(), "머지 커밋은 옛 동작(엄격한 조상 검사)")
+
+
+class ScheduleSignatureFailSafeTest(VaultFixture):
+    def test_schedule_outside_repo_omits_patch_id(self):
+        self.seed("lowturnover")
+        path = resume.schedule(self.root, "lowturnover", after_commit="a1b2c3d",
+                               now=NOW, _run=_real_git_run)
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(rec["after_commit"], "a1b2c3d")
+        self.assertNotIn("patch_id", rec, "git 저장소가 아니면 서명 없이 예약만 저장")
+
+    def test_schedule_survives_git_raising(self):
+        self.seed("lowturnover")
+        path = resume.schedule(self.root, "lowturnover", after_commit="a1b2c3d",
+                               now=NOW, _run=_fake_run(raises=True))
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(rec["after_commit"], "a1b2c3d")
+        self.assertNotIn("patch_id", rec)
+
+    def test_schedule_without_after_commit_calls_no_git(self):
+        self.seed("lowturnover")
+
+        def run(argv, **kwargs):
+            raise AssertionError(f"unexpected git call: {argv}")
+
+        path = resume.schedule(self.root, "lowturnover", now=NOW, _run=run)
+        self.assertNotIn("patch_id", json.loads(path.read_text(encoding="utf-8")))
+
+
+class RebasedCommitTest(RealGitRepoFixture):
+    def test_rebased_commit_satisfies_reservation(self):
+        base, x = self.task_commit()
+        self.reserve(x)
+        x2 = self.rebase_onto_upstream(base)
+        self.assertNotEqual(x, x2, "rebase가 sha를 바꿨다 — 사건 재현")
+        self.assertIs(resume.head_contains(self.root, x, _real_git_run), False)
+        self.assertEqual(resume.find_rewritten(self.root, self.record(), _real_git_run),
+                         (True, x2))
+
+        self.assertEqual(self.consume(), [self.SLUG])
+
+        a = self.ledger.load(self.SLUG)
+        self.assertEqual((a.state, a.refail_count, a.blocked_on), (FAILED, 0, ""))
+        self.assertEqual(a.history[-1]["after_commit"], x)
+        self.assertEqual(a.history[-1]["rebased_to"], x2)
+        self.assertIn(x, a.last_note)
+        self.assertFalse(resume.record_path(self.root, self.SLUG).exists())
+        self.assertTrue(any("rebased:" in line and x in line and x2 in line
+                            for line in self.logs), self.logs)
+
+    def test_abbreviated_sha_is_rebased_too(self):
+        base, x = self.task_commit()
+        self.reserve(x[:9])
+        x2 = self.rebase_onto_upstream(base)
+        self.assertEqual(self.consume(), [self.SLUG])
+        self.assertEqual(self.ledger.load(self.SLUG).history[-1]["rebased_to"], x2)
+
+    def test_stale_sha_given_after_rebase_is_found(self):
+        """사람이 rebase 뒤에 옛 sha로 예약해도 원 커밋 시각부터 찾으므로 충족된다."""
+        base, x = self.task_commit()
+        x2 = self.rebase_onto_upstream(base)
+        self.reserve(x)
+        self.assertIn("patch_id", self.record())
+        self.assertEqual(self.consume(), [self.SLUG])
+        self.assertEqual(self.ledger.load(self.SLUG).history[-1]["rebased_to"], x2)
+
+    def test_plain_ancestor_still_resumes_without_rebased_note(self):
+        _, x = self.task_commit()
+        self.reserve(x)
+        self.assertEqual(self.consume(), [self.SLUG])
+        self.assertNotIn("rebased_to", self.ledger.load(self.SLUG).history[-1])
+        self.assertFalse(any("rebased:" in line for line in self.logs))
+
+    def test_different_patch_is_not_satisfied(self):
+        base, x = self.task_commit()
+        self.reserve(x)
+        # main moves on WITHOUT X: an upstream commit, then a different edit to the same md
+        self.git("checkout", "-q", "-B", "main", base)
+        self.commit("Notes/other.md", "from the other host\n", "upstream change")
+        text = (self.root / self.md_rel).read_text(encoding="utf-8")
+        self.commit(self.md_rel, text + "\nlong_job: something-else\n", "other edit")
+
+        self.assertIs(resume.head_contains(self.root, x, _real_git_run), False)
+        self.assertEqual(resume.find_rewritten(self.root, self.record(), _real_git_run),
+                         (False, ""))
+        self.assertEqual(self.consume(), [])
+        self.assertTrue(resume.record_path(self.root, self.SLUG).exists())
+        self.assertEqual(self.ledger.load(self.SLUG).state, AWAITING_HUMAN)
+        self.assertTrue(any("아직 아님" in line for line in self.logs))
+        self.assertFalse(any("rebased:" in line for line in self.logs))
+
+    def test_old_record_without_patch_id_keeps_waiting(self):
+        base, x = self.task_commit()
+        path = self.reserve(x)
+        rec = self.record()
+        for key in ("patch_id", "commit_ts", "paths"):
+            rec.pop(key, None)
+        path.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        self.rebase_onto_upstream(base)
+
+        self.assertEqual(resume.find_rewritten(self.root, rec, _real_git_run),
+                         (None, ""))
+        self.assertEqual(self.consume(), [], "patch_id 없는 옛 레코드는 옛 동작 그대로")
+        self.assertTrue(path.exists())
+        self.assertTrue(any("아직 아님" in line for line in self.logs))
+
+    def test_expired_rebased_reservation_still_expires(self):
+        base, x = self.task_commit()
+        path = self.reserve(x)
+        self.rebase_onto_upstream(base)
+        rec = self.record()
+        rec["expires_ts"] = (NOW - dt.timedelta(hours=1)).isoformat()
+        path.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+
+        self.assertEqual(self.consume(), [])
+        self.assertFalse(path.exists(), "만료가 rebase 폴백보다 먼저다")
+        self.assertEqual(self.ledger.load(self.SLUG).state, AWAITING_HUMAN)
+        self.assertEqual([key for _, key in self.alerts], [f"resume-expired:{self.SLUG}"])
+        self.assertFalse(any("rebased:" in line for line in self.logs))
+
+    def test_rebased_on_a_worker_branch_still_waits(self):
+        base, x = self.task_commit()
+        self.reserve(x)
+        self.rebase_onto_upstream(base)
+        self.git("checkout", "-q", "-b", "worker/other")
+        self.assertEqual(self.consume(), [])
+        self.assertFalse(any("rebased:" in line for line in self.logs),
+                         "main이 아니면 폴백 검색도 하지 않는다")
+
+
+class FindRewrittenFailSafeTest(VaultFixture):
+    RECORD = {"slug": "lowturnover", "after_commit": "a1b2c3d",
+              "patch_id": "f" * 40, "commit_ts": NOW.isoformat(),
+              "created_ts": NOW.isoformat(), "paths": ["Todo/items/lowturnover.md"]}
+
+    def test_git_raising_is_none(self):
+        self.assertEqual(resume.find_rewritten(self.root, dict(self.RECORD),
+                                               _fake_run(raises=True)), (None, ""))
+
+    def test_log_rc_128_is_none(self):
+        def run(argv, **kwargs):
+            return _completed(argv, 128, "", "fatal: bad revision")
+
+        self.assertEqual(resume.find_rewritten(self.root, dict(self.RECORD), run),
+                         (None, ""))
+
+    def test_unparseable_dates_are_none(self):
+        rec = dict(self.RECORD, commit_ts="nope", created_ts="")
+
+        def run(argv, **kwargs):
+            raise AssertionError(f"unexpected git call: {argv}")
+
+        self.assertEqual(resume.find_rewritten(self.root, rec, run), (None, ""))
+
+    def test_git_error_during_fallback_waits_without_skip(self):
+        self.seed("lowturnover")
+        path = resume.schedule(self.root, "lowturnover", after_commit="a1b2c3d", now=NOW)
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        rec.update(patch_id="f" * 40, commit_ts=NOW.isoformat())
+        path.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:3] == ["rev-parse", "--abbrev-ref"]:
+                return _completed(argv, 0, "main\n")
+            if argv[1:3] == ["merge-base", "--is-ancestor"]:
+                return _completed(argv, 1)
+            raise OSError("git log blew up")
+
+        logs: list[str] = []
+        resumed = resume.consume(self.ledger, self.root, backdate_s=1860.0, now=NOW,
+                                 log=logs.append, _run=run)
+
+        self.assertEqual(resumed, [])
+        self.assertTrue(any(argv[1] == "log" for argv in calls), "폴백이 실제로 시도됐다")
+        self.assertTrue(path.exists())
+        self.assertTrue(any("아직 아님" in line for line in logs))
+        self.assertFalse(any("건너뜀" in line for line in logs), logs)
+        self.assertEqual(self.ledger.load("lowturnover").state, AWAITING_HUMAN)
 
 
 if __name__ == "__main__":
