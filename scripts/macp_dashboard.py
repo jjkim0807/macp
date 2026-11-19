@@ -332,6 +332,10 @@ def collect_assignments() -> list[dict]:
             # that predates the new state value.
             "state": display_state(d) or "?",
             "deferred": is_deferred(d),
+            # Same idea for batch verify: state `batch_ready` (quick verify passed,
+            # waiting on the repo's shared full gate), repeated as a bool for a
+            # client that predates the state value.
+            "batch_ready": d.get("state") == "batch_ready",
             "agent": d.get("agent_id", ""),
             # Heavy routing (additive): the default agent a heavy-remote task
             # comes back to, and the latest reroute away from a remote
@@ -1809,6 +1813,11 @@ def collect_status() -> dict:
     # group. recent/runs stay unstamped — recent (a[:40]) shares dict objects with
     # active/attention, so those objects may end up carrying `group` too; harmless,
     # it is a field addition and no consumer removes or renames anything.
+    # `batch_ready[]` (additive) is the fourth stamped section: open rows in state
+    # `batch_ready` — they passed a quick verify and wait for the repo's shared
+    # full gate (docs/batch-verify.md). Nobody owes them anything, so they are in
+    # neither `active` nor `attention`. Every row (recent included) carries the
+    # bool `batch_ready` from collect_assignments.
     active = [r for r in a if r["state"] in ACTIVE]
     for r in active:                               # additive: the server decides whether
         # the runner is the default one, so the client can hide the "agent …" line
@@ -1823,13 +1832,15 @@ def collect_status() -> dict:
     attention = [r for r in a if r["state"] in ("awaiting_human", "failed")
                  and not is_closed(r.get("todo_status"))
                  and r["task"] not in umbrellas][:12]
+    batch_ready = [r for r in a if r["state"] == "batch_ready"
+                   and not is_closed(r.get("todo_status"))]
     projects_rows = collect_projects(a)
     human_all = collect_human(a, projects={p["slug"] for p in projects_rows},
                               umbrellas=umbrellas)
     human_all = _merge_proposals(human_all, collect_proposals())
     human = [r for r in human_all if not r.get("later")]
     human_later = [r for r in human_all if r.get("later")]
-    for r in (*active, *attention, *human, *human_later):
+    for r in (*active, *attention, *batch_ready, *human, *human_later):
         r["group"] = _group_of(r)
 
     # ---- worker-state derivation (why "idle"?) ----
@@ -1882,6 +1893,7 @@ def collect_status() -> dict:
         "runs_today": runs_today,
         "active": active,
         "attention": attention,
+        "batch_ready": batch_ready,
         "human": human,
         "human_later": human_later,
         "projects": projects_rows,
