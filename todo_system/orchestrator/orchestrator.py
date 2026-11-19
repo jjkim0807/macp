@@ -156,10 +156,11 @@ _SUPERSEDED_MD_NOTE = "superseded: 브랜치 변경이 이미 기본 브랜치�
 # the task. Like the two parks above it is benign (not a defect), so it is NOT in
 # FAILURE_ALERT_KINDS. Mirrors rescope.ALERT_RESCOPE_PENDING (wire format).
 ALERT_RESCOPE_PENDING = "rescope-pending"
-# ALERT_BATCH_GATE_FAILED: the repo's shared full gate failed for a batch of
-# quick-verified tasks (batch verify, batch_gate.py) and each was sent back to an
-# individual full verify. Wired by the integration-gate leaf, which runs that
-# gate; declared here with the other framings because the string is wire format.
+# ALERT_BATCH_GATE_FAILED: the repo's shared full gate failed (or timed out) for
+# a batch of quick-verified tasks (batch verify, batch_gate.py) and each was sent
+# back to an individual full verify. reconcile_batch_gate stamps it on every
+# member's row and builds the one alert's event key from it; declared here with
+# the other framings because the string is wire format.
 # Not in FAILURE_ALERT_KINDS: which task broke the batch is not known yet, so a
 # benign close of one of them is not a false alarm.
 ALERT_BATCH_GATE_FAILED = "batch-gate-failed"
@@ -1122,9 +1123,38 @@ class Orchestrator:
         if self.max_parallel_gradle_builds > 0 and self._is_gradle_checkout(key):
             gradle_runs = sum(len(rows) for k, rows in live.items()
                               if self._is_gradle_checkout(k))
+            # A batch integration gate that is out is a Gradle build on this
+            # host too, though no ledger row is in flight for it.
+            gradle_runs += self._batch_gradle_jobs()
             if gradle_runs >= self.max_parallel_gradle_builds:
                 return CheckoutGate(WAIT_GRADLE_CAP, gradle_runs=gradle_runs)
         return CheckoutGate(None)
+
+    def _batch_gradle_jobs(self) -> int:
+        """How many batch integration gates (batch_gate.py) are running a Gradle
+        build on this host right now: the job records in state `running` whose
+        repo is a Gradle checkout. Read-only — no write, no print — because
+        _checkout_gate, and through it the queue view, calls it. Any error
+        answers 0: the count only ever tightens the cap, and a broken state
+        dir must not stop dispatch."""
+        try:
+            from . import batch_gate
+            vault_root = Path(self.ledger.root).parent.parent
+            return sum(1 for job in batch_gate.running_jobs(vault_root)
+                       if self._is_gradle_checkout(str(job.get("repo") or "")))
+        except Exception:  # noqa: BLE001 - fail-open: count nothing
+            return 0
+
+    def _batch_gate_gradle_busy(self, repo_url: str) -> bool:
+        """Would starting this repo's integration gate now go over the Gradle
+        build cap? The other direction of _checkout_gate's count: live Gradle
+        runs plus the gates already out. False with the cap off (0) or for a
+        repo that is not a Gradle checkout, so those start as before."""
+        if self.max_parallel_gradle_builds <= 0 or not self._is_gradle_checkout(repo_url):
+            return False
+        live = sum(len(rows) for key, rows in self._checkout_inflight().items()
+                   if self._is_gradle_checkout(key))
+        return live + self._batch_gradle_jobs() >= self.max_parallel_gradle_builds
 
     def _dispatch_serial_per_checkout(self, runnable: list[Task]) -> list[Assignment]:
         """Dispatch, but never put two tasks in one checkout at the same time.
@@ -3516,15 +3546,14 @@ class Orchestrator:
             print(f"[orchestrator] rescope sweep skipped (fail-open): {e}")
             return []
 
-    def reconcile_batch_gate(self, now: float | None = None) -> dict:
-        """Tend the rows waiting for a repo's integration gate (BATCH_READY).
+    def reconcile_batch_gate(self, now: float | None = None, *, env=None) -> dict:
+        """Tend the rows waiting for a repo's integration gate (BATCH_READY) and
+        move each repo's integration-gate job one step.
 
         Batch verify (batch_gate.py) parks a quick-verified run's PR here until
-        the repo's full gate has run once for several tasks. This is the
-        SAFETY-NET half of that sweep: building the integration branch, running
-        the gate and merging are the integration-gate leaf's and not here yet, so
-        `started` and `merged` are always empty. What this guarantees meanwhile is
-        that no row waits forever. Per row, first match wins:
+        the repo's full gate has run once for several tasks. Two halves:
+
+        The SAFETY NET, per row, first match wins — no row waits forever:
 
           1. the task md is already closed (a human merged and closed it) → the
              row is tidied to DONE, the same close reconcile_split_parents does;
@@ -3534,27 +3563,119 @@ class Orchestrator:
              cannot be read → back to a full verify (`expired`) with ONE digest
              alert (event key `batch-expired:<slug>`).
 
+        The GATE, per repo, for the rows the net left waiting: batch_gate.step
+        under the repo's lock — build the integration branch once two tasks wait
+        (or one has waited half an hour), run the full gate as a detached job,
+        then merge the PRs in order and close the tasks (history `batch-merged`).
+        A failed or timed-out gate sends every member back with ONE immediate
+        alert and stamps ALERT_BATCH_GATE_FAILED on their rows. A repo is
+        stepped only when it has a job record or its rows reached the trigger;
+        otherwise nothing is locked, written, printed or run for it, and no
+        `gh` or git call is made. PAUSED holds back a new gate only; a gate that
+        is out is still judged and merged. A new gate also waits while the
+        Gradle build cap is reached (_batch_gate_gradle_busy).
+
         A sent-back row is a deferral, not a failure (batch_gate.mark_returned):
         FAILED + `batch-returned`, re-dispatched after the flat poll cooldown with
         `verify_full` on its payload and no refail.
 
         Returns {"started", "merged", "returned", "closed"} — lists of slugs.
-        Runs on EVERY tick, so with no BATCH_READY row (every host until a vault
-        registers a repo) it does nothing beyond reading the ledger: no config
-        read, no output. Never raises into tick(): per-row isolation plus an
-        outer net, like the other sweeps."""
+        Runs on EVERY tick, so with no BATCH_READY row and no job record (every
+        host until a vault registers a repo) it does nothing beyond reading the
+        ledger and one directory check: no config read, no output. `env` is the
+        batch_gate.Env to step with (tests); the default is built on first use.
+        Never raises into tick(): per-row and per-repo isolation plus an outer
+        net, like the other sweeps."""
         out: dict = {"started": [], "merged": [], "returned": [], "closed": []}
         try:
             rows = [a for a in self.ledger.all() if a.state == BATCH_READY]
-            if not rows:
-                return out
             from . import batch_gate
+            try:
+                # ledger.root is Worker/assignments -> the vault root is two up.
+                vault_root = Path(self.ledger.root).parent.parent
+            except Exception:  # noqa: BLE001 — a ledger with no directory
+                if not rows:
+                    return out          # nothing waits: stay silent, as before
+                raise
+            if not rows and not batch_gate.has_jobs(vault_root):
+                return out
             now = now if now is not None else dt.datetime.now().timestamp()
-            # ledger.root is Worker/assignments -> the vault root is two up.
             # Read through the module attribute: that is the seam the test suite
-            # guards against a live vault's config.
-            cfg = batch_gate.load_config(Path(self.ledger.root).parent.parent)
+            # guards against a live vault's config. Once per sweep.
+            cfg = batch_gate.load_config(vault_root)
             skips = _SkipTally("reconcile_batch_gate")
+
+            def returned(a: Assignment, reason: str) -> None:
+                batch_gate.mark_returned(a, reason, now_iso=m.now_iso())
+                if reason in (batch_gate.RETURN_GATE_FAILED,
+                              batch_gate.RETURN_GATE_TIMEOUT):
+                    # Stamped with the state, before the save: the framing that
+                    # fired for this row (see ALERT_BATCH_GATE_FAILED).
+                    a.last_alert_kind = ALERT_BATCH_GATE_FAILED
+                self.ledger.save(a)
+                print(f"[orchestrator] batch gate: {a.task_id} returned to an "
+                      f"individual full verify ({reason})")
+
+            def close(a: Assignment, note: str) -> None:
+                # reconcile_merge_holds' close shape: evidence + mark_done first,
+                # then DONE with the deferral flags cleared.
+                self._close_with_evidence(a)
+                a.state = DONE
+                a.updated_ts = m.now_iso()
+                a.last_note = note[:200]
+                a.job_running = False
+                a.checkout_busy = False
+                a.history.append({"ts": m.now_iso(), "type": batch_gate.HISTORY_MERGED,
+                                  "from": "orchestrator"})
+                self.ledger.save(a)
+
+            def park(a: Assignment, note: str) -> None:
+                # The PR was closed without merging: a person decides. No history
+                # entry and no alert here — reconcile_merged, later in this same
+                # tick, sees the parked row and sends its one closed-unmerged
+                # notice. It looks the PR up by payload["branch"].
+                record = a.payload.get(batch_gate.KEY_BATCH) if isinstance(a.payload, dict) else None
+                if isinstance(record, dict) and record.get("branch"):
+                    a.payload.setdefault("branch", record["branch"])
+                a.state = AWAITING_HUMAN
+                a.updated_ts = m.now_iso()
+                a.last_note = note[:200]
+                self.ledger.save(a)
+
+            def alert(kind: str, repo_name: str, slugs: list, detail: dict) -> None:
+                lines = [f"📋 {self._task_title(s)}" for s in slugs]
+                branch = str(detail.get("branch") or "")
+                tail = ""
+                if kind == batch_gate.NOTICE_FAILED:
+                    # Immediate: the batch did not land and somebody may want to
+                    # look at the log before five individual verifies re-run it.
+                    headline = i18n.t("alert.batch_gate_failed", repo=repo_name,
+                                      n=len(slugs))
+                    if detail.get("log"):
+                        lines.append(i18n.t("alert.batch_gate_log", path=detail["log"]))
+                    tail = i18n.t("alert.reason", reason=detail.get("reason") or "")
+                    level = kakao_format.LEVEL_IMMEDIATE
+                    key = f"{ALERT_BATCH_GATE_FAILED}:{repo_name}:{branch}"
+                elif kind == batch_gate.NOTICE_PASSED:
+                    headline = i18n.t("alert.batch_gate_passed", repo=repo_name,
+                                      n=len(slugs))
+                    level = kakao_format.LEVEL_DIGEST
+                    key = f"{batch_gate.EVENT_PASSED}:{repo_name}:{branch}"
+                elif kind == batch_gate.NOTICE_RESTARTS:
+                    # Digest: the tasks re-dispatch by themselves.
+                    headline = i18n.t("alert.batch_restarts", max=batch_gate.MAX_RESTARTS,
+                                      repo=repo_name, n=len(slugs))
+                    level = kakao_format.LEVEL_DIGEST
+                    key = f"{batch_gate.EVENT_RESTARTS}:{repo_name}:{branch}"
+                else:
+                    return
+                self._notify_routed(human.compose_alert(headline, lines, tail=tail),
+                                    None, level=level, event_key=key)
+
+            hooks = batch_gate.Hooks(close=close, returned=returned, park=park,
+                                     alert=alert)
+            # job name -> what the safety net left waiting for that repo
+            waiting: dict[str, dict] = {}
             for a in rows:
                 try:
                     payload = a.payload if isinstance(a.payload, dict) else {}
@@ -3567,7 +3688,8 @@ class Orchestrator:
                               "todo already closed")
                         continue
                     reason = None
-                    if batch_gate.repo_gate(cfg, payload.get("repo")) is None:
+                    gate_cfg = batch_gate.repo_gate(cfg, payload.get("repo"))
+                    if gate_cfg is None:
                         reason = batch_gate.RETURN_NOT_ENABLED
                     else:
                         record = payload.get(batch_gate.KEY_BATCH)
@@ -3575,24 +3697,59 @@ class Orchestrator:
                         if now - _parse_ts(ready_ts) >= batch_gate.EXPIRE_S:
                             reason = batch_gate.RETURN_EXPIRED
                     if reason is None:
-                        continue                 # still waiting for its gate
-                    batch_gate.mark_returned(a, reason, now_iso=m.now_iso())
-                    self.ledger.save(a)
+                        # still waiting for its gate — the repo loop below
+                        url = str(payload.get("repo"))
+                        waiting.setdefault(batch_gate.job_name(url), {
+                            "url": url, "gate": gate_cfg, "rows": []})["rows"].append(a)
+                        continue
+                    returned(a, reason)
                     out["returned"].append(a.task_id)
-                    print(f"[orchestrator] batch gate: {a.task_id} returned to an "
-                          f"individual full verify ({reason})")
                     if reason == batch_gate.RETURN_EXPIRED:
                         # Digest, not immediate: the task re-dispatches by itself,
                         # so there is nothing for a person to do. The per-slug
                         # event key keeps it to one notice per task.
                         self._notify_routed(
-                            f"⌛ 묶음 검증 대기 만료: {self._task_title(a.task_id)} — "
-                            f"{batch_gate.EXPIRE_S // 3600}시간 안에 통합 게이트가 돌지 "
-                            "않아 개별 전체 Verify로 되돌렸습니다",
+                            i18n.t("alert.batch_expired",
+                                   title=self._task_title(a.task_id),
+                                   hours=batch_gate.EXPIRE_S // 3600),
                             None, level=kakao_format.LEVEL_DIGEST,
-                            event_key=f"batch-expired:{a.task_id}")
+                            event_key=f"{batch_gate.EVENT_EXPIRED}:{a.task_id}")
                 except Exception as e:  # noqa: BLE001 — per-row isolation
                     skips.record(getattr(a, "task_id", "?") or "?", e)
+            records = {job["repo_name"]: job for job in batch_gate.all_jobs(vault_root)}
+            for name in sorted(set(waiting) | set(records)):
+                try:
+                    slot = waiting.get(name)
+                    if slot is not None:
+                        url, gate_cfg, repo_rows = slot["url"], slot["gate"], slot["rows"]
+                    else:
+                        # A job whose rows all left (closed, expired, config gone).
+                        url = str(records[name].get("repo") or "")
+                        gate_cfg, repo_rows = batch_gate.repo_gate(cfg, url), []
+                    if not batch_gate.wants_step(vault_root, name, repo_rows, gate_cfg, now):
+                        continue        # nothing to do: no lock, no output
+                    with batch_gate.repo_lock(vault_root, name) as held:
+                        if not held:
+                            print(f"[orchestrator] batch gate: {name} is being "
+                                  "stepped by another process — skipped this tick")
+                            continue
+                        if env is None:
+                            env = batch_gate.default_env(now=lambda: now)
+                        if slot is None and (not url or batch_gate.job_name(url) != name):
+                            # A record that does not name its own repo cannot be
+                            # stepped; drop it rather than trip on it every tick.
+                            batch_gate.abandon(records[name], env, vault_root)
+                            print(f"[orchestrator] batch gate: {name} job record "
+                                  "dropped — it names no repo")
+                            continue
+                        res = batch_gate.step(
+                            url, repo_rows, gate_cfg, env, hooks, vault_root=vault_root,
+                            paused=self.paused(),
+                            gradle_busy=lambda url=url: self._batch_gate_gradle_busy(url))
+                    for key in out:
+                        out[key].extend(res.get(key) or [])
+                except Exception as e:  # noqa: BLE001 — per-repo isolation
+                    skips.record(name, e)
             skips.flush()
         except Exception as e:  # noqa: BLE001 — never raise into tick()
             print(f"[orchestrator] batch gate sweep skipped (fail-open): {e}")

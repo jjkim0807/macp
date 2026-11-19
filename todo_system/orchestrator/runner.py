@@ -69,6 +69,30 @@ _CODE_CHECK_TTL = 60.0
 # report opened no PR because there was nothing to change.
 _NO_OP_MERGE_NOTE = " — no-op — 변경할 것 없음(점검으로 충족)"
 
+# The retry note of a run whose task the batch integration gate sent back for a
+# merge conflict (batch_gate.RETURN_CONFLICT). It replaces the previous run's
+# verify.md as the retry context: that verify PASSED (quick mode), so there is no
+# failure to fix forward — the one thing to do is merge the default branch.
+# stages.build_stage_argv prints it under its "Previous attempt FAILED" heading,
+# which is why it opens by saying what did and did not fail. `{default}` is the
+# only placeholder.
+_BATCH_CONFLICT_RETRY = (
+    "What failed is the BATCH INTEGRATION GATE's merge, not this branch's own "
+    "checks: the implementation on this branch is complete and passed its quick "
+    "Verify. The gate could not merge this branch cleanly with `origin/{default}` "
+    "(or with a task merged just before it), so the task was sent back.\n\n"
+    "Do this, and only this:\n"
+    "1. Do NOT re-implement or re-scaffold anything.\n"
+    "2. Run `git fetch origin`, then `git merge origin/{default}` — an ordinary "
+    "merge commit. Never rebase and never force-push: the branch is published and "
+    "its PR is open.\n"
+    "3. Resolve every conflict so that BOTH changes keep their intent, re-run the "
+    "tests that cover the files you touched while resolving, and commit the "
+    "merge.\n"
+    "4. If the merge is already clean, commit nothing else and finish.\n\n"
+    "A full Verify runs after this stage."
+)
+
 
 @dataclass
 class ExecOutcome:
@@ -354,6 +378,27 @@ class StagedExecutor(ClaudeCodeExecutor):
             return ok, hint
         except Exception:           # noqa: BLE001 — advisory on the start path, fail open
             return False, ""
+
+    def _batch_conflict_context(self, payload: dict, failure_ctx: str, repo) -> str:
+        """The retry note for a run whose task the batch integration gate sent
+        back because its branch did not merge (`batch_return_reason: conflict`),
+        else "".
+
+        Such a run must not inherit `implement`: the branch has to take the
+        default branch in first, and the full Verify then judges the merged
+        tree. "" — leave the run exactly as it would be — when the task came
+        back for any other reason, and when the most recent verify.md
+        (`failure_ctx`, stages.previous_failure_context) says FAIL: that is the
+        returned run's own full Verify failing, and its diagnosis is what the
+        next attempt has to fix. Fails open: any error is ""."""
+        try:
+            if (payload or {}).get(batch_gate.KEY_RETURN_REASON) != batch_gate.RETURN_CONFLICT:
+                return ""
+            if stages.parse_verify_verdict(failure_ctx) == "FAIL":
+                return ""
+            return _BATCH_CONFLICT_RETRY.format(default=stages.default_branch(repo))
+        except Exception:           # noqa: BLE001 — advisory on the start path, fail open
+            return ""
 
     @staticmethod
     def _account_env(msg: m.Envelope, repo: Path | None, *,
@@ -1227,6 +1272,15 @@ class StagedExecutor(ClaudeCodeExecutor):
         # creative stages so they fix the exact failure instead of re-implementing
         # blind (which just re-verifies the same red CI). Empty on first attempt.
         retry_ctx = stages.previous_failure_context(msg.task_id, run_id)
+        # Batch verify: a task the integration gate sent back for a merge
+        # conflict has no failed verify to fix forward — its last verify.md is
+        # the QUICK one, and it passed. The note that tells implement to merge
+        # the default branch takes its place. "" for every other run.
+        conflict_ctx = self._batch_conflict_context(payload, retry_ctx, repo)
+        if conflict_ctx:
+            retry_ctx = conflict_ctx
+            progress("batch return (conflict): implement re-runs to merge the "
+                     "default branch")
         # A prior TIMEOUT is fix-forward too, but of a different shape: the code is
         # already on origin/<branch>, so the creative stages must CONTINUE it, not
         # re-implement blind. Fold both notes in — a run can have a verify FAIL and,
@@ -1252,6 +1306,14 @@ class StagedExecutor(ClaudeCodeExecutor):
         if prior:
             prior_dir, candidates = prior
             if not (repo_url and stages.remote_branch_exists(repo, branch)):
+                candidates = [s for s in candidates if s != "implement"]
+            if conflict_ctx and (prior_dir / stages.STAGE_ARTIFACT["verify"]).exists():
+                # Sent back for a merge conflict, and the run being inherited
+                # from got as far as a verify (the quick-verified one): its
+                # implement predates the merge, so implement runs again. A prior
+                # run WITHOUT a verify.md is the returned run itself, cut short
+                # after its implement — that one already did the merge and is
+                # inherited like any other.
                 candidates = [s for s in candidates if s != "implement"]
             inherited = stages.inherit_artifacts(prior_dir, run_dir, candidates)
             if inherited:

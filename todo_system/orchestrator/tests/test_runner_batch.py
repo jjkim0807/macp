@@ -114,6 +114,7 @@ class _Sandbox:
 
         self.artifacts = {"verify": VERIFY_PASS, "report": REPORT_PASS}
         self.implement_commits = True      # the implement stub commits one file
+        self.implement_text = "changed"    # …with this content (a re-run needs new bytes)
         self.calls: list[tuple[str, dict]] = []
         self.prompts: dict[str, str] = {}
         self.lines: list[str] = []
@@ -165,7 +166,8 @@ class _Sandbox:
                   f"> {shlex.quote(str(artifact))}")
         if stage == "implement" and self.implement_commits:
             clone = shlex.quote(str(self.clone))
-            script = (f"printf changed > {clone}/impl.txt && git -C {clone} add impl.txt "
+            script = (f"printf %s {shlex.quote(self.implement_text)} > {clone}/impl.txt "
+                      f"&& git -C {clone} add impl.txt "
                       f"&& git -C {clone} commit -q -m implement && {script}")
         return ["/bin/sh", "-c", script]
 
@@ -513,3 +515,155 @@ def test_verify_and_report_are_never_inherited_by_a_later_run():
     assert "verify" not in stages.RESUMABLE
     assert "report" not in stages.RESUMABLE
     assert stages.RESUMABLE == ("research", "plan", "implement")
+
+
+# --- (k) the run AFTER the integration gate sent the task back ---------------------
+# dispatch() copies `verify_full` and `batch_return_reason` from the returned
+# ledger row onto the next payload (test_batch_ready_state.py); these tests start
+# from that payload. The first execute() is the quick-verified run that waited.
+
+FIRST_RUN = "20200101T000000-batch-task"
+SECOND_RUN = "20210101T000000-batch-task"
+
+
+def _latest_run(box: _Sandbox) -> Path:
+    [latest] = [p for p in box.runs.iterdir() if not p.name.startswith(("2020", "2021"))]
+    return latest
+
+
+def _rerun(box: _Sandbox, as_name: str, **payload):
+    """Dispatch the task again. The run that just finished is filed under
+    `as_name` first — two runs inside one second would share a run id — and the
+    recorders are emptied, so what is read back is this run's alone."""
+    _latest_run(box).rename(box.runs / as_name)
+    box.calls.clear()
+    box.prompts.clear()
+    box.lines.clear()
+    box.merge_landed.reset_mock()
+    return box.execute(verify_full=True, **payload)
+
+
+def _assert_full_verify_run(box: _Sandbox, out) -> None:
+    """A returned task's run: never batched again, verified in full, merged."""
+    assert out.ok, out.summary
+    for stage, kwargs in box.calls:
+        assert "batch_mode" not in kwargs, stage
+        assert "Verify mode: QUICK" not in box.prompts[stage], stage
+    assert box.batch_lines() == ["batch verify: off (returned to full verify)"]
+    for key in BATCH_KEYS:
+        assert key not in out.payload, key
+    assert box.kw("report")["auto_merge"] is True
+    box.merge_landed.assert_called_once()
+    assert out.payload["review_required"] is False
+
+
+def test_conflict_return_reruns_implement_to_merge_the_default_branch(box):
+    box.write_config()
+    _assert_batch_hold(box, box.execute())
+    quick_tip = box.branch_tip()
+    box.implement_text = "merged"          # the re-run implement makes a new commit
+
+    out = _rerun(box, FIRST_RUN, batch_return_reason=batch_gate.RETURN_CONFLICT)
+
+    _assert_full_verify_run(box, out)
+    assert box.stages_run() == ["implement", "verify", "report"]
+    assert f"resume: inheriting research+plan from {FIRST_RUN}" in box.lines
+    assert ("batch return (conflict): implement re-runs to merge the default branch"
+            in box.lines)
+    # what the implement stage is told: merge, do not re-implement
+    told = box.kw("implement")["retry_context"]
+    assert "git merge origin/main" in told
+    assert "Do NOT re-implement" in told and "never force-push" in told
+    # …and NOT the quick verify.md, which passed and is no failure to fix
+    assert "# verify" not in told and "overall_status" not in told
+    assert "git merge origin/main" in box.prompts["implement"]
+    assert box.kw("verify")["retry_context"] == ""
+    # the commit it made is on origin before the full verify judges the branch
+    assert box.branch_tip() != quick_tip
+    assert _git(box.origin, "rev-parse", BRANCH) == box.branch_tip()
+
+
+@pytest.mark.parametrize("reason", [
+    batch_gate.RETURN_GATE_FAILED, batch_gate.RETURN_EXPIRED,
+    batch_gate.RETURN_BRANCH_MOVED])
+def test_other_returns_inherit_implement_and_only_verify_again(box, reason):
+    box.write_config()
+    box.execute()
+    tip = box.branch_tip()
+
+    out = _rerun(box, FIRST_RUN, batch_return_reason=reason)
+
+    _assert_full_verify_run(box, out)
+    assert box.stages_run() == ["verify", "report"]
+    assert f"resume: inheriting research+plan+implement from {FIRST_RUN}" in box.lines
+    assert not any(ln.startswith("batch return (conflict)") for ln in box.lines)
+    assert box.branch_tip() == tip                       # nothing was implemented again
+
+
+def test_a_failed_full_verify_after_a_conflict_return_is_what_the_next_run_fixes(box):
+    # The payload still says `conflict` (dispatch carries it until the task is
+    # done), but the latest verdict is now a real FAIL: that diagnosis is the
+    # retry context, and nothing of the failed run is inherited.
+    box.write_config()
+    box.execute()
+    box.implement_text = "merged"
+    box.artifacts["verify"] = VERIFY_FAIL
+    second = _rerun(box, FIRST_RUN, batch_return_reason=batch_gate.RETURN_CONFLICT)
+    assert not second.ok and second.payload["verify"] == "FAIL"
+    assert box.stages_run() == ["implement", "verify"]
+
+    box.implement_text = "fixed"
+    box.artifacts["verify"] = VERIFY_PASS
+    third = _rerun(box, SECOND_RUN, batch_return_reason=batch_gate.RETURN_CONFLICT)
+
+    _assert_full_verify_run(box, third)
+    assert box.stages_run() == list(stages.STAGES_AUTO)
+    told = box.kw("implement")["retry_context"]
+    assert f"(from previous run `{SECOND_RUN}`)" in told
+    assert "overall_status: fail" in told
+    assert "git merge origin/main" not in told
+    assert not any(ln.startswith("batch return (conflict)") for ln in box.lines)
+    assert not any(ln.startswith("resume: inheriting") for ln in box.lines)
+
+
+def test_a_conflict_return_cut_short_after_implement_is_not_implemented_again(box):
+    box.write_config()
+    box.execute()
+    box.implement_text = "merged"
+    _rerun(box, FIRST_RUN, batch_return_reason=batch_gate.RETURN_CONFLICT)
+    merged_tip = box.branch_tip()
+    # Make that run one that died in verify: implement is recorded and pushed,
+    # verify left no verdict.
+    second = _latest_run(box)
+    progress = json.loads((second / stages.STAGE_PROGRESS).read_text(encoding="utf-8"))
+    progress["completed"] = [s for s in progress["completed"]
+                             if s not in ("verify", "report")]
+    (second / stages.STAGE_PROGRESS).write_text(json.dumps(progress), encoding="utf-8")
+    (second / stages.STAGE_ARTIFACT["verify"]).unlink()
+    (second / stages.STAGE_ARTIFACT["report"]).unlink()
+
+    third = _rerun(box, SECOND_RUN, batch_return_reason=batch_gate.RETURN_CONFLICT)
+
+    _assert_full_verify_run(box, third)
+    assert box.stages_run() == ["verify", "report"]      # the merge is not done twice
+    assert f"resume: inheriting research+plan+implement from {SECOND_RUN}" in box.lines
+    assert box.branch_tip() == merged_tip
+
+
+def test_conflict_context_is_only_for_a_conflict_and_fails_open(box, monkeypatch):
+    executor = StagedExecutor()
+    conflict = {batch_gate.KEY_RETURN_REASON: batch_gate.RETURN_CONFLICT}
+    note = executor._batch_conflict_context(conflict, "", box.clone)
+    assert "git merge origin/main" in note and "{" not in note
+    assert executor._batch_conflict_context(conflict, VERIFY_PASS, box.clone) == note
+    assert executor._batch_conflict_context(conflict, VERIFY_FAIL, box.clone) == ""
+    assert executor._batch_conflict_context({}, "", box.clone) == ""
+    assert executor._batch_conflict_context(None, "", box.clone) == ""
+    assert executor._batch_conflict_context(
+        {batch_gate.KEY_RETURN_REASON: batch_gate.RETURN_GATE_FAILED}, "", box.clone) == ""
+
+    def boom(*_a, **_k):
+        raise RuntimeError("git is broken")
+
+    monkeypatch.setattr(stages, "default_branch", boom)
+    assert executor._batch_conflict_context(conflict, "", box.clone) == ""
