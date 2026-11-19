@@ -594,15 +594,11 @@ def _node_env(result_dir: Path | str, remote_cfg: dict | None) -> dict:
     result dir; node name/zone come from the vault's ``.macp/remote_gate.json``
     (``remote_cfg``) when present, so the real node identity stays in vault data
     and engine code carries no literal. Absent keys leave the script's own
-    defaults in force."""
-    env = dict(os.environ)
+    defaults in force. The mapping is ``remote_gate.node_script_env`` — shared
+    with screen_check and ``macp-emulator stop`` — and the script's start/stop
+    follow the same config's ``node_mode``."""
+    env = remote_gate.node_script_env(remote_cfg)
     env["APP_TEST_OUT"] = str(Path(result_dir) / "screens")
-    node = (remote_cfg or {}).get("node")
-    zone = (remote_cfg or {}).get("zone")
-    if node:
-        env["APP_TEST_NODE"] = str(node)
-    if zone:
-        env["APP_TEST_ZONE"] = str(zone)
     return env
 
 
@@ -640,7 +636,8 @@ def _restore_clock(run: Runner, node_script: Path | str, env: dict, clock_state:
                    progress: Callable[[str], None]) -> None:
     """Put the device's automatic time/zone (and the zone it had before the first
     clock step) back before the node stops, so a clock step never leaks into a
-    later run — ``/data`` survives between runs. Only when a clock step touched
+    later run — ``/data`` may survive between runs (start-stop node) or reset to
+    the image (create-delete node); restore anyway. Only when a clock step touched
     the device: a run without one makes ZERO extra node calls. Never raises (the
     twin of :func:`_stop_node`) and uses its own fixed timeout, since the cap
     deadline may already be spent."""

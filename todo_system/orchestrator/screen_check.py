@@ -315,17 +315,24 @@ def _remaining(deadline: float) -> float:
     return max(1.0, deadline - time.monotonic())
 
 
-def _node_env(run_dir: Path | str) -> dict:
+def _node_env(run_dir: Path | str, remote_cfg: dict | None = None) -> dict:
     """Environment for the node script: inherit, but pin ``APP_TEST_OUT`` to the
     run's ``screens/`` dir so screenshots land straight in
-    ``Worker/runs/<run-id>/screens/`` (AC #4). Node name/zone/gcloud binary are
-    left to the script's own defaults — no literals in the engine module."""
-    env = dict(os.environ)
+    ``Worker/runs/<run-id>/screens/`` (AC #4). Node name/zone come from the
+    vault's ``.macp/remote_gate.json`` (``remote_cfg``, loaded when None) via
+    ``remote_gate.node_script_env`` — the same mapping beta_smoke uses, so both
+    address the node the config names and the script's start/stop follow its
+    ``node_mode``. Absent keys leave the script's own defaults in force; no
+    literals in the engine module."""
+    from . import remote_gate      # lazy: keeps this module's import graph unchanged
+    cfg = remote_gate.load_remote_config() if remote_cfg is None else remote_cfg
+    env = remote_gate.node_script_env(cfg)
     env["APP_TEST_OUT"] = str(Path(run_dir) / "screens")
     return env
 
 
 def _launch_env(run_dir: Path | str, config: dict | None,
+                remote_cfg: dict | None = None,
                 ) -> "tuple[dict, list[str], str | None]":
     """``(env, secrets, note)`` — the node env plus the launch-extras decision.
 
@@ -338,7 +345,7 @@ def _launch_env(run_dir: Path | str, config: dict | None,
 
     ``note`` is a value-free one-liner for ``verify.md`` when extras were declared
     but could not be used; ``secrets`` are the raw values, for redaction."""
-    env = _node_env(run_dir)
+    env = _node_env(run_dir, remote_cfg)
     res = launch_extras.resolve(config, vault_root=_VAULT_DATA_ROOT)
     act = launch_extras.activity(config)
     if res.args and launch_extras.valid_activity(act):
@@ -438,7 +445,8 @@ def _ok_note(dst: str, run_dir: Path | str) -> str:
 
 def _run_locked(repo: Path | str, run_dir: Path | str, *, cap_s: int, task: str,
                 node_script: Path | str, run: Runner,
-                progress: Callable[[str], None], config: dict | None = None) -> str:
+                progress: Callable[[str], None], config: dict | None = None,
+                remote_cfg: dict | None = None) -> str:
     """The node round-trip, assuming the lock is held. Returns a note; NEVER
     raises — every failure is absorbed into a "화면 확인 불가(…)" note.
 
@@ -450,7 +458,7 @@ def _run_locked(repo: Path | str, run_dir: Path | str, *, cap_s: int, task: str,
     misconfigured secret is visible in ``verify.md`` (by file + key name, never a
     value) instead of silently screenshotting the login screen."""
     deadline = time.monotonic() + cap_s
-    env, _secrets, extras_note = _launch_env(run_dir, config)
+    env, _secrets, extras_note = _launch_env(run_dir, config, remote_cfg)
     if extras_note:
         progress(f"screen check: {extras_note}")
     suffix = f" (launch_extras: {extras_note})" if extras_note else ""
@@ -474,7 +482,8 @@ def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
               lock_path: Path | str, node_script: Path | str,
               gradle_task: str = _DEFAULT_GRADLE_TASK, run: Runner = _run,
               config: dict | None = None,
-              progress: Callable[[str], None] | None = None) -> str:
+              progress: Callable[[str], None] | None = None,
+              remote_cfg: dict | None = None) -> str:
     """Build the debug APK, capture the app's first screen on the shared emulator
     node, and return a one-line note for ``verify.md``. NEVER raises.
 
@@ -488,7 +497,11 @@ def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
     ``config`` is the repo's vault config entry; its ``launch_extras`` /
     ``activity`` let a sign-in-gated app be launched past its login screen
     (:mod:`launch_extras`). ``None`` or an entry declaring neither keeps the node
-    script's original ``monkey`` launch, byte for byte."""
+    script's original ``monkey`` launch, byte for byte.
+
+    ``remote_cfg`` is the vault's ``.macp/remote_gate.json`` (loaded when None):
+    the node name/zone handed to the script, whose start/stop follow its
+    ``node_mode`` (start-stop, or create-from-image / delete)."""
     progress = progress or (lambda _m: None)
     lock = lease.Lease(str(lock_path), ttl=cap_s + _LOCK_MARGIN)
     if not lock.acquire():
@@ -496,6 +509,6 @@ def run_check(repo: Path | str, run_dir: Path | str, *, cap_s: int,
     try:
         return _run_locked(repo, run_dir, cap_s=cap_s, task=gradle_task,
                            node_script=node_script, run=run, progress=progress,
-                           config=config)
+                           config=config, remote_cfg=remote_cfg)
     finally:
         lock.release()

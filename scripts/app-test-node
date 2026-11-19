@@ -1,19 +1,44 @@
 #!/usr/bin/env bash
 # App test node (macp-app-test): an on-demand Android emulator host, separate from HQ.
-# n2-standard-4 spot + nested virtualization, normally STOPPED (disk only, ~$4/mo).
+# n2-standard-4 spot + nested virtualization; lifecycle per node_mode (see below).
 # AVD api30 = android-30 google_apis x86_64, 1072x1448 @300dpi (Crema-like).
 # Override the node/zone with APP_TEST_NODE/APP_TEST_ZONE; pick a different AVD per run with `boot <avd>`.
 #
-#   scripts/app-test-node start                 # start VM, wait for ssh
+#   scripts/app-test-node start                 # bring the VM up (create or start), wait for ssh
 #   scripts/app-test-node shot <apk> [wait_s]   # boot emulator, install+launch, pull screenshot
 #   scripts/app-test-node boot [avd]            # boot the AVD only (idempotent) — for a scenario driver
 #   scripts/app-test-node push <local> <remote> # scp a local file to the node (~ expands on the node)
 #   scripts/app-test-node pull <remote> <local> # scp a node file back to the host
 #   scripts/app-test-node ssh '<cmd>'           # run a command on the node
-#   scripts/app-test-node stop                  # stop VM (always do this when done)
+#   scripts/app-test-node stop                  # tear the VM down (always do this when done)
 #
-# Screenshots land in ./app-test-shots/<pkg>-<ts>.png. A spot preemption stops the VM
-# (termination action STOP); `start` again and retry once.
+# Screenshots land in ./app-test-shots/<pkg>-<ts>.png. A spot preemption stops or
+# deletes the VM; `start` again (it recreates a deleted one) and retry once.
+#
+# Lifecycle: start/stop run the engine helper
+# (python -m todo_system.orchestrator.remote_gate node-up|node-down), which follows
+# `node_mode` in the vault's .macp/remote_gate.json:
+#   start-stop     `instances start/stop` of a kept VM (its disk is billed while stopped).
+#   create-delete  start creates the VM from the config's `image_family` with the
+#                  config's spec (spot, nested virtualization, boot disk, …) and a
+#                  `--max-run-duration` DELETE backstop; stop deletes it with its boot
+#                  disk, so only the image remains between runs. An existing VM is
+#                  reused (running) or started (stopped); an absent one on stop is ok.
+# The helper runs on $APP_TEST_PYTHON (default python3; the engine passes its own) and
+# needs the vault root (MACP_VAULT_ROOT). If it cannot run at all (no vault config,
+# import failure) start/stop warn and fall back to a direct gcloud start/stop.
+# APP_TEST_SSH_WAIT (default 300s) bounds the ssh wait after start: a fresh create
+# restores the disk from the image and boots slower than a start.
+#
+# Image refresh (create-delete) — after changing the SDK/AVD/system on the node:
+#   1. scripts/app-test-node start; make the change over `ssh`; ssh 'sudo sync'
+#      (the VM self-deletes after per_run_vm_ttl_min — finish within it)
+#   2. gcloud compute instances stop <node> --zone <zone>          # stop, NOT delete
+#   3. gcloud compute images create <family>-$(date +%Y%m%d) --source-disk <node> \
+#        --source-disk-zone <zone> --family <family> --storage-location <region>
+#   4. gcloud compute instances delete <node> --zone <zone> --quiet # boot disk goes too
+#   5. optional: delete the previous image (gcloud compute images list --filter=family=<family>)
+# New creates take the newest image in the family — no config edit needed.
 #
 # APP_TEST_NODE_MODE=local: the same subcommands against an emulator on THIS host (a
 # remote runner with capability `device`, e.g. a MacBook). "ssh" runs the command
@@ -36,6 +61,22 @@ POLL_INTERVAL=${APP_TEST_POLL_INTERVAL:-3}
 # A sign-in-gated app needs these to get past its login screen.
 EXTRAS=${APP_TEST_LAUNCH_EXTRAS:-}
 ACTIVITY=${APP_TEST_ACTIVITY:-}
+SSH_WAIT=${APP_TEST_SSH_WAIT:-300}
+ENGINE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The engine's node-up / node-down for THIS script's node/zone (see Lifecycle).
+# rc 3 (and 127) = the helper itself is unavailable; any other rc is its verdict.
+_engine() {
+  APP_TEST_NODE="$NODE" APP_TEST_ZONE="$ZONE" \
+  PYTHONPATH="$ENGINE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "${APP_TEST_PYTHON:-python3}" -c 'import sys
+try:
+    from todo_system.orchestrator import remote_gate
+except Exception as e:
+    print(f"app-test-node: engine helper unavailable ({type(e).__name__}: {e})", file=sys.stderr)
+    sys.exit(3)
+sys.exit(remote_gate._main(sys.argv[1:]))' "$1"
+}
 
 _ssh() { "$G" compute ssh "$NODE" --zone "$ZONE" --internal-ip --quiet --command "$1"; }
 _scp() { "$G" compute scp "$@" --zone "$ZONE" --internal-ip --quiet; }
@@ -104,9 +145,15 @@ case "$cmd" in
       ls "$NODE_HOME"/android/build-tools/*/aapt2 >/dev/null 2>&1 || { echo "local node: no build-tools aapt2" >&2; exit 1; }
       echo "local node ready"; exit 0
     fi
-    "$G" compute instances start "$NODE" --zone "$ZONE" --quiet
-    for _ in $(seq 1 30); do _ssh true 2>/dev/null && { echo "ssh ready"; exit 0; }; sleep 5; done
-    echo "ssh not ready after 150s" >&2; exit 1 ;;
+    rc=0; _engine node-up || rc=$?
+    if [ "$rc" = 3 ] || [ "$rc" = 127 ]; then
+      echo "app-test-node: engine helper unavailable (rc=$rc) — direct gcloud start" >&2
+      "$G" compute instances start "$NODE" --zone "$ZONE" --quiet
+    elif [ "$rc" != 0 ]; then
+      exit "$rc"
+    fi
+    for _ in $(seq 1 $(( (SSH_WAIT + 4) / 5 ))); do _ssh true 2>/dev/null && { echo "ssh ready"; exit 0; }; sleep 5; done
+    echo "ssh not ready after ${SSH_WAIT}s" >&2; exit 1 ;;
   stop)
     if [ "$LOCAL" = 1 ]; then
       # Through _ssh: the same HOME/ANDROID_USER_HOME as `shot`, so it reaches the
@@ -122,7 +169,13 @@ case "$cmd" in
       pkill -9 -f "$QEMU_PAT" 2>/dev/null || true
       exit 0
     fi
-    "$G" compute instances stop "$NODE" --zone "$ZONE" --quiet ;;
+    rc=0; _engine node-down || rc=$?
+    if [ "$rc" = 3 ] || [ "$rc" = 127 ]; then
+      echo "app-test-node: engine helper unavailable (rc=$rc) — direct gcloud stop" >&2
+      "$G" compute instances stop "$NODE" --zone "$ZONE" --quiet
+    else
+      exit "$rc"
+    fi ;;
   ssh)
     _ssh "$1" ;;
   shot)
@@ -150,7 +203,10 @@ case "$cmd" in
       done
     fi
 
-    pkg=$(_ssh_retry '~/android/build-tools/*/aapt2 dump packagename ~/under-test.apk | head -1')
+    # The NEWEST build-tools' aapt2: a bare `build-tools/*/aapt2` expands to every
+    # installed version and aapt2 then reads the second path as its subcommand
+    # (empty pkg → the launch fails). Same pick as beta_smoke._AAPT2.
+    pkg=$(_ssh_retry '"$(ls -1d ~/android/build-tools/*/aapt2 | sort -V | tail -1)" dump packagename ~/under-test.apk | head -1')
     # The launch line, built here and spliced in below with the same '"$var"'
     # pattern the rest of this script uses. With no extras it is CHARACTER-FOR-
     # CHARACTER the monkey line that was inline here before, so every repo that

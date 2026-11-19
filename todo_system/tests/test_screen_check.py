@@ -648,6 +648,36 @@ def test_extras_reach_the_node_env_and_never_the_progress_log(tmp_path, monkeypa
     assert "s3cret-token-value" not in note
 
 
+def test_node_identity_from_remote_cfg_reaches_start_shot_and_stop(tmp_path, monkeypatch):
+    """The node the vault's remote_gate config names is handed to EVERY node call
+    (start, shot, stop), so the script's start/stop follow its node_mode on the
+    same instance the shot uses."""
+    repo, run_dir, lock_path, node_script = _mk_env(tmp_path)
+    monkeypatch.delenv("APP_TEST_NODE", raising=False)
+    monkeypatch.delenv("APP_TEST_ZONE", raising=False)
+    fake = FakeRun()
+
+    note = screen_check.run_check(
+        repo, run_dir, cap_s=600, lock_path=lock_path, node_script=node_script,
+        run=fake, remote_cfg={"node": "demo-node", "zone": "demo-zone"})
+
+    assert note.startswith("화면 확인됨")
+    node_calls = [c for c in fake.calls if c["argv"][:1] == ["bash"]]
+    assert {c["argv"][2] for c in node_calls} >= {"start", "shot", "stop"}
+    for c in node_calls:
+        assert c["env"]["APP_TEST_NODE"] == "demo-node"
+        assert c["env"]["APP_TEST_ZONE"] == "demo-zone"
+        assert c["env"]["APP_TEST_PYTHON"]
+
+
+def test_node_env_without_remote_cfg_keeps_script_defaults(tmp_path, monkeypatch):
+    monkeypatch.delenv("APP_TEST_NODE", raising=False)
+    monkeypatch.delenv("APP_TEST_ZONE", raising=False)
+    env = screen_check._node_env(tmp_path, {})
+    assert "APP_TEST_NODE" not in env and "APP_TEST_ZONE" not in env
+    assert env["APP_TEST_OUT"] == str(tmp_path / "screens")
+
+
 def test_no_extras_declared_leaves_the_node_env_without_launch_vars(tmp_path, monkeypatch):
     """Regression guard: a repo declaring nothing gets no launch vars at all, so
     the node script keeps its original ``monkey`` line."""
