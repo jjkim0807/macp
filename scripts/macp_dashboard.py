@@ -332,6 +332,10 @@ def collect_assignments() -> list[dict]:
             # that predates the new state value.
             "state": display_state(d) or "?",
             "deferred": is_deferred(d),
+            # Same idea for batch verify: state `batch_ready` (quick verify passed,
+            # waiting on the repo's shared full gate), repeated as a bool for a
+            # client that predates the state value.
+            "batch_ready": d.get("state") == "batch_ready",
             "agent": d.get("agent_id", ""),
             # Heavy routing (additive): the default agent a heavy-remote task
             # comes back to, and the latest reroute away from a remote
@@ -1809,6 +1813,11 @@ def collect_status() -> dict:
     # group. recent/runs stay unstamped — recent (a[:40]) shares dict objects with
     # active/attention, so those objects may end up carrying `group` too; harmless,
     # it is a field addition and no consumer removes or renames anything.
+    # `batch_ready[]` (additive) is the fourth stamped section: open rows in state
+    # `batch_ready` — they passed a quick verify and wait for the repo's shared
+    # full gate (docs/batch-verify.md). Nobody owes them anything, so they are in
+    # neither `active` nor `attention`. Every row (recent included) carries the
+    # bool `batch_ready` from collect_assignments.
     active = [r for r in a if r["state"] in ACTIVE]
     for r in active:                               # additive: the server decides whether
         # the runner is the default one, so the client can hide the "agent …" line
@@ -1823,13 +1832,15 @@ def collect_status() -> dict:
     attention = [r for r in a if r["state"] in ("awaiting_human", "failed")
                  and not is_closed(r.get("todo_status"))
                  and r["task"] not in umbrellas][:12]
+    batch_ready = [r for r in a if r["state"] == "batch_ready"
+                   and not is_closed(r.get("todo_status"))]
     projects_rows = collect_projects(a)
     human_all = collect_human(a, projects={p["slug"] for p in projects_rows},
                               umbrellas=umbrellas)
     human_all = _merge_proposals(human_all, collect_proposals())
     human = [r for r in human_all if not r.get("later")]
     human_later = [r for r in human_all if r.get("later")]
-    for r in (*active, *attention, *human, *human_later):
+    for r in (*active, *attention, *batch_ready, *human, *human_later):
         r["group"] = _group_of(r)
 
     # ---- worker-state derivation (why "idle"?) ----
@@ -1882,6 +1893,7 @@ def collect_status() -> dict:
         "runs_today": runs_today,
         "active": active,
         "attention": attention,
+        "batch_ready": batch_ready,
         "human": human,
         "human_later": human_later,
         "projects": projects_rows,
@@ -2118,6 +2130,12 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
     <button class="more" data-sec="active" hidden>@@dash.html.more@@</button>
   </section>
 
+  <!-- @@dash.cmt.batch_ready@@ -->
+  <section class="card" id="c-batch" hidden>
+    <h2>📦 @@dash.html.batch_ready@@ <span class="cnt" id="cnt-batch">0</span></h2>
+    <div class="list" id="batch"></div>
+  </section>
+
   <!-- @@dash.cmt.queue@@ -->
   <section class="card" id="c-queue">
     <details id="d-queue">
@@ -2189,7 +2207,8 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
 const $=id=>document.getElementById(id);
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const esca=s=>(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(s)}</span>`};
+const BL={batch_ready:'@@dash.js.st_batch_ready@@'};
+const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',batch_ready:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(BL[s]||s)}</span>`};
 function pcolor(s){let h=0;for(const c of(s||''))h=(h*31+c.charCodeAt(0))>>>0;return h%360}
 function copyBtn(id){return `<button class="cp" data-cp="${esca(id)}" title="@@dash.js.copy_id@@ ${esca(id)}">⧉ id</button>`}
 function pchip(p){if(!p)return '';const h=pcolor(p);return `<span class="pchip" style="color:hsl(${h},65%,74%);border-color:hsl(${h},35%,44%)" title="@@dash.js.project@@ ${esca(p)}">${esc(p)}</span>`}
@@ -2213,6 +2232,7 @@ const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
 const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
+const batchRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
 const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(dn*100/t):0,st=PST[r.status];
   return `<div class="row clk prj" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta">${r.active?`<span class="badge b-run">● ${r.active}</span> `:''}${r.attention?`<span class="badge b-fail">⚠ ${r.attention}</span> `:''}${st?`<span class="badge ${st[1]}">${st[0]}</span> `:''}${r.last_age?`<span class="age" title="@@dash.js.last_activity@@ ${esca(r.last_activity)} @@dash.js.latest_of@@">${esc(r.last_age)}@@dash.js.ago@@</span> `:''}<span class="pbar" title="${dn}/${t}@@dash.js.done@@"><i style="width:${pc}%"></i></span> <span class="age mono">${dn}/${t}</span></div></div>`};
@@ -2438,6 +2458,12 @@ function update(d){
   foldFill('active','active',shownA,activeRow,'@@dash.js.no_active@@');
   const abtn=document.querySelector('.more[data-sec="active"]');
   if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'@@dash.js.less@@':`@@dash.html.more@@ (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
+
+  // @@dash.html.batch_ready@@: hidden when empty; `|| []` keeps an older server (no batch_ready key) working.
+  const bq=d.batch_ready||[];
+  $('cnt-batch').textContent=bq.length;
+  $('c-batch').hidden=!bq.length;
+  fill('batch',bq,batchRow,'@@dash.js.none@@');
 
   // @@dash.html.queue@@: server order as-is, no group folding (the order is the information).
   const q=d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
