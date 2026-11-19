@@ -64,6 +64,51 @@ The maintenance tick fast-forwards the engine checkout (`git pull --ff-only`) an
 restarts resident daemons whose code changed. You can also `git pull` yourself; the
 daemons pick it up within one maintenance tick.
 
+## Where a run works
+
+A run never switches branches in a directory a person works in. Each one gets its own
+git worktree under the **worker root** (`~/Worker` by default; set `MACP_WORKER_ROOT`
+or `worker_root` in `.macp/config.toml` to move it), on the branch `worker/<slug>`:
+
+| Task | Where its branch lives | Cut from | Removed |
+|---|---|---|---|
+| has `repo:` | `<worker root>/<repo>.wt/<slug>`, a worktree of the shared clone `<worker root>/<repo>` | `origin/<default>`; `origin/worker/<slug>` on a retry | after a run that succeeded. A failed or parked run's is kept for the retry and swept later |
+| no `repo:` (a vault task: `auto`, `quick`, `delegate`) | `<worker root>/vault.wt/<slug>`, a linked worktree of the vault repository | the vault's **local** default branch, so commits that are not pushed yet are in it; `origin/worker/<slug>` when an earlier attempt pushed it | when the run ends, whatever the outcome |
+| no `repo:`, `worker_mode: discover` | nowhere — it has no branch and no worktree | | |
+
+**The live vault stays on its default branch for the whole run.** The stages still run
+with the vault as their working directory (it is the trusted workspace), but a vault
+task's edits, commits, push, PR and merge all happen in its worktree. A commit that you,
+the planner or the sync daemon make in the vault while a run is in flight therefore
+lands on the default branch, where you made it. After every stage the runner checks
+that the vault's `HEAD` did not move. If a stage moved it, the runner puts it back and
+records `live_head_moved` in the run's `stages.json`.
+
+A vault run still writes these **in the live vault**, as before: `Worker/runs/<run_id>/`
+(the run's artifacts), the ledger (`Worker/assignments/`), the mailbox, `Worker/_state/`
+and `Memory/episodes/`. The worktree does **not** have the vault's gitignored files
+(`Todo/todo.db`, `Worker/runs/`, …) or changes that are not committed yet. The stage is
+told both, and to copy the current version of a file into the worktree before editing
+it when the committed one is older.
+
+What follows from this:
+
+- A vault task needs the vault to be **its own git repository with at least one
+  commit**. Otherwise the run fails at the start with
+  `could not prepare vault worktree: …` and the reason.
+- Before the worktree is removed, whatever a stage left uncommitted in it is committed
+  onto `worker/<slug>` (`chore(worker): <slug> WIP rescue …`). A failed run's work is on
+  the branch, not gone. The runner never deletes the branch.
+- Only a clean worktree is removed. If its leftovers could not be committed (a refused
+  commit, a detached `HEAD`), it stays and the run says `vault worktree kept`. The next
+  run of that task then fails with `a leftover vault worktree is in the way` until you
+  have looked: `git -C <vault> worktree list` shows it, and once you have saved what you
+  need, `git -C <vault> worktree remove --force <path>` removes it.
+- A run that was killed outright (power loss, `kill -9`) leaves its worktree behind as
+  well. The next run of the same task commits what was in it, removes it and starts
+  from a fresh one. The maintenance worktree sweep does not look at `vault.wt/`.
+- Vault runs still run one at a time.
+
 ## Disk space
 
 Android and Gradle work fills a root disk quickly. Two guards keep it usable. Both

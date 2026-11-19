@@ -2939,6 +2939,17 @@ class VaultPushGuardInstallTest(unittest.TestCase):
         self.repo = self.tmp / "vault"
         subprocess.run(["git", "init", "-b", "main", str(self.repo)],
                        check=True, capture_output=True)
+        # One commit: a vault run works in a linked worktree of the vault, and a
+        # repository with no commit has nothing to cut one from (the run would
+        # fail at prep, before the hook under test is ever looked at).
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", str(self.repo), "config", k, v],
+                           check=True, capture_output=True)
+        (self.repo / "seed.txt").write_text("x")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "init"],
+                       check=True, capture_output=True)
         self._orig_vault, self._orig_runs = (
             stages._VAULT_DATA_ROOT, stages.RUNS_DIR)
         stages._VAULT_DATA_ROOT = self.repo
@@ -3805,6 +3816,9 @@ class VaultDelegateBranchPublishTest(unittest.TestCase):
 
         def spy_argv(stage, **kw):
             spy_argv.pending = (kw["run_dir"], stage)
+            # Where the runner tells the stage its branch is: the run's worktree
+            # of the vault, no longer the live vault checkout itself.
+            spy_argv.working_dir = Path(kw["working_dir"])
             return real_argv(stage, **kw)
 
         def fake_run(argv, **kw):
@@ -3820,11 +3834,12 @@ class VaultDelegateBranchPublishTest(unittest.TestCase):
             rd, stage = spy_argv.pending
             (Path(rd) / stages.STAGE_ARTIFACT[stage]).write_text(
                 "overall_status: pass\nmerged: no\n", encoding="utf-8")
+            wd = spy_argv.working_dir
             for i in range(commits):
-                (self.vault / f"{stage}-{i}.md").write_text(f"{stage} output {i}")
-                real_run(["git", "-C", str(self.vault), "add", "-A"],
+                (wd / f"{stage}-{i}.md").write_text(f"{stage} output {i}")
+                real_run(["git", "-C", str(wd), "add", "-A"],
                          check=True, capture_output=True)
-                real_run(["git", "-C", str(self.vault), "commit", "-m",
+                real_run(["git", "-C", str(wd), "commit", "-m",
                           f"{stage} did work {i}"], check=True, capture_output=True)
             return subprocess.CompletedProcess(argv, 0, "ok", "")
 
@@ -3949,6 +3964,7 @@ class VaultDelegateBranchPublishTest(unittest.TestCase):
 
         def spy_argv(stage, **kw):
             spy_argv.pending = (kw["run_dir"], stage)
+            spy_argv.working_dir = Path(kw["working_dir"])    # the run's worktree
             return real_argv(stage, **kw)
 
         def fake_run(argv, **kw):
@@ -3962,10 +3978,11 @@ class VaultDelegateBranchPublishTest(unittest.TestCase):
                         argv, 0, "https://github.com/o/r/pull/9\n", "")
                 return subprocess.CompletedProcess(argv, 1, "", "")
             # commits, then dies WITHOUT writing delegate.md
-            (self.vault / "half.md").write_text("half-finished work")
-            real_run(["git", "-C", str(self.vault), "add", "-A"],
+            wd = spy_argv.working_dir
+            (wd / "half.md").write_text("half-finished work")
+            real_run(["git", "-C", str(wd), "add", "-A"],
                      check=True, capture_output=True)
-            real_run(["git", "-C", str(self.vault), "commit", "-m", "half work"],
+            real_run(["git", "-C", str(wd), "commit", "-m", "half work"],
                      check=True, capture_output=True)
             return subprocess.CompletedProcess(argv, 0, "ok", "")
 

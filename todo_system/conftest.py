@@ -161,6 +161,32 @@ fixed at import to the vault's ``Worker/jobs``. ``_batch_gate_runner_isolated``
 replaces ``batch_gate.default_gate`` with a runner whose ``start`` raises, so no
 test can launch a real gate there; a test that needs one swaps in its own fake.
 
+The vault worktree (``orchestrator/repos.py``) — every ``StagedExecutor._execute``
+of a task with no ``repo:`` cuts a linked worktree of the VAULT repository under
+the worker root (``<worker root>/vault.wt/<slug>``) and runs the task's branch
+there. Unisolated, a test would create that directory under the real worker root,
+and — when ``MACP_VAULT_ROOT`` names the live vault, as it does in a worker stage —
+register a worktree in the live vault's ``.git``. ``_vault_worktree_isolated``
+closes it in three places:
+
+* ``repos.vault_worktree_path`` — a call that names no ``worker_root`` answers
+  under a tmp dir (same ``…/vault.wt/<slug>`` shape), so no worktree ever lands
+  under the real worker root.
+* ``repos.ensure_vault_worktree`` — for a real root (the vault each module
+  resolved, this checkout) it runs no git and hands back an empty tmp directory
+  that is NOT a worktree. The same goes for a test that replaced
+  ``stages.prepare_vault_branch``: it has put the vault's branch prep out of its
+  scope, and its fake git should not have to answer ``worktree add``. A test's
+  own tmp vault with the real branch prep gets the real function.
+* ``stages.remove_worktree`` — removing one of those stand-in directories, or
+  anything off a real root, is a silent ``False`` with no git.
+
+The runner only rescues, rechecks a merge in, arms its live-HEAD watch for or
+removes a path that still is a worktree (its ``.git`` entry exists), so a stand-in
+directory adds no git call to a run. Like the batch-gate guard, this works only
+because production reaches all three through the module attribute
+(``repos.x(...)``, ``stages.x(...)``).
+
 Two shared, non-autouse fixtures live here too, so both suites see one copy:
 ``combined_layout`` (a throwaway engine checkout that is also the vault) and
 ``install_engine_at`` (points ``paths.__file__`` into such a tree).
@@ -196,6 +222,7 @@ from todo_system.orchestrator import (
     human,
     mailbox,
     metrics,
+    repos,
     stages,
     worktree_sweep,
 )
@@ -432,6 +459,12 @@ _REAL_CHECK_DIVERGENCE = _orch_mod._check_divergence
 _REAL_BATCH_LOAD_CONFIG = batch_gate.load_config
 _REAL_BATCH_ROOTS = frozenset(
     os.path.realpath(root) for root in (stages._VAULT_DATA_ROOT, _REPO_ROOT, worker.ROOT))
+# The vault-worktree seams, captured at import like the ones above. The roots no
+# test may cut a worktree from are the same real roots the batch-gate guard uses.
+_REAL_VAULT_WORKTREE_PATH = repos.vault_worktree_path
+_REAL_ENSURE_VAULT_WORKTREE = repos.ensure_vault_worktree
+_REAL_REMOVE_WORKTREE = stages.remove_worktree
+_REAL_PREPARE_VAULT_BRANCH = stages.prepare_vault_branch
 
 
 class RealUsageFetchBlocked(RuntimeError):
@@ -670,6 +703,49 @@ def _batch_gate_runner_isolated(monkeypatch):
     monkeypatch.setattr(batch_gate, "default_gate", _BlockedBatchGate)
 
 
+def _is_real_root(path) -> bool:
+    try:
+        return os.path.realpath(path) in _REAL_BATCH_ROOTS
+    except (TypeError, ValueError):
+        return False                        # not a path: nothing real to protect
+
+
+@pytest.fixture(autouse=True)
+def _vault_worktree_isolated(tmp_path_factory, monkeypatch):
+    # See the module docstring. mktemp rather than tmp_path, like the runtime
+    # redirect, so a test that lists its own tmp_path sees nothing new.
+    base = tmp_path_factory.mktemp("vault-worktrees")
+    stand_ins: set[str] = set()
+
+    def _path(slug, worker_root=None):
+        return _REAL_VAULT_WORKTREE_PATH(
+            slug, base / "worker-root" if worker_root is None else worker_root)
+
+    def _ensure(vault_root, slug, *args, **kwargs):
+        if (_is_real_root(vault_root)
+                or stages.prepare_vault_branch is not _REAL_PREPARE_VAULT_BRANCH):
+            # Not `…/vault.wt/<slug>` and no `.git`: neither the path shape nor
+            # the runner's "is it still a worktree" check takes it for one.
+            stand_in = base / "stand-in" / str(slug)
+            stand_in.mkdir(parents=True, exist_ok=True)
+            stand_ins.add(os.path.realpath(stand_in))
+            return stand_in
+        return _REAL_ENSURE_VAULT_WORKTREE(vault_root, slug, *args, **kwargs)
+
+    def _remove(base_dir, worktree, *args, **kwargs):
+        try:
+            stand_in = os.path.realpath(worktree) in stand_ins
+        except (TypeError, ValueError):
+            stand_in = False
+        if stand_in or _is_real_root(base_dir):
+            return False
+        return _REAL_REMOVE_WORKTREE(base_dir, worktree, *args, **kwargs)
+
+    monkeypatch.setattr(repos, "vault_worktree_path", _path)
+    monkeypatch.setattr(repos, "ensure_vault_worktree", _ensure)
+    monkeypatch.setattr(stages, "remove_worktree", _remove)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _real_runtime_untouched():
     """Fail the run on any tripwire record, or on a real queue.lock / todo.db
@@ -735,6 +811,18 @@ def real_batch_gate_config():
     guard answers ``{}`` for."""
     return types.MappingProxyType({
         "load_config": _REAL_BATCH_LOAD_CONFIG,
+        "roots": _REAL_BATCH_ROOTS,
+    })
+
+
+@pytest.fixture
+def real_vault_worktree():
+    """The unguarded vault-worktree seams and the real roots (realpaths) the guard
+    hands a stand-in directory for."""
+    return types.MappingProxyType({
+        "vault_worktree_path": _REAL_VAULT_WORKTREE_PATH,
+        "ensure_vault_worktree": _REAL_ENSURE_VAULT_WORKTREE,
+        "remove_worktree": _REAL_REMOVE_WORKTREE,
         "roots": _REAL_BATCH_ROOTS,
     })
 

@@ -237,6 +237,11 @@ class ImplementRescueWiringTest(unittest.TestCase):
         self.assertIn("implement WIP rescue", log)
 
     def test_vault_implement_does_not_rescue(self):
+        # A vault task's rescue is not the external one: it commits in the run's
+        # own worktree of the vault and never checkpoint-pushes
+        # (test_vault_worktree.py drives that for real). Here branch prep is
+        # mocked, so the run has no worktree — and then nothing is rescued at
+        # all: the live vault checkout is never a rescue or a checkpoint target.
         out, order = self._run(repo_url=None)
         self.assertNotIn("rescue", [o[0] for o in order])
         self.assertNotIn("checkpoint", [o[0] for o in order])

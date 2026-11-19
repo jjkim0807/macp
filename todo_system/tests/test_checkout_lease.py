@@ -422,8 +422,12 @@ class RunnerCheckoutLeaseGuardTest(unittest.TestCase):
         self.assertNotIn("checkout_busy", out.payload)
         self.assertFalse(self.lock.exists(),
                          "checkout lease left held after branch prep — planner starves")
-        self.assertEqual(self._head(), "worker/mine",
-                         "branch prep should have moved HEAD (restore_main is mocked)")
+        # Branch prep ran (the run's branch exists) — in the run's own worktree of
+        # the vault, so the live checkout's HEAD is where it was. Until vault runs
+        # got that worktree this asserted the opposite: HEAD on `worker/mine`.
+        self._git("rev-parse", "--verify", "--quiet", "refs/heads/worker/mine")
+        self.assertEqual(self._head(), "main",
+                         "branch prep moved the live vault's HEAD")
 
     def test_external_repo_task_is_not_gated_by_the_vault_lease(self):
         """The lease guards the VAULT checkout only; an external clone is a
