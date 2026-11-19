@@ -3966,7 +3966,6 @@ class Orchestrator:
         # `_main`'s auto_unblock just applied; fail-open, never raises.
         human_ready = self.reconcile_human_ready(unblock_flips)
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
-        self._advote_bridge_tick()             # advote feedback → task bridge (fail-open, min-poll+main guarded)
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
         nudged = self.renudge_due(now)
