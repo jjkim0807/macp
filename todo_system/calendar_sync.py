@@ -13,7 +13,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from .ownership import human_owned_sql_filter
+from .ownership import human_owned_sql_filter, is_worker_owned
 from . import paths
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -717,6 +717,46 @@ def _done_event_expired(ev: dict, now: dt.datetime, keep_days: int) -> bool:
     if ref is None:
         return False
     return now - ref > dt.timedelta(days=keep_days)
+
+
+def record_completion_transition(con: sqlite3.Connection, slug: str, new_status: str | None,
+                                 worker_mode: str | None, md_path: Path,
+                                 now: dt.datetime | None = None) -> str | None:
+    """Stamp `completed: "YYYY-MM-DD HH:MM"` into a task md on its open→done.
+
+    Called by ``cli.upsert_task`` BEFORE it overwrites the row, so the DB still
+    holds the previous status. Writes only when all hold: the md says done, the
+    DB row exists and is `open`, the task is human-owned, its md has a timed
+    block, and the md has no `completed:` yet. A task first seen already done
+    (old done) is never stamped. Returns the stamp written, else None. Never
+    raises — a failure here must not break the todo import.
+    """
+    try:
+        if (new_status or "").strip().lower() != "done":
+            return None
+        row = con.execute("SELECT status FROM tasks WHERE slug = ?", (slug,)).fetchone()
+        if row is None or str(row[0] or "").strip().lower() != "open":
+            return None
+        if is_worker_owned(worker_mode):
+            return None
+        from .cli import parse_frontmatter, update_frontmatter_value
+        path = Path(md_path)
+        text = path.read_text(encoding="utf-8")
+        fm, _ = parse_frontmatter(text)
+        done_at = fm.get("completed")
+        if isinstance(done_at, str) and done_at.strip() not in ("", "-"):
+            return None
+        sched = fm.get("scheduled")
+        d, s, e = _parse_scheduled_value(sched if isinstance(sched, str) else None)
+        if not (d and s and e):
+            return None
+        stamp = _fmt_completed(now or _now_local())
+        path.write_text(update_frontmatter_value(text, "completed", f'"{stamp}"'), encoding="utf-8")
+        print(f"calendar: recorded completed {slug} {stamp}")
+        return stamp
+    except Exception as exc:  # noqa: BLE001 - never break the import
+        print(f"calendar: completed record skipped — {exc}")
+        return None
 
 
 # (tag, calendarId) — one `--calendar-route TAG=CALENDAR_ID` flag.
