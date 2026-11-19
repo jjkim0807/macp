@@ -141,7 +141,8 @@ allowlist contains a few dangerous rules (`_safe_tools` raises `ValueError`; it 
 strip them), and `validate` reports the same as an ERROR beforehand. Treat the allowlist as a guard rail, not a sandbox (see [SECURITY.md](../SECURITY.md)).
 
 **Isolation and concurrency.** Every run gets its own git worktree on
-`worker/<slug>`. Two tasks on the same repository run at the same time only when both
+`worker/<slug>` — a vault task too, so the vault you work in stays on its default
+branch while it runs ([where a run works](running.md#where-a-run-works)). Two tasks on the same repository run at the same time only when both
 declare `touches` lists that do not overlap. Global caps are
 `MACP_MAX_PARALLEL_PER_REPO` (default 2) and `MACP_MAX_PARALLEL_GRADLE_BUILDS`.
 
