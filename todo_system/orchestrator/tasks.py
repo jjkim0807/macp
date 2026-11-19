@@ -210,6 +210,14 @@ def load_dispatchable(db_path: str | Path = DEFAULT_DB,
         verify_batch = _fm_bool(fm.get(batch_gate.KEY_VERIFY_BATCH))
         if verify_batch is not None:
             payload[batch_gate.KEY_VERIFY_BATCH] = verify_batch
+        # Routing input (Orchestrator._route_decision): a task a person must
+        # decide stays with a human glob owner even in a dispatchable mode. Only
+        # when true, so every other task keeps a byte-identical payload.
+        raw_decision = fm.get("needs_decision")
+        if isinstance(raw_decision, str):     # tolerate a stray `# comment`
+            raw_decision = raw_decision.split("#")[0]
+        if _fm_bool(raw_decision) is True:
+            payload["needs_decision"] = True
         if repos.task_bypass_guard_from_fm(fm):
             payload["bypass_guard"] = True   # run despite a cost hold; see tick()
         tools = repos.task_allowed_tools_from_fm(fm)

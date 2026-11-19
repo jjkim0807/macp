@@ -378,6 +378,37 @@ def _payload_bool(v) -> bool | None:
     return None
 
 
+def _worker_mode_beats_human_glob(payload: dict | None) -> bool:
+    """Should a task a human owns only by GLOB go to an AI agent instead?
+
+    True when the payload's `worker_mode` is one the queue dispatches on its own
+    (tasks.DISPATCHABLE_MODES) and the task carries no explicit "a person must
+    decide" marker (`decision` tag / `needs_decision: true` — the same predicate
+    as task_deps / the dashboard's human `why`). A worker prep task under a
+    person's `foo-*` glob is a machine's job; without this, dispatch() parked it
+    as a kind-human AWAITING_HUMAN row. Never raises: any odd payload → False,
+    i.e. today's human answer.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        # Lazy: tasks.py imports Task from this module at its top.
+        from .tasks import DISPATCHABLE_MODES
+        from .. import task_deps
+        mode = payload.get("worker_mode")
+        if not isinstance(mode, str) or mode.strip().lower() not in DISPATCHABLE_MODES:
+            return False
+        raw_tags = payload.get("tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = raw_tags.split(",")
+        tags = [str(t).strip().lower() for t in raw_tags]
+        marker = {"tags": tags,
+                  "needs_decision": bool(_payload_bool(payload.get("needs_decision")))}
+        return not task_deps._has_decision_marker(marker)
+    except Exception:  # noqa: BLE001 - fail-closed to the human owner
+        return False
+
+
 def is_heavy(payload: dict | None, repo_dir: Path | None) -> bool:
     """Is this task heavy enough to prefer a stronger machine?
 
@@ -639,7 +670,9 @@ class Orchestrator:
               existing: Assignment | None = None) -> Agent | None:
         """The agent a task goes to. With no payload this is the plain
         for_project owner — every slug-only caller (queue view, human-owned
-        check) keeps its exact old answer."""
+        check) keeps its exact old answer. With a payload, a dispatchable
+        non-decision task a human owns only by glob goes to the most specific
+        non-human agent (see _route_decision)."""
         return self._route_decision(slug, payload, existing)[0]
 
     def _route_decision(self, slug: str, payload: dict | None,
@@ -647,8 +680,23 @@ class Orchestrator:
                         ) -> tuple[Agent | None, Agent | None]:
         """(agent, fallback). `fallback` is the for_project owner when the heavy
         router picked a remote instead of it, else None. Only an AI-local owner
-        is ever bypassed: a human or a project-owned remote keeps its task."""
+        is ever bypassed: a human or a project-owned remote keeps its task.
+
+        One exception to "a human keeps its task": when the human matched the
+        slug only by GLOB and the payload is a dispatchable, non-decision task
+        (_worker_mode_beats_human_glob), the base becomes the most specific
+        non-human match (registry `"*"` catch-all in practice) and the heavy
+        branch below runs on it as usual. An exact human listing, a decision
+        task, a non-dispatchable mode, or no non-human match keeps the human."""
         base = self.reg.for_project(slug)
+        if (payload is not None and base is not None and base.is_human
+                and not base.matches_exactly(slug)
+                and _worker_mode_beats_human_glob(payload)):
+            alt = self.reg.for_project(slug, skip_human_globs=True)
+            # No log line here: route() also runs on every tick's remote-queue
+            # view (_routes_remote), so a print would repeat each tick.
+            if alt is not None and not alt.is_human:
+                base = alt
         if (payload is None or base is None or base.is_human or base.is_remote
                 or not is_heavy(payload, self._heavy_repo_dir(payload))):
             return base, None
