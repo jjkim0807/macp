@@ -30,7 +30,7 @@ from todo_system import kakao_format
 from todo_system.orchestrator import assignment as A
 from todo_system.orchestrator import batch_gate
 from todo_system.orchestrator import message as m
-from todo_system.orchestrator import stages
+from todo_system.orchestrator import repos, stages
 from todo_system.orchestrator.assignment import Assignment, Ledger
 from todo_system.orchestrator.mailbox import FileMailbox
 from todo_system.orchestrator.orchestrator import (
@@ -484,19 +484,44 @@ def test_sweep_returns_a_row_whose_repo_has_no_gate(world, config, capsys):
     assert world.orch.reconcile_batch_gate() == EMPTY_SWEEP
 
 
-def test_sweep_keeps_a_row_that_is_still_within_its_wait(world, capsys):
+def test_sweep_keeps_a_single_row_until_its_wait_is_over(world, capsys):
+    # One task alone waits MAX_WAIT_S for company. Until then the sweep leaves
+    # no trace of it anywhere: no write, no output, no job state.
     world.write_config()
     a = world.ready_row()
     ready_at = _parse_ts(a.payload[batch_gate.KEY_BATCH]["ready_ts"])
 
     assert world.orch.reconcile_batch_gate(now=ready_at + 60) == EMPTY_SWEEP
     assert world.orch.reconcile_batch_gate(
-        now=ready_at + batch_gate.EXPIRE_S - 1) == EMPTY_SWEEP
+        now=ready_at + batch_gate.MAX_WAIT_S - 1) == EMPTY_SWEEP
     row = world.row()
     assert row.state == A.BATCH_READY
     assert row.to_json() == a.to_json()                  # not rewritten while it waits
     assert world.routed == []
     assert capsys.readouterr().out == ""
+    assert not batch_gate.state_dir(world.root).exists()  # no job record, no lock
+
+
+def test_sweep_tries_the_gate_once_a_single_row_has_waited(world, monkeypatch, tmp_path):
+    # Past MAX_WAIT_S the integration gate takes over (test_batch_gate_job.py).
+    # This host has no shared clone of the repo, so all the gate can do is send
+    # the task back — and it finds that out before asking gh about any PR.
+    world.write_config()
+    a = world.ready_row()
+    ready_at = _parse_ts(a.payload[batch_gate.KEY_BATCH]["ready_ts"])
+    monkeypatch.setattr(repos, "local_path",
+                        lambda url, worker_root=None: tmp_path / "no-such-clone")
+    monkeypatch.setattr(stages, "gh_pr_state",
+                        lambda *_a, **_k: pytest.fail("gh was asked about a PR"))
+
+    result = world.orch.reconcile_batch_gate(now=ready_at + batch_gate.MAX_WAIT_S + 1)
+
+    assert result == {**EMPTY_SWEEP, "returned": [SLUG]}
+    row = world.row()
+    assert row.payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_NO_CHECKOUT
+    assert row.display_state == "deferred"
+    assert world.routed == []                            # nobody is paged for it
+    assert batch_gate.load_job(world.root, "batchrepo") is None
 
 
 def test_sweep_expires_an_old_row_with_one_digest_notice(world):

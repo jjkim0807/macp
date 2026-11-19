@@ -16,17 +16,30 @@ or reaches a network.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import signal
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from todo_system import kakao_format
 from todo_system.orchestrator import assignment as A
 from todo_system.orchestrator import batch_gate, beta_publish, jobs, repos, stages, tasks
 from todo_system.orchestrator import message as m
-from todo_system.orchestrator.assignment import Assignment
+from todo_system.orchestrator.assignment import Assignment, Ledger
+from todo_system.orchestrator.mailbox import FileMailbox
+from todo_system.orchestrator.orchestrator import (
+    ALERT_BATCH_GATE_FAILED,
+    WAIT_GRADLE_CAP,
+    CheckoutGate,
+    Orchestrator,
+    Task,
+    _parse_ts,
+)
+from todo_system.orchestrator.registry import Agent, Registry
 
 URL = "https://example.test/acme/batchrepo.git"
 NAME = "batchrepo"
@@ -132,13 +145,14 @@ class _Repo:
         return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
 
 
-def _row(slug: str, head_sha: str, *, ready: float = T0, n: int = 1) -> Assignment:
+def _row(slug: str, head_sha: str, *, ready: float = T0, n: int = 1,
+         url: str = URL) -> Assignment:
     """A BATCH_READY ledger row, made by the transition collect() uses."""
     a = Assignment(task_id=slug, agent_id="w", corr_id=f"c-{slug}", kind="ai-local",
                    state=A.DONE,
-                   payload={"summary": slug, "repo": URL, "worker_mode": "auto",
+                   payload={"summary": slug, "repo": url, "worker_mode": "auto",
                             "task_path": "", "heavy": False})
-    result = {"pr_url": f"https://example.test/acme/batchrepo/pull/{n}", "repo": URL,
+    result = {"pr_url": f"https://example.test/acme/batchrepo/pull/{n}", "repo": url,
               "branch": f"worker/{slug}", batch_gate.KEY_BATCH: {"head_sha": head_sha}}
     stamp = dt.datetime.fromtimestamp(ready).astimezone().isoformat()
     assert batch_gate.mark_ready(a, result, now_iso=stamp)
@@ -1091,3 +1105,449 @@ def test_default_env_takes_the_squash_sha_from_gh_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(beta_publish, "_run", boom)
     assert env.merge_sha(str(tmp_path), "worker/a", "main") is None
+
+
+# =============================================================================
+# Orchestrator.tick() → reconcile_batch_gate → batch_gate.step
+# =============================================================================
+# The same repo, now reached the way production reaches it: rows in a ledger, the
+# config in a vault, and `orch.tick([])`. Only the tick's OTHER sweeps are
+# stubbed. The job runs on the real default Env; what it would do outside this
+# host is swapped at the engine's own seams (the gate runner, stages.merge_pr,
+# the two gh readers, the squash-sha lookup) and the shared clone is found by
+# patching repos.local_path.
+
+OTHER_URL = "https://example.test/acme/otherapp.git"
+CONFIG = {"enabled": True, "repos": {NAME: GATE}}
+
+_TICK_STUBS = (
+    "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
+    "reconcile_rescope", "_dispatch_serial_per_checkout", "collect",
+    "reconcile_split_parents", "reconcile_merge_holds", "reconcile_merged",
+    "reconcile_closed", "reconcile_unblocked", "reconcile_parents",
+    "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
+    "_beta_sweep_tick", "_project_stall_tick", "renudge_due",
+)
+
+
+class _TickWorld:
+    def __init__(self, tmp: Path, monkeypatch, *, slugs: str = "abc",
+                 config: dict | None = CONFIG, gradle_cap: int = 0):
+        self.tmp = tmp
+        self.repo = _Repo(tmp, monkeypatch)
+        self.vault = tmp / "vault"
+        self.ledger = Ledger(self.vault / "Worker" / "assignments")
+        self.mb = FileMailbox(self.vault / "Worker" / "agents")
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"],
+                                   capabilities=[], repo="~/x")])
+        self.notified: list[tuple] = []
+        self.routed: list[dict] = []
+
+        def notify(text, link=None):
+            self.notified.append((text, link))
+
+        def route(text, *, level=None, event_key=None, cooldown_s=0.0):
+            self.routed.append({"text": text, "level": level, "event_key": event_key})
+            if level == kakao_format.LEVEL_DIGEST:
+                return "digest", None                    # queued, never sent now
+            return "send", text
+
+        self.orch = Orchestrator(self.mb, self.reg, self.ledger, notify=notify,
+                                 alert_route=route,
+                                 max_parallel_gradle_builds=gradle_cap)
+        monkeypatch.setattr(self.orch, "_task_title", lambda slug: slug)
+        if config is not None:
+            path = self.vault / batch_gate.CONFIG_REL
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.gate = _FakeGate()
+        monkeypatch.setattr(batch_gate, "default_gate", lambda: self.gate)
+        self.merge_pr = mock.Mock(return_value={"merged": True, "note": "squash-merged"})
+        monkeypatch.setattr(stages, "merge_pr", self.merge_pr)
+        self.pr_states: dict[str, str] = {}
+        monkeypatch.setattr(stages, "gh_pr_state",
+                            lambda branch, repo=None, cwd=None: self.pr_states.get(branch, "OPEN"))
+        monkeypatch.setattr(stages, "gh_pr_merged", lambda branch, repo=None: None)
+        monkeypatch.setattr(beta_publish, "resolve_merge_sha", lambda *a, **k: None)
+        self.jobs_start = mock.Mock(side_effect=AssertionError("a real job was started"))
+        monkeypatch.setattr(jobs, "start", self.jobs_start)
+        # Where each repo's shared clone is on this "host".
+        self.other_clone = tmp / "worker" / "otherapp"
+        self.clones = {URL: self.repo.clone, OTHER_URL: self.other_clone}
+        monkeypatch.setattr(repos, "local_path", lambda url, worker_root=None: self.clones.get(
+            url, tmp / "worker" / "no-such-clone"))
+        self.git_calls: list[tuple] = []
+        real_git = stages._git
+
+        def counted(repo_dir, *args, **kw):
+            self.git_calls.append(args)
+            return real_git(repo_dir, *args, **kw)
+
+        monkeypatch.setattr(stages, "_git", counted)
+        self.now = FRESH
+        for i, slug in enumerate(slugs):
+            self.ledger.save(_row(slug, self.repo.heads[slug], ready=T0 + i, n=i + 1))
+
+    def tick(self, now: float | None = None, *, paused: bool = False) -> dict:
+        """`orch.tick([])` with every other sweep stubbed and the holds answered."""
+        patches = [mock.patch.object(self.orch, name, return_value=[])
+                   for name in _TICK_STUBS]
+        patches += [mock.patch.object(self.orch, "usage_hold", return_value=None),
+                    mock.patch.object(self.orch, "paused", return_value=paused),
+                    mock.patch.object(self.orch, "budget_exceeded", return_value=False)]
+        for patch in patches:
+            patch.start()
+        try:
+            return self.orch.tick([], self.now if now is None else now)["batch_gate"]
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+    def row(self, slug: str) -> Assignment:
+        return self.ledger.load(slug)
+
+    def job(self) -> dict | None:
+        return batch_gate.load_job(self.vault, NAME)
+
+    def gradle(self, *clones: Path) -> None:
+        """Make these shared clones Gradle projects (a `gradlew` at the root)."""
+        for clone in clones:
+            clone.mkdir(parents=True, exist_ok=True)
+            (clone / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def alerts(self, prefix: str) -> list[dict]:
+        return [r for r in self.routed if str(r["event_key"]).startswith(prefix)]
+
+
+@pytest.fixture
+def tw(tmp_path, monkeypatch) -> _TickWorld:
+    return _TickWorld(tmp_path, monkeypatch)
+
+
+def _task_payload() -> dict:
+    return {"summary": "c", "repo": URL, "worker_mode": "auto", "task_path": "",
+            "heavy": False}
+
+
+# --- AC 2: three branches, one conflicts ------------------------------------------
+
+def test_tick_gates_two_of_three_tasks_once_and_merges_them_in_order(tw, closes):
+    first = tw.tick()
+
+    assert first == {**EMPTY, "started": ["a", "b"], "returned": ["c"]}
+    [started] = tw.gate.started                          # ONE gate run
+    assert started["members"] == ["a", "b"]
+    assert started["files"] == ["a.txt", "b.txt", "shared.txt"]
+    assert started["shared"] == "main's edit\n"
+    assert started["full_gate"] == GATE["full_gate"]
+    tw.jobs_start.assert_not_called()
+    tw.merge_pr.assert_not_called()                      # nothing merges before the gate
+    assert tw.job()["state"] == batch_gate.JOB_RUNNING
+    # the conflicting task is queued for an individual full verify
+    c = tw.row("c")
+    assert c.state == A.FAILED
+    assert c.history[-1]["type"] == A.BATCH_RETURNED
+    assert c.payload[batch_gate.KEY_VERIFY_FULL] is True
+    assert c.payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_CONFLICT
+    assert c.display_state == "deferred"
+    assert tw.orch._ledger_gate(c, _parse_ts(c.updated_ts) + 1).deferred
+    assert tw.routed == []                               # a conflict pages nobody
+
+    tw.gate.verdict = batch_gate.GATE_PASSED
+    second = tw.tick()
+
+    assert second == {**EMPTY, "merged": ["a", "b"]}
+    assert tw.merge_pr.call_args_list == [
+        mock.call(tw.repo.clone, "worker/a", repo=URL),
+        mock.call(tw.repo.clone, "worker/b", repo=URL)]
+    for slug in ("a", "b"):
+        row = tw.row(slug)
+        assert row.state == A.DONE
+        assert row.history[-1]["type"] == batch_gate.HISTORY_MERGED == "batch-merged"
+        assert row.close_fingerprint == f"fp-{slug}"     # closed with evidence
+    assert closes == ["a", "b"]                          # the task mds, in merge order
+    assert len(tw.gate.started) == 1
+    assert tw.job() is None and not batch_gate.has_jobs(tw.vault)
+    assert tw.repo.integ_worktrees() == [] and tw.repo.integ_branches() == []
+    [notice] = tw.alerts("batch-gate-passed:batchrepo:integ/batchrepo/")
+    assert notice["level"] == kakao_format.LEVEL_DIGEST
+    assert tw.notified == []                             # digest only: nothing sent now
+    # a third tick has nothing left to do
+    assert tw.tick() == EMPTY
+
+
+def test_tick_sends_the_conflicting_task_out_again_for_a_full_verify(tw):
+    tw.tick()
+    c = tw.row("c")
+    due = _parse_ts(c.updated_ts) + tw.orch.job_poll_cooldown_s + 1
+
+    sent = tw.orch.dispatch(Task("c", _task_payload()), now=due)
+
+    assert sent is not None and sent.state == A.DISPATCHED
+    assert sent.refail_count == 0                        # a deferral, not a failure
+    assert sent.payload[batch_gate.KEY_VERIFY_FULL] is True
+    assert sent.payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_CONFLICT
+    [envelope] = [e for e in tw.mb.receive("w") if e.type == m.TASK_ASSIGN]
+    assert envelope.payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_CONFLICT
+
+
+# --- AC 1 at the tick: failure → back to individual verify, ONE alert ---------------
+
+def test_tick_failed_gate_returns_the_members_and_alerts_once(tw, closes):
+    tw.tick()
+    branch = tw.job()["branch"]
+    tw.gate.verdict = batch_gate.GATE_FAILED
+
+    result = tw.tick()
+
+    assert result == {**EMPTY, "returned": ["a", "b"]}
+    for slug in ("a", "b"):
+        row = tw.row(slug)
+        assert row.state == A.FAILED
+        assert row.history[-1]["type"] == A.BATCH_RETURNED
+        assert row.payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_GATE_FAILED
+        assert row.last_alert_kind == ALERT_BATCH_GATE_FAILED
+        assert row.refail_count == 0 and row.display_state == "deferred"
+    [alert] = tw.alerts("batch-gate-failed")
+    assert alert["event_key"] == f"batch-gate-failed:batchrepo:{branch}"
+    assert alert["level"] == kakao_format.LEVEL_IMMEDIATE
+    assert "batchrepo" in alert["text"] and "2" in alert["text"]
+    assert "📋 a" in alert["text"] and "📋 b" in alert["text"]
+    assert "Worker/jobs/batch-gate-batchrepo.log" in alert["text"]
+    assert "gate-failed" in alert["text"]
+    assert len(tw.notified) == 1                         # sent, once
+    tw.merge_pr.assert_not_called()
+    assert closes == []
+    assert tw.job() is None and tw.repo.integ_worktrees() == []
+
+    assert tw.tick() == EMPTY
+    assert len(tw.alerts("batch-gate-failed")) == 1 and len(tw.notified) == 1
+
+
+def test_tick_restart_limit_returns_the_tasks_with_one_digest_notice(tw):
+    tw.gate.verdict = batch_gate.GATE_PASSED
+    for n in range(batch_gate.MAX_RESTARTS + 1):
+        tw.tick()                                        # build + start
+        tw.repo.push_main(f"move{n}.txt", "x\n")
+        tw.tick()                                        # passed, main moved
+    for slug in ("a", "b"):
+        assert tw.row(slug).payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_RESTARTS
+        assert tw.row(slug).last_alert_kind == ""        # not a gate failure
+    [notice] = tw.alerts("batch-restarts:batchrepo:")
+    assert notice["level"] == kakao_format.LEVEL_DIGEST
+    assert str(batch_gate.MAX_RESTARTS) in notice["text"]
+    tw.merge_pr.assert_not_called()
+    assert tw.notified == [] and tw.job() is None
+
+
+# --- the safety net runs first ------------------------------------------------------
+
+def test_tick_expires_members_before_stepping_and_then_drops_the_job(tw):
+    tw.tick()
+    branch = tw.job()["branch"]
+    late = T0 + batch_gate.EXPIRE_S + 5
+
+    result = tw.tick(late)
+
+    assert result == {**EMPTY, "returned": ["a", "b"]}
+    for slug in ("a", "b"):
+        assert tw.row(slug).payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_EXPIRED
+    assert [r["event_key"] for r in tw.routed] == ["batch-expired:a", "batch-expired:b"]
+    assert "24" in tw.routed[0]["text"]
+    # the job no longer has a row to gate: stopped, torn down, forgotten
+    assert tw.gate.stopped == [branch]
+    assert tw.job() is None and tw.repo.integ_worktrees() == []
+    tw.merge_pr.assert_not_called()
+
+
+def test_tick_drops_a_job_whose_repo_left_the_config(tw, capsys):
+    tw.tick()
+    (tw.vault / batch_gate.CONFIG_REL).unlink()
+    capsys.readouterr()
+
+    result = tw.tick()
+
+    assert result == {**EMPTY, "returned": ["a", "b"]}
+    assert tw.row("a").payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_NOT_ENABLED
+    assert tw.job() is None and len(tw.gate.stopped) == 1
+    assert "job dropped" in capsys.readouterr().out
+    # with the job gone the sweep is back to doing nothing at all
+    capsys.readouterr()
+    assert tw.tick() == EMPTY
+    assert capsys.readouterr().out == ""
+
+
+def test_tick_closes_a_pr_someone_merged_and_parks_one_someone_closed(tw, closes):
+    tw.pr_states = {"worker/a": "MERGED", "worker/b": "CLOSED"}
+
+    result = tw.tick()
+
+    assert result == {**EMPTY, "closed": ["a"]}
+    a, b = tw.row("a"), tw.row("b")
+    assert a.state == A.DONE and a.history[-1]["type"] == batch_gate.HISTORY_MERGED
+    assert closes == ["a"]
+    # b: a person's call. Parked with the branch reconcile_merged looks the PR
+    # up by, and with no history entry or alert of this sweep's own.
+    assert b.state == A.AWAITING_HUMAN
+    assert b.payload["branch"] == "worker/b"
+    assert b.history[-1]["type"] == batch_gate.HISTORY_READY
+    assert tw.routed == [] and tw.gate.started == []
+    assert tw.row("c").state == A.BATCH_READY            # alone now: it waits
+
+
+def test_tick_paused_starts_no_gate(tw):
+    assert tw.tick(paused=True) == EMPTY
+    assert tw.gate.started == [] and tw.git_calls == [] and tw.job() is None
+    assert tw.tick()["started"] == ["a", "b"]
+
+
+def test_tick_skips_a_repo_another_process_is_stepping(tw, capsys):
+    with batch_gate.repo_lock(tw.vault, NAME) as held:
+        assert held
+        assert tw.tick() == EMPTY
+    assert tw.gate.started == [] and tw.git_calls == []
+    assert "stepped by another process" in capsys.readouterr().out
+    assert tw.tick()["started"] == ["a", "b"]
+
+
+def test_tick_survives_a_step_that_raises_and_still_tends_the_other_repo(
+        tmp_path, monkeypatch, capsys):
+    config = {"enabled": True, "repos": {NAME: GATE, "otherapp": GATE}}
+    w = _TickWorld(tmp_path, monkeypatch, config=config)
+    for i, slug in enumerate(("o1", "o2")):
+        w.ledger.save(_row(slug, "0" * 40, ready=T0 + i, n=10 + i, url=OTHER_URL))
+    stepped = []
+
+    def flaky(repo_url, rows, *_a, **_k):
+        stepped.append(repo_url)
+        if repo_url == URL:
+            raise RuntimeError("clone is on fire")
+        return {**EMPTY, "started": [a.task_id for a in rows]}
+
+    monkeypatch.setattr(batch_gate, "step", flaky)
+
+    result = w.tick()
+
+    assert stepped == [URL, OTHER_URL]                   # the raise skipped only its repo
+    assert result == {**EMPTY, "started": ["o1", "o2"]}
+    assert "reconcile_batch_gate: batchrepo skipped: clone is on fire" in capsys.readouterr().out
+    assert w.row("a").state == A.BATCH_READY             # kept for the next tick
+
+
+# --- AC 3: the gate and the Gradle build cap -----------------------------------------
+
+def test_tick_defers_the_gate_while_the_gradle_cap_is_reached(tmp_path, monkeypatch):
+    w = _TickWorld(tmp_path, monkeypatch, slugs="ab", gradle_cap=1)
+    w.gradle(w.repo.clone, w.other_clone)
+    busy = Assignment(task_id="other-task", agent_id="w", corr_id="c-o", kind="ai-local",
+                      state=A.IN_PROGRESS, payload={"repo": OTHER_URL})
+    w.ledger.save(busy)                                  # one Gradle run is live
+
+    assert w.tick() == EMPTY
+
+    assert w.gate.started == [] and w.job() is None
+    assert w.git_calls == []                             # deferred before any git
+    assert w.row("a").state == w.row("b").state == A.BATCH_READY
+
+    busy.state = A.DONE                                  # the run finished
+    w.ledger.save(busy)
+    assert w.tick()["started"] == ["a", "b"]
+
+
+def test_a_running_gate_counts_toward_the_gradle_cap_at_dispatch(tmp_path, monkeypatch, capsys):
+    w = _TickWorld(tmp_path, monkeypatch, slugs="ab", gradle_cap=1)
+    w.gradle(w.repo.clone, w.other_clone)
+    task = Task("other-task", {"summary": "x", "repo": OTHER_URL, "heavy": False})
+    free = CheckoutGate(None)
+    assert w.orch._checkout_gate(task, OTHER_URL, w.orch._checkout_inflight(), 2) == free
+
+    w.tick()                                             # the gate is out now
+    assert w.job()["state"] == batch_gate.JOB_RUNNING
+
+    assert w.orch._batch_gradle_jobs() == 1
+    gate = w.orch._checkout_gate(task, OTHER_URL, w.orch._checkout_inflight(), 2)
+    assert (gate.wait, gate.gradle_runs) == (WAIT_GRADLE_CAP, 1)
+    [queued] = w.orch.queue_snapshot([task], now=w.now)
+    assert queued["wait"] == "gradle_cap"
+    assert w.orch._dispatch_serial_per_checkout([task]) == []
+    assert "global gradle-build cap 1 reached (1 live)" in capsys.readouterr().out
+    assert w.ledger.load("other-task") is None           # held back, nothing sent
+
+    # the cap switched off: the gate is not even counted
+    w.orch.max_parallel_gradle_builds = 0
+    assert w.orch._checkout_gate(task, OTHER_URL, w.orch._checkout_inflight(), 2) == free
+    w.orch.max_parallel_gradle_builds = 1
+    # a job that is merging or waiting to rebuild runs no build
+    job = w.job()
+    for state in (batch_gate.JOB_PASSED, batch_gate.JOB_IDLE):
+        batch_gate.save_job(w.vault, {**job, "state": state})
+        assert w.orch._batch_gradle_jobs() == 0
+        assert w.orch._checkout_gate(task, OTHER_URL, w.orch._checkout_inflight(), 2) == free
+    # and once the gate is gone the task goes out
+    batch_gate.clear_job(w.vault, NAME)
+    [sent] = w.orch._dispatch_serial_per_checkout([task])
+    assert sent.task_id == "other-task"
+
+
+def test_a_running_gate_of_a_non_gradle_repo_is_not_a_gradle_build(tmp_path, monkeypatch):
+    w = _TickWorld(tmp_path, monkeypatch, slugs="ab", gradle_cap=1)
+    w.gradle(w.other_clone)                              # batchrepo has no gradlew
+    w.tick()
+    assert w.job()["state"] == batch_gate.JOB_RUNNING
+    assert w.orch._batch_gradle_jobs() == 0
+    assert not w.orch._batch_gate_gradle_busy(URL)
+
+
+def test_gradle_accounting_never_raises_on_a_ledger_without_a_directory(tw):
+    tw.orch.ledger = object()                            # e.g. another ledger backend
+    assert tw.orch._batch_gradle_jobs() == 0
+
+
+# --- AC 4: nothing to do = nothing done -------------------------------------------------
+
+def test_idle_tick_with_no_config_and_no_rows_does_nothing(tmp_path, monkeypatch, capsys):
+    w = _TickWorld(tmp_path, monkeypatch, slugs="", config=None)
+    load_config = mock.Mock(return_value={})
+    monkeypatch.setattr(batch_gate, "load_config", load_config)
+    capsys.readouterr()
+
+    assert w.tick() == EMPTY
+
+    load_config.assert_not_called()
+    assert w.git_calls == []
+    w.jobs_start.assert_not_called()
+    assert not batch_gate.state_dir(w.vault).exists()    # no job file, no lock
+    assert not (w.vault / "Worker" / "jobs").exists()
+    assert capsys.readouterr().out == ""
+    assert w.routed == [] and w.gate.started == []
+
+
+def test_idle_tick_with_one_fresh_row_leaves_no_trace(tmp_path, monkeypatch, capsys):
+    w = _TickWorld(tmp_path, monkeypatch, slugs="a")
+    before = w.row("a").to_json()
+    capsys.readouterr()
+
+    assert w.tick() == EMPTY
+
+    assert w.git_calls == []
+    assert not batch_gate.state_dir(w.vault).exists()    # not even a lock file
+    assert capsys.readouterr().out == ""
+    assert w.row("a").to_json() == before
+    assert w.routed == [] and w.gate.started == []
+
+
+def test_no_config_tick_only_returns_the_waiting_rows(tmp_path, monkeypatch, capsys):
+    w = _TickWorld(tmp_path, monkeypatch, config=None)
+    capsys.readouterr()
+
+    assert w.tick() == {**EMPTY, "returned": ["a", "b", "c"]}
+
+    for slug in "abc":
+        assert w.row(slug).payload[batch_gate.KEY_RETURN_REASON] == batch_gate.RETURN_NOT_ENABLED
+    assert w.git_calls == []
+    w.jobs_start.assert_not_called()
+    assert not batch_gate.state_dir(w.vault).exists()
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 3 and all("returned to an individual full verify" in ln for ln in lines)
+    assert w.routed == [] and w.gate.started == []

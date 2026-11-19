@@ -156,6 +156,10 @@ real root (the vault, this checkout) answers ``{}``, a call for any other root â
 a test's own tmp vault â€” runs the real function. It works only because
 production reads the config as ``batch_gate.load_config(...)``, through the
 module attribute; ``from .batch_gate import load_config`` would bypass it.
+The integration gate itself is a detached job under ``jobs.JOBS_DIR``, which is
+fixed at import to the vault's ``Worker/jobs``. ``_batch_gate_runner_isolated``
+replaces ``batch_gate.default_gate`` with a runner whose ``start`` raises, so no
+test can launch a real gate there; a test that needs one swaps in its own fake.
 
 Two shared, non-autouse fixtures live here too, so both suites see one copy:
 ``combined_layout`` (a throwaway engine checkout that is also the vault) and
@@ -639,6 +643,31 @@ def _batch_gate_config_isolated(monkeypatch):
         return _REAL_BATCH_LOAD_CONFIG(vault_root, *args, **kwargs)
 
     monkeypatch.setattr(batch_gate, "load_config", _guarded)
+
+
+class _BlockedBatchGate:
+    """The gate runner every test gets unless it brings its own: nothing starts."""
+
+    def start(self, job):
+        raise RuntimeError(
+            "real batch gate blocked by todo_system/conftest.py "
+            "(patch batch_gate.default_gate with a fake)")
+
+    def poll(self, job):
+        return batch_gate.GATE_FAILED
+
+    def stop(self, job):
+        return None
+
+    def cleanup(self, job):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _batch_gate_runner_isolated(monkeypatch):
+    # See the module docstring. Production builds its runner through
+    # batch_gate.default_gate(), looked up on the module when called.
+    monkeypatch.setattr(batch_gate, "default_gate", _BlockedBatchGate)
 
 
 @pytest.fixture(scope="session", autouse=True)

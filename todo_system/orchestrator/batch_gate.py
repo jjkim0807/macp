@@ -482,6 +482,14 @@ def _safe(repo_name) -> str:
     return name
 
 
+def job_name(repo_url) -> str:
+    """The name a repo's job goes by — its record, lock, gate job, branch and
+    worktree: ``repos.repo_name(url)`` made path-safe. The sweep groups waiting
+    rows by it, so a row and its repo's record always meet under one name."""
+    from . import repos
+    return _safe(repos.repo_name(str(repo_url or "")))
+
+
 def job_path(vault_root, repo_name) -> Path:
     return state_dir(vault_root) / f"{_safe(repo_name)}.json"
 
@@ -1168,10 +1176,8 @@ def step(repo_url, rows, gate_cfg, env, hooks, *, vault_root, paused=False,
     Call it under :func:`repo_lock`. A raise leaves the record as last saved,
     and the next call continues from it."""
     out: dict = {"started": [], "merged": [], "returned": [], "closed": []}
-    from . import repos
-
     repo_url = str(repo_url or "")
-    name = _safe(repos.repo_name(repo_url))
+    name = job_name(repo_url)
     rows = list(rows or [])
     job = load_job(vault_root, name)
     if job is not None:
