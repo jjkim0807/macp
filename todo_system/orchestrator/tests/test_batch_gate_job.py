@@ -1189,10 +1189,12 @@ class _TickWorld:
         for i, slug in enumerate(slugs):
             self.ledger.save(_row(slug, self.repo.heads[slug], ready=T0 + i, n=i + 1))
 
-    def tick(self, now: float | None = None, *, paused: bool = False) -> dict:
-        """`orch.tick([])` with every other sweep stubbed and the holds answered."""
+    def tick(self, now: float | None = None, *, paused: bool = False,
+             live: tuple = ()) -> dict:
+        """`orch.tick([])` with every other sweep stubbed (except those `live`
+        names) and the holds answered."""
         patches = [mock.patch.object(self.orch, name, return_value=[])
-                   for name in _TICK_STUBS]
+                   for name in _TICK_STUBS if name not in live]
         patches += [mock.patch.object(self.orch, "usage_hold", return_value=None),
                     mock.patch.object(self.orch, "paused", return_value=paused),
                     mock.patch.object(self.orch, "budget_exceeded", return_value=False)]
@@ -1275,6 +1277,58 @@ def test_tick_gates_two_of_three_tasks_once_and_merges_them_in_order(tw, closes)
     assert tw.notified == []                             # digest only: nothing sent now
     # a third tick has nothing left to do
     assert tw.tick() == EMPTY
+
+
+def test_tick_merges_through_real_squash_commits_without_a_second_gate(
+        tmp_path, monkeypatch, closes):
+    # The recorder above never moves origin. Here each merge is a real squash
+    # commit on the default branch (and the branch is deleted), as the server
+    # leaves it: our own commits must not read as "the default branch moved".
+    w = _TickWorld(tmp_path, monkeypatch, slugs="ab")
+    squashed: dict[str, str] = {}
+
+    def squash(repo_dir, branch, repo=None):
+        squashed[branch] = w.repo.squash_merge(branch)
+        return {"merged": True, "note": f"squash-merged {branch}"}
+
+    w.merge_pr.side_effect = squash
+    monkeypatch.setattr(beta_publish, "resolve_merge_sha",
+                        lambda repo_dir, branch, **_k: squashed.get(branch))
+    w.tick()
+    gated = w.job()["head_sha"]
+    w.gate.verdict = batch_gate.GATE_PASSED
+
+    assert w.tick() == {**EMPTY, "merged": ["a", "b"]}
+
+    assert [call.args[1] for call in w.merge_pr.call_args_list] == ["worker/a", "worker/b"]
+    assert closes == ["a", "b"]
+    assert len(w.gate.started) == 1 and w.job() is None
+    assert w.repo.origin_sha("main") == squashed["worker/b"]
+    # what landed is exactly the tree the one gate run judged
+    assert w.repo.origin_sha("main^{tree}") == _git(
+        w.repo.clone, "rev-parse", f"{gated}^{{tree}}")
+
+
+def test_tick_parked_closed_pr_gets_its_one_alert_from_reconcile_merged(
+        tw, monkeypatch):
+    # The batch sweep parks a task whose PR a person closed and says nothing
+    # itself: reconcile_merged, later in the SAME tick, owns that alert.
+    tw.pr_states = {"worker/b": "CLOSED"}
+    monkeypatch.setattr(tasks, "task_status", lambda slug, *a, **k: "open")
+
+    result = tw.tick(live=("reconcile_merged",))
+
+    assert result == {**EMPTY, "started": ["a"], "returned": ["c"]}
+    b = tw.row("b")
+    assert b.state == A.AWAITING_HUMAN
+    assert b.history[-1]["type"] == "closed-unmerged-alerted"
+    assert [r["event_key"] for r in tw.routed] == ["closed-unmerged:b"]
+    assert len(tw.notified) == 1
+    # the next tick does not say it again, and the gate for `a` is untouched
+    tw.tick(live=("reconcile_merged",))
+    assert len(tw.notified) == 1
+    assert tw.job()["state"] == batch_gate.JOB_RUNNING
+    assert [member["slug"] for member in tw.job()["members"]] == ["a"]
 
 
 def test_tick_sends_the_conflicting_task_out_again_for_a_full_verify(tw):
