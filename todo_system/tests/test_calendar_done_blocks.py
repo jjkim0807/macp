@@ -343,3 +343,76 @@ def test_done_task_without_event_gets_a_done_event(tmp_path, pinned, monkeypatch
     # Different day → moved, same 5h length, ends at completion.
     assert CS._canon(body["start"]) == _seoul(D(2026, 11, 19, 11, 53))
     assert CS._canon(body["end"]) == _seoul(D(2026, 11, 19, 16, 53))
+
+
+# --- wiring: the real todo import → calendar sync path ------------------------------
+
+def _vault_md(items: Path, slug: str, sched: str) -> Path:
+    p = items / f"{slug}.md"
+    p.write_text(f'---\nstatus: open\nscheduled: "{sched}"\n---\n\n# {slug} title\n\n'
+                 f"- [ ] step\n\n## Progress Log\n\n- 2026-11-01: created\n", encoding="utf-8")
+    return p
+
+
+def _sched_line(p: Path) -> str:
+    return next(line for line in p.read_text(encoding="utf-8").splitlines()
+                if line.startswith("scheduled:"))
+
+
+def test_done_path_keeps_and_trims_block_and_reschedule_pull_leave_it(tmp_path, pinned, monkeypatch):
+    """cli.import_markdown_to_db (stamps completed:) → sync_due_tasks_to_calendar
+    (keeps + trims the done block) with the real overdue mover and two-way pull."""
+    from todo_system import cli
+
+    root = tmp_path / "vault"
+    items = root / "Todo" / "items"
+    items.mkdir(parents=True)
+    monkeypatch.setattr(cli, "ROOT", root)
+    monkeypatch.setattr(cli, "ITEMS_DIR", items)
+    monkeypatch.setattr(CS, "ROOT", root)
+    monkeypatch.setenv("MACP_CALENDAR_DONE_KEEP_DAYS", "100000")   # pinned 2026 never ages out
+    con = cli.db_connect(root / "todo.db")
+    cli.init_db(con)
+    events = _GEvents()
+
+    done_md = _vault_md(items, "done-me", "2026-11-18 10:00~13:00")
+    cli.import_markdown_to_db(con)
+    _run_sync(con, events, monkeypatch)                     # mover off for this first tick
+    (ev,) = events.existing
+    eid = ev["id"]
+    assert _priv(ev)["todo_slug"] == "done-me"
+
+    # Calendar-app edit after the last sync: a live pull would write it to the md.
+    live = events.get(eid)
+    live["start"] = {"dateTime": "2026-11-18T14:00:00", "timeZone": "Asia/Seoul"}
+    live["end"] = {"dateTime": "2026-11-18T17:00:00", "timeZone": "Asia/Seoul"}
+    live["updated"] = "2099-01-01T00:00:00Z"
+
+    # The person finishes the task; an unrelated open block is long overdue.
+    open_md = _vault_md(items, "still-open", "2020-01-06 10:00~10:30")
+    done_md.write_text(done_md.read_text(encoding="utf-8").replace("status: open", "status: done"),
+                       encoding="utf-8")
+    cli.import_markdown_to_db(con)
+    assert 'completed: "2026-11-19 16:53"' in done_md.read_text(encoding="utf-8")
+    sched_before = _sched_line(done_md)
+
+    monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "1")      # the real mover runs this tick
+    _run_sync(con, events, monkeypatch)
+
+    assert eid not in events.deleted
+    ev = events.get(eid)
+    assert CS._canon(ev["end"]) == _seoul(PINNED_NOW)
+    assert CS._canon(ev["start"]) == _seoul(D(2026, 11, 19, 13, 53))   # different day → moved, 3h
+    assert ev["summary"].startswith("✅")
+    assert "todo_slug" not in _priv(ev)
+    assert _priv(ev)["todo_done_slug"] == "done-me"
+    # Neither the two-way pull nor the overdue mover touched the done md …
+    assert _sched_line(done_md) == sched_before
+    assert "자동 재배치" not in done_md.read_text(encoding="utf-8")
+    # … while the mover did run on this same tick.
+    assert "자동 재배치" in open_md.read_text(encoding="utf-8")
+
+    # A third sync makes no further write on the done event.
+    writes = (len([p for p in events.patched if p[0] == eid]), events.deleted.count(eid))
+    _run_sync(con, events, monkeypatch)
+    assert (len([p for p in events.patched if p[0] == eid]), events.deleted.count(eid)) == writes
