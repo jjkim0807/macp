@@ -181,10 +181,11 @@ closes it in three places:
 * ``stages.remove_worktree`` — removing one of those stand-in directories, or
   anything off a real root, is a silent ``False`` with no git.
 
-The runner only rescues, publishes from, watches or removes a path that still is
-a worktree (its ``.git`` entry exists), so a stand-in directory adds no git call
-to a run. Like the batch-gate guard, this works only because production reaches
-all three through the module attribute (``repos.x(...)``, ``stages.x(...)``).
+The runner only rescues, rechecks a merge in, arms its live-HEAD watch for or
+removes a path that still is a worktree (its ``.git`` entry exists), so a stand-in
+directory adds no git call to a run. Like the batch-gate guard, this works only
+because production reaches all three through the module attribute
+(``repos.x(...)``, ``stages.x(...)``).
 
 Two shared, non-autouse fixtures live here too, so both suites see one copy:
 ``combined_layout`` (a throwaway engine checkout that is also the vault) and

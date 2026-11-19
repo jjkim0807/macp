@@ -744,12 +744,14 @@ class StagedExecutor(ClaudeCodeExecutor):
     def _is_worktree(path) -> bool:
         """Whether `path` still is a git worktree: its `.git` entry exists.
 
-        Asked before every git call the runner makes against a vault task's
-        worktree once the stages have had it — rescue, publish, removal, and the
-        live-HEAD watch that goes with it. A stage, a person or a cleanup can have
-        taken the directory away by then, and `git -C <a path that is not a
-        worktree>` does not fail: it walks up and answers for whatever repository
-        encloses the path. Filesystem only; never raises."""
+        Asked before the runner's own git against a vault task's worktree once
+        the stages have had it — the rescues, the merge recheck, the removal —
+        and to arm the live-HEAD watch that goes with it. A stage, a person or a
+        cleanup can have taken the directory away by then, and `git -C <a path
+        that is not a worktree>` does not fail: it walks up and answers for
+        whatever repository encloses the path. (The delegate publish is not gated
+        on it: it measures the branch first and refuses to push on anything it
+        cannot count.) Filesystem only; never raises."""
         try:
             return (Path(path) / ".git").exists()
         except Exception:       # noqa: BLE001
@@ -802,6 +804,11 @@ class StagedExecutor(ClaudeCodeExecutor):
             rsc = stages.rescue_uncommitted(wt, cur, slug)
             if rsc.get("committed"):
                 progress(f"{what}: {rsc['note']}")
+            elif rsc.get("note") and rsc["note"] != "nothing to rescue":
+                # A rescue that had something to save and could not (a stage
+                # killed mid-git leaves `index.lock`; a hook refused the commit).
+                # The worktree will be kept for it — say why, here.
+                progress(f"{what}: not rescued — {rsc['note']}")
         except Exception as e:      # noqa: BLE001 — finally-called; never mask the outcome
             try:
                 progress(f"{what}: rescue skipped ({type(e).__name__})")

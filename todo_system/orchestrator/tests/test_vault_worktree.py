@@ -650,6 +650,37 @@ def test_a_worktree_whose_work_cannot_be_committed_is_kept_not_deleted(live, vau
     assert (wt / "only-copy.md").read_text(encoding="utf-8") == "irreplaceable"
 
 
+def test_a_rescue_that_fails_says_why_and_the_worktree_is_kept(live, vault):
+    """A stage killed mid-git leaves `index.lock` behind, and then nothing can be
+    staged. The work stays on disk and the run names the reason."""
+    wt = repos.vault_worktree_path("t")
+    lock: dict = {}
+
+    def act(ctx):
+        if ctx.stage == "plan":
+            (ctx.wd / "work.md").write_text("not committed", encoding="utf-8")
+            gitdir = Path(ctx.g(ctx.wd, "rev-parse", "--absolute-git-dir").stdout.strip())
+            lock["path"] = gitdir / "index.lock"
+            lock["path"].write_text("", encoding="utf-8")
+            return False
+
+    out = live.execute(act=act)
+
+    assert not out.ok
+    assert (wt / "work.md").read_text(encoding="utf-8") == "not committed"
+    assert any(line.startswith("vault worktree: not rescued — git add -A failed")
+               for line in live.lines), live.lines
+    assert any("vault worktree kept" in line for line in live.lines)
+    # once the lock is cleared, the task's next run saves the work and carries on
+    lock["path"].unlink()
+    again = _Run(vault, live.runs)
+    out2 = again.execute(act=_agent_commits)
+    assert out2.ok, out2.summary
+    saved = out2.payload["orphaned_commits"]["shas"][0]
+    assert _git(vault, "show", f"{saved}:work.md").stdout == "not committed"
+    assert not wt.exists()
+
+
 def test_a_stage_that_moves_the_live_head_is_caught_at_the_stage_boundary(live, vault):
     def act(ctx):
         if ctx.stage == "research":
