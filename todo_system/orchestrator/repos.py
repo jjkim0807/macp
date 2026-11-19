@@ -459,6 +459,148 @@ def ensure_worktree(url: str, slug: str, worker_root: str | Path | None = None,
     return None
 
 
+# The directory under the worker root that holds the worktrees of VAULT tasks —
+# the vault's counterpart of an external repo's `<repo>.wt`. `is_vault_worktree`
+# reads a path's parent name against it, so the shape `<...>/vault.wt/<slug>` is
+# the contract, not just a default.
+VAULT_WORKTREE_DIRNAME = "vault.wt"
+
+
+def vault_worktree_path(slug: str,
+                        worker_root: str | Path | None = None) -> Path:
+    """Where the linked worktree of a vault task's run lives:
+    `<worker_root>/vault.wt/<slug>`.
+
+    Pure — touches no filesystem — and resolved at call time like every other
+    path here. Under the worker root on purpose: a stage reaches it through the
+    `--add-dir <worker_root>` it already gets, and it sits beside the external
+    repos' `<repo>.wt/<slug>` worktrees. One directory deeper than the worker
+    root and not named `wt-*`, so neither the disk guard (direct children that
+    are clones) nor the legacy `wt-*` sweep ever looks at it; the run that made
+    it removes it (see `ensure_vault_worktree`).
+
+    A repo literally named `vault` shares the parent directory; slugs name one
+    task each, so the leaf paths still cannot meet."""
+    return _worker_root(worker_root) / VAULT_WORKTREE_DIRNAME / slug
+
+
+def is_vault_worktree(path: str | Path | None) -> bool:
+    """Whether `path` has the shape `vault_worktree_path` produces.
+
+    Lexical only — no filesystem, no git — and never raises: the stage-prompt
+    builder asks this about whatever `working_dir` it was handed."""
+    try:
+        return Path(path).parent.name == VAULT_WORKTREE_DIRNAME
+    except Exception:       # noqa: BLE001 — "not a path" is simply not a worktree
+        return False
+
+
+def ensure_vault_worktree(vault_root: str | Path, slug: str,
+                          worker_root: str | Path | None = None,
+                          log: list[str] | None = None,
+                          branch: str | None = None) -> Path | None:
+    """Ensure a linked worktree of the VAULT repository exists for `slug` and
+    return its path, or None (with the reason appended to `log`). `branch` is
+    the branch the caller is about to put on it, when it knows one.
+
+    A task with no `repo:` works on the vault itself. Its branch used to be
+    checked out in the live vault, which moved that checkout's HEAD for the whole
+    run — and the live vault is where a person, the planner and the sync daemon
+    commit, so their commits rode the worker branch (2026-11-17). The run now
+    gets this worktree instead, and the live checkout is never the one switched.
+
+    Nothing here moves the vault's own HEAD or writes its index: `worktree add`
+    only registers the new tree. The tree is cut `--detach` from the LOCAL
+    default branch, named explicitly — not from whatever the live checkout has
+    checked out — because the local default branch is what carries commits that
+    are not pushed yet (the task file a person just committed, sync commits),
+    and a live checkout that is abnormally elsewhere must not become the base.
+    `stages.prepare_vault_branch` then puts `worker/<slug>` on it.
+
+    Returns None rather than guessing when:
+    * `vault_root` is not the top of its git checkout (not a repository, or a
+      directory inside another one — the worktree would be that other
+      repository's);
+    * the local default branch does not exist yet (a repository with no commit
+      has nothing to cut a worktree from);
+    * the vault's own checkout is sitting on `branch`: one branch cannot be
+      checked out in two worktrees, and the live checkout is not this function's
+      to move;
+    * the target path exists but is not a worktree of this repository. It is
+      never deleted or moved — it may hold someone's work — so the add is not
+      attempted over it;
+    * git fails or times out.
+    An existing worktree of this repository at the path is returned as-is, like
+    `ensure_worktree`'s early return. Never raises."""
+    def _note(s: str) -> None:
+        if log is not None:
+            log.append(s)
+
+    vault = Path(vault_root)
+
+    def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(cwd), *args],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=GIT_TIMEOUT_WORKTREE_S)
+
+    def _common_dir(cwd: Path) -> Path | None:
+        r = _git(cwd, "rev-parse", "--git-common-dir")
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 or not out:
+            return None
+        p = Path(out)
+        return (p if p.is_absolute() else cwd / p).resolve()
+
+    try:
+        top = _git(vault, "rev-parse", "--show-toplevel")
+        top_out = (top.stdout or "").strip()
+        if top.returncode != 0 or not top_out or Path(top_out).resolve() != vault.resolve():
+            _note(f"{vault} is not the top of a git checkout — a vault task needs "
+                  "the vault to be its own git repository")
+            return None
+        # Same rule as stages.default_branch (repos does not import stages).
+        head = _git(vault, "symbolic-ref", "refs/remotes/origin/HEAD")
+        head_out = (head.stdout or "").strip()
+        default = head_out.rsplit("/", 1)[-1] if head.returncode == 0 and head_out else "main"
+        if _git(vault, "rev-parse", "--verify", "--quiet",
+                f"refs/heads/{default}").returncode != 0:
+            _note(f"no local {default} branch — the vault has no commit to cut a "
+                  "worktree from")
+            return None
+        if branch:
+            cur = _git(vault, "branch", "--show-current")
+            if cur.returncode == 0 and (cur.stdout or "").strip() == branch:
+                _note(f"the vault checkout itself is on {branch} — not cutting a "
+                      "worktree over it")
+                return None
+        # Through the module attribute and with `worker_root` passed on untouched
+        # (None stays None), so the one place that decides the location decides it
+        # here too.
+        wt = vault_worktree_path(slug, worker_root)
+        if (wt / ".git").exists():
+            ours = _common_dir(vault)
+            if ours is not None and _common_dir(wt) == ours:
+                return wt
+            _note(f"{wt} exists but is not a worktree of {vault} — left as it is")
+            return None
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        _git(vault, "worktree", "prune")
+        r = _git(vault, "worktree", "add", "--detach", str(wt), default)
+    except subprocess.TimeoutExpired:
+        _note(f"vault worktree git timed out after {GIT_TIMEOUT_WORKTREE_S}s: {vault}")
+        return None
+    except Exception as e:      # noqa: BLE001 — a prep helper reports, never raises
+        _note(f"vault worktree prep errored ({type(e).__name__}): {vault}")
+        return None
+    if r.returncode == 0:
+        _note(f"vault worktree {wt} added (detached at {default}) from {vault}")
+        return wt
+    lines = (r.stderr or "").strip().splitlines()
+    last = lines[-1].strip() if lines else ""
+    _note(f"vault worktree add failed: {last}")
+    return None
+
+
 def resolve(payload: dict, agent_repo: str | None,
             worker_root: str | Path | None = None,
             clone: bool = False) -> Path | None:
