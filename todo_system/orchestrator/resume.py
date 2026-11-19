@@ -347,6 +347,47 @@ def head_contains(root: str | Path, sha: str, _run=None) -> bool | None:
     return None
 
 
+def find_rewritten(root: str | Path, record: dict, _run=None) -> tuple[bool | None, str]:
+    """Look for the reserved commit's patch under a new sha in HEAD's history.
+
+    `(True, new_full_sha)` — a commit with the stored `patch_id` that is not the
+    old sha is in HEAD's history; `(False, "")` — git answered and nothing
+    matched; `(None, "")` — can't tell (no `patch_id`, unparseable dates, any git
+    error or timeout). Only `True` may count as "contains"; the other two keep
+    the reservation waiting. **Never raises.**
+
+    The walk starts at the original commit's committer date (`commit_ts`, else
+    the reservation's `created_ts`) minus `_SEARCH_SLACK`: a rebase stamps the
+    rewritten commit with the rebase time, which is never earlier, so this also
+    covers an old sha handed to `schedule()` after the rebase already happened.
+    """
+    try:
+        target = str(record.get("patch_id") or "").strip()
+        old = str(record.get("after_commit") or "").strip()
+        if not target or not old:
+            return None, ""
+        tz = _now().tzinfo
+        lower = (_parse_ts(record.get("commit_ts"), tz=tz)
+                 or _parse_ts(record.get("created_ts"), tz=tz))
+        if lower is None:
+            return None, ""
+        args = [*_LOG_PATCH_FLAGS, f"--since={_iso(lower - _SEARCH_SLACK)}",
+                f"--max-count={_SEARCH_MAX_COUNT}", "HEAD"]
+        paths = record.get("paths")
+        if (isinstance(paths, list) and paths
+                and all(isinstance(p, str) and p for p in paths)):
+            args += ["--", *paths]
+        pairs = _patch_ids(Path(root), args, _run, timeout=60)
+        if pairs is None:
+            return None, ""
+        for patch_id, commit in pairs:
+            if patch_id == target and not commit.startswith(old):
+                return True, commit
+        return False, ""
+    except Exception:
+        return None, ""
+
+
 def load_records(vault_root: str | Path) -> tuple[list[tuple[Path, dict]],
                                                   list[tuple[Path, str]]]:
     """Two lists: (records read, records that failed to read).
@@ -446,6 +487,14 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
     `collect()` even after being resumed — a known limitation, written down
     in `Worker/README.md`.
 
+    **Rebase fallback.** On main, when `after_commit` is not (or can't be told
+    to be) an ancestor of HEAD and the record carries a `patch_id`,
+    `find_rewritten()` searches HEAD's history for the same patch under a new
+    sha; a match counts as "contains", logs `rebased: <old> → <new>`, and a
+    RESUME then records `rebased_to` in the history entry. Old records without
+    `patch_id` → no extra git call, exactly the previous behaviour. Expiry and
+    the missing-ledger-row check still run before any git call.
+
     `notify(msg, event_key=...)` is optional. It's called **after** the
     ledger save, so a notification failure never undoes the resume, and the
     call itself swallows its own errors.
@@ -465,16 +514,27 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                 slug = str(record.get("slug") or path.stem)
                 a = ledger.load(slug)
                 sha = str(record.get("after_commit") or "")
+                rebased_to = ""
                 if is_expired(record, moment):
                     verdict = EXPIRED
                 elif a is None:
                     # No ledger row means there's nothing to resume — discard the reservation only.
                     verdict = STALE
                 else:
+                    branch = current_branch(root, _run)
+                    contains = head_contains(root, sha, _run) if sha else None
+                    if (branch == "main" and sha and contains is not True
+                            and record.get("patch_id")):
+                        # The sync rebase may have rewritten the sha — same patch counts.
+                        found, new_sha = find_rewritten(root, record, _run)
+                        if found is True:
+                            contains = True
+                            rebased_to = new_sha
+                            emit(f"{slug}: rebased: {sha} → {new_sha}")
                     verdict = evaluate(
                         record,
-                        branch=current_branch(root, _run),
-                        head_contains=head_contains(root, sha, _run) if sha else None,
+                        branch=branch,
+                        head_contains=contains,
                         state=a.state,
                         now=moment,
                     )
@@ -491,19 +551,24 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
                     a.state = FAILED
                     a.blocked_on = ""
                     a.updated_ts = _iso(moment - dt.timedelta(seconds=backdate_s))
+                    suffix = f" (rebased → {rebased_to[:12]})" if rebased_to else ""
                     a.last_note = (
-                        f"예약 재개: 볼트 main이 {sha or 'HEAD'}를 반영 — 재디스패치")[:200]
-                    a.history.append({"ts": _iso(moment), "type": RESUMED_SCHEDULED,
-                                      "from": "orchestrator", "after_commit": sha,
-                                      "note": str(record.get("note") or "")})
+                        f"예약 재개: 볼트 main이 {sha or 'HEAD'}를 반영{suffix} "
+                        f"— 재디스패치")[:200]
+                    entry = {"ts": _iso(moment), "type": RESUMED_SCHEDULED,
+                             "from": "orchestrator", "after_commit": sha,
+                             "note": str(record.get("note") or "")}
+                    if rebased_to:
+                        entry["rebased_to"] = rebased_to
+                    a.history.append(entry)
                     ledger.save(a)
                     path.unlink(missing_ok=True)
                     resumed.append(slug)
                     emit(f"{slug}: 조건 충족 — refail=0/state=failed/blocked_on='' "
                          f"+ updated_ts -{backdate_s:.0f}s, 예약 소비 "
-                         f"(after_commit={sha or '-'})")
+                         f"(after_commit={sha or '-'}{suffix})")
                     _notify(notify, f"♻️ 예약 재개: {slug} — 볼트 main이 "
-                                    f"{sha or 'HEAD'}를 반영해 재디스패치합니다",
+                                    f"{sha or 'HEAD'}{suffix}를 반영해 재디스패치합니다",
                             f"resume:{slug}", emit)
                 elif verdict == STALE:
                     # Leave the assignment alone. Someone already resumed it, or it's done.
