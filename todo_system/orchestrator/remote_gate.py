@@ -190,7 +190,16 @@ def node_params(cfg: dict) -> dict:
     Keys: ``project`` (None → gcloud active config), ``zone``, ``machine_type``,
     ``node`` (instance name), ``image`` (None for start-stop), ``hourly_rate_usd``
     (for the offline cost estimate). The real values are read from
-    ``.macp/remote_gate.json``; this module never hardcodes a project/node."""
+    ``.macp/remote_gate.json``; this module never hardcodes a project/node.
+
+    The ``create-delete`` create spec (see :func:`node_create_argv`) adds
+    optional keys, each OMITTED from the create argv when absent so a bare
+    config still creates a plain VM: ``spot`` / ``nested_virtualization`` /
+    ``no_address`` / ``no_service_account`` (bools, default False),
+    ``boot_disk_gb`` (int), ``boot_disk_type``, ``image_family`` (wins over
+    ``image``), ``image_project``, ``network``, ``subnet``, ``tags``,
+    ``service_account``, ``scopes``, ``labels`` (strings, gcloud's own
+    comma-separated forms)."""
     cfg = cfg or {}
     return {
         "project": cfg.get("project") or None,
@@ -199,7 +208,31 @@ def node_params(cfg: dict) -> dict:
         "node": str(cfg.get("node") or _DEFAULT_NODE_NAME),
         "image": cfg.get("image") or None,
         "hourly_rate_usd": _coerce_rate(cfg.get("hourly_rate_usd")),
+        "spot": _as_bool(cfg.get("spot")),
+        "nested_virtualization": _as_bool(cfg.get("nested_virtualization")),
+        "no_address": _as_bool(cfg.get("no_address")),
+        "no_service_account": _as_bool(cfg.get("no_service_account")),
+        "boot_disk_gb": _coerce_pos_int(cfg.get("boot_disk_gb")),
+        **{k: _opt_str(cfg.get(k)) for k in _CREATE_STR_KEYS},
     }
+
+
+# Optional string keys of the create spec, in the order their flags are emitted.
+_CREATE_STR_KEYS = ("boot_disk_type", "image_family", "image_project", "network",
+                    "subnet", "tags", "service_account", "scopes", "labels")
+
+
+def _opt_str(raw: object) -> str | None:
+    s = "" if raw is None else str(raw).strip()
+    return s or None
+
+
+def _coerce_pos_int(raw: object) -> int | None:
+    try:
+        v = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
 
 
 def _coerce_rate(raw: object) -> float:
@@ -544,41 +577,130 @@ def _ssh(run: Runner, params: dict, command: str, *, timeout: float) -> "subproc
     return run(argv, timeout=timeout)
 
 
-def _node_up(run: Runner, mode: str, params: dict, ttl_s: int, *, timeout: float) -> None:
+def node_create_argv(params: dict, ttl_s: int) -> list[str]:
+    """The ``instances create`` argv for ``create-delete``. Pure.
+
+    ``--max-run-duration`` + termination=DELETE are unconditional: a server-side
+    orphan backstop even if teardown is somehow missed (and, on a spot VM, a
+    preemption therefore deletes rather than stops). Every other spec flag comes
+    from :func:`node_params` and is omitted when its key is absent, so the engine
+    carries no node/image literal."""
+    argv = [_gcloud(), "compute", "instances", "create", params["node"],
+            "--zone", params["zone"], "--machine-type", params["machine_type"],
+            f"--max-run-duration={int(ttl_s)}s",
+            "--instance-termination-action=DELETE", "--quiet"]
+    if params.get("image_family"):
+        argv += ["--image-family", params["image_family"]]
+    elif params.get("image"):
+        argv += ["--image", params["image"]]
+    if params.get("image_project"):
+        argv += ["--image-project", params["image_project"]]
+    if params.get("spot"):
+        argv.append("--provisioning-model=SPOT")
+    if params.get("nested_virtualization"):
+        argv.append("--enable-nested-virtualization")
+    if params.get("boot_disk_gb"):
+        argv.append(f"--boot-disk-size={int(params['boot_disk_gb'])}GB")
+    flag = {"boot_disk_type": "--boot-disk-type", "network": "--network",
+            "subnet": "--subnet", "tags": "--tags", "labels": "--labels"}
+    for key in ("boot_disk_type", "network", "subnet", "tags", "labels"):
+        if params.get(key):
+            argv.append(f"{flag[key]}={params[key]}")
+    if params.get("no_service_account"):
+        argv += ["--no-service-account", "--no-scopes"]
+    else:
+        if params.get("service_account"):
+            argv.append(f"--service-account={params['service_account']}")
+        if params.get("scopes"):
+            argv.append(f"--scopes={params['scopes']}")
+    if params.get("no_address"):
+        argv.append("--no-address")
+    if params.get("project"):
+        argv += ["--project", params["project"]]
+    return argv
+
+
+# gcloud's not-found wording on describe/delete/stop of a missing instance
+# ("The resource '…/instances/x' was not found", or the API reason notFound).
+_NOT_FOUND_RE = re.compile(r"(?i)was not found|\bnotFound\b")
+# Statuses where the instance is (or is becoming) up — reuse, never create.
+_UP_STATUSES = ("RUNNING", "PROVISIONING", "STAGING", "REPAIRING")
+# Statuses where it exists but is down — `instances start` it.
+_DOWN_STATUSES = ("TERMINATED", "STOPPED", "SUSPENDED", "STOPPING", "SUSPENDING")
+
+
+def _is_not_found(r: object) -> bool:
+    return bool(_NOT_FOUND_RE.search((getattr(r, "stderr", "") or "")
+                                     + (getattr(r, "stdout", "") or "")))
+
+
+def _node_status(run: Runner, params: dict, *, timeout: float) -> str | None:
+    """The instance's status (``RUNNING``, ``TERMINATED``, …), or ``None`` when
+    it does not exist. Any other describe failure raises :class:`RemoteGateError`
+    — guessing "absent" there would create a second VM next to a live one."""
+    r = run(_base_node_argv(params, "instances", "describe") + ["--format=value(status)"],
+            timeout=timeout)
+    if getattr(r, "returncode", 1) != 0:
+        if _is_not_found(r):
+            return None
+        raise RemoteGateError(f"node describe rc={getattr(r, 'returncode', None)}")
+    return (getattr(r, "stdout", "") or "").strip().upper()
+
+
+def _node_up(run: Runner, mode: str, params: dict, ttl_s: int, *, timeout: float,
+             progress: Callable[[str], None] | None = None) -> str:
     """Start (start-stop) or create (create-delete) the node. Raises
     :class:`RemoteGateError` on a non-zero rc — an infra failure, so the caller
-    falls back to local. ``create`` passes ``--max-run-duration``/termination=DELETE
-    as a server-side orphan backstop even if teardown is somehow missed."""
+    falls back to local. Returns what it did: ``started`` / ``created`` /
+    ``reused``.
+
+    ``create-delete`` is idempotent so a retry after a spot preemption (which
+    DELETES the VM) and a second caller both work: describe first — up → reuse,
+    down → ``instances start``, absent → ``instances create``
+    (:func:`node_create_argv`)."""
+    say = progress or (lambda _m: None)
     if mode == "create-delete":
-        argv = [_gcloud(), "compute", "instances", "create", params["node"],
-                "--zone", params["zone"], "--machine-type", params["machine_type"],
-                f"--max-run-duration={int(ttl_s)}s",
-                "--instance-termination-action=DELETE", "--quiet"]
-        if params.get("image"):
-            argv += ["--image", params["image"]]
-        if params.get("project"):
-            argv += ["--project", params["project"]]
+        status = _node_status(run, params, timeout=timeout)
+        if status is None:
+            argv, action = node_create_argv(params, ttl_s), "created"
+        elif status in _UP_STATUSES:
+            say(f"remote gate: node already {status} — reused")
+            return "reused"
+        elif status in _DOWN_STATUSES:
+            argv, action = _base_node_argv(params, "instances", "start"), "started"
+        else:
+            raise RemoteGateError(f"node up (create-delete) unexpected status {status!r}")
     else:
-        argv = _base_node_argv(params, "instances", "start")
+        argv, action = _base_node_argv(params, "instances", "start"), "started"
     r = run(argv, timeout=timeout)
     if getattr(r, "returncode", 1) != 0:
         raise RemoteGateError(f"node up ({mode}) rc={getattr(r, 'returncode', None)}")
+    say(f"remote gate: node {action}")
+    return action
 
 
 def _node_down(run: Runner, mode: str, params: dict,
-               progress: Callable[[str], None], *, timeout: float = _STOP_TIMEOUT_S) -> None:
+               progress: Callable[[str], None], *, timeout: float = _STOP_TIMEOUT_S) -> int | None:
     """Stop (start-stop) or delete (create-delete) the node, NEVER raising.
 
     The twin of ``screen_check._stop_node``: runs in the inner ``finally`` on every
     exit path, with its OWN fixed timeout (not the expired cap deadline), so the
     VM is still torn down after a cap breach. Stopping/deleting an un-started node
-    is idempotent, so it is called unconditionally."""
+    is idempotent, so it is called unconditionally. Returns the gcloud rc — ``0``
+    also when the instance was already absent (a preempted create-delete VM is
+    already gone) — or ``None`` when the call itself raised."""
     sub = "delete" if mode == "create-delete" else "stop"
     try:
         r = run(_base_node_argv(params, "instances", sub), timeout=timeout)
-        progress(f"remote gate: node {sub} rc={getattr(r, 'returncode', None)}")
+        rc = getattr(r, "returncode", None)
+        if rc not in (0, None) and _is_not_found(r):
+            progress(f"remote gate: node {sub} — already absent")
+            return 0
+        progress(f"remote gate: node {sub} rc={rc}")
+        return rc
     except Exception as e:      # noqa: BLE001 — teardown must not mask the real outcome
         progress(f"remote gate: node {sub} skipped ({type(e).__name__})")
+        return None
 
 
 def _remote_prepare(run: Runner, params: dict, repo_url: str, sha: str, *, timeout: float) -> None:
@@ -710,7 +832,7 @@ def run_remote_gate(slug: str, repo_url: str, sha: str, cmd: str, *,
     error: str | None = None
     try:
         try:
-            _node_up(run, mode, params, ttl_s, timeout=_STOP_TIMEOUT_S)
+            _node_up(run, mode, params, ttl_s, timeout=_STOP_TIMEOUT_S, progress=progress)
             _remote_prepare(run, params, repo_url, sha, timeout=_SSH_PREP_TIMEOUT_S)
             rc, log_text = _remote_exec(run, params, cmd, timeout=cmd_timeout)
             junit = _harvest_junit(run, params, timeout=_STOP_TIMEOUT_S)
@@ -804,14 +926,86 @@ def poll_handle(handle: str, *, jobs_dir: Path | str = JOBS_DIR) -> dict:
     return {"state": "failed" if st == "failed" else "absent", "handle": handle}
 
 
+def node_script_env(cfg: dict | None, base_env: dict | None = None) -> dict:
+    """Environment for ``scripts/app-test-node``: ``base_env`` (default: this
+    process's env) plus the node identity from the vault config — ``node`` →
+    ``APP_TEST_NODE``, ``zone`` → ``APP_TEST_ZONE`` — when present, and
+    ``APP_TEST_PYTHON`` = this interpreter, so the script's ``start``/``stop``
+    reach :func:`_main`'s ``node-up``/``node-down`` with the same Python the
+    engine runs on. Absent keys leave the script's own defaults in force; the
+    real node identity stays in vault data, never a literal here."""
+    import sys
+
+    env = dict(os.environ if base_env is None else base_env)
+    node = (cfg or {}).get("node")
+    zone = (cfg or {}).get("zone")
+    if node:
+        env["APP_TEST_NODE"] = str(node)
+    if zone:
+        env["APP_TEST_ZONE"] = str(zone)
+    env.setdefault("APP_TEST_PYTHON", sys.executable)
+    return env
+
+
+# `node-up` gets longer than a stop: a create from an image restores the boot
+# disk before gcloud returns. Still bounded — the script then waits for ssh.
+_NODE_UP_CLI_TIMEOUT_S = 600
+# Exit code for "the helper cannot decide" (no vault config / unresolvable vault):
+# scripts/app-test-node falls back to its legacy direct start/stop ONLY on this
+# (or 127), never on a real gcloud failure.
+NODE_CLI_UNAVAILABLE = 3
+
+
+def _node_cli(action: str, *, run: Runner = _run, cfg: dict | None = None,
+              environ: dict | None = None) -> int:
+    """``node-up`` / ``node-down`` for ``scripts/app-test-node start|stop``.
+
+    Mode/spec come from the vault's ``.macp/remote_gate.json`` (``node_mode``:
+    start-stop → ``instances start|stop``; create-delete → idempotent
+    create-from-image / delete). ``APP_TEST_NODE`` / ``APP_TEST_ZONE`` override
+    the config's node/zone so the script and this helper always address the
+    same instance. rc: 0 ok (down: also already absent), 1 gcloud failure,
+    :data:`NODE_CLI_UNAVAILABLE` when there is no config to follow."""
+    import sys
+
+    def say(m: str) -> None:
+        print(m.replace("remote gate:", "app-test-node:"), file=sys.stderr)
+
+    env = os.environ if environ is None else environ
+    cfg = load_remote_config() if cfg is None else cfg
+    if not cfg:
+        say(f"remote gate: no node config at {REMOTE_CONFIG_PATH} — helper unavailable")
+        return NODE_CLI_UNAVAILABLE
+    params = node_params(cfg)
+    if env.get("APP_TEST_NODE"):
+        params["node"] = env["APP_TEST_NODE"]
+    if env.get("APP_TEST_ZONE"):
+        params["zone"] = env["APP_TEST_ZONE"]
+    mode = node_mode(cfg)
+    say(f"remote gate: {action} {params['node']} ({mode})")
+    if action == "node-up":
+        try:
+            _node_up(run, mode, params, per_run_vm_ttl_s(cfg),
+                     timeout=_NODE_UP_CLI_TIMEOUT_S, progress=say)
+        except (RemoteGateError, subprocess.SubprocessError, OSError) as e:
+            say(f"remote gate: node up failed ({e})")
+            return 1
+        return 0
+    rc = _node_down(run, mode, params, say)
+    return 0 if rc == 0 else 1
+
+
 def _main(argv: list[str] | None = None) -> int:
-    """`macp-remote-gate <decide|run|poll|result>` — see the wrapper's header."""
+    """`macp-remote-gate <decide|run|poll|result>` — see the wrapper's header.
+    `node-up` / `node-down` are the node lifecycle for ``scripts/app-test-node``."""
     import argparse
     import shlex
     import sys
 
     p = argparse.ArgumentParser(prog="macp-remote-gate")
     sub = p.add_subparsers(dest="action", required=True)
+    sub.add_parser("node-up", help="bring the node up per .macp/remote_gate.json node_mode")
+    sub.add_parser("node-down", help="stop/delete the node per node_mode (absent = ok)")
 
     d = sub.add_parser("decide", help="print remote|local (read-only)")
     d.add_argument("--repo", default=None, help="the TARGET repo checkout (.macp/gates.json)")
@@ -834,6 +1028,9 @@ def _main(argv: list[str] | None = None) -> int:
     sub.add_parser("result").add_argument("handle")
 
     args = p.parse_args(argv)
+
+    if args.action in ("node-up", "node-down"):
+        return _node_cli(args.action)
 
     if args.action == "decide":
         cmd = _join_cmd(args.cmd)

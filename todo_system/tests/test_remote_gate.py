@@ -32,6 +32,11 @@ _XML_B = '<testsuite name="B" tests="3" failures="0" errors="0" skipped="0"></te
 _XML_MIXED = '<testsuite name="C" tests="4" failures="1" errors="1" skipped="1"></testsuite>'
 
 
+# gcloud's real wording for a missing instance (neutral resource path).
+_NOT_FOUND_ERR = ("ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n"
+                  " - The resource 'projects/p/zones/z/instances/n' was not found\n")
+
+
 def _cfg(**over):
     base = {"enabled": True, "node_mode": "start-stop", "zone": "z", "node": "n",
             "machine_type": "mt", "image": None, "monthly_cap_usd": 20,
@@ -50,18 +55,28 @@ class FakeGcloud:
     ``harvest_xml`` is a list of JUnit XML strings the harvest ssh streams back."""
 
     def __init__(self, *, up_rc=0, exec_rc=0, harvest_xml=None,
-                 raise_on=None, raise_exc=None):
+                 raise_on=None, raise_exc=None, status=None, describe_rc=None,
+                 down_rc=0, down_err=""):
         self.calls: list[dict] = []
         self.up_rc = up_rc
         self.exec_rc = exec_rc
         self.harvest_xml = harvest_xml
         self.raise_on = raise_on
         self.raise_exc = raise_exc
+        # create-delete describes first: ``status=None`` = the instance is absent
+        # (gcloud's not-found stderr), else that status string on stdout.
+        # ``describe_rc`` forces a non-not-found describe failure.
+        self.status = status
+        self.describe_rc = describe_rc
+        self.down_rc = down_rc
+        self.down_err = down_err
 
     @staticmethod
     def _classify(argv: list[str]) -> str:
         a = list(argv)
         if "instances" in a:
+            if "describe" in a:
+                return "describe"
             if "create" in a or "start" in a:
                 return "up"
             if "delete" in a or "stop" in a:
@@ -83,11 +98,19 @@ class FakeGcloud:
             assert self.raise_exc is not None
             raise self.raise_exc
 
-        def cp(rc=0, out=""):
-            return subprocess.CompletedProcess(argv, rc, out, "")
+        def cp(rc=0, out="", err=""):
+            return subprocess.CompletedProcess(argv, rc, out, err)
 
+        if kind == "describe":
+            if self.describe_rc is not None:
+                return cp(self.describe_rc, "", "ERROR: permission denied")
+            if self.status is None:
+                return cp(1, "", _NOT_FOUND_ERR)
+            return cp(0, self.status + "\n")
         if kind == "up":
             return cp(self.up_rc, "")
+        if kind == "down":
+            return cp(self.down_rc, "", self.down_err)
         if kind == "exec":
             return cp(self.exec_rc,
                       "BUILD SUCCESSFUL" if self.exec_rc == 0 else "BUILD FAILED")
@@ -346,6 +369,203 @@ def test_create_delete_backend_passes_ttl_and_deletes(tmp_path):
     assert "--image" in up["argv"] and "toolchain-img" in up["argv"]
     assert "delete" in {t for c in fake.calls for t in c["argv"]}   # teardown deletes
     assert res["node_mode"] == "create-delete"
+
+
+# ---------------------------------------------------------------------------
+# create-delete: create spec, idempotent up, always-delete on every exit path
+# ---------------------------------------------------------------------------
+
+_CD_SPEC = {"node_mode": "create-delete", "image_family": "toolchain-fam",
+            "image_project": "img-proj", "spot": True, "nested_virtualization": True,
+            "boot_disk_gb": 40, "boot_disk_type": "pd-balanced",
+            "no_service_account": True, "labels": "purpose=test"}
+
+
+def test_node_create_argv_carries_the_configured_spec():
+    argv = rg.node_create_argv(rg.node_params(_cfg(**_CD_SPEC, image="toolchain-img")), 600)
+    assert argv[2:5] == ["instances", "create", "n"]
+    assert "--max-run-duration=600s" in argv
+    assert "--instance-termination-action=DELETE" in argv
+    assert argv[argv.index("--image-family") + 1] == "toolchain-fam"
+    assert "--image" not in argv                       # family wins over a plain image
+    assert argv[argv.index("--image-project") + 1] == "img-proj"
+    assert "--provisioning-model=SPOT" in argv
+    assert "--enable-nested-virtualization" in argv
+    assert "--boot-disk-size=40GB" in argv
+    assert "--boot-disk-type=pd-balanced" in argv
+    assert "--no-service-account" in argv and "--no-scopes" in argv
+    assert "--labels=purpose=test" in argv
+
+
+def test_node_create_argv_omits_every_optional_flag_when_absent():
+    argv = rg.node_create_argv(rg.node_params(_cfg(node_mode="create-delete")), 600)
+    joined = " ".join(argv)
+    for flag in ("--image", "--provisioning-model", "--enable-nested-virtualization",
+                 "--boot-disk", "--network", "--subnet", "--tags", "--service-account",
+                 "--scopes", "--no-service-account", "--no-address", "--labels", "--project"):
+        assert flag not in joined, flag
+    # the orphan backstop is unconditional
+    assert "--max-run-duration=600s" in argv
+    assert "--instance-termination-action=DELETE" in argv
+
+
+def test_node_params_tolerates_bad_spec_values():
+    p = rg.node_params(_cfg(spot="false", boot_disk_gb="x", boot_disk_type="  "))
+    assert p["spot"] is False and p["boot_disk_gb"] is None and p["boot_disk_type"] is None
+
+
+def _up(fake, cfg, *, progress=None):
+    return rg._node_up(fake, rg.node_mode(cfg), rg.node_params(cfg), 600,
+                       timeout=5, progress=progress)
+
+
+def test_create_delete_up_reuses_a_running_node_without_create():
+    fake = FakeGcloud(status="RUNNING")
+    assert _up(fake, _cfg(**_CD_SPEC)) == "reused"
+    assert fake.kinds() == ["describe"]
+
+
+def test_create_delete_up_creates_when_absent():
+    fake = FakeGcloud(status=None)
+    assert _up(fake, _cfg(**_CD_SPEC)) == "created"
+    assert fake.kinds() == ["describe", "up"]
+    assert "create" in fake.calls[1]["argv"]
+    assert "--instance-termination-action=DELETE" in fake.calls[1]["argv"]
+
+
+def test_create_delete_up_starts_an_existing_stopped_node():
+    fake = FakeGcloud(status="TERMINATED")
+    assert _up(fake, _cfg(**_CD_SPEC)) == "started"
+    assert "start" in fake.calls[1]["argv"] and "create" not in fake.calls[1]["argv"]
+
+
+def test_create_delete_up_raises_on_a_non_not_found_describe_failure():
+    fake = FakeGcloud(describe_rc=1)
+    try:
+        _up(fake, _cfg(**_CD_SPEC))
+    except rg.RemoteGateError:
+        pass
+    else:
+        raise AssertionError("expected RemoteGateError")
+    assert fake.kinds() == ["describe"]                # never guesses "absent" → no create
+
+
+def test_start_stop_up_is_unchanged_no_describe():
+    fake = FakeGcloud()
+    assert _up(fake, _cfg()) == "started"
+    assert fake.kinds() == ["up"] and "start" in fake.calls[0]["argv"]
+
+
+def _deleted(fake) -> bool:
+    return any("delete" in c["argv"] for c in fake.calls)
+
+
+def test_create_delete_success_deletes(tmp_path):
+    fake = FakeGcloud(harvest_xml=[_XML_A])
+    res = _run_gate(tmp_path, fake, cfg=_cfg(**_CD_SPEC))
+    assert res["rc"] == 0 and res["fell_back_local"] is False
+    assert _deleted(fake) and fake.kinds()[-1] == "down"
+
+
+def test_create_delete_build_failure_still_deletes(tmp_path):
+    fake = FakeGcloud(exec_rc=1, harvest_xml=[_XML_MIXED])
+    res = _run_gate(tmp_path, fake, cfg=_cfg(**_CD_SPEC))
+    assert res["rc"] == 1 and _deleted(fake)
+
+
+def test_create_delete_exception_still_deletes(tmp_path):
+    fake = FakeGcloud(raise_on="prepare", raise_exc=RuntimeError("ssh exploded"))
+    res = _run_gate(tmp_path, fake, cfg=_cfg(**_CD_SPEC))
+    assert res["fell_back_local"] is True and _deleted(fake)
+
+
+def test_create_delete_timeout_still_deletes(tmp_path):
+    fake = FakeGcloud(raise_on="exec",
+                      raise_exc=subprocess.TimeoutExpired(cmd=["ssh"], timeout=1))
+    res = _run_gate(tmp_path, fake, cfg=_cfg(**_CD_SPEC))
+    assert res["fell_back_local"] is True and _deleted(fake)
+
+
+def test_create_delete_describe_failure_falls_back_and_still_deletes(tmp_path):
+    fake = FakeGcloud(describe_rc=1)
+    res = _run_gate(tmp_path, fake, cfg=_cfg(**_CD_SPEC))
+    assert res["fell_back_local"] is True and _deleted(fake)
+
+
+def test_node_down_already_absent_is_ok_and_never_raises():
+    lines: list[str] = []
+    fake = FakeGcloud(down_rc=1, down_err=_NOT_FOUND_ERR)
+    rc = rg._node_down(fake, "create-delete", rg.node_params(_cfg()), lines.append)
+    assert rc == 0 and "already absent" in lines[-1]
+
+
+def test_node_down_real_failure_returns_rc_and_raise_is_absorbed():
+    fake = FakeGcloud(down_rc=1, down_err="ERROR: quota")
+    assert rg._node_down(fake, "create-delete", rg.node_params(_cfg()), lambda _m: None) == 1
+    boom = FakeGcloud(raise_on="down", raise_exc=subprocess.TimeoutExpired(["g"], 1))
+    assert rg._node_down(boom, "create-delete", rg.node_params(_cfg()), lambda _m: None) is None
+
+
+# ---------------------------------------------------------------------------
+# node-up / node-down CLI (scripts/app-test-node start|stop) + node_script_env
+# ---------------------------------------------------------------------------
+
+def test_node_cli_up_applies_env_overrides_and_creates(capsys):
+    fake = FakeGcloud(status=None)
+    rc = rg._node_cli("node-up", run=fake, cfg=_cfg(**_CD_SPEC),
+                      environ={"APP_TEST_NODE": "n-cd", "APP_TEST_ZONE": "z2"})
+    assert rc == 0
+    for call in fake.calls:
+        a = call["argv"]
+        assert "n-cd" in a and a[a.index("--zone") + 1] == "z2"
+    assert fake.kinds() == ["describe", "up"]
+    assert "app-test-node:" in capsys.readouterr().err
+
+
+def test_node_cli_down_deletes_and_absent_is_rc0():
+    fake = FakeGcloud()
+    assert rg._node_cli("node-down", run=fake, cfg=_cfg(**_CD_SPEC), environ={}) == 0
+    assert "delete" in fake.calls[0]["argv"] and "n" in fake.calls[0]["argv"]
+    gone = FakeGcloud(down_rc=1, down_err=_NOT_FOUND_ERR)
+    assert rg._node_cli("node-down", run=gone, cfg=_cfg(**_CD_SPEC), environ={}) == 0
+    failed = FakeGcloud(down_rc=1, down_err="ERROR: quota")
+    assert rg._node_cli("node-down", run=failed, cfg=_cfg(**_CD_SPEC), environ={}) == 1
+
+
+def test_node_cli_start_stop_mode_uses_start_and_stop():
+    up = FakeGcloud()
+    assert rg._node_cli("node-up", run=up, cfg=_cfg(), environ={}) == 0
+    assert up.kinds() == ["up"] and "start" in up.calls[0]["argv"]
+    down = FakeGcloud()
+    assert rg._node_cli("node-down", run=down, cfg=_cfg(), environ={}) == 0
+    assert "stop" in down.calls[0]["argv"]
+
+
+def test_node_cli_up_failure_is_rc1():
+    fake = FakeGcloud(status=None, up_rc=1)
+    assert rg._node_cli("node-up", run=fake, cfg=_cfg(**_CD_SPEC), environ={}) == 1
+
+
+def test_node_cli_without_config_is_unavailable_and_touches_nothing():
+    fake = FakeGcloud()
+    assert rg._node_cli("node-up", run=fake, cfg={}, environ={}) == rg.NODE_CLI_UNAVAILABLE
+    assert rg._node_cli("node-down", run=fake, cfg={}, environ={}) == rg.NODE_CLI_UNAVAILABLE
+    assert fake.calls == []
+
+
+def test_main_dispatches_node_subcommands(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(rg, "_node_cli", lambda action, **_kw: seen.append(action) or 0)
+    assert rg._main(["node-up"]) == 0 and rg._main(["node-down"]) == 0
+    assert seen == ["node-up", "node-down"]
+
+
+def test_node_script_env_maps_config_and_pins_python():
+    env = rg.node_script_env({"node": "n", "zone": "z"}, {"KEEP": "1"})
+    assert env["APP_TEST_NODE"] == "n" and env["APP_TEST_ZONE"] == "z"
+    assert env["KEEP"] == "1" and env["APP_TEST_PYTHON"]
+    bare = rg.node_script_env({}, {})
+    assert "APP_TEST_NODE" not in bare and "APP_TEST_ZONE" not in bare
 
 
 def test_per_run_timeout_default_is_the_vm_ttl(tmp_path):
