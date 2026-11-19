@@ -13,6 +13,7 @@ from typing import Iterable
 
 from .calendar_sync import (
     parse_calendar_route,
+    record_completion_transition,
     render_calendar_markdown,
     render_unified_markdown,
     sync_due_tasks_to_calendar,
@@ -1127,6 +1128,8 @@ def snapshot_mtime() -> dict[str, float]:
 
 
 def upsert_task(con: sqlite3.Connection, task: ParsedTask, lane: str | None) -> None:
+    # open→done of a human timed block: stamp `completed:` in the md for the calendar (calendar_sync.py).
+    record_completion_transition(con, task.slug, task.status, task.worker_mode, ROOT / task.path)
     now = dt.datetime.now().isoformat(timespec="seconds")
     # Resolve priority: frontmatter overrides; fallback to lane default; else 50
     priority = task.priority

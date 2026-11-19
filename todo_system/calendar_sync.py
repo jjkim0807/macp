@@ -13,7 +13,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from .ownership import human_owned_sql_filter
+from .ownership import human_owned_sql_filter, is_worker_owned
 from . import paths
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -599,6 +599,235 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
         return []
 
 
+# ---------------------------------------------------------------------------
+# Done human blocks → trimmed to the real completion time (2026-11-19)
+# ---------------------------------------------------------------------------
+# A human task with a timed block used to lose its event the moment its md
+# went `status: done` (the stale-event cleanup deleted it), so the calendar
+# kept no record of when the work actually happened. Now the todo import
+# stamps `completed: "YYYY-MM-DD HH:MM"` on the open→done transition
+# (:func:`record_completion_transition`) and the sync re-shapes the event to
+# end at that time, titles it `✅ …`, and swaps its private `todo_slug` for
+# `todo_done_slug` — so the cleanup, the calendar→md pull and the overdue mover
+# all leave it alone. Done events are deleted `MACP_CALENDAR_DONE_KEEP_DAYS`
+# (default 30) after completion.
+#
+# A done task that is reopened keeps its ✅ event as history until it ages
+# out; the reopened task simply gets a fresh `todo_slug` event beside it.
+
+DONE_MIN = dt.timedelta(minutes=15)
+DONE_KEEP_DAYS_DEFAULT = 30
+_DONE_MARK = "✅"
+
+
+def _now_local() -> dt.datetime:
+    """Local wall-clock now (naive, minute precision) for the done-block code.
+    One seam so tests can pin it; older code keeps its own clocks."""
+    return dt.datetime.now(_event_tzinfo()).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def _parse_completed(raw: str | None) -> dt.datetime | None:
+    """A `completed:` value (`YYYY-MM-DD HH:MM`, `T` or 1-digit hour ok) as a
+    naive local datetime, or None for empty / `-` / junk."""
+    if not raw:
+        return None
+    m = re.match(r"\s*['\"]?(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})", str(raw))
+    if not m:
+        return None
+    try:
+        d = dt.date.fromisoformat(m.group(1))
+        return dt.datetime(d.year, d.month, d.day, int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _fmt_completed(t: dt.datetime) -> str:
+    return t.strftime("%Y-%m-%d %H:%M")
+
+
+def done_block_window(start: dt.datetime, end: dt.datetime,
+                      completed: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+    """The (start, end) a done block's event takes, on naive local datetimes.
+
+    Rules (``c`` = completion, ``[s, e]`` = the planned block):
+
+    1. ``s <= c <= e`` (finished inside the block): ``[s, max(c, s + 15m)]``.
+    2. ``c > e`` on the block's start day (ran over): ``[s, c]``.
+    3. Otherwise (before the block, or another day): the block keeps its
+       length (at least 15m) and moves to end at ``c``.
+
+    Every rule keeps at least 15 minutes. Pure — unit-tested.
+    """
+    if start <= completed <= end:
+        return start, max(completed, start + DONE_MIN)
+    if completed > end and completed.date() == start.date():
+        return start, completed
+    length = max(end - start, DONE_MIN)
+    return completed - length, completed
+
+
+def _done_title(title: str) -> str:
+    """`✅ <title>` with exactly one mark, whatever the title already had."""
+    return f"{_DONE_MARK} " + re.sub(rf"^(?:\s|{_DONE_MARK})+", "", title or "")
+
+
+def _done_keep_days() -> int:
+    """`MACP_CALENDAR_DONE_KEEP_DAYS` (default 30; junk or < 1 → 30)."""
+    try:
+        n = int(os.environ.get("MACP_CALENDAR_DONE_KEEP_DAYS", "").strip())
+    except ValueError:
+        return DONE_KEEP_DAYS_DEFAULT
+    return n if n >= 1 else DONE_KEEP_DAYS_DEFAULT
+
+
+def _timed_when(t: dt.datetime) -> dict[str, str]:
+    """A naive local datetime as an event start/end (same shape as
+    :func:`_event_window`'s timed form)."""
+    d = {"dateTime": t.isoformat()}
+    tz = _event_timezone()
+    if tz:
+        d["timeZone"] = tz
+    return d
+
+
+def _event_end_local(ev: dict) -> dt.datetime | None:
+    end = ev.get("end") or {}
+    if end.get("dateTime"):
+        try:
+            t = dt.datetime.fromisoformat(str(end["dateTime"]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if t.tzinfo is not None:
+            t = t.astimezone(_event_tzinfo()).replace(tzinfo=None)
+        return t
+    if end.get("date"):
+        try:
+            d = dt.date.fromisoformat(str(end["date"]))
+        except ValueError:
+            return None
+        return dt.datetime(d.year, d.month, d.day)
+    return None
+
+
+def _done_event_expired(ev: dict, now: dt.datetime, keep_days: int) -> bool:
+    """A done event is past its keep window: measured from private
+    `macp_completed`, else (a hand-detached event) from the event's end."""
+    priv = (ev.get("extendedProperties") or {}).get("private") or {}
+    ref = _parse_completed(priv.get("macp_completed")) or _event_end_local(ev)
+    if ref is None:
+        return False
+    return now - ref > dt.timedelta(days=keep_days)
+
+
+def record_completion_transition(con: sqlite3.Connection, slug: str, new_status: str | None,
+                                 worker_mode: str | None, md_path: Path,
+                                 now: dt.datetime | None = None) -> str | None:
+    """Stamp `completed: "YYYY-MM-DD HH:MM"` into a task md on its open→done.
+
+    Called by ``cli.upsert_task`` BEFORE it overwrites the row, so the DB still
+    holds the previous status. Writes only when all hold: the md says done, the
+    DB row exists and is `open`, the task is human-owned, its md has a timed
+    block, and the md has no `completed:` yet. A task first seen already done
+    (old done) is never stamped. Returns the stamp written, else None. Never
+    raises — a failure here must not break the todo import.
+    """
+    try:
+        if (new_status or "").strip().lower() != "done":
+            return None
+        row = con.execute("SELECT status FROM tasks WHERE slug = ?", (slug,)).fetchone()
+        if row is None or str(row[0] or "").strip().lower() != "open":
+            return None
+        if is_worker_owned(worker_mode):
+            return None
+        from .cli import parse_frontmatter, update_frontmatter_value
+        path = Path(md_path)
+        text = path.read_text(encoding="utf-8")
+        fm, _ = parse_frontmatter(text)
+        done_at = fm.get("completed")
+        if isinstance(done_at, str) and done_at.strip() not in ("", "-"):
+            return None
+        sched = fm.get("scheduled")
+        d, s, e = _parse_scheduled_value(sched if isinstance(sched, str) else None)
+        if not (d and s and e):
+            return None
+        stamp = _fmt_completed(now or _now_local())
+        path.write_text(update_frontmatter_value(text, "completed", f'"{stamp}"'), encoding="utf-8")
+        print(f"calendar: recorded completed {slug} {stamp}")
+        return stamp
+    except Exception as exc:  # noqa: BLE001 - never break the import
+        print(f"calendar: completed record skipped — {exc}")
+        return None
+
+
+def _finalize_done_event(service, calendar_id: str, slug: str, title: str, next_action: str,
+                         source_path: str, block: tuple[dt.datetime, dt.datetime],
+                         completed: dt.datetime) -> str:
+    """Re-shape one done task's event: `✅ title`, trimmed/moved to end at the
+    completion time, private `todo_slug` swapped for `todo_done_slug`.
+
+    An event already marked `todo_done_slug` (a previous run, or one detached
+    by hand) is reused before a live `todo_slug` one, so no duplicate appears;
+    any extra copies are deleted. Returns created / updated / unchanged — a
+    done event already in the desired shape costs no API write.
+    """
+    def _find(key: str) -> list[dict]:
+        return (
+            service.events()
+            .list(calendarId=calendar_id, privateExtendedProperty=f"{key}={slug}",
+                  singleEvents=True, maxResults=50)
+            .execute()
+            .get("items", [])
+        )
+
+    done_items, live_items = _find("todo_done_slug"), _find("todo_slug")
+    candidates = done_items + [e for e in live_items
+                               if e.get("id") not in {d.get("id") for d in done_items}]
+    target = candidates[0] if candidates else None
+    for item in candidates[1:]:
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=item["id"]).execute()
+        except Exception:
+            # Already gone (HTTP 410) or otherwise unavailable.
+            pass
+
+    s, e = done_block_window(*block, completed)
+    stamp = _fmt_completed(completed)
+    private: dict[str, object] = {
+        # Explicit null: Google's patch merges private keys, so only a null
+        # removes the live `todo_slug` (see _clear_other_shape).
+        "todo_slug": None,
+        "todo_done_slug": slug,
+        "todo_source": source_path,
+        "macp_completed": stamp,
+    }
+    body: dict[str, object] = {
+        "summary": _done_title(title),
+        "description": f"slug: {slug}\nnext_action: {next_action or '-'}\nsource: {source_path}",
+        "start": _timed_when(s),
+        "end": _timed_when(e),
+        "extendedProperties": {"private": private},
+        "reminders": {"useDefault": False, "overrides": []},
+    }
+
+    if target is None:
+        private.pop("todo_slug")
+        service.events().insert(calendarId=calendar_id, body=body).execute()
+        return "created"
+
+    priv = (target.get("extendedProperties") or {}).get("private") or {}
+    if (priv.get("todo_done_slug") == slug
+            and not priv.get("todo_slug")
+            and priv.get("macp_completed") == stamp
+            and target.get("summary") == body["summary"]
+            and _canon(target.get("start") or {}) == _canon(body["start"])
+            and _canon(target.get("end") or {}) == _canon(body["end"])):
+        return "unchanged"
+
+    body["start"], body["end"] = _clear_other_shape(body["start"]), _clear_other_shape(body["end"])
+    service.events().patch(calendarId=calendar_id, eventId=target["id"], body=body).execute()
+    return "updated"
+
+
 # (tag, calendarId) — one `--calendar-route TAG=CALENDAR_ID` flag.
 CalendarRoute = tuple[str, str]
 
@@ -676,6 +905,13 @@ def sync_due_tasks_to_calendar(
     unrouted task goes to ``calendar_id``. Cleanup covers every managed
     calendar (``calendar_id`` plus each route calendar). No routes → only
     ``calendar_id``, exactly as before routing existed.
+
+    Done human tasks with a timed block and a `completed:` stamp (written by
+    :func:`record_completion_transition`) keep their event as a `✅` record
+    trimmed to the completion time (:func:`_finalize_done_event`); done events
+    are deleted ``MACP_CALENDAR_DONE_KEEP_DAYS`` (default 30) after completion.
+    A done task without `completed:` (done before 2026-11-19) loses its event
+    as before. A reopened task's ✅ event stays as history until it ages out.
     """
     creds = load_credentials(client_secret_path, token_path)
     service = build("calendar", "v3", credentials=creds)
@@ -739,11 +975,47 @@ def sync_due_tasks_to_calendar(
         for r in rows
     }
 
+    # Done human blocks that keep a ✅ event (2026-11-19). Collected BEFORE the
+    # cleanup: a task that just went done still has its live `todo_slug` event,
+    # which the cleanup would otherwise delete before it can be trimmed.
+    now_local = _now_local()
+    keep_days = _done_keep_days()
+    done_targets: list[tuple[sqlite3.Row, str, tuple[dt.datetime, dt.datetime], dt.datetime]] = []
+    try:
+        done_rows = con.execute(
+            f"""
+            SELECT {cols}
+            FROM tasks
+            WHERE status = 'done'
+              AND {human_owned}
+            ORDER BY title
+            """,
+            human_params,
+        ).fetchall()
+        for r in done_rows:
+            src = str(r["path"])
+            d, s, e = _parse_scheduled(src)
+            if not (d and s and e):
+                continue
+            completed = _parse_completed(_extract_field_from_markdown(src, "completed"))
+            if completed is None or now_local - completed > dt.timedelta(days=keep_days):
+                continue
+            cal = (route_calendar(_split_tags(r["tags"]), calendar_routes, calendar_id)
+                   if calendar_routes else calendar_id)
+            done_targets.append((r, cal, _block_bounds(d, s, e), completed))
+    except Exception as exc:  # noqa: BLE001 - old behaviour beats a dead tick
+        print(f"calendar: done blocks skipped — {exc}")
+        done_targets = []
+    done_cal_by_slug = {str(r["slug"]): cal for r, cal, _, _ in done_targets}
+
     # --- Cleanup: delete stale events in every managed calendar ---
     # Stale = the event's todo_slug is not synced any more, or is synced to a
     # different calendar (the task moved: it is inserted fresh in its new
     # calendar from the md, so edits made to the old event in the calendar app
-    # are dropped). Events without a todo_slug are never touched.
+    # are dropped). A just-done task's `todo_slug` event is kept for
+    # _finalize_done_event below. Done events (`todo_done_slug`, no
+    # `todo_slug`) are kept until MACP_CALENDAR_DONE_KEEP_DAYS after
+    # completion. Events with neither key are never touched.
     # Lookback is generous: an event only gets deleted if it carries a
     # todo_slug we no longer sync here, and events drift out of a narrow window
     # (done long ago, or newly worker-owned) faster than they get cleaned.
@@ -767,8 +1039,17 @@ def sync_due_tasks_to_calendar(
                 .execute()
             )
             for ev in all_events.get("items", []):
-                slug = ev.get("extendedProperties", {}).get("private", {}).get("todo_slug")
-                if slug and target_by_slug.get(slug) != cal:
+                priv = (ev.get("extendedProperties") or {}).get("private") or {}
+                slug = priv.get("todo_slug")
+                done_slug = priv.get("todo_done_slug")
+                if slug:
+                    stale = (target_by_slug.get(slug) != cal
+                             and done_cal_by_slug.get(slug) != cal)
+                else:
+                    stale = bool(done_slug
+                                 and done_cal_by_slug.get(done_slug) != cal
+                                 and _done_event_expired(ev, now_local, keep_days))
+                if stale:
                     try:
                         service.events().delete(calendarId=cal, eventId=ev["id"]).execute()
                         deleted_stale += 1
@@ -801,6 +1082,20 @@ def sync_due_tasks_to_calendar(
             source_path=source_path,
             due_from_scheduled=not has_due,
         )
+        if result != "unchanged":
+            created_or_updated += 1
+
+    # Done blocks → ✅ events ending at the completion time. They carry no
+    # `todo_slug`, so the upserts above never pull them into the md, and the
+    # overdue mover below only sees open `rows`.
+    for r, cal, block, completed in done_targets:
+        try:
+            result = _finalize_done_event(
+                service, cal, str(r["slug"]), str(r["title"]), str(r["next_action"] or ""),
+                str(r["path"]), block, completed)
+        except Exception as exc:  # noqa: BLE001 - one bad event must not stop the sync
+            print(f"calendar: done block {r['slug']} skipped — {exc}")
+            continue
         if result != "unchanged":
             created_or_updated += 1
 
