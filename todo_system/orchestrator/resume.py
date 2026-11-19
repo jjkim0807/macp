@@ -18,6 +18,15 @@ Reservation records live in `Worker/_state/pending_resumes/<slug>.json`.
 committing a reservation pinned to "how far has this checkout's HEAD gotten"
 would let another host consume someone else's condition.
 
+**Surviving a rebased commit.** The vault sync daemon runs `pull --rebase
+origin main`, which rewrites a local commit not yet pushed to a new sha
+(2026-11-17: `6d70667aa` became `0cd391875`, and the reservation waited until
+it expired). So `schedule()` also stores the commit's `git patch-id --stable`
+(+ its committer date and changed paths), and when the old sha is not an
+ancestor of HEAD the sweep looks for the same patch in HEAD's history since that
+date (`find_rewritten()`). Records written before this — no `patch_id` — keep
+the strict ancestor check and make no extra git call.
+
 Design constraints:
 
 - **stdlib only.** This code runs on the orchestrator's tick path, and the
@@ -154,9 +163,14 @@ def evaluate(record: dict, *, branch: str | None, head_contains: bool | None,
 
 def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = None,
              expire_hours: float = DEFAULT_EXPIRE_HOURS, note: str = "",
-             now: dt.datetime | None = None) -> Path:
+             now: dt.datetime | None = None, _run=None) -> Path:
     """Write a reservation record. A reservation that can't be accepted is
     rejected with `ResumeError`.
+
+    With `after_commit`, the record also carries the commit's signature
+    (`commit_signature()`: `patch_id`/`commit_ts`/`paths`) when it can be
+    captured, so the sweep still recognizes the commit after a vault sync
+    rebase rewrites its sha. A failed capture never refuses the reservation.
 
     **Both** `Todo/items/<slug>.md` and `Worker/assignments/<slug>.json`
     must exist: if only the md exists, there's nothing to resume (it has
@@ -187,6 +201,8 @@ def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = No
         "expires_ts": _iso(when + dt.timedelta(hours=expire_hours)),
         "note": note or "",
     }
+    if record["after_commit"]:
+        record.update(commit_signature(root, record["after_commit"], _run))
     path = record_path(root, slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n",
@@ -194,10 +210,102 @@ def schedule(vault_root: str | Path, slug: str, *, after_commit: str | None = No
     return path
 
 
-def _git(root: Path, args: list[str], _run=None, *, timeout: float = 30):
+def _git(root: Path, args: list[str], _run=None, *, timeout: float = 30,
+         input: str | None = None):
     run = _run or subprocess.run
-    return run(["git", *args], cwd=root, capture_output=True, text=True,
-               timeout=timeout)
+    kwargs = {"cwd": root, "capture_output": True, "text": True, "timeout": timeout}
+    if input is not None:
+        # Only passed when needed, so `_run` fakes that predate stdin keep working.
+        kwargs["input"] = input
+    return run(["git", *args], **kwargs)
+
+
+# The ONE diff rendering both sides of the patch-id comparison use. The stored
+# patch-id (schedule) and the search (consume) must render diffs byte-for-byte
+# alike or equal patches get different ids — so neither side builds its own flags.
+_LOG_PATCH_FLAGS = ["-p", "--no-color", "--no-ext-diff", "--no-textconv",
+                    "--no-renames", "--no-decorate", "--no-show-signature",
+                    "--no-merges"]
+
+# `paths` narrows the fallback search; a commit touching more files than this
+# does not narrow anything worth the record size, so the key is omitted.
+_MAX_SIGNATURE_PATHS = 100
+
+# The fallback search walks at most this many commits of HEAD's history.
+_SEARCH_MAX_COUNT = 1000
+
+# Lower-bound slack for the fallback search (clock skew between hosts).
+_SEARCH_SLACK = dt.timedelta(hours=1)
+
+
+def _patch_ids(root: Path, log_args: list[str], _run=None, *,
+               timeout: float = 30) -> list[tuple[str, str]] | None:
+    """`git log <log_args>` piped into `git patch-id --stable`.
+
+    Returns `(patch_id, commit)` pairs, or None on any exception / non-zero rc.
+    """
+    try:
+        log = _git(root, ["log", *log_args], _run, timeout=timeout)
+        if getattr(log, "returncode", 1) != 0:
+            return None
+        pid = _git(root, ["patch-id", "--stable"], _run, timeout=timeout,
+                   input=log.stdout or "")
+        if getattr(pid, "returncode", 1) != 0:
+            return None
+    except Exception:
+        return None
+    pairs: list[tuple[str, str]] = []
+    for line in (pid.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            pairs.append((parts[0], parts[1]))
+    return pairs
+
+
+def commit_signature(root: str | Path, sha: str, _run=None) -> dict:
+    """What `schedule()` stores so a rebased commit can still be recognized.
+
+    Returns `{"patch_id", "commit_ts"[, "paths"]}` or `{}` — **never raises**, so a
+    reservation is never refused because the signature could not be captured
+    (the record then simply keeps the strict ancestor check).
+
+    - Captured only when `root` itself is the git toplevel: a tmp vault that
+      happens to sit inside some other checkout must not pick up that repo's
+      commit by the same abbreviated sha.
+    - A merge or empty commit yields no single patch-id → `{}` (old behaviour).
+    """
+    try:
+        root = Path(root)
+        sha = (sha or "").strip()
+        if not sha:
+            return {}
+        top = _git(root, ["rev-parse", "--show-toplevel"], _run)
+        if getattr(top, "returncode", 1) != 0:
+            return {}
+        if Path((top.stdout or "").strip()).resolve() != root.resolve():
+            return {}
+        full_p = _git(root, ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], _run)
+        if getattr(full_p, "returncode", 1) != 0:
+            return {}
+        full = (full_p.stdout or "").strip()
+        if not full:
+            return {}
+        pairs = _patch_ids(root, ["-1", *_LOG_PATCH_FLAGS, full], _run)
+        if not pairs or len(pairs) != 1 or pairs[0][1] != full:
+            return {}
+        sig: dict = {"patch_id": pairs[0][0]}
+        ts = _git(root, ["show", "-s", "--format=%cI", full], _run)
+        if getattr(ts, "returncode", 1) != 0 or not (ts.stdout or "").strip():
+            return {}
+        sig["commit_ts"] = ts.stdout.strip()
+        names = _git(root, ["show", "--format=", "--name-only", "--no-renames", full], _run)
+        if getattr(names, "returncode", 1) == 0:
+            paths = sorted({p for p in (names.stdout or "").splitlines() if p.strip()})
+            if 0 < len(paths) <= _MAX_SIGNATURE_PATHS:
+                sig["paths"] = paths
+        return sig
+    except Exception:
+        return {}
 
 
 def current_branch(root: str | Path, _run=None) -> str | None:
