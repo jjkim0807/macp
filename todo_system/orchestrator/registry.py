@@ -57,6 +57,10 @@ class Agent:
         """True if this agent owns `project_slug` (exact or glob, e.g. withdrawal-*)."""
         return any(fnmatch.fnmatch(project_slug, pat) for pat in self.projects)
 
+    def matches_exactly(self, project_slug: str) -> bool:
+        """True if this agent lists `project_slug` verbatim (not via a glob)."""
+        return project_slug in self.projects
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Agent":
         known = {f for f in cls.__dataclass_fields__ if f != "raw"}
@@ -78,17 +82,24 @@ class Registry:
         except KeyError:
             raise KeyError(f"no agent '{agent_id}' in registry") from None
 
-    def for_project(self, project_slug: str) -> Agent | None:
+    def for_project(self, project_slug: str, *,
+                    skip_human_globs: bool = False) -> Agent | None:
         """Resolve the owning agent for a task/project slug.
 
         Exact project match wins over a glob match; among globs, the most
         specific (longest non-wildcard prefix) wins so `withdrawal-a2` prefers
         an agent listing `withdrawal-a2` over one listing `withdrawal-*`.
+
+        `skip_human_globs=True` drops human agents from the GLOB candidates only
+        (an exact human listing still wins) — the router's "a dispatchable
+        worker_mode beats a human glob" lookup. The default keeps every existing
+        caller's answer unchanged.
         """
         exact = [a for a in self.agents if project_slug in a.projects]
         if exact:
             return exact[0]
-        globbers = [a for a in self.agents if a.handles(project_slug)]
+        globbers = [a for a in self.agents if a.handles(project_slug)
+                    and not (skip_human_globs and a.is_human)]
         if not globbers:
             return None
         return max(globbers, key=lambda a: self._match_specificity(a, project_slug))
