@@ -25,6 +25,9 @@ Design constraints (identical to :mod:`resume`):
   an uncertainty would merge a change nobody saw run. The one exception is
   **expiry**: a broken or past expiry goes to discard + alert, never silent
   forever-wait (the "does not silently linger" criterion ``resume`` also holds).
+- **A PR already merged/closed outside the hold is discarded silently** by the
+  caller (:func:`resolved_outside` is the pure check; the gh lookup lives in the
+  orchestrator, not here) — no expiry alert for work a person already finished.
 - **All paths are injected.** ``vault_root`` is a required argument of every public
   function, so tests never escape ``tmp_path``.
 """
@@ -55,6 +58,11 @@ RELEASE = "release"  # device pass for the held sha + a releasable state — mer
 WAIT = "wait"        # no device pass yet, or a different sha — keep the hold
 STALE = "stale"      # already resolved / done — discard the hold, leave the task alone
 EXPIRED = "expired"  # expired before a device pass arrived — discard + alert once
+
+# Definite PR states that mean the hold was resolved OUTSIDE it (a person merged
+# or closed the PR by hand). The caller looks the state up (gh lives in the
+# orchestrator, not here) and discards such a hold silently — no expiry alert.
+RESOLVED_OUTSIDE_STATES = frozenset({"MERGED", "CLOSED"})
 
 _SKIP_LINE_CAP = 3
 # A run dir is named ``<YYYYMMDDTHHMMSS>-<slug>``; this reads the leading stamp.
@@ -143,6 +151,18 @@ def evaluate(record: dict, *, device_pass: bool, device_pass_sha: str | None,
     if state not in RELEASABLE_STATES:
         return STALE
     return RELEASE
+
+
+def resolved_outside(pr_state: str | None) -> bool:
+    """Pure: was the held PR already merged or closed outside the hold? No I/O.
+
+    True only for a DEFINITE ``MERGED`` / ``CLOSED`` (case-insensitive). ``None``
+    ("cannot tell": no gh, timeout, no PR) and ``OPEN`` / anything else are False,
+    so an uncertain lookup fails safe to the existing wait/release/expire path.
+
+    Without this a hand-merged PR's hold lingered until expiry and then raised an
+    immediate "보류 만료 … PR은 열려 있음" alert about a PR that was long merged."""
+    return bool(pr_state) and str(pr_state).upper() in RESOLVED_OUTSIDE_STATES
 
 
 def _run_ts(dir_name: str, *, tz) -> dt.datetime | None:
