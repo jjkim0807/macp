@@ -85,7 +85,9 @@ if args[:2] == ["compute", "ssh"]:
         (home / "emu.log").write_text("fake emulator log tail\\n")
         save()
         sys.exit(0)
-    elif "aapt2 dump packagename" in cmd:
+    elif "dump packagename" in cmd:
+        # the newest build-tools' aapt2, never a bare multi-version glob
+        assert "sort -V | tail -1" in cmd, cmd
         print("com.example.fake")
         sys.exit(0)
     elif "install -r" in cmd:

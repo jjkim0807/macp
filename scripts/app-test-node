@@ -203,7 +203,10 @@ case "$cmd" in
       done
     fi
 
-    pkg=$(_ssh_retry '~/android/build-tools/*/aapt2 dump packagename ~/under-test.apk | head -1')
+    # The NEWEST build-tools' aapt2: a bare `build-tools/*/aapt2` expands to every
+    # installed version and aapt2 then reads the second path as its subcommand
+    # (empty pkg → the launch fails). Same pick as beta_smoke._AAPT2.
+    pkg=$(_ssh_retry '"$(ls -1d ~/android/build-tools/*/aapt2 | sort -V | tail -1)" dump packagename ~/under-test.apk | head -1')
     # The launch line, built here and spliced in below with the same '"$var"'
     # pattern the rest of this script uses. With no extras it is CHARACTER-FOR-
     # CHARACTER the monkey line that was inline here before, so every repo that
