@@ -346,6 +346,10 @@ REMOTE_ACCEPT_TIMEOUT_ENV = "MACP_REMOTE_ACCEPT_TIMEOUT_S"  # DISPATCHED -> ACCE
 DEFAULT_REMOTE_ONLINE_S = 900.0
 DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
 
+# reconcile_merge_holds asks gh for each held PR's state every tick; a short cap
+# keeps a slow gh from stretching the tick (a timeout reads as None = unknown).
+HOLD_PR_STATE_TIMEOUT_S = 15.0
+
 # Ledger `rerouted_from.reason` values — shown in status/trace/api: wire format.
 REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
 REROUTE_AGENT_STALE = "agent-stale"
@@ -3850,6 +3854,14 @@ class Orchestrator:
         confirm this tick keeps the record and retries next tick rather than closing
         on an open PR.
 
+        Before judging, each record's PR state is looked up with gh (short
+        timeout). A definite MERGED / CLOSED means a person resolved the PR outside
+        the hold: the record is deleted with one log line — no alert, no ledger or
+        task-md change (reconcile_merged, right after in tick(), closes a merged
+        row and owns the closed-unmerged alert). None ("cannot tell") keeps the
+        existing path, and an expiry alert then says "PR 상태 미확인" instead of
+        claiming the PR is open.
+
         Placed BEFORE reconcile_merged in tick(): a release marks the row DONE
         (TERMINAL), so reconcile_merged's state guard then skips it — no double
         close. fail-open like reconcile_resumes: per-record isolation (one bad
@@ -3870,10 +3882,25 @@ class Orchestrator:
             for path, record in records:
                 try:
                     slug = str(record.get("slug") or path.stem)
+                    branch = record.get("branch") or f"worker/{slug}"
+                    repo = record.get("repo") or None
+                    pr_state: str | None = None
                     a = self.ledger.load(slug)
                     if a is None:
                         verdict = merge_hold.STALE
                     else:
+                        # A person may have merged/closed the PR by hand: then the
+                        # hold has nothing left to guard — drop it quietly instead
+                        # of waiting for expiry and alerting "PR은 열려 있음".
+                        # Same cwd/repo merge_pr would use on RELEASE.
+                        pr_state = stages.gh_pr_state(
+                            branch, repo, cwd=vault_root,
+                            timeout=HOLD_PR_STATE_TIMEOUT_S)
+                        if merge_hold.resolved_outside(pr_state):
+                            path.unlink(missing_ok=True)
+                            print(f"[orchestrator] merge-hold: {slug} merged outside "
+                                  f"the hold — 보류만 폐기 (state={pr_state})")
+                            continue
                         device_pass, device_pass_sha = merge_hold.scan_device_evidence(
                             vault_root, slug, after_ts=record.get("created_ts"))
                         verdict = merge_hold.evaluate(
@@ -3885,8 +3912,7 @@ class Orchestrator:
                               f"expires={record.get('expires_ts')})")
                         continue
                     if verdict == merge_hold.RELEASE:
-                        res = stages.merge_pr(vault_root, record.get("branch") or f"worker/{slug}",
-                                              repo=record.get("repo") or None)
+                        res = stages.merge_pr(vault_root, branch, repo=repo)
                         if not res.get("merged"):
                             # Could not confirm the merge this tick — keep the hold
                             # and retry next tick (never close on a still-open PR).
@@ -3913,9 +3939,13 @@ class Orchestrator:
                         print(f"[orchestrator] merge-hold: {slug} 해제·머지·close")
                     elif verdict == merge_hold.EXPIRED:
                         path.unlink(missing_ok=True)
+                        # Only claim the PR is open when gh said so; None (lookup
+                        # failed) is the one other value that can reach here.
+                        pr_note = ("PR은 열려 있음" if pr_state == "OPEN"
+                                   else "PR 상태 미확인")
                         self._notify_routed(
                             f"⌛ UI 미확인 보류 만료: {self._task_title(slug)} — 기기 "
-                            "확인 PASS가 만료 전에 오지 않아 보류를 지웠습니다(PR은 열려 있음)",
+                            f"확인 PASS가 만료 전에 오지 않아 보류를 지웠습니다({pr_note})",
                             None, level=LEVEL_IMMEDIATE,
                             event_key=f"ui-merge-hold-expired:{slug}")
                         print(f"[orchestrator] merge-hold: {slug} 만료 — 보류 폐기")
