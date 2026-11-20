@@ -2917,12 +2917,8 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # 2026-11-17: +432 bytes = tick()'s 45 s disconnect grace (DISCONNECT_AFTER_MS /
 # lastOk / showDisconnected / 401 branch, macp-dashboard-status-background-refresh);
 # no new i18n key; the rest of the page is byte-identical.
-# 2026-11-19: +918 bytes = the hidden `c-batch` card (📦 묶음 검증 대기), the
-# `BL` badge-label map + `batch_ready:'b-def'`, `batchRow`, and update()'s
-# batch_ready fill (macp-batch-verify-3-dashboard, three new i18n keys). Removing
-# exactly those additions gives back the previous golden byte for byte.
-_KO_HTML_SHA256 = "345e7a398388a320185ebd65f7c776cbf844507a35f84a569b8fe4825152c7e2"
-_KO_HTML_LEN = 47399
+_KO_HTML_SHA256 = "7607063afc672173f3007cd171d0ba819239f7ab33809731be03cb673cbb2df8"
+_KO_HTML_LEN = 46481
 _HANGUL = re.compile("[가-힣]")
 
 
