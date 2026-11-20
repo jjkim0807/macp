@@ -13,12 +13,15 @@ fails ``pytest -q`` with the offending file named in the assertion output:
   over ``scripts/public_identifiers_baseline.txt``.
 * export (``... --export``) — the public export set must stay at zero.
 * engine isolation (``scripts/check_engine_isolation.sh``) — the engine tree
-  archived alone still runs against a throwaway vault, with ``UV_OFFLINE=1``
-  so it can never reach the network. Measured 2026-10-08 on the HQ host, warm uv
-  cache: PASS in 6.31s and 3.00s (limit for inclusion was 60s offline). The
-  script archives committed HEAD and builds a fresh ``.venv`` in a ``mktemp``
-  dir from the uv cache for its four ``uv run`` calls — a host with a cold
-  cache fails here offline rather than hanging.
+  archived alone still runs against a copy of ``vault-template``, with
+  ``UV_OFFLINE=1`` so it can never reach the network. It also runs the README
+  "Try it in five minutes" loop (leg T) in a fresh HOME and fails if any step
+  exits non-zero or an expected output line goes missing. Measured 2026-10-08
+  on the HQ host, warm uv cache: PASS in 6.31s and 3.00s (limit for inclusion
+  was 60s offline); 2026-11-20 with leg T: PASS in 7.6s. The script archives
+  committed HEAD and builds a fresh ``.venv`` in a ``mktemp`` dir from the uv
+  cache for its ``uv run`` calls — a host with a cold cache fails here offline
+  rather than hanging.
 
 No literal from the identifier gate's ``PATTERN`` may appear in this file: it
 sits inside the scanned tree and is *not* on the script's self-exclude list,
