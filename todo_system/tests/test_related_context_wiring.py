@@ -35,6 +35,8 @@ from todo_system.orchestrator import stages
 
 _REAL_ENGINE = Path(__file__).resolve().parents[2]
 _PLANNER = "planner_tick.sh"
+_PLANNER_BODY = stages.strip_frontmatter((_REAL_ENGINE / "todo_system" / "prompts" / "worker-planner.md")
+                                         .read_text(encoding="utf-8")).rstrip("\n")
 _BRIEF = "brief.sh"
 _PROMPT_MARKER = "ENGINE-PROMPT-G4B"
 _RC_MODULE = "todo_system.orchestrator.related_context"
@@ -109,6 +111,9 @@ argv = sys.argv[1:]
 with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({{"tool": "py", "argv": argv, "cwd": os.getcwd(),
                          "MACP_VAULT_ROOT": os.environ.get("MACP_VAULT_ROOT")}}) + "\\n")
+if "-c" in argv:   # planner_tick's prompt loader, run against this checkout
+    sys.path.insert(0, {str(_REAL_ENGINE)!r})
+    exec(argv[argv.index("-c") + 1], {{}})
 mod = argv[argv.index("-m") + 1] if "-m" in argv else ""
 if mod == "todo_system.orchestrator.keep_alive" and "queue-depth" in argv:
     sys.stdout.write("0\\n")
@@ -221,7 +226,7 @@ def test_planner_prompt_is_byte_identical_when_the_block_is_empty(tmp_path):
     r = h.run(shell="bash", block="")
 
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert h.prompts() == ["/worker-planner"], h.prompts()
+    assert h.prompts() == [_PLANNER_BODY], h.prompts()
     assert "related past records" not in r.stdout, r.stdout
     assert len(h.rc_calls()) == 1, "the query must still have been attempted"
 
@@ -234,7 +239,7 @@ def test_planner_prompt_gains_the_block_when_there_is_one(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert ("[planner-tick] injecting related past records for 1 task(s) into planner "
             "context") in r.stdout, r.stdout
-    assert h.prompts() == ["/worker-planner\n\n" + _BLOCK.rstrip("\n")], h.prompts()
+    assert h.prompts() == [_PLANNER_BODY + "\n\n" + _BLOCK.rstrip("\n")], h.prompts()
 
 
 def test_planner_survives_a_crashing_query(tmp_path):
@@ -245,7 +250,7 @@ def test_planner_survives_a_crashing_query(tmp_path):
     r = h.run(shell="bash", block="", SEAM_RC_FILE=str(tmp_path / "missing.txt"))
 
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert h.prompts() == ["/worker-planner"], h.prompts()
+    assert h.prompts() == [_PLANNER_BODY], h.prompts()
 
 
 def test_the_planner_query_runs_in_the_vault_with_the_engine_interpreter(tmp_path):

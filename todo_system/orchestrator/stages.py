@@ -2,7 +2,7 @@
 (research → plan → implement → verify → report) into the orchestrator.
 
 The intelligence lives in the SAME stage prompts the legacy worker uses
-(.claude/commands/worker-<stage>.md): implement edits code, verify runs the
+(todo_system/prompts/worker-<stage>.md): implement edits code, verify runs the
 project's own checks locally (GitHub Actions is not used) and writes
 overall_status, report opens the PR via gh and merges on that verdict. This
 module only reproduces the light orchestration worker.py did inline — build the
@@ -33,8 +33,7 @@ from .. import paths
 # Two roots, split the way beta_publish._ENGINE_ROOT / _VAULT_DATA_ROOT are.
 # _ENGINE_ROOT comes from paths.engine_root() (the repo root in a development
 # checkout, todo_system/_engine in an installed wheel) and is immune to
-# MACP_VAULT_ROOT: it anchors .claude/commands (the stage prompts that ship with
-# the engine). _VAULT_DATA_ROOT resolves through the vault resolver so a
+# MACP_VAULT_ROOT. _VAULT_DATA_ROOT resolves through the vault resolver so a
 # redirected vault is read from the right place; anchored at
 # paths.vault_search_start() — the engine root in a checkout, byte-identical to
 # _ENGINE_ROOT when the env is unset (the live config); None in an installed
@@ -47,7 +46,9 @@ from .. import paths
 # local).
 _ENGINE_ROOT = paths.engine_root()
 _VAULT_DATA_ROOT = paths.vault_root(start=paths.vault_search_start())
-COMMANDS_DIR = _ENGINE_ROOT / ".claude" / "commands"
+# The stage prompts ship inside the package, so one path holds in a checkout,
+# a git-archive tree and an installed wheel alike (immune to MACP_VAULT_ROOT).
+COMMANDS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 # Worker/runs = stage artifacts; vault-data, redirected via _VAULT_DATA_ROOT to
 # match metrics.RUNS (PR #168) — NOT engine-immune. (Was pinned to the engine root
 # before this leaf; that was the stages-vs-metrics split-brain the outcome closes.)
@@ -663,8 +664,7 @@ def vault_worktree_meta(stage: str, working_dir: str, branch: str) -> list[str]:
 
     The stage prompts were written for a run that owned the live vault: "you are
     at the vault root", "`git checkout -b worker/<slug>`", "push from the vault
-    root". They live under `.claude/**`, which a headless stage cannot edit, and
-    every one of them already branches on "is there a `working_dir` in the run
+    root". Every one of them already branches on "is there a `working_dir` in the run
     metadata" for an external repo. So the rule rides here, after the prompt,
     where it wins: a `working_dir`, and for the stages that change the branch an
     explicit statement that the worktree is where the branch is.
@@ -762,8 +762,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         f"above): {' '.join(_safe_tools(stage, allowed_tools, browser_mcp=mcp_on))}\n",
     ]
     if stage in BROWSER_TOOL_STAGES:
-        # The worker-*.md prompts live under .claude/**, which a headless stage
-        # cannot edit, so the lease rule rides on the metadata instead.
+        # The lease rule rides on the metadata, after the prompt, so it wins.
         meta.append(
             f"- **Logged-in browser ({BROWSER_CLI}, CLAUDE.md §12)**: before "
             f"probe/steps/text run `{BROWSER_CLI} lease acquire --purpose '<why>'` "
@@ -798,8 +797,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     if stage in REMOTE_GATE_TOOL_STAGES:
         # A gate command too heavy for one stage (overruns the cap, or won't finish
         # inside the runner cgroup's memory — e.g. a full Robolectric/Gradle suite)
-        # goes to a roomier node via the metadata, same as the BROWSER line, since
-        # the worker-*.md prompts under .claude/** are unwriteable by a headless stage.
+        # goes to a roomier node via the metadata, same as the BROWSER line.
         meta.append(
             f"- **Heavy / over-memory verification ({REMOTE_GATE_CLI})**: do NOT "
             "block-poll a command that would overrun this stage's cap or the host's "
@@ -810,9 +808,8 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             f"<handle>` / `{REMOTE_GATE_CLI} result <handle>` — the heavy wall-clock "
             "runs on the node, outside this stage's timeout window.\n")
     if stage in EMULATOR_TOOL_STAGES:
-        # The on-demand emulator-node check, on the metadata rather than the
-        # worker-*.md prompt under .claude/** (unwriteable by a headless stage),
-        # same as the BROWSER/REMOTE_GATE lines above.
+        # The on-demand emulator-node check, on the metadata like the
+        # BROWSER/REMOTE_GATE lines above.
         meta.append(
             f"- **On-device emulator check ({EMULATOR_CLI})**: ONLY when the task's "
             "frontmatter/acceptance asks for a real on-device run (advisory "
@@ -851,9 +848,8 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     if batch_mode == BATCH_QUICK and stage == "verify":
         # Batch verify (batch_gate.py): this run checks only what it changed and
         # the repo's full gate runs once, later, for several tasks together. On
-        # the metadata rather than in worker-verify.md for the same reason as
-        # the BROWSER line above: a headless stage cannot edit .claude/**. Comes
-        # after the prompt, so it wins over the prompt's Step 2 and pass rule.
+        # the metadata, after the prompt, so it wins over the prompt's Step 2 and
+        # pass rule.
         meta.append(
             "- **Verify mode: QUICK — batch gate (overrides Step 2 and the pass "
             "rule in the prompt above)**: this repo's full gate runs ONCE after "
@@ -885,9 +881,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "검토해야 할 부분`.\n")
     if stage == "plan":
         # How an oversize plan states a split the engine can run without a person
-        # (rescope.rescope_from_split_block). On the metadata for the same reason
-        # as the BROWSER line above: worker-plan.md lives under .claude/**, which
-        # a headless stage cannot edit — and here it takes effect on merge.
+        # (rescope.rescope_from_split_block).
         meta.append(plan_split_hint(task_id))
     if project_context:
         meta.append("\n## Project memory (.macp/memory — accumulated context)\n\n"

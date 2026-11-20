@@ -31,8 +31,9 @@
 #     orchestrator/stages.py (via [[macp-vault-root-human-stages-modules]]) were each
 #     migrated to `paths.vault_root(...)` (for human·stages, `_VAULT_DATA_ROOT`), so
 #     all three respect MACP_VAULT_ROOT for vault data.
-#     All three modules anchor only the engine files (`.claude/commands`,
-#     `scripts/kakao_send.sh`, `scripts/health_report.py`) to `_ENGINE_ROOT` relative to
+#     All three modules anchor only the engine files (`scripts/kakao_send.sh`,
+#     `scripts/health_report.py`; the stage prompts sit in the package,
+#     `todo_system/prompts`) to `_ENGINE_ROOT` relative to
 #     `__file__` (human·stages use `parents[2]`, worker.py uses `parents[1]` —
 #     macp-public-split-11-worker-engine-root-split, inventory §11.8 c-1). This is
 #     intended, so ignoring MACP_VAULT_ROOT there is correct.
@@ -332,8 +333,8 @@ else
       echo "  MACP_VAULT_ROOT(VAULT_TMP)를 존중한다(PR #167,"
       echo "  [[macp-vault-root-human-stages-modules]]). 'no pending runs' 는 VAULT_TMP"
       echo "  픽스처에 Worker/queue.json 이 없어 나오는 정상 결과다(레그 A/B처럼"
-      echo "  VAULT_TMP 를 읽었다는 뜻). 세 모듈 모두 엔진 파일(.claude/commands,"
-      echo "  scripts/)만 __file__ 기준 _ENGINE_ROOT 에 앵커하며(worker.py 포함),"
+      echo "  VAULT_TMP 를 읽었다는 뜻). 세 모듈 모두 엔진 파일(scripts/, 스테이지 프롬프트는"
+      echo "  패키지의 todo_system/prompts)만 __file__ 기준으로 앵커하며(worker.py 포함),"
       echo "  이는 의도된 것이라 MACP_VAULT_ROOT 를 무시하는 게 맞다."
       echo
       ;;

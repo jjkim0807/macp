@@ -3,14 +3,15 @@
 A starved keep-alive project (keep_alive.py) bypasses exactly two gates — the
 queue-depth skip and the exhausted backoff — and its block rides in the
 planner prompt. With nothing starved the tick is unchanged: same skip lines,
-prompt exactly ``/worker-planner``. The hard gates (usage guard, PAUSED, daily
-budget) still exit first and never even ask the keep-alive check.
+prompt exactly the body of ``todo_system/prompts/worker-planner.md``. The hard
+gates (usage guard, PAUSED, daily budget) still exit first and never even ask
+the keep-alive check.
 
 Harness shape copied from test_split_engine_root_13b_planner.py (installed
 layout: no pyproject, a fake ``MACP_PYTHON``). The fake interpreter records its
-argv and answers ``keep_alive queue-depth`` / ``emit-context`` from env, so
-nothing is imported. Neutral prefixes only: this file sits in the tree the
-public identifier gate scans.
+argv, answers ``keep_alive queue-depth`` / ``emit-context`` from env, and runs
+the script's planner-prompt loader (``-c``) against this checkout. Neutral
+prefixes only: this file sits in the tree the public identifier gate scans.
 """
 from __future__ import annotations
 
@@ -25,15 +26,22 @@ from pathlib import Path
 import pytest
 
 from todo_system.orchestrator import keep_alive as ka
+from todo_system.orchestrator import stages
 
 _REAL_ENGINE = Path(__file__).resolve().parents[2]
 _PLANNER = "planner_tick.sh"
+# What claude must get: the moved prompt file's body ($(...) drops the newline).
+_BODY = stages.strip_frontmatter((_REAL_ENGINE / "todo_system" / "prompts" / "worker-planner.md")
+                                 .read_text(encoding="utf-8")).rstrip("\n")
 
 _FAKE_PY = f'''#!{sys.executable}
 import json, os, sys
 argv = sys.argv[1:]
 with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({{"tool": "py", "argv": argv}}) + "\\n")
+if "-c" in argv:
+    sys.path.insert(0, {str(_REAL_ENGINE)!r})
+    exec(argv[argv.index("-c") + 1], {{}})
 mod = argv[argv.index("-m") + 1] if "-m" in argv else ""
 if mod == "todo_system.usage_guard" and "check" in argv and os.environ.get("SEAM_USAGE_BLOCK") == "1":
     sys.exit(3)
@@ -138,7 +146,7 @@ def test_depth_limit_with_starved_plans_with_the_block(tick):
             "project(s) starved; planning anyway") in r.stdout, r.stdout
     assert "[planner-tick] mode=normal (" in r.stdout, r.stdout
     assert "[planner-tick] injecting 1 keep-alive starved project(s) into planner context" in r.stdout
-    assert tick.prompts() == ["/worker-planner\n\n" + _CTX.rstrip("\n")]
+    assert tick.prompts() == [_BODY + "\n\n" + _CTX.rstrip("\n")]
     assert "- [proj-a-] decision: Decisions/proj-a.md" in tick.prompts()[0]
     assert "[planner-tick] done" in r.stdout, r.stdout
 
@@ -146,7 +154,8 @@ def test_depth_limit_with_starved_plans_with_the_block(tick):
 def test_nothing_starved_keeps_the_prompt_byte_identical(tick):
     r = tick.run(depth=0)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert tick.prompts() == ["/worker-planner"]
+    assert tick.prompts() == [_BODY]
+    assert _BODY.startswith("You are the **Planner agent**"), _BODY[:80]
     assert "[planner-tick] auto-queue=0 (< 5); invoking planner agent…" in r.stdout, r.stdout
     assert "keep-alive" not in r.stdout, r.stdout
 

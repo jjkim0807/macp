@@ -848,8 +848,8 @@ def test_beta_publish_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_
 # --- orchestrator/human + stages: engine root immune, vault-data root redirectable --
 # Both modules split their former single REPO_ROOT the way beta_publish did.
 # _ENGINE_ROOT (repo/install root, __file__-anchored) anchors scripts/kakao_send.sh
-# + the subprocess cwd (human) and .claude/commands (stages) — engine files that
-# must NOT move under MACP_VAULT_ROOT. _VAULT_DATA_ROOT resolves via
+# + the subprocess cwd (human) — engine files that must NOT move under
+# MACP_VAULT_ROOT; stages' prompts sit in the package itself. _VAULT_DATA_ROOT resolves via
 # paths.vault_root(start=parents[2]) and anchors the Worker/assignments ledger
 # (human._ledger_corr) and Worker/runs (stages.RUNS_DIR), which the inventory
 # (Notes/macp-public-split-inventory.md §2.1) classifies as vault-data and which
@@ -933,10 +933,10 @@ def test_stages_roots_no_env_byte_identical_and_wired(monkeypatch, combined_layo
         mod = importlib.reload(stages)
         root = combined_layout
         assert root == paths.engine_root()
-        # engine root + the .claude/commands prompts it anchors (immune),
-        # all byte-identical to the engine root.
+        # engine root byte-identical to the install root (immune); the prompts
+        # sit in the package itself.
         assert mod._ENGINE_ROOT == root
-        assert mod.COMMANDS_DIR == root / ".claude" / "commands"
+        assert mod.COMMANDS_DIR == Path(mod.__file__).resolve().parents[1] / "prompts"
         # vault-data root byte-identical to the engine root when unset; it anchors
         # Worker/runs, which metrics.RUNS reads from the vault too.
         assert mod._VAULT_DATA_ROOT == root
@@ -959,7 +959,7 @@ def test_stages_env_redirects_runs_only_engine_immune(monkeypatch, tmp_path):
         # but the engine root and the commands dir stay pinned
         assert mod._ENGINE_ROOT == root
         assert mod._ENGINE_ROOT != tmp_path
-        assert mod.COMMANDS_DIR == root / ".claude" / "commands"
+        assert mod.COMMANDS_DIR == root / "todo_system" / "prompts"
     importlib.reload(stages)
 
 
@@ -977,7 +977,7 @@ def test_stages_data_root_start_pins_install_dir_not_cwd(monkeypatch, tmp_path, 
         # data root, and COMMANDS_DIR / the engine root are never cwd-derived.
         assert mod._VAULT_DATA_ROOT == combined_layout
         assert mod._VAULT_DATA_ROOT != Path("/bogus")
-        assert mod.COMMANDS_DIR == combined_layout / ".claude" / "commands"
+        assert mod.COMMANDS_DIR == Path(mod.__file__).resolve().parents[1] / "prompts"
         assert mod._ENGINE_ROOT == combined_layout
     importlib.reload(stages)
     assert paths.engine_root() == Path(stages.__file__).resolve().parents[2]

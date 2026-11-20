@@ -174,12 +174,6 @@ say so in run.log so Verify can accept it.
 - Never merge to `main` — the Report stage opens the PR and handles the merge according to `auto_merge`.
 - Do not add, re-enable or repair GitHub Actions workflows (`.github/workflows/`) to get CI — Actions is not used in any project. Only touch them when the task explicitly asks (it will carry `ci: actions` or name the workflow change).
 - Stay within the `--allowed-tools` whitelist the orchestrator passes you (see "Bash in this stage").
-- Deliverables under `.claude/**` (own stage prompts, settings, commands): do not attempt the
-  edit. The harness hard-blocks headless writes there regardless of allow rules (every allow-rule
-  form has been tried and refused; tasks lost whole cycles discovering this). Instead write the COMPLETE finished
-  file (not a diff) to `<vault_root>/Worker/proposals/<slug>/<repo-relative-path>`, commit it on
-  your worker branch, and note in `run.log` that a human applies it with one `cp`. That counts as
-  the deliverable landing — do not mark the phase failed for the gate alone.
 - If a step fails (test, edit conflict, tool denial), stop and write the failure reason to `run.log` rather than retrying blindly.
 
 ## Output

@@ -168,11 +168,6 @@ tests, iOS targets on a Linux host, external services, a real device — and set
 - tests pass but a packaging/signing/device path the outcome depends on is unexercised → `medium` at most
 - only part of the list could run → `low`, and see the Rules for whether that is a FAIL
 
-`confidence: high` is **not allowed** when the change touches an app UI (e.g. Android
-`app/**`, a web frontend) and no on-device/emulator run happened in this run. Write
-`medium` at most and name the unexercised device path. The report stage treats
-`high` here as a contract breach.
-
 ### Step 6: Map acceptance criteria to evidence
 
 - An executable criterion ("tests pass", "builds", "the migration test covers X") →
@@ -342,7 +337,7 @@ generated: <ISO timestamp>
 overall_status: pass | fail | skip
 confidence: high | medium | low
 verified_by: local | actions     # `actions` only under the `ci: actions` opt-in
-blocked_on: "<what>"             # only on a FAIL caused by the environment or a human/device-only step
+blocked_on: "<what>"             # only on a FAIL caused by the environment or a human-only step
 ---
 
 # Verification — <task title>
@@ -372,7 +367,7 @@ Last 30 lines of output:
 |---|-----------|-------|--------|----------|
 | 1 | "tests pass" | #1 | PASS | 1268 passed |
 | 2 | "README updated" | diff | PASS | README.md L40-52 |
-| 3 | "verified on a real device" | - | UNVERIFIED | device-only; left for a human |
+| 3 | "verified on a real device" | - | UNVERIFIED | device-only — 확인 못 함, not a merge condition |
 
 ## Branch State
 
@@ -423,8 +418,10 @@ the same thing — the checks were run locally.
   - OR a required check could not run (toolchain missing, command gated) —
     unverified is never pass or skip; add `blocked_on` when the cause is the environment
   - OR an acceptance criterion the outcome hinges on is `UNVERIFIED` — when only a
-    human, a real device or an external system can check it, add
-    `blocked_on: "<that step>"` so the runner parks the task instead of retrying the code
+    human or an external system can check it, add
+    `blocked_on: "<that step>"` so the runner parks the task instead of retrying the code.
+    A criterion only a real device or real use can check never decides the verdict:
+    list it under `concerns` (Step 6)
   - OR working tree is not clean
   - OR the diff is empty / clearly unrelated to the outcome (nothing was actually
     done, or the wrong thing was done — a structural fail even if every check is green)

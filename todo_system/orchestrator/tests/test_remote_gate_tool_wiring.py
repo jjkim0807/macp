@@ -5,8 +5,7 @@ The whitelist splits on spaces, so the executor is granted through one space-fre
 PATH-wrapper rule, stages.REMOTE_GATE_TOOL_RULE == `Bash(macp-remote-gate:*)`.
 These tests pin which stages get it, that verify stays read-only, that a task's
 own list keeps it, that the rule is a single safe token, that build_stage_argv
-injects the usage metadata (the worker-*.md prompts under .claude/** are
-unwriteable headless, so it rides on metadata like the BROWSER line), and that
+injects the usage metadata (on the metadata like the BROWSER line), and that
 the wrapper runs `decide` from any cwd.
 """
 

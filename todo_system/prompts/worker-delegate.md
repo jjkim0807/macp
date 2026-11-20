@@ -60,7 +60,7 @@ After edits:
 - Never run `rm -rf`, `git push --force`, `git reset --hard`, `git checkout -- .`, or any `--no-verify` flag.
 - Never edit `.secrets/`, `.env`, `~/.ssh/`, `todo_system/cli.py`, `todo_system/worker.py`, or anything under `.git/`.
 - Never commit to `main`; all commits go on `worker/<slug>`.
-- Never push. After you exit, the runner pushes `worker/<slug>` and opens a PR that is not auto-merged; a human reviews and merges it.
+- Never push. After you exit, the runner pushes `worker/<slug>` and opens a PR; with `auto_merge: true` it merges it too.
 - Do not spawn subagents or call other slash commands.
 - Stay within `--allowed-tools` (`git`, `pwd`, `ls` for Bash; the Run metadata's "allowed tools" line is authoritative). If you need something outside, write that as an "open question" in `delegate.md` instead of trying to work around it.
 
@@ -95,7 +95,7 @@ status: pass | fail
 
 ## 사람이 검토해야 할 부분
 
-- <bullet, or "없음">
+- <only what cannot be undone and needs the user — an external submission or send, a payment, making something public, an unrecoverable deletion, an act in the user's name; otherwise "없음">
 
 ## 다음 단계 (있다면)
 

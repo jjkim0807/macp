@@ -91,7 +91,7 @@ Each phase appends its sections to `docs/design/example.md` and commits.
 ### Phase 1: Scaffold + §1 census
 - **Goal**: Front-matter, the intro, and §1 — the census of where lessons live today.
 - **Files**: `docs/design/example.md` (create). Read-only anchor sources:
-  `.claude/commands/worker-planner.md`, `docs/concepts.md`.
+  `Worker/planner_policy.yaml`, `docs/concepts.md`.
 - **Steps**:
   1. Copy the sister doc's front-matter shape.
   2. Write §1 as a table.
@@ -100,7 +100,7 @@ Each phase appends its sections to `docs/design/example.md` and commits.
 ### Phase 2: §2 detection + §3 ladder
 - **Goal**: §2 defines "same-type"; §3 specifies the three rungs.
 - **Files**: `docs/design/example.md` (append). Anchors:
-  `.claude/commands/worker-planner.md` (read-only), `todo_system/graph_memory.py`.
+  `Worker/planner_policy.yaml` (read-only), `todo_system/graph_memory.py`.
 - **Steps**:
   1. §2 detection signal and the promotion bar.
   2. §3 rung formats and storage.
@@ -311,9 +311,9 @@ def test_skill_shape_splits_into_four():
     assert plan["source"] == "plan-phases"
     assert plan["run_ref"] == plan_ref
     assert any(plan_ref in n and req_ref in n for n in plan["design_notes"])
-    # The Files lines cite a guardrail prompt read-only; nothing from them leaks,
+    # The Files lines cite a guardrail file read-only; nothing from them leaks,
     # so the guardrail scan sees only the real write scope and the split is allowed.
-    assert ".claude/" not in json.dumps(plan, ensure_ascii=False)
+    assert "planner_policy" not in json.dumps(plan, ensure_ascii=False)
     assert rescope.can_auto_rescope(plan, _parent_fm()).allow
 
 

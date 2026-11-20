@@ -322,8 +322,7 @@ def test_an_unknown_batch_mode_adds_nothing(monkeypatch, tmp_path, stage):
 
 # ---------------------------------------------------------------------------
 # Plan stage: the machine-readable split block (rescope.rescope_from_split_block)
-# is documented on the metadata, because a headless stage cannot edit the
-# worker-plan.md prompt under .claude/**.
+# is documented on the metadata.
 # ---------------------------------------------------------------------------
 
 # The hint's own heading. Not the bare phrase "machine-readable split": the

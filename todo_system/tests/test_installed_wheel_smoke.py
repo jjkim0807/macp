@@ -52,7 +52,8 @@ _SCRUB = (
 VAULT_PREFIXES = (".macp/", "Todo/", "Memory/", "Worker/", "Notes/", "Decisions/")
 REQUIRED_IN_WHEEL = (
     "todo_system/_engine/scripts/orchestrator_tick.sh",
-    "todo_system/_engine/.claude/commands/worker-implement.md",
+    "todo_system/_engine/.claude/commands/brief.md",
+    "todo_system/prompts/worker-implement.md",
     "todo_system/__init__.py",
     "todo_system/paths.py",
     "todo_system/cli.py",
@@ -180,15 +181,15 @@ root = paths.engine_root()
 assert root == f.parent / "_engine", (root, f)
 assert root.parts[-3:] == ("site-packages", "todo_system", "_engine"), root
 assert (root / "scripts" / "orchestrator_tick.sh").is_file(), root
-assert (root / ".claude" / "commands" / "worker-implement.md").is_file(), root
+assert stages.COMMANDS_DIR == f.parent / "prompts", stages.COMMANDS_DIR
+assert (stages.COMMANDS_DIR / "worker-implement.md").is_file(), stages.COMMANDS_DIR
 assert worker._ENGINE_ROOT == root, worker._ENGINE_ROOT
 assert human._ENGINE_ROOT == root, human._ENGINE_ROOT
 assert stages._ENGINE_ROOT == root, stages._ENGINE_ROOT
 assert beta_publish._ENGINE_ROOT == root, beta_publish._ENGINE_ROOT
-assert worker.COMMANDS_DIR.is_dir(), worker.COMMANDS_DIR
+assert worker.COMMANDS_DIR == stages.COMMANDS_DIR, worker.COMMANDS_DIR
 assert worker.KAKAO_SEND_SCRIPT.is_file(), worker.KAKAO_SEND_SCRIPT
 assert worker.HEALTH_REPORT_SCRIPT.is_file(), worker.HEALTH_REPORT_SCRIPT
-assert stages.COMMANDS_DIR.is_dir(), stages.COMMANDS_DIR
 assert human.KAKAO_SCRIPT.is_file(), human.KAKAO_SCRIPT
 assert worker.ROOT == pathlib.Path(os.environ["MACP_VAULT_ROOT"]), worker.ROOT
 repo = pathlib.Path(os.environ["SMOKE_REPO"]).resolve()

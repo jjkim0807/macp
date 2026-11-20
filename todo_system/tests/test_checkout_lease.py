@@ -2,8 +2,8 @@
 branch-prep so the planner's self-commit can never land on (and be orphaned
 from) a worker branch.
 
-The race (observed `ed395e1b`): `scripts/planner_tick.sh` runs `claude -p
-/worker-planner` in the LIVE vault checkout with no lock. The planner, following
+The race (observed `ed395e1b`): `scripts/planner_tick.sh` runs the planner's
+`claude -p` in the LIVE vault checkout with no lock. The planner, following
 CLAUDE.md §10.1 ("uncommitted vault files stall the queue"), commits what it
 wrote. Meanwhile the orchestrator's `prepare_vault_branch` does `checkout -B
 worker/<slug>`, moving HEAD off `main`. If those interleave, the planner's
@@ -14,8 +14,7 @@ Three layers, each pinned here:
   * the checkout lease (`Worker/checkout.lock`, reusing `lease.Lease`) closes the
     TOCTOU — the orchestrator holds it across its HEAD-moving branch prep, the
     planner holds it across its claude call, so the two serialize;
-  * the branch pin (a `.claude/commands/worker-planner.md` hard rule, shipped as
-    a proposal because `.claude/**` is hard-gated for headless workers) covers
+  * the branch pin (a `todo_system/prompts/worker-planner.md` hard rule) covers
     the static case where HEAD is already on a worker branch when the planner
     starts;
   * the post-verify in `planner_tick.sh` alerts (reusing `scripts/kakao_send.sh`)
@@ -478,10 +477,10 @@ class PlannerTickWiringTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# worker-planner.md branch pin — rule lives directly in .claude/commands/
+# worker-planner.md branch pin — rule lives directly in the planner prompt
 # ---------------------------------------------------------------------------
 class BranchPinRuleTest(unittest.TestCase):
-    PROMPT = (REPO_ROOT / ".claude" / "commands" / "worker-planner.md")
+    PROMPT = (REPO_ROOT / "todo_system" / "prompts" / "worker-planner.md")
 
     def test_worker_planner_doc_pins_the_default_branch(self):
         self.assertTrue(self.PROMPT.exists(),

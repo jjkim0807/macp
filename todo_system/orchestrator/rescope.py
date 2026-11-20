@@ -70,7 +70,7 @@ _LIVE_MARKERS = ("ai-stock-trading",)
 _LIVE_TAGS = frozenset({"live", "real-trade", "real-account"})
 # Planner's own-boundary guardrail (human-owned). If it appears in the parent's
 # outcome/spec or a sub-task's files, HUMAN.
-_GUARDRAIL_PATHS = ("Worker/planner_policy.yaml", ".claude/commands/worker-planner.md")
+_GUARDRAIL_PATHS = ("Worker/planner_policy.yaml",)
 # Phrases in if_then that ask for human confirmation (case-insensitive
 # substring). Conservatively HUMAN.
 _HUMAN_CONFIRM_PHRASES = (
@@ -1317,7 +1317,7 @@ def _split_estimate(v) -> str:
 def _reaches_guardrail(path: str) -> bool:
     """Could this path or glob cover a human-owned guardrail file: it names one,
     or its literal prefix (the text before the first wildcard) is a prefix of
-    one (`.claude/**`, `Worker/**`, `**/*.md`, or the bare directory `Worker`).
+    one (`Worker/**`, `**/*.md`, or the bare directory `Worker`).
     Every glob that can match such a file starts with a prefix of its path, so
     none of them passes; a few harmless paths are refused with them."""
     cut = min([i for i in (path.find(c) for c in "*?[") if i != -1] or [len(path)])

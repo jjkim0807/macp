@@ -2214,7 +2214,7 @@ class StagedExecutor(ClaudeCodeExecutor):
             # A delegate run's output lives ONLY on `worker/<slug>`: it is a single
             # stage with no report stage behind it to push, and nothing else ever
             # looks at that branch again once this run's worktree is gone. Three
-            # runs' work was lost that way. worker-delegate.md's ":43 Never push."
+            # runs' work was lost that way. worker-delegate.md's "Never push."
             # rule is about the AGENT and stays true — this is the runner pushing.
             #
             # In the `finally` rather than beside the success `return`, because the

@@ -132,7 +132,7 @@ personal-scale system, published as-is:
   notifications, an app-beta publishing sweep, and an `advote` bridge. They stay
   silent unless their config file exists; see
   [scripts/NOTIFICATIONS.md](scripts/NOTIFICATIONS.md).
-- Parts of the worker prompts (`.claude/commands/`), code comments and log messages
+- Parts of the worker prompts (`todo_system/prompts/`), code comments and log messages
   are in Korean. Translation is in progress.
 
 ## Contributing

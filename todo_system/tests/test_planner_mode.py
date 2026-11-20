@@ -351,7 +351,8 @@ def test_tick_normal_path_lines_unchanged(tick_text):
     for line in (
         "DEPTH_LIMIT=5",
         "EXHAUST_HOURS=24",
-        'PROMPT="/worker-planner"',
+        "PROMPT=$($PY -c 'from todo_system.orchestrator import stages; "
+        "print(stages.strip_frontmatter(stages.load_stage_prompt(\"planner\")))')",
         'echo "[planner-tick] open-task state unchanged and last run < '
         '${EXHAUST_HOURS}h ago; skip (exhausted)"',
         "  DISC=$($PY -m todo_system.orchestrator.discovery maybe-create 2>/dev/null)",
