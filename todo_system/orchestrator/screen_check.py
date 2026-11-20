@@ -288,14 +288,11 @@ def has_device_pass(run_dir: Path | str) -> bool:
     (``화면 확인 불가(…)``) is NOT evidence, and a missing / unreadable file is
     NOT evidence: both resolve to False.
 
-    Fail-SAFE to False on purpose. This reader gates a merge-hold: "no proof we
-    saw a screen" must withhold, so every uncertainty (file absent, read error,
-    an app diff whose check never ran) counts as "no evidence". That is the
-    opposite default from a would-be-helpful reader that assumes success — the
-    whole point of the guard is to stop a high-confidence UI change from merging
-    with nobody having seen it run. Reads only the success PREFIX, so a note that
-    merely quotes the phrase inside a longer failure reason can't be constructed
-    here (``_ok_note`` is the sole writer and always leads with the prefix)."""
+    Fail-SAFE to False on purpose: every uncertainty (file absent, read error,
+    an app diff whose check never ran) counts as "no evidence". Reads only the
+    success PREFIX, so a note that merely quotes the phrase inside a longer
+    failure reason can't be constructed here (``_ok_note`` is the sole writer and
+    always leads with the prefix)."""
     path = Path(run_dir) / "verify.md"
     try:
         text = path.read_text(encoding="utf-8", errors="replace")

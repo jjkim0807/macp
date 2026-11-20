@@ -277,13 +277,10 @@ def eligible(payload, *, tier, gate, five_stage, auto_merge,
     return tier in _BATCHABLE_TIERS, f"tier {tier}"
 
 
-def device_ok(payload, *, device_pass, ui_hold) -> bool:
-    """May a quick-verified run wait for the integration gate?
-
-    Not when the UI confidence guard fired (a high-confidence app-UI change
-    nobody saw on a device), and not when the task asked for a device run that
-    left no evidence this run."""
-    return not ui_hold and (not needs_device(payload) or bool(device_pass))
+def device_ok(payload, *, device_pass) -> bool:
+    """May a quick-verified run wait for the integration gate? Not when the
+    task asked for a device run that left no evidence this run."""
+    return not needs_device(payload) or bool(device_pass)
 
 
 def mark_ready(a, result_payload, *, now_iso: str) -> bool:

@@ -135,7 +135,6 @@ ALERT_FAILURE_SUSPECTED = "failure-suspected"   # suspected failure, needs inves
 ALERT_QUARANTINE = "quarantine"                 # quarantined after repeated failures
 ALERT_TIMEOUT_PARK = "timeout-park"             # 2 consecutive stage timeouts — cannot continue
 ALERT_CLOSED_UNMERGED = "closed-unmerged"       # delegate PR closed without merging — needs a decision
-ALERT_UI_MERGE_HOLD = "ui-merge-hold"           # high-confidence app-UI change, no device run — merge withheld
 # History-type stamp reconcile_merged leaves on a parked delegate row whose PR a
 # human CLOSED without merging — the one-time "it will never merge, decide" alert's
 # park-once guard, sibling to _MERGED_BUT_BLOCKED. Also wire format (git-tracked
@@ -346,10 +345,6 @@ REMOTE_ACCEPT_TIMEOUT_ENV = "MACP_REMOTE_ACCEPT_TIMEOUT_S"  # DISPATCHED -> ACCE
 DEFAULT_REMOTE_ONLINE_S = 900.0
 DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
 
-# reconcile_merge_holds asks gh for each held PR's state every tick; a short cap
-# keeps a slow gh from stretching the tick (a timeout reads as None = unknown).
-HOLD_PR_STATE_TIMEOUT_S = 15.0
-
 # Ledger `rerouted_from.reason` values — shown in status/trace/api: wire format.
 REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
 REROUTE_AGENT_STALE = "agent-stale"
@@ -458,8 +453,7 @@ def needs_device(payload: dict | None, repo_dir: Path | None,
        no-op for a non-app repo (screen_check.is_app_repo).
     5. Any of the repo's `app_paths` (default `app/`; widened per repo in the
        vault's beta_publish_config) exists as a directory → True: an app diff
-       turns the screen check on by default, and a remote without the node would
-       leave a UI change parked in a host-local merge hold.
+       turns the screen check on by default.
     Otherwise False (e.g. a Gradle server repo). Any error → True (safe side).
 
     There is deliberately no `screen_check: false` exemption: that frontmatter
@@ -1428,14 +1422,7 @@ class Orchestrator:
                     elif msg.type == m.RESULT:
                         if (msg.payload or {}).get("review_required"):
                             a.state = AWAITING_HUMAN      # PR opened, not merged —
-                            if (msg.payload or {}).get("ui_merge_hold"):
-                                # UI-unseen merge hold (macp#131): a dedicated
-                                # one-time alert, NOT the generic review ping — this
-                                # park auto-releases on a later same-sha device PASS
-                                # (reconcile_merge_holds), so the message says that.
-                                self._notify_ui_merge_hold(a, msg)
-                            else:
-                                self._notify_review(a, msg)   # park for human approval
+                            self._notify_review(a, msg)   # park for human approval
                         else:
                             # A proven no-op (runner tagged the payload `no_op`)
                             # closes with a Progress-Log evidence line and NO alert;
@@ -1808,28 +1795,6 @@ class Orchestrator:
         self._notify_routed(text, link,
                             event_key=f"review:{a.last_alert_kind}:{a.task_id}",
                             cooldown_s=REVIEW_RENOTIFY_COOLDOWN_S)
-
-    def _notify_ui_merge_hold(self, a: Assignment, msg: m.Envelope) -> None:
-        """One-time alert for a UI-unseen merge hold (macp#131).
-
-        The confidence guard withheld auto-merge for a high-confidence app-UI
-        change that no device check saw this run; the PR is open and ready, and the
-        hold auto-releases when a later run captures the app's screen on the SAME
-        sha. Say that — a human may act (merge/eyeball) but does not HAVE to, since
-        the pipeline will release it on its own. Immediate, keyed per task so the
-        same hold within the window merges into one delivery (the PR link rides the
-        'Open' button, never the text body)."""
-        a.last_alert_kind = ALERT_UI_MERGE_HOLD
-        pr = (msg.payload or {}).get("pr_url") or ""
-        lines = [f"📋 {self._task_title(a.task_id)}"]
-        headline = ("🖐️ UI 미확인 — 자동 머지 보류: 앱 UI 변경인데 이 런에서 화면을 "
-                    "확인하지 못해 PR을 ready로 열고 머지는 보류했습니다. "
-                    "같은 sha로 기기 확인이 통과하면 자동으로 머지됩니다.")
-        self._notify_routed(
-            human.compose_alert(headline, lines), pr or None,
-            level=kakao_format.LEVEL_IMMEDIATE,
-            event_key=f"ui-merge-hold:{a.task_id}",
-            cooldown_s=REVIEW_RENOTIFY_COOLDOWN_S)
 
     def _rescope_pending(self, a: Assignment, run_dir: str) -> bool:
         """True if this blocked park carries a machine-readable split plan that is
@@ -3702,7 +3667,7 @@ class Orchestrator:
                       f"individual full verify ({reason})")
 
             def close(a: Assignment, note: str) -> None:
-                # reconcile_merge_holds' close shape: evidence + mark_done first,
+                # reconcile_merged's close shape: evidence + mark_done first,
                 # then DONE with the deferral flags cleared.
                 self._close_with_evidence(a)
                 a.state = DONE
@@ -3840,126 +3805,6 @@ class Orchestrator:
             print(f"[orchestrator] batch gate sweep skipped (fail-open): {e}")
         return out
 
-    def reconcile_merge_holds(self) -> list[str]:
-        """Release UI-unseen auto-merge holds whose device check has since passed
-        for the held sha (macp#131). Returns the slugs it released. Fail-open.
-
-        The confidence guard parked these: a high-confidence app-UI change opened a
-        ready PR but was NOT auto-merged because no device check saw it this run. A
-        LATER run that captured the app's screen on the SAME branch sha is the
-        release signal. For each hold record this reads that run's device evidence
-        (merge_hold.scan_device_evidence) + the ledger state, judges it with the
-        pure merge_hold.evaluate, and on RELEASE squash-merges the PR + closes the
-        task — the same close shape reconcile_merged uses, so a merge that does NOT
-        confirm this tick keeps the record and retries next tick rather than closing
-        on an open PR.
-
-        Before judging, each record's PR state is looked up with gh (short
-        timeout). A definite MERGED / CLOSED means a person resolved the PR outside
-        the hold: the record is deleted with one log line — no alert, no ledger or
-        task-md change (reconcile_merged, right after in tick(), closes a merged
-        row and owns the closed-unmerged alert). None ("cannot tell") keeps the
-        existing path, and an expiry alert then says "PR 상태 미확인" instead of
-        claiming the PR is open.
-
-        Placed BEFORE reconcile_merged in tick(): a release marks the row DONE
-        (TERMINAL), so reconcile_merged's state guard then skips it — no double
-        close. fail-open like reconcile_resumes: per-record isolation (one bad
-        record skips only itself) + an outer net so a sweep fault never stalls the
-        tick's dispatch. An unreadable record is surfaced and KEPT, never deleted
-        (its intent can't be recovered)."""
-        released: list[str] = []
-        try:
-            from ..kakao_format import LEVEL_DIGEST, LEVEL_IMMEDIATE
-            from . import merge_hold, stages
-            vault_root = Path(self.ledger.root).parent.parent
-            now = merge_hold._now()
-            records, unreadable = merge_hold.load_records(vault_root)
-            tally = merge_hold._Tally(
-                lambda msg: print(f"[orchestrator] merge-hold: {msg}"))
-            for path, cause in unreadable:
-                tally.record(f"{path.name} (읽기 실패, 보존)", cause)
-            for path, record in records:
-                try:
-                    slug = str(record.get("slug") or path.stem)
-                    branch = record.get("branch") or f"worker/{slug}"
-                    repo = record.get("repo") or None
-                    pr_state: str | None = None
-                    a = self.ledger.load(slug)
-                    if a is None:
-                        verdict = merge_hold.STALE
-                    else:
-                        # A person may have merged/closed the PR by hand: then the
-                        # hold has nothing left to guard — drop it quietly instead
-                        # of waiting for expiry and alerting "PR은 열려 있음".
-                        # Same cwd/repo merge_pr would use on RELEASE.
-                        pr_state = stages.gh_pr_state(
-                            branch, repo, cwd=vault_root,
-                            timeout=HOLD_PR_STATE_TIMEOUT_S)
-                        if merge_hold.resolved_outside(pr_state):
-                            path.unlink(missing_ok=True)
-                            print(f"[orchestrator] merge-hold: {slug} merged outside "
-                                  f"the hold — 보류만 폐기 (state={pr_state})")
-                            continue
-                        device_pass, device_pass_sha = merge_hold.scan_device_evidence(
-                            vault_root, slug, after_ts=record.get("created_ts"))
-                        verdict = merge_hold.evaluate(
-                            record, device_pass=device_pass,
-                            device_pass_sha=device_pass_sha, state=a.state, now=now)
-                    if verdict == merge_hold.WAIT:
-                        print(f"[orchestrator] merge-hold: {slug} 대기 유지 "
-                              f"(held_sha={str(record.get('held_sha'))[:12]}, "
-                              f"expires={record.get('expires_ts')})")
-                        continue
-                    if verdict == merge_hold.RELEASE:
-                        res = stages.merge_pr(vault_root, branch, repo=repo)
-                        if not res.get("merged"):
-                            # Could not confirm the merge this tick — keep the hold
-                            # and retry next tick (never close on a still-open PR).
-                            tally.record(slug, f"머지 미확인: {res.get('note')}")
-                            continue
-                        note = ("reconciled: UI 미확인 보류 해제 — 같은 sha 기기 확인 "
-                                "PASS 후 머지")
-                        self._close_with_evidence(a)
-                        a.state = DONE
-                        a.updated_ts = m.now_iso()
-                        a.last_note = note
-                        a.job_running = False
-                        a.checkout_busy = False
-                        a.history.append({"ts": m.now_iso(),
-                                          "type": "ui-merge-hold-released",
-                                          "from": "orchestrator"})
-                        self.ledger.save(a)
-                        path.unlink(missing_ok=True)
-                        released.append(slug)
-                        self._notify_routed(
-                            f"✅ UI 미확인 보류 해제 후 머지: {self._task_title(slug)}",
-                            None, level=LEVEL_DIGEST,
-                            event_key=f"ui-merge-hold-release:{slug}")
-                        print(f"[orchestrator] merge-hold: {slug} 해제·머지·close")
-                    elif verdict == merge_hold.EXPIRED:
-                        path.unlink(missing_ok=True)
-                        # Only claim the PR is open when gh said so; None (lookup
-                        # failed) is the one other value that can reach here.
-                        pr_note = ("PR은 열려 있음" if pr_state == "OPEN"
-                                   else "PR 상태 미확인")
-                        self._notify_routed(
-                            f"⌛ UI 미확인 보류 만료: {self._task_title(slug)} — 기기 "
-                            f"확인 PASS가 만료 전에 오지 않아 보류를 지웠습니다({pr_note})",
-                            None, level=LEVEL_IMMEDIATE,
-                            event_key=f"ui-merge-hold-expired:{slug}")
-                        print(f"[orchestrator] merge-hold: {slug} 만료 — 보류 폐기")
-                    elif verdict == merge_hold.STALE:
-                        path.unlink(missing_ok=True)
-                        print(f"[orchestrator] merge-hold: {slug} 이미 처리됨 — 보류만 폐기")
-                except Exception as e:
-                    tid = str(record.get("slug") or path.name)
-                    tally.record(tid, f"{type(e).__name__}: {e}")
-            tally.flush()
-        except Exception as e:
-            print(f"[orchestrator] merge-hold sweep skipped (fail-open): {e}")
-        return released
-
     def tick(self, tasks: list[Task], now: float | None = None, *,
              unblock_flips: list | None = None) -> dict:
         # FIRST: a heavy task whose remote went quiet (or refused) moves back to
@@ -4015,10 +3860,6 @@ class Orchestrator:
         # to DONE is skipped by that sweep's state guard (no double close). With
         # no batch_ready row it only reads the ledger. Fail-open; never raises.
         batch_gate_res = self.reconcile_batch_gate(now)  # quick-verified PRs -> gate / back to full verify
-        # BEFORE reconcile_merged (same reason as reconcile_split_parents): a
-        # released UI-merge hold marks its row DONE, so reconcile_merged's state
-        # guard then skips it (no double close). Fail-open; never raises into tick.
-        merge_released = self.reconcile_merge_holds()  # UI-unseen hold -> device PASS -> merge
         reconciled = self.reconcile_merged()   # #5: close merged-but-open PR tasks
         closed = self.reconcile_closed(now)     # ledger done but todo open -> close
         unblocked = self.reconcile_unblocked()  # blocker resolved -> stop waiting
@@ -4041,7 +3882,6 @@ class Orchestrator:
                 "rescoped": rescoped,
                 "split_parents": split_parents,
                 "batch_gate": batch_gate_res,
-                "merge_released": merge_released,
                 "parents": parents,
                 "human_ready": human_ready,
                 "project_stalls": project_stalls,

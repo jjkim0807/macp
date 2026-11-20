@@ -51,7 +51,7 @@ _STUBBED = ("collect", "reconcile_merged", "reconcile_unblocked",
             "reconcile_unparked", "reconcile_closed", "reconcile_queue",
             "reconcile_parents", "renudge_due", "reap_stale",
             "reconcile_resumes", "reconcile_rescope", "reconcile_split_parents",
-            "reconcile_merge_holds", "reconcile_human_ready",
+            "reconcile_human_ready",
             "_advote_bridge_tick", "_beta_sweep_tick", "_project_stall_tick")
 
 

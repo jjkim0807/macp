@@ -157,19 +157,15 @@ def test_needs_device(payload, want):
     assert batch_gate.needs_device(payload) is want
 
 
-@pytest.mark.parametrize("needs, device_pass, ui_hold, want", [
-    (False, False, False, True),     # nothing asked for: may wait for the gate
-    (False, True, False, True),
-    (True, True, False, True),       # asked for and seen
-    (True, False, False, False),     # asked for, no evidence this run
-    (False, False, True, False),     # the UI confidence guard fired
-    (False, True, True, False),
-    (True, True, True, False),
-    (True, False, True, False),
+@pytest.mark.parametrize("needs, device_pass, want", [
+    (False, False, True),     # nothing asked for: may wait for the gate
+    (False, True, True),
+    (True, True, True),       # asked for and seen
+    (True, False, False),     # asked for, no evidence this run
 ])
-def test_device_ok(needs, device_pass, ui_hold, want):
+def test_device_ok(needs, device_pass, want):
     payload = {"heavy_signals": ["emulator"]} if needs else {}
-    assert batch_gate.device_ok(payload, device_pass=device_pass, ui_hold=ui_hold) is want
+    assert batch_gate.device_ok(payload, device_pass=device_pass) is want
 
 
 # --- load_config --------------------------------------------------------------

@@ -39,7 +39,6 @@ from todo_system.orchestrator.orchestrator import (
     ALERT_BLOCKED,
     ALERT_REVIEW_PR,
     ALERT_TIMEOUT_PARK,
-    ALERT_UI_MERGE_HOLD,
     Orchestrator,
     Task,
 )
@@ -60,7 +59,7 @@ PR_URL = "https://github.com/example-org/example-repo/pull/7"
 # reconcile_closed, reconcile_unblocked and renudge_due run for real.
 _TICK_STUBS = (
     "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
-    "reconcile_rescope", "reconcile_merge_holds", "reconcile_merged",
+    "reconcile_rescope", "reconcile_merged",
     "reconcile_parents", "reconcile_human_ready", "reconcile_queue",
     "_advote_bridge_tick", "_beta_sweep_tick", "_project_stall_tick",
 )
@@ -244,22 +243,6 @@ class ReviewParkTest(_Fixture):
         self.assertEqual(a.state, A.AWAITING_HUMAN)
         self.assertEqual(a.last_alert_kind, ALERT_REVIEW_PR)
         self.assertEqual([link for _, link in self.sent], [PR_URL])
-
-    def test_closed_md_drops_the_ui_merge_hold_alert(self):
-        self._write_md("done")
-        self._row()
-        self._reply(m.RESULT, review_required=True, ui_merge_hold=True, pr_url=PR_URL)
-        a = self._collect()
-        self._assert_closed_quietly(a, sup.REASON_MD_CLOSED)
-
-    def test_control_open_md_still_sends_the_ui_merge_hold_alert(self):
-        self._write_md("open")
-        self._row()
-        self._reply(m.RESULT, review_required=True, ui_merge_hold=True, pr_url=PR_URL)
-        a = self._collect()
-        self.assertEqual(a.state, A.AWAITING_HUMAN)
-        self.assertEqual(a.last_alert_kind, ALERT_UI_MERGE_HOLD)
-        self.assertEqual(len(self.sent), 1)
 
 
 class RunnerReportedTest(_Fixture):

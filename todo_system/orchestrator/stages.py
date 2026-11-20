@@ -826,10 +826,15 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "screenshot paths). SKIP it for a simple/non-visual change; for MANY "
             "changes at once leave it to the beta-sweep smoke gate rather than one "
             "scenario here. Exit 75 = node busy (someone else holds the lease — wait "
-            "or stop), 76 = over the shared monthly budget. On any non-zero exit, or "
-            "if the live node / gcloud / `.macp/remote_gate.json` is unreachable from "
-            "this stage, write `blocked_on:` naming the missing precondition and stop "
-            "— do NOT fake a result. Aggregates only: never copy the seed DB, "
+            "or stop), 76 = over the shared monthly budget. A device check is "
+            "never a merge condition: on any non-zero exit, or if the live node / "
+            "gcloud / `.macp/remote_gate.json` is unreachable from this stage, do NOT "
+            "fake a result and do NOT write `blocked_on:` for it — record the check "
+            "as `UNVERIFIED` (확인 못 함) with the reason under `concerns`, and let "
+            "the other checks decide the verdict. The same holds for any acceptance "
+            "criterion that only a real device, an emulator or real use can check — "
+            "this overrides the prompt's rule that parks such a criterion with "
+            "`blocked_on:`. Aggregates only: never copy the seed DB, "
             "screenshots, or dumps into run.log / the commit / the PR.\n")
     if repo:
         meta.append(f"- repo: `{repo}`\n")
@@ -920,55 +925,6 @@ def parse_verify_verdict(verify_md_text: str) -> str | None:
     """verify.md declares `overall_status: pass | fail | skip` in frontmatter."""
     m = re.search(r"overall_status:\s*(pass|fail|skip)", verify_md_text or "", re.I)
     return m.group(1).upper() if m else None
-
-
-def parse_verify_confidence(verify_md_text: str) -> str | None:
-    """verify.md declares `confidence: high | medium | low` in frontmatter — the
-    verify stage's self-assessed certainty that the change is correct
-    (worker-verify.md). Returns the lower-cased value, or None when unstated.
-
-    Same first-match-only contract as :func:`parse_verify_verdict`: the top
-    frontmatter line is authoritative, and a later mention in the prose body is
-    ignored. The merge-hold guard reads only this field, so a change the stage
-    itself is not `high`-confident in never trips the guard."""
-    m = re.search(r"confidence:\s*(high|medium|low)", verify_md_text or "", re.I)
-    return m.group(1).lower() if m else None
-
-
-# The confidence-guard block header + the code-owned downgrade note. Owned HERE,
-# not left to the verify agent's prose: the runner — not the LLM — decides a UI
-# change with no device evidence is not `high`-confident, so the reason string is
-# the engine's (the same `rebase_conflict_park` / `review_hold` discipline).
-_CONFIDENCE_GUARD_HEADER = "## 확신도 가드"
-
-
-def downgrade_verify_confidence(run_dir: Path | str, note: str) -> bool:
-    """Rewrite verify.md's first ``confidence: high`` to ``confidence: medium`` and
-    append a code-owned ``## 확신도 가드`` note. Returns True iff the file changed.
-
-    The runner calls this when its own guard fires: the verify stage declared
-    ``high`` for a UI change this run never saw on a device, so the recorded
-    confidence is lowered to ``medium`` with the reason. Mirrors
-    :func:`screen_check.append_note`'s append-only discipline for the note, but the
-    confidence line is an in-place ``re.sub(count=1)`` on the FIRST frontmatter
-    match only — the same first-match contract :func:`parse_verify_confidence`
-    reads, so a stray ``confidence: high`` in the prose body is left untouched.
-    Never writes ``overall_status:``, so the verdict is unchanged. Best-effort: a
-    missing/unreadable file returns False without raising (the guard's other
-    effects — hold record, auto_merge=False — still stand)."""
-    path = Path(run_dir) / "verify.md"
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        return False
-    new_text, _n = re.subn(r"(confidence:\s*)high", r"\1medium", text,
-                           count=1, flags=re.I)
-    block = f"\n{_CONFIDENCE_GUARD_HEADER}\n\n- {note}\n"
-    try:
-        path.write_text(new_text + block, encoding="utf-8")
-    except OSError:
-        return False
-    return True
 
 
 def parse_report_merged(report_md_text: str) -> bool | None:
@@ -2156,22 +2112,20 @@ def merge_pr(repo_dir: Path, branch: str, repo: str | None = None,
 
 
 def gh_pr_state(branch: str, repo: str | None = None,
-                cwd: Path | str | None = None, *,
-                timeout: float = 30) -> str | None:
+                cwd: Path | str | None = None) -> str | None:
     """The PR state for `branch` as gh's upper-case string, or None.
 
     `"MERGED" | "OPEN" | "CLOSED"`, else None — the same non-committal UNKNOWN
     `gh_pr_merged` keeps: no `gh`, no PR for the branch, unauthenticated, timeout,
     or any parse error. Callers must read None as "cannot tell", never as a
     definite state — so a gh hiccup can never, e.g., alert on a PR as
-    closed-unmerged when it is actually still open. `timeout` (seconds, default
-    30) lets a per-tick sweep ask with a shorter cap."""
+    closed-unmerged when it is actually still open."""
     args = ["gh", "pr", "view", branch, "--json", "state"]
     if repo:
         args += ["--repo", repo]
     try:
         r = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
