@@ -33,7 +33,6 @@ from ..kakao_format import compose_alert
 from .. import paths
 from .. import worker as _worker
 from . import background
-from . import batch_gate
 from . import beta_publish
 from . import claims as claims_mod
 from . import disk_guard
@@ -63,34 +62,9 @@ RunStartFn = Callable[[str, Path], None]
 # feeds is sticky, so the TTL only ever delays a True, never re-opens one.
 _CODE_CHECK_TTL = 60.0
 
-# The summary suffix of a proven no-op close (stages.no_op_run). One literal for
-# the two places that close one: the landed gate, and a batch-verified run whose
-# report opened no PR because there was nothing to change.
+# The summary suffix of a proven no-op close (stages.no_op_run), stamped by the
+# landed gate.
 _NO_OP_MERGE_NOTE = " — no-op — 변경할 것 없음(점검으로 충족)"
-
-# The retry note of a run whose task the batch integration gate sent back for a
-# merge conflict (batch_gate.RETURN_CONFLICT). It replaces the previous run's
-# verify.md as the retry context: that verify PASSED (quick mode), so there is no
-# failure to fix forward — the one thing to do is merge the default branch.
-# stages.build_stage_argv prints it under its "Previous attempt FAILED" heading,
-# which is why it opens by saying what did and did not fail. `{default}` is the
-# only placeholder.
-_BATCH_CONFLICT_RETRY = (
-    "What failed is the BATCH INTEGRATION GATE's merge, not this branch's own "
-    "checks: the implementation on this branch is complete and passed its quick "
-    "Verify. The gate could not merge this branch cleanly with `origin/{default}` "
-    "(or with a task merged just before it), so the task was sent back.\n\n"
-    "Do this, and only this:\n"
-    "1. Do NOT re-implement or re-scaffold anything.\n"
-    "2. Run `git fetch origin`, then `git merge origin/{default}` — an ordinary "
-    "merge commit. Never rebase and never force-push: the branch is published and "
-    "its PR is open.\n"
-    "3. Resolve every conflict so that BOTH changes keep their intent, re-run the "
-    "tests that cover the files you touched while resolving, and commit the "
-    "merge.\n"
-    "4. If the merge is already clean, commit nothing else and finish.\n\n"
-    "A full Verify runs after this stage."
-)
 
 
 @dataclass
@@ -344,60 +318,6 @@ class StagedExecutor(ClaudeCodeExecutor):
             return classify_tier(payload or {})
         except Exception as e:   # pragma: no cover — defensive
             return stages.DEFAULT_STAGE_TIER, f"classify failed: {e!r}"
-
-    def _batch_plan(self, payload: dict, tier: str, repo, repo_url,
-                    auto_merge: bool, progress: ProgressFn) -> tuple[bool, str]:
-        """(verify this run in QUICK mode?, the hint appended to the verify line).
-
-        Batch verify (batch_gate.py): a light task in a repo with a batch gate
-        configured checks only what it changed and leaves the repo's full gate to
-        one shared run. A repo with no gate entry — every repo until the vault
-        registers one — answers (False, "") with no progress line, so its runs
-        are untouched. A registered repo's run logs one line either way, naming
-        the rule that decided.
-
-        Runs on the start path of every run, so it fails open like the other
-        guards there: any error is (False, ""), the ordinary full verify. The
-        config is read through the module attribute (`batch_gate.load_config`)
-        on purpose — that is the seam the test suite guards."""
-        try:
-            if not repo_url:
-                return False, ""
-            gate = batch_gate.repo_gate(
-                batch_gate.load_config(stages._VAULT_DATA_ROOT), repo_url)
-            if gate is None:
-                return False, ""
-            five_stage = tuple(self._pipeline_for(payload)) == tuple(stages.STAGES_AUTO)
-            ok, why = batch_gate.eligible(
-                payload, tier=tier, gate=gate, five_stage=five_stage,
-                auto_merge=auto_merge,
-                remote_marked=batch_gate.remote_marked(gate, repo))
-            hint = batch_gate.verify_hint(gate, stages.default_branch(repo)) if ok else ""
-            progress(f"batch verify: {'quick' if ok else 'off'} ({why})")
-            return ok, hint
-        except Exception:           # noqa: BLE001 — advisory on the start path, fail open
-            return False, ""
-
-    def _batch_conflict_context(self, payload: dict, failure_ctx: str, repo) -> str:
-        """The retry note for a run whose task the batch integration gate sent
-        back because its branch did not merge (`batch_return_reason: conflict`),
-        else "".
-
-        Such a run must not inherit `implement`: the branch has to take the
-        default branch in first, and the full Verify then judges the merged
-        tree. "" — leave the run exactly as it would be — when the task came
-        back for any other reason, and when the most recent verify.md
-        (`failure_ctx`, stages.previous_failure_context) says FAIL: that is the
-        returned run's own full Verify failing, and its diagnosis is what the
-        next attempt has to fix. Fails open: any error is ""."""
-        try:
-            if (payload or {}).get(batch_gate.KEY_RETURN_REASON) != batch_gate.RETURN_CONFLICT:
-                return ""
-            if stages.parse_verify_verdict(failure_ctx) == "FAIL":
-                return ""
-            return _BATCH_CONFLICT_RETRY.format(default=stages.default_branch(repo))
-        except Exception:           # noqa: BLE001 — advisory on the start path, fail open
-            return ""
 
     @staticmethod
     def _account_env(msg: m.Envelope, repo: Path | None, *,
@@ -1463,15 +1383,6 @@ class StagedExecutor(ClaudeCodeExecutor):
         # creative stages so they fix the exact failure instead of re-implementing
         # blind (which just re-verifies the same red CI). Empty on first attempt.
         retry_ctx = stages.previous_failure_context(msg.task_id, run_id)
-        # Batch verify: a task the integration gate sent back for a merge
-        # conflict has no failed verify to fix forward — its last verify.md is
-        # the QUICK one, and it passed. The note that tells implement to merge
-        # the default branch takes its place. "" for every other run.
-        conflict_ctx = self._batch_conflict_context(payload, retry_ctx, repo)
-        if conflict_ctx:
-            retry_ctx = conflict_ctx
-            progress("batch return (conflict): implement re-runs to merge the "
-                     "default branch")
         # A prior TIMEOUT is fix-forward too, but of a different shape: the code is
         # already on origin/<branch>, so the creative stages must CONTINUE it, not
         # re-implement blind. Fold both notes in — a run can have a verify FAIL and,
@@ -1498,14 +1409,6 @@ class StagedExecutor(ClaudeCodeExecutor):
             prior_dir, candidates = prior
             if not (repo_url and stages.remote_branch_exists(repo, branch)):
                 candidates = [s for s in candidates if s != "implement"]
-            if conflict_ctx and (prior_dir / stages.STAGE_ARTIFACT["verify"]).exists():
-                # Sent back for a merge conflict, and the run being inherited
-                # from got as far as a verify (the quick-verified one): its
-                # implement predates the merge, so implement runs again. A prior
-                # run WITHOUT a verify.md is the returned run itself, cut short
-                # after its implement — that one already did the merge and is
-                # inherited like any other.
-                candidates = [s for s in candidates if s != "implement"]
             inherited = stages.inherit_artifacts(prior_dir, run_dir, candidates)
             if inherited:
                 progress(f"resume: inheriting {'+'.join(inherited)} from {prior_dir.name}")
@@ -1516,12 +1419,6 @@ class StagedExecutor(ClaudeCodeExecutor):
         tier, tier_reason = self._model_tier_for(payload)
         progress(f"model tier: {tier} ({tier_reason})")
         stages.record_model_tier(run_dir, tier, tier_reason)
-        # Batch verify, decided once per run beside the tier it reads: True only
-        # for an eligible task in a repo with a batch gate configured. False —
-        # every other run — changes nothing below: no extra stage kwargs, no
-        # extra RESULT keys, and for an unregistered repo no progress line.
-        batch_quick, batch_hint = self._batch_plan(
-            payload, tier, repo, repo_url, auto_merge, progress)
         # Size the per-stage subprocess timeout to the task tier — a heavy task
         # legitimately needs longer than the historical flat 3600. The class
         # constant stays a FLOOR so nothing ever gets less than before. The
@@ -1569,15 +1466,6 @@ class StagedExecutor(ClaudeCodeExecutor):
         # timeout/park. Declared before the `try` so the `finally` never sees it
         # unbound on an exception that escapes mid-pipeline.
         run_ok = False
-        # Batch verify outcome, set by the verify-stage block of a `batch_quick`
-        # run and read after the loop. Exactly one of the two ends up set:
-        # `batch_hold` (quick verify passed — wait for the integration gate, with
-        # the judged sha) or `batch_return` (a batch_gate.RETURN_* reason — go
-        # back to an individual full verify). Declared before the `try` so the
-        # post-loop block always sees a value.
-        batch_hold = False
-        batch_return = ""
-        batch_head_sha = ""
         # Set when the orchestrator CANCELs this run (it rerouted the task to
         # another agent): the loop stops at the next stage boundary and NOTHING is
         # pushed — no checkpoint, no report stage (no PR), no delegate publish.
@@ -1716,14 +1604,6 @@ class StagedExecutor(ClaudeCodeExecutor):
                     stage_env_run = (stages.with_emulator_owner(
                         stage, stages.with_browser_owner(stage, stage_env, run_id), run_id)
                         if is_claude else stage_env)
-                    # Batch verify: only the verify and report stages of a
-                    # batch-verified run get the QUICK instruction, and only on
-                    # the claude backend (the one whose prompt carries it). Empty
-                    # otherwise, so every other call keeps its exact keyword set.
-                    batch_kw = ({"batch_mode": stages.BATCH_QUICK,
-                                 "batch_hint": batch_hint}
-                                if batch_quick and is_claude
-                                and stage in ("verify", "report") else {})
                     stage_started = time.monotonic()
                     try:
                         r = backend.run_stage(
@@ -1734,7 +1614,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                             max_turns=payload.get("max_turns"),
                             retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
                             account=backend_acct, cwd=stage_cwd, env=stage_env_run,
-                            timeout=stage_timeout, progress=progress, **batch_kw)
+                            timeout=stage_timeout, progress=progress)
                     except subprocess.TimeoutExpired as e:
                         # The stage cap fired. BEFORE this catch, TimeoutExpired escaped
                         # the whole try/finally: the finally's restore_main walked HEAD
@@ -2040,31 +1920,6 @@ class StagedExecutor(ClaudeCodeExecutor):
                         return ExecOutcome(False, f"{stage} FAIL — not merged",
                                            {"branch": branch, "run_dir": str(run_dir),
                                             "verify": "FAIL", "stages": completed})
-                    # Batch verify: this verify ran in QUICK mode, so THIS run
-                    # never merges (auto_merge goes False; the report stage opens
-                    # a ready PR and the landed gate below is skipped). Then either
-                    # the tree waits for the integration gate (`batch_hold`, with
-                    # the sha it was judged at), or the task goes straight back to
-                    # an individual full verify (`batch_return`): the quick verdict
-                    # was not PASS, a device run the task asked for left no
-                    # evidence, or the sha is unreadable.
-                    if stage == "verify" and batch_quick:
-                        auto_merge = False
-                        if verdict != "PASS":
-                            batch_return = batch_gate.RETURN_QUICK_NOT_PASS
-                        else:
-                            sha = self._head_sha(repo)
-                            if not batch_gate.device_ok(
-                                    payload,
-                                    device_pass=screen_check.has_device_pass(run_dir)):
-                                batch_return = batch_gate.RETURN_NO_DEVICE
-                            elif not sha:
-                                batch_return = batch_gate.RETURN_NO_HEAD_SHA
-                            else:
-                                batch_hold, batch_head_sha = True, sha
-                        progress("batch verify: hold for the integration gate"
-                                 if batch_hold else
-                                 f"batch verify: return to full verify ({batch_return})")
             merge_note = ""
             # A proven no-op closes instead of parking; this flag rides the RESULT
             # payload (extra["no_op"]) so the orchestrator writes the close note.
@@ -2152,42 +2007,8 @@ class StagedExecutor(ClaudeCodeExecutor):
                 except Exception:
                     pass
             pr_url = stages.parse_report_pr_url(report_txt)
-            # Batch verify: settle the outcome the verify-stage block chose, now
-            # that the report has run. `auto_merge` went False there, so the
-            # landed gate above was skipped and nothing was merged. A hold needs
-            # the PR the integration gate will merge: with none, a PROVEN no-op
-            # (same proof as the landed gate — `no_op: true` AND a 0-commit
-            # branch) closes exactly as it does there, and anything else goes
-            # back to an individual full verify. Both outcomes set
-            # review_required so an orchestrator that predates batch verify parks
-            # the PR for a human instead of closing the task unmerged; the
-            # current one reads the batch keys below first and alerts nobody.
-            if batch_hold and not pr_url:
-                batch_hold = False
-                if stages.no_op_run(run_dir, completed[-1] if completed else "report",
-                                    branch, repo):
-                    review, no_op_close, merge_note = False, True, _NO_OP_MERGE_NOTE
-                else:
-                    batch_return = batch_gate.RETURN_NO_PR
-            if batch_hold:
-                review = True
-                merge_note = (" — 묶음 검증 대기 (quick Verify 통과; 통합 게이트 뒤 머지, "
-                              "PR은 ready)")
-            elif batch_return:
-                review = True
-                merge_note = f" — 묶음 제외 → 개별 전체 Verify로 복귀 ({batch_return})"
             extra = {"branch": branch, "run_dir": str(run_dir), "stages": completed,
                      "review_required": review, "repo": repo_url}
-            if batch_hold:
-                # The orchestrator's RESULT path (collect → _batch_result) reads
-                # these BEFORE review_required: the row becomes batch_ready with
-                # the sha this quick verify judged, and nobody is alerted.
-                extra[batch_gate.RESULT_READY] = True
-                extra[batch_gate.KEY_BATCH] = {"head_sha": batch_head_sha}
-            elif batch_return:
-                # ...or goes back to the queue for an individual full verify,
-                # with no refail and `verify_full` on its next payload.
-                extra[batch_gate.RESULT_RETURN] = batch_return
             if no_op_close:
                 # review_required is already False for a no-op; this tells the
                 # orchestrator's RESULT close path to stamp the Progress-Log note.

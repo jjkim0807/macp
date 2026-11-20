@@ -144,8 +144,7 @@ class ClaudeAgentBackend:
                   worker_root: Path | None = None, account=None,
                   cwd: str | None = None, env: dict | None = None,
                   timeout: float | None = None,
-                  progress=None, batch_mode: str | None = None,
-                  batch_hint: str = "") -> subprocess.CompletedProcess:
+                  progress=None) -> subprocess.CompletedProcess:
         """Build the claude argv and run it. ``account`` is accepted for interface
         parity but unused: the claude account's env (``CLAUDE_CONFIG_DIR`` +
         ``CLAUDE_CODE_OAUTH_TOKEN``) is already layered into ``env`` by the runner,
@@ -154,20 +153,13 @@ class ClaudeAgentBackend:
         One argv is built and run; the keyword set is 1:1 with
         ``stages.build_stage_argv`` (design §4 drop-in). ``TimeoutExpired`` is NOT
         caught — it carries the argv in ``.cmd`` and the runner's timeout arm owns
-        the checkpoint/record.
-
-        ``batch_mode`` / ``batch_hint`` (batch verify, ``stages.BATCH_QUICK``) are
-        forwarded ONLY when a mode is set, so the ``build_stage_argv`` call of
-        every run that is not batch-verified keeps the exact keyword set it
-        always had."""
-        batch_kw = ({"batch_mode": batch_mode, "batch_hint": batch_hint}
-                    if batch_mode else {})
+        the checkpoint/record."""
         argv = stages.build_stage_argv(
             stage, task_id=task_id, run_id=run_id, run_dir=run_dir, branch=branch,
             repo=repo, working_dir=working_dir, auto_merge=auto_merge,
             worker_root=worker_root, project_context=project_context,
             retry_context=retry_context, allowed_tools=allowed_tools, tier=tier,
-            max_turns=max_turns, **batch_kw)
+            max_turns=max_turns)
         return stages.run_stage_subprocess(
             argv, cwd=cwd, env=env, timeout=timeout, progress=progress)
 
