@@ -163,12 +163,6 @@ def _cfg() -> dict:
         # left covers stages already running plus the human. 0 disables.
         "session_stage_cap": f("USAGE_GUARD_SESSION_STAGE_CAP", 80.0),
         "weekly_parallel_step": f("USAGE_GUARD_WEEKLY_PARALLEL_STEP", 5.0),
-        # Opt-in minimum-progress mode (orchestrator `_min_progress_dispatch`):
-        # during a *pace* hold with nothing live, still dispatch the single top
-        # priority task. Hard-cap / paused / no-data holds stay full holds. Off
-        # by default so the plain hold behaviour is unchanged.
-        "min_progress": os.environ.get("USAGE_GUARD_MIN_PROGRESS", "0").strip().lower()
-                        in ("1", "true", "yes", "on"),
     }
 
 
@@ -209,14 +203,6 @@ def stage_gate(decision: dict | None = None, now: float | None = None) -> tuple[
         return None
     except Exception:
         return None
-
-
-def min_progress_enabled() -> bool:
-    """Whether `USAGE_GUARD_MIN_PROGRESS` is on (read per call). Never raises."""
-    try:
-        return bool(_cfg()["min_progress"])
-    except Exception:
-        return False
 
 
 def _state_path() -> Path:

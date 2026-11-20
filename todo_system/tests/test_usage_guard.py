@@ -579,7 +579,7 @@ def test_disable_switch_only_on_exact_one(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# release ETA (pure pace_release_at), hold kind, min-progress switch
+# release ETA (pure pace_release_at), hold kind
 # ---------------------------------------------------------------------------
 
 _R = NOW + 10 * 86400.0  # an arbitrary reset epoch for the pure-function table
@@ -668,14 +668,6 @@ def test_hold_kind_paused_and_unknown():
     assert ug.hold_kind({"allowed": False, "paused": True,
                          "windows": [], "reason": "all accounts unavailable"}) == "paused"
     assert ug.hold_kind({"allowed": False, "reason": "x"}) == "unknown"
-
-
-def test_min_progress_switch_default_off(monkeypatch):
-    assert ug.min_progress_enabled() is False
-    monkeypatch.setenv("USAGE_GUARD_MIN_PROGRESS", "0")
-    assert ug.min_progress_enabled() is False
-    monkeypatch.setenv("USAGE_GUARD_MIN_PROGRESS", "1")
-    assert ug.min_progress_enabled() is True
 
 
 def test_check_persists_release_eta(tmp_path, monkeypatch):

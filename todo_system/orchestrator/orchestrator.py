@@ -772,16 +772,11 @@ class Orchestrator:
         return None
 
     # -- Dispatcher -------------------------------------------------------
-    def dispatch(self, task: Task, now: float | None = None, *,
-                 envelope_extra: dict | None = None) -> Assignment | None:
+    def dispatch(self, task: Task, now: float | None = None) -> Assignment | None:
         """Send a task to its owning agent. No-op if already active (dedup),
         unroutable, or recently failed (cooldown — so an open-but-unresolvable
         task is not re-processed every tick; that once looped expensive
-        opus+max-effort pipelines on already-done tasks).
-
-        `envelope_extra` is merged into the ENVELOPE payload only; the ledger
-        row keeps the task's own payload, so `_retry` and a cooldown re-dispatch
-        (both rebuilt from the ledger/task payload) never re-send it."""
+        opus+max-effort pipelines on already-done tasks)."""
         closed = self._task_md_closed(task)
         if closed:
             print(f"[orchestrator] dispatch: {task.slug} md status={closed!r} — not dispatched")
@@ -820,20 +815,18 @@ class Orchestrator:
         agent, fallback = self._route_decision(task.slug, task.payload, existing)
         if agent is None:
             return None
+        extra: dict = {}
         if fallback is not None:
             # Heavy → remote: `requires: [heavy]` rides on the ENVELOPE only. In
             # the ledger payload it would follow a reroute/_retry to the default
             # agent, which lacks the capability and would REJECT it forever.
-            extra = dict(envelope_extra or {})
-            base_req = extra.get("requires", (task.payload or {}).get("requires")) or []
+            base_req = (task.payload or {}).get("requires") or []
             if isinstance(base_req, str):
                 base_req = [base_req]
             extra["requires"] = sorted({*base_req, "heavy"})
-            envelope_extra = extra
             print(f"[orchestrator] {task.slug}: heavy → {agent.id} "
                   f"(fallback {fallback.id})")
-        env_payload = ({**(task.payload or {}), **envelope_extra}
-                       if envelope_extra else task.payload)
+        env_payload = {**(task.payload or {}), **extra} if extra else task.payload
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=task.slug,
                          payload=env_payload)
         self._mailbox_for(agent).send(env)   # via the agent's own transport
@@ -891,8 +884,8 @@ class Orchestrator:
     def _task_md_closed(self, task: Task) -> str | None:
         """The closed status (done/cancelled/canceled) the payload's own task md
         states, else None. Every send passes dispatch(), including callers that
-        build a Task without load_dispatchable (CLI dispatch,
-        _min_progress_dispatch). Reads `task_path`, not tasks.task_status(slug),
+        build a Task without load_dispatchable (CLI dispatch). Reads `task_path`,
+        not tasks.task_status(slug),
         so a payload without one is untouched. Fail-open: never raises."""
         try:
             from . import repos
@@ -3122,7 +3115,7 @@ class Orchestrator:
         lock/backoff) for the dashboard and the runner's `exhausted_until` —
         never part of the verdict, and its failure is swallowed on its own.
         A blocked verdict also sets `self.usage_hold_info` ({"kind",
-        "release_eta"}) for the min-progress branch and the tick log line."""
+        "release_eta"}) for the tick log line."""
         self.usage_hold_info = None
         try:
             from todo_system import usage_guard
@@ -3541,9 +3534,6 @@ class Orchestrator:
         # picks it up next tick). Fail-open — never raises into the tick.
         rescoped = self.reconcile_rescope()    # parked rescope plan -> auto-split
         dispatched = self._dispatch_serial_per_checkout(runnable)
-        if usage_hold and not paused and not budget and not dispatched:
-            # Opt-in (USAGE_GUARD_MIN_PROGRESS): one task during a pace hold.
-            dispatched = self._min_progress_dispatch(tasks, usage_hold)
         updated = self.collect()          # still collect replies from in-flight work
         # AFTER collect (a child closed THIS tick is already in todo.db — mark_done
         # refreshes it synchronously) and BEFORE reconcile_merged, so this
@@ -3582,54 +3572,6 @@ class Orchestrator:
                 "usage_hold": usage_hold,
                 "usage_hold_eta": ((self.usage_hold_info or {}).get("release_eta")
                                    if usage_hold else None)}
-
-    def _min_progress_dispatch(self, tasks: list[Task],
-                               usage_hold: str | None) -> list[Assignment]:
-        """Minimum-progress mode: dispatch at most ONE task during a usage hold.
-
-        Only when `USAGE_GUARD_MIN_PROGRESS` is on, the hold is a *pace* hold
-        (`usage_guard.hold_kind` — never a hard cap, PAUSED or no-data hold) and
-        no run is live anywhere (every in-flight ledger row counts, including a
-        DISPATCHED envelope the runner has not picked up yet). tick() calls it
-        only without an explicit pause or a daily-budget hold. Candidates are
-        walked in `load_dispatchable` order (priority first); one that cannot go
-        (cooldown, dedup, busy checkout) yields to the next, so a stuck top task
-        cannot freeze the whole hold.
-
-        The runner still holds while the guard blocks and only runs envelopes
-        whose payload carries `bypass_guard`, so the marker is put on the
-        ENVELOPE only (`dispatch(envelope_extra=...)`): the ledger row keeps the
-        task's own payload, and a retry / re-dispatch never inherits the bypass.
-        Fail-open to the plain hold: any error dispatches nothing.
-        """
-        try:
-            from todo_system import usage_guard
-            info = self.usage_hold_info or {}
-            if info.get("kind") != "pace" or not usage_guard.min_progress_enabled():
-                return []
-            live = self._checkout_inflight()
-            if any(live.values()):
-                return []
-            cap = max(1, int(self.max_parallel_per_repo))
-            eta = info.get("release_eta")
-            for t in tasks:
-                key = self._checkout_key(t.payload)
-                if self._checkout_gate(t, key, live, cap).wait:
-                    continue
-                a = self.dispatch(t, envelope_extra={"bypass_guard": True,
-                                                     "min_progress": True})
-                if a is None:
-                    continue
-                a.history.append({"ts": m.now_iso(), "type": "min-progress-dispatch",
-                                  "from": "orchestrator", "release_eta": eta})
-                self.ledger.save(a)
-                print(f"[orchestrator] {t.slug}: min-progress — 1 task during pace "
-                      f"hold ({usage_hold}; eta {eta or '?'})")
-                return [a]
-            return []
-        except Exception as e:
-            print(f"[orchestrator] min-progress skipped (fail-open → hold): {e}")
-            return []
 
 
 def status_line(a: Assignment) -> str:
