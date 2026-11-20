@@ -1983,7 +1983,7 @@ def _add_calendar_route_arg(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="second-brain todo system (SQLite + Markdown sync)")
+    parser = argparse.ArgumentParser(description="macp task CLI — markdown task files synced into a SQLite cache")
     parser.add_argument("--db", default=str(DB_PATH), help="Path to SQLite DB file")
 
     sub = parser.add_subparsers(dest="command", required=True)
