@@ -65,7 +65,7 @@ acceptance 가 이름을 댄 셋(에피소드·프로젝트 메모리·제안 �
 | ★ **제안 파일** | `Worker/proposals/<slug>/{commands,.claude/commands}/<name>.md` + README | 스테이지가 `.claude/**` 하드 가드 때문에 완성본을 여기 커밋 `worker-implement.md:177-182`(선례: graph-memory G4 `graph-memory.md:298`, event-triggers §6.3 `event-triggers.md:340-344`) | 사람이 README 의 `cp` 한 줄로 `.claude/commands/` 에 반영 → 다음 런이 `load_stage_prompt` 로 읽음 `stages.py:429-430`(`COMMANDS_DIR` `:50`). 알림 = 대시보드 `why="todo"` 행 `proposals.py:188-208` ← `macp_dashboard.py:1220-1228`·`:1784` | 추적 | **사람이 손으로 옮긴다**. 알림 이전엔 "하나가 며칠씩 미반영" `proposals.py:6-7`. 대시보드가 스캔하는 `<root>` 문제는 §3.4 |
 | **스테이지 프롬프트** (시스템의 실제 "스킬") | 엔진 `.claude/commands/worker-*.md` | **사람만**(헤드리스 하드 가드) | 매 스테이지가 `worker-<stage>.md` 를 통째로 로드 `stages.py:429-430` | 엔진 리포 추적 | 모든 태스크에 같은 텍스트 — 태스크 **유형별** 절차를 담을 자리가 아니다 |
 | **런북 노트 + 회차 체인** (오늘의 손 스킬) | `Notes/<topic>/README.md` + `Todo/items/<topic>-<YYYYMMDD>.md` | 사람이 런북을 쓰고, delegate 회차가 끝날 때 다음 회차 md 를 `not_before` 로 스스로 쓴다 | delegate 가 태스크 본문 wikilink 로 런북을 읽음 `worker-delegate.md:11` | 추적 | 엔진 recurrence 없음 — `not_before` 는 1회 시각 게이트 `event-triggers.md:67-70`. 체인이 한 번 끊기면 아무도 다시 잇지 않는다 |
-| 내구 follow-up | `Worker/_state/followups.jsonl` | 러너가 report 의 `## 다음 단계`·`## 사람이 검토해야 할 부분` 을 파싱해 append(와이어 포맷 `worker-report.md:69-81`; `followups.py:150,223`) | 플래너 `emit-context` `planner_tick.sh:248` → `from_followup` 태스크 `worker-planner.md:351` 또는 rejected jsonl; `route: human` → `awaiting_human` → `approve`/`dismiss`/`reroute` `followups.py:27-34,577-645` | 비추적 | **한 런**의 다음 할 일 — 교차 런 집계 없음 |
+| 내구 follow-up | `Worker/_state/followups.jsonl` | 러너가 report 의 `## 다음 단계`·`## 사람이 검토해야 할 부분` 을 파싱해 append(와이어 포맷 `worker-report.md:69-81`; `followups.py:150,223`) | 플래너 `emit-context` `planner_tick.sh:248` → `from_followup` 태스크 `worker-planner.md:351` 또는 rejected jsonl; `route: human` → 기각 + 원 태스크 Progress Log 「확인 못 함」 한 줄(`_record_unverified`, 2026-11-20) | 비추적 | **한 런**의 다음 할 일 — 교차 런 집계 없음 |
 | discovery 리포트 | `Memory/episodes/<date>-discovery-<name>.md` | discover 스테이지 `discovery.py:16-21` | 플래너 `emit-context`·`emit-consumed` `planner_tick.sh:259,268` → `from_discovery` 태스크 `worker-planner.md:299` 또는 `discovery_rejected.jsonl`; `MAX_INJECTIONS = 3` 뒤 만료 `discovery.py:65,562-563` | 리포트 추적 / 상태 비추적 | 후보는 "할 일"이지 "절차"가 아니다 |
 | 런 산출물 | `Worker/runs/<run-id>/{requirements,implementation_plan,verify,report,delegate}.md` + `run.log` | 각 스테이지 `stages.py:409-418` | 같은 런의 다음 스테이지(재시도는 상속) | **비추적**(호스트 로컬) | `run.log` 는 스테이지 stdout 마지막 2000자만 `run-event-stream.md:70` |
 | 원장 | `Worker/assignments/<slug>.json` | 오케스트레이터 | 디스패치·대시보드 | 추적 | 슬러그당 **한 행**, 재디스패치가 행을 교체 `assignment.py:51-52` — 실물: 재디스패치 직후 행은 `history: []`·`attempts: 1` 로 돌아가고 `refail_count` 만 이월(이 태스크 자신의 2026-11-16 행) |
@@ -310,7 +310,7 @@ proposed_by: planner
 
 **(a) 승인 = 사람의 커밋.** 가칭 `python -m todo_system.cli skills approve <id>` 가 `status: approved`·`approved_at`·
 `version + 1` 을 쓰고 볼트에 커밋한다. `reject <id> --reason …`·`suspend <id>`·`retire <id>` 도 같은 CLI 다 — follow-up
-의 사람 결정 CLI `approve`/`dismiss`/`reroute`(`followups.py:577-645`)와 같은 모양이다. 워커 스테이지가 쓸 수 있는
+의 사람 결정 CLI `approve`/`dismiss`/`reroute`(2026-11-20 삭제)와 같은 모양이다. 워커 스테이지가 쓸 수 있는
 상태는 `proposed` 뿐이라는 **규약**과, 그것을 기계로 보장하는 수단(후보: 주입기가 `approved` 를 믿기 전에 그 전이
 커밋의 출처를 확인 / `Worker/skills/` 의 `status` 변경을 워커 브랜치 diff 의 금지 변경으로 두기)은 **§4 가 정한다**.
 
@@ -504,8 +504,8 @@ implement 한정(`stages.py:446`)을 말하지 않는다(`SECURITY.md:7-8`, `con
 **위협.** "사람만 승인"을 깨는 길은 셋이다. ① 플래너는 `Write`·`Edit` 와 bare `Bash` 를 가진다(`planner_tick.sh:357,367`;
 테스트가 글자 그대로 고정 `test_related_context_wiring.py:84`) — 볼트 작업 트리(`cd "$VAULT_DIR"`
 `planner_tick.sh:72`)에서 `Worker/skills/<id>.md` 의 `status:` 를 직접 고치거나 승인 CLI 를 부를 수 있다. ② implement
-의 `Bash(uv:*)` 는 임의 코드 실행이다(`SECURITY.md:11-13`). ③ 사람 결정 CLI 의 선례인 follow-up `approve` 는 **상태만**
-검사한다(`followups.py:577-600` — `awaiting_human` 인지 보고 바꿀 뿐, 부른 쪽이 사람인지는 묻지 않는다). 그대로 베끼면
+의 `Bash(uv:*)` 는 임의 코드 실행이다(`SECURITY.md:11-13`). ③ 사람 결정 CLI 의 선례인 follow-up `approve`(2026-11-20 삭제)는 **상태만**
+검사했다(`awaiting_human` 인지 보고 바꿀 뿐, 부른 쪽이 사람인지는 묻지 않았다). 그대로 베끼면
 §3.2 의 "승인 CLI 한 곳"이 아무에게나 열린다. 의도된 공격보다 흔한 것은 **환각**이다 — "근거 런이 충분하니 승인해
 둔다"는 에이전트의 선의.
 

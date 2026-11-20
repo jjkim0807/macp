@@ -475,7 +475,7 @@ GET /api/channels → 200 {"channels": [ {"id": "...", "title": "...", "can_post
 | worker fail `_run_next_impl` — `worker-fail:<slug>` (`:60`) | 즉시 | 즉시 유지 + 딥링크 | 런 로그 확인 |
 | worker start `_run_next_impl` — `worker-start:<slug>` (`:59`) | 요약 | **무음** | 스레드의 `progress` 가 같은 사실을 보인다 |
 | worker done `_run_next_impl` — `worker-done:<slug>` (`:61`) | 요약 | **무음** | 스레드의 `result` 가 같은 사실을 보인다 |
-| 하류 전파 `_propagate_downstream` (`:48`) · followups 결정 대기 `_notify_awaiting` (`:51`) | 요약 | 요약 유지 | 새로 생긴 하류·후속 태스크는 채널 출처가 아니라 채널에 뜨지 않는다 |
+| 하류 전파 `_propagate_downstream` (`:48`) | 요약 | 요약 유지 | 새로 생긴 하류·후속 태스크는 채널 출처가 아니라 채널에 뜨지 않는다 |
 | 실계좌 알림 전부 (`:82`) | 즉시 | **하향 금지** | 돈 — 채널과 무관 |
 | 그 밖의 발신처(`:52-58,62-69` — 정체·유휴·재기동·미커밋 정지·베타·헬스·인증·SMS 수신 거부 등; 외부 리포의 나머지 행 `:78-85`) | 지금 등급 | 그대로 | 채널 출처와 무관한 시스템·외부 경보이거나 이미 행동이 필요한 즉시 등급이다 |
 | (새) 즉답 · 라우팅 판정 · `note` | — | **보내지 않는다** | 채널에서 시킨 일의 응답은 채널에만 |

@@ -276,43 +276,13 @@ def read_digest_entries(text: str) -> list[dict]:
     return entries
 
 
-# The ko value of todo_system.orchestrator.followups.HUMAN_DIGEST_HEAD. Both read
-# the i18n table rather than importing each other — this module is a leaf per the
-# module docstring (launchd runs it under bare /usr/bin/python3 with no
-# orchestrator package on the path), and i18n is the stdlib-only table both share.
-# Used only to detect entries that need a human decision, so the digest headline
-# never claims "no action needed" while one is waiting.
-_HUMAN_DECISION_HEAD = i18n.MESSAGES["ko"]["followup.digest_head"]
-
-
-def _human_decision_heads() -> tuple[str, ...]:
-    """The follow-up digest head in every language. A notice queued under one
-    language can be drained under the other, and it must still count."""
-    heads = {tbl["followup.digest_head"] for tbl in i18n.MESSAGES.values()
-             if tbl.get("followup.digest_head")}
-    return tuple(sorted(heads | {_HUMAN_DECISION_HEAD}))
-
-
 def compose_digest(entries: list[dict]) -> str:
     """One self-limiting memo summarising the queued FYI alerts. Repeats of the
     same headline kind collapse to one "×N" line; singletons keep their first
     line (word-clipped, so a slug is never bisected). Lines that still overflow
     are dropped whole by compose_alert — the FULL entries survive in
-    logs/kakao_digest.sent.jsonl, and the headline always carries the count.
-
-    If any entry is a parked human-decision follow-up (see
-    ``_human_decision_heads``, in either language), the headline swaps "no action
-    needed" for the pending decision count so that signal never gets buried in a
-    digest that otherwise reads as "nothing to do"."""
-    heads = _human_decision_heads()
-    human_pending = sum(
-        1 for e in entries
-        if str(e.get("msg") or "").strip().startswith(heads)
-    )
-    if human_pending:
-        headline = i18n.t("digest.headline_pending", n=len(entries), k=human_pending)
-    else:
-        headline = i18n.t("digest.headline_fyi", n=len(entries))
+    logs/kakao_digest.sent.jsonl, and the headline always carries the count."""
+    headline = i18n.t("digest.headline_fyi", n=len(entries))
     empty = i18n.t("digest.empty_entry")
     groups: dict[str, list[str]] = {}
     for e in entries:

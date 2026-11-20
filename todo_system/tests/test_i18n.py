@@ -17,8 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from todo_system import cli, i18n
-from todo_system import kakao_format
-from todo_system.orchestrator import followups, human, stages, tasks
+from todo_system.orchestrator import human, stages, tasks
 from todo_system.orchestrator import message as m
 from todo_system.orchestrator import resume
 from todo_system.orchestrator.assignment import AWAITING_HUMAN, FAILED, Assignment, Ledger
@@ -270,7 +269,6 @@ def test_dashboard_phrases_follows_ui_language(monkeypatch):
 # titles, slugs and blockers are data, not translated text.
 
 SLUG = "demo-task"
-FID = "abcdef012345"
 
 
 def _alert_orch(tmp: Path, monkeypatch) -> tuple[Orchestrator, list]:
@@ -350,40 +348,6 @@ def _closed_unmerged_text(orch, sent, monkeypatch) -> tuple:
     return sent.pop()
 
 
-def _waiting_rec(**kw) -> dict:
-    rec = {"id": FID, "source_task": SLUG, "section": "다음 단계", "text": "do the thing",
-           "status": "awaiting_human", "human_reason": "needs a person"}
-    rec.update(kw)
-    return rec
-
-
-APPROVED_REC = {"id": "0123456789ab", "source_task": "other-task", "section": "다음 단계",
-                "text": "approved thing", "status": "open", "approved": True,
-                "approved_ts": "2026-10-23T10:00:00"}
-
-
-def _followup_files(tmp: Path, monkeypatch, *recs: dict) -> tuple[Path, Path]:
-    import json
-    fpath = tmp / "_state" / "followups.jsonl"
-    fpath.parent.mkdir(parents=True, exist_ok=True)
-    fpath.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs),
-                     encoding="utf-8")
-    monkeypatch.setattr(followups, "DIGEST_PATH", tmp / "logs" / "kakao_digest.jsonl")
-    monkeypatch.setattr(followups, "ROUTE_LOG_PATH", tmp / "logs" / "kakao_route.log")
-    return fpath, tmp / "_state" / "followups_rejected.jsonl"
-
-
-def _cli_replies(tmp: Path, monkeypatch) -> tuple[str, str, str]:
-    fpath, rpath = _followup_files(
-        tmp, monkeypatch, _waiting_rec(), _waiting_rec(id="111111111111"),
-        _waiting_rec(id="222222222222", status="done", resolution="rejected: old"))
-    rc1, approved = followups.approve(FID, path=fpath, rejections_path=rpath)
-    rc2, dismissed = followups.dismiss("111111111111", "not needed", path=fpath)
-    rc3, rerouted = followups.reroute("222222222222", path=fpath, rejections_path=rpath)
-    assert (rc1, rc2, rc3) == (0, 0, 0)
-    return approved, dismissed, rerouted
-
-
 def test_ko_review_alerts_are_byte_identical(monkeypatch, tmp_path):
     monkeypatch.setenv("MACP_LANGUAGE", "ko")
     orch, sent = _alert_orch(tmp_path, monkeypatch)
@@ -452,48 +416,6 @@ def test_ko_closed_unmerged_alert_is_byte_identical(monkeypatch, tmp_path):
         None)
 
 
-def test_ko_followup_digest_notice_is_byte_identical(monkeypatch):
-    monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    assert followups.HUMAN_DIGEST_HEAD == "🙋 사람 결정 대기(followups human)"
-    assert kakao_format._HUMAN_DECISION_HEAD == followups.HUMAN_DIGEST_HEAD
-    assert followups._digest_message(_waiting_rec()) == (
-        f"🙋 사람 결정 대기(followups human): [{FID}] {SLUG}\n"
-        "→ python -m todo_system.orchestrator.followups human\n"
-        "사유: needs a person")
-
-
-def test_ko_render_human_is_byte_identical(monkeypatch):
-    monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    cli_ = followups.CLI
-    assert followups.render_human([]) == "사람 결정 대기 없음\n"
-    assert followups.render_human([_waiting_rec(), APPROVED_REC]) == (
-        "사람 결정 대기 1건\n"
-        "\n"
-        f"- [{FID}] from {SLUG} (다음 단계)\n"
-        "  본문: do the thing\n"
-        "  사유: needs a person\n"
-        "\n"
-        "승인됨 — planner 태스크화 대기 1건\n"
-        "- [0123456789ab] from other-task (승인 2026-10-23T10:00:00)\n"
-        "\n"
-        f"승인:   {cli_} approve <id>\n"
-        f"기각:   {cli_} dismiss <id> --reason <사유>\n"
-        f"재분류: {cli_} reroute <id>   (rejected → 사람 결정 대기)\n")
-    assert followups.render_human([APPROVED_REC]).startswith(
-        "사람 결정 대기 없음\n\n승인됨 — planner 태스크화 대기 1건\n")
-
-
-def test_ko_followup_cli_replies_are_byte_identical(monkeypatch, tmp_path):
-    monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    approved, dismissed, rerouted = _cli_replies(tmp_path, monkeypatch)
-    assert approved == (
-        f"승인: {FID} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
-        "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
-        "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다.")
-    assert dismissed == "기각: 111111111111 → done (dismissed: not needed)"
-    assert rerouted == "재분류: 222222222222 → awaiting_human"
-
-
 HUMAN_KO_HEADS = {
     m.TASK_ASSIGN: "🙋 새 할당이 도착했어요",
     m.QUERY: "❓ 확인이 필요한 질문이 있어요",
@@ -556,20 +478,6 @@ def test_en_poison_alert_has_no_hangul(monkeypatch, tmp_path):
     _no_hangul(text)
 
 
-def test_en_followup_digest_notice_has_no_hangul(monkeypatch):
-    monkeypatch.setenv("MACP_LANGUAGE", "en")
-    notice = followups._digest_message(_waiting_rec())
-    assert notice == (
-        f"🙋 Decision pending (followups human): [{FID}] {SLUG}\n"
-        "→ python -m todo_system.orchestrator.followups human\n"
-        "reason: needs a person")
-    digest = kakao_format.compose_digest([{"msg": notice}])
-    assert digest.splitlines()[0] == "📮 macp digest — 1 alert(s), 1 decision(s) pending"
-    assert f"[{FID}]" in digest
-    _no_hangul(notice)
-    _no_hangul(digest)
-
-
 # The rest of the in-scope alerts.
 
 def test_en_other_review_framings_have_no_hangul(monkeypatch, tmp_path):
@@ -623,35 +531,6 @@ def test_en_closed_unmerged_alert_has_no_hangul(monkeypatch, tmp_path):
     _no_hangul(text)
 
 
-def test_en_render_human_has_no_hangul(monkeypatch):
-    monkeypatch.setenv("MACP_LANGUAGE", "en")
-    assert followups.render_human([]) == "no human decisions pending\n"
-    out = followups.render_human([_waiting_rec(), APPROVED_REC])
-    assert out.splitlines()[:6] == [
-        "1 human decision(s) pending",
-        "",
-        f"- [{FID}] from {SLUG} (Next steps)",
-        "  text: do the thing",
-        "  reason: needs a person",
-        "",
-    ]
-    assert "- [0123456789ab] from other-task (approved 2026-10-23T10:00:00)" in out
-    _no_hangul(out)
-    _no_hangul(followups.render_human([APPROVED_REC]), "approved only")
-    _no_hangul(followups.render_human([_waiting_rec(section="사람이 검토해야 할 부분")]),
-               "review section")
-
-
-def test_en_followup_cli_replies_have_no_hangul(monkeypatch, tmp_path):
-    monkeypatch.setenv("MACP_LANGUAGE", "en")
-    approved, dismissed, rerouted = _cli_replies(tmp_path, monkeypatch)
-    assert approved.startswith(f"approved: {FID} → open+approved. ")
-    assert dismissed == "dismissed: 111111111111 → done (dismissed: not needed)"
-    assert rerouted == "rerouted: 222222222222 → awaiting_human"
-    for text in (approved, dismissed, rerouted):
-        _no_hangul(text)
-
-
 def test_en_human_nudges_have_no_hangul(monkeypatch):
     monkeypatch.setenv("MACP_LANGUAGE", "en")
     for type_ in HUMAN_KO_HEADS:
@@ -662,24 +541,3 @@ def test_en_human_nudges_have_no_hangul(monkeypatch):
         _no_hangul(text, type_)
     bare = m.Envelope(to="human-1", type=m.RESULT)
     assert human.compose_kakao(bare, _human_agent()) == "✉️ A message arrived — please take a look"
-
-
-def test_digest_counts_a_decision_queued_in_the_other_language(monkeypatch):
-    for queued, drained, pending in (("ko", "en", "1 decision(s) pending"),
-                                     ("en", "ko", "결정 1건 대기")):
-        monkeypatch.setenv("MACP_LANGUAGE", queued)
-        notice = followups._digest_message(_waiting_rec())
-        monkeypatch.setenv("MACP_LANGUAGE", drained)
-        digest = kakao_format.compose_digest([{"msg": notice}, {"msg": "⚠️ beta: built"}])
-        assert digest.splitlines()[0].endswith(pending), (queued, drained)
-
-
-def test_alert_text_resolves_language_at_call_time(monkeypatch):
-    rec = _waiting_rec()
-    monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    assert followups._digest_message(rec).startswith(followups.HUMAN_DIGEST_HEAD)
-    monkeypatch.setenv("MACP_LANGUAGE", "en")
-    assert followups._digest_message(rec).startswith(i18n.MESSAGES["en"]["followup.digest_head"])
-    assert followups.human_digest_head() == "🙋 Decision pending (followups human)"
-    monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    assert followups.human_digest_head() == followups.HUMAN_DIGEST_HEAD

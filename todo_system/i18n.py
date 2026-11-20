@@ -1,7 +1,7 @@
 """Engine log/CLI, alert and dashboard text in the configured UI language (``paths.ui_language()``).
 
 ``t(key, **fmt)`` is the one entry point for messages — log/CLI lines and the
-Slack/Kakao alert and follow-up texts alike; the dashboard page's fragments live
+Slack/Kakao alert texts alike; the dashboard page's fragments live
 in :data:`DASHBOARD` (see :func:`dashboard_phrases`). Scope is human-facing text
 only — strings a parser reads back (stage-artifact headings, the ``없음``
 sentinel, alert event keys, ledger ``last_note`` texts) stay out of these
@@ -53,7 +53,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.sms.title": "SMS 릴레이 설정",
         # daily digest + route() merge suffix (kakao_format)
         "digest.headline_fyi": "📮 macp 알림 요약 {n}건 — 조치 불필요",
-        "digest.headline_pending": "📮 macp 알림 요약 {n}건 — 결정 {k}건 대기",
         "digest.empty_entry": "(빈 항목)",
         "digest.merged": "외 {n}건 합침",
         # human inbox nudges (orchestrator/human.py)
@@ -64,24 +63,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "human.head.ping": "📡 핑",
         "human.head.other": "✉️ 메시지가 도착했어요",
         "human.headline": "{head} — 확인해주세요",
-        # follow-up digest notice + `followups human|approve|dismiss|reroute`
-        "followup.digest_head": "🙋 사람 결정 대기(followups human)",
-        "followup.none": "사람 결정 대기 없음",
-        "followup.waiting": "사람 결정 대기 {n}건",
-        "followup.section_next_steps": "다음 단계",
-        "followup.section_human_review": "사람이 검토해야 할 부분",
-        "followup.body": "본문: {text}",
-        "followup.approved_head": "승인됨 — planner 태스크화 대기 {n}건",
-        "followup.approved_at": "(승인 {ts})",
-        "followup.hint_approve": "승인:   {cli} approve <id>",
-        "followup.hint_dismiss": "기각:   {cli} dismiss <id> --reason <사유>",
-        "followup.hint_reroute": "재분류: {cli} reroute <id>   (rejected → 사람 결정 대기)",
-        "followup.approved_msg": (
-            "승인: {fid} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
-            "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
-            "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다."),
-        "followup.dismissed_msg": "기각: {fid} → done (dismissed: {reason})",
-        "followup.rerouted_msg": "재분류: {fid} → {status}",
         # orchestrator alerts (Orchestrator._notify_* and reconcile_merged)
         "alert.reason": "사유: {reason}",
         "alert.account_switch": (
@@ -236,7 +217,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.sms.apply": "Apply settings in the SMS Relay app",
         "dash.sms.title": "SMS relay setup",
         "digest.headline_fyi": "📮 macp digest — {n} alert(s), no action needed",
-        "digest.headline_pending": "📮 macp digest — {n} alert(s), {k} decision(s) pending",
         "digest.empty_entry": "(empty entry)",
         "digest.merged": "+{n} more merged",
         "human.head.assign": "🙋 New assignment arrived",
@@ -246,26 +226,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "human.head.ping": "📡 Ping",
         "human.head.other": "✉️ A message arrived",
         "human.headline": "{head} — please take a look",
-        # No colon, ≤ 41 chars: compose_digest groups on the first ":" and clips a
-        # singleton line to 60, which must still keep the "[<12-hex id>]" after it.
-        "followup.digest_head": "🙋 Decision pending (followups human)",
-        "followup.none": "no human decisions pending",
-        "followup.waiting": "{n} human decision(s) pending",
-        "followup.section_next_steps": "Next steps",
-        "followup.section_human_review": "Needs human review",
-        "followup.body": "text: {text}",
-        "followup.approved_head": "approved — {n} waiting for the planner to file a task",
-        "followup.approved_at": "(approved {ts})",
-        "followup.hint_approve": "approve: {cli} approve <id>",
-        "followup.hint_dismiss": "dismiss: {cli} dismiss <id> --reason <reason>",
-        "followup.hint_reroute": "reroute: {cli} reroute <id>   (rejected → awaiting a human)",
-        "followup.approved_msg": (
-            "approved: {fid} → open+approved. The next planner run injects it in the "
-            "human-approved block. The planner only runs on a run completion, a task "
-            "change or the 24h heartbeat, so on a quiet day this can take up to about "
-            "24 hours."),
-        "followup.dismissed_msg": "dismissed: {fid} → done (dismissed: {reason})",
-        "followup.rerouted_msg": "rerouted: {fid} → {status}",
         "alert.reason": "reason: {reason}",
         "alert.account_switch": (
             "🔁 Claude account switched {frm} → {to} ({reason}) — "
