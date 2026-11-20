@@ -66,7 +66,7 @@ related:
 | # | 상황 | 지금 일어나는 일 (`파일:줄`) | 알림 | 재개 경로 | 재개 때 버리는 것 |
 |---|---|---|---|---|---|
 | ① | **권한 거부** — 허용 목록 밖 호출 | 스테이지 argv 는 `-p` + `--allowed-tools`(`stages.py:701`)뿐이고 `--permission-mode`·`--permission-prompt-tool`·`--settings` 가 없다(`:688-705`). 권한 모드를 정하지 않은 `-p` 런에서 승인이 필요한 호출은 승인 주체가 없으면 그 자리에서 거부된다(V2). 실사례 둘이 "This command requires approval" 로 FAIL(unverified) 파킹됐다 — pnpm(`stages.py:263-266`), flutter(`:268-274`) | verify 가 `blocked_on` 을 쓰면 ⛔ 1회(`orchestrator.py:1207-1232`, 문구 `:1399-1403`). 아니면 알림 없이 `_retry`(`:1245-1247`) | 사람이 md 의 `allowed_tools` 를 넓혀 커밋하고 `cli resume`(`concepts.md:190-193`). 단 이 필드는 implement 에만 먹는다(`stages.py:441-446`) — verify 에서 막힌 두 사례는 엔진 코드 수정(`FALLBACK_RUNNER_TOOLS` `:275-278`)으로만 풀렸다 | 새 run_id(`runner.py:1091-1093`). 직전 verify 가 FAIL 이면 상속 0(`stages.py:2535-2537`) — research 부터 다시. flutter 사례는 "one human intervention and two worker runs"(`:268-274`) |
-| ② | **되돌리기 어려운 조작** — 실계좌·결제·사용자 명의 제출·배포·공개 | 스테이지 **안**에는 엔진 게이트가 없다. 막는 것은 프롬프트 규칙 (볼트) CLAUDE.md §12 "태스크 본문이 명시적으로 허용할 때만" 뿐이고, 허용 목록 안의 명령(예: `Bash(npm:*)` 아래의 publish)은 그대로 실행된다. 엔진 게이트는 **경계**에만 있다 — `auto_merge` 와 UI merge hold(`concepts.md:69-75`), 실계좌 태스크의 자동 분할 거부(`rescope.py:226-227`, 태그 `:70`), 채널 R2 신호 → `manual`(`chat-channels.md:258`, `:268-270`) | 에이전트가 스스로 멈추고 `blocked_on` 을 쓸 때만 ⛔ | 사람이 손으로 처리한 뒤 md 를 고치고 `cli resume` | 파이프라인 전체(①과 같음) |
+| ② | **되돌리기 어려운 조작** — 실계좌·결제·사용자 명의 제출·배포·공개 | 스테이지 **안**에는 엔진 게이트가 없다. 막는 것은 프롬프트 규칙 (볼트) CLAUDE.md §12 "태스크 본문이 명시적으로 허용할 때만" 뿐이고, 허용 목록 안의 명령(예: `Bash(npm:*)` 아래의 publish)은 그대로 실행된다. 엔진 게이트는 **경계**에만 있다 — `auto_merge`(`concepts.md:69-72`), 실계좌 태스크의 자동 분할 거부(`rescope.py:226-227`, 태그 `:70`), 채널 R2 신호 → `manual`(`chat-channels.md:258`, `:268-270`) | 에이전트가 스스로 멈추고 `blocked_on` 을 쓸 때만 ⛔ | 사람이 손으로 처리한 뒤 md 를 고치고 `cli resume` | 파이프라인 전체(①과 같음) |
 | ③ | **방향 선택** — 설계 갈림길, 정보 부족 | 스테이지에서 사람에게 묻는 채널이 없다. 질문 도구 AskUserQuestion 은 `-p` 에서 **권한 호스트가 있을 때만** 제공되는데(V3) 지금 argv 엔 호스트가 없다. 백그라운드를 켰던 시절의 헤드리스는 "Awaiting user input." 으로 끝났다(`stages.py:3113-3116`). 그래서 에이전트는 추측하거나 `blocked_on` 으로 파킹된다 | ⛔ 1회(`blocked_on` 인 경우), 그 뒤 AWAITING_HUMAN 재알림 백오프(기본 1d/3d/7d — `orchestrator.py:1770-1772`, `:1823-1843`) | `/decide`(reply 는 `kind: human` 일 때만 — `decide.md:25-35`), `human reply` CLI(`concepts.md:182-190`), md 수정 + resume. 셋 다 터미널이 필요하다 | 파이프라인 전체 |
 | ④ | **로그인·2FA·캡차** | 2FA **인증번호**는 사람이 필요 없다 — 상시 규칙 `macp-sms`·`macp-mail` 로 읽는다(`stages.py:280-298`; (볼트) CLAUDE.md §11·§11b). **로그아웃**이면 에이전트는 로그인하지 않고 멈춰 `blocked_on` 을 쓴다(메타데이터 `stages.py:619-621`). 사람은 (볼트) CLAUDE.md §12 의 재로그인 절차를 밟는다. 캡차·폰 앱 간편인증은 같은 모양으로 보이나 엔진 경로로 확인하지 못했다 — 미확인 | browser_watch 경보(볼트 운영 — 미확인) + ⛔ | 재로그인 뒤 `cli resume` | 파이프라인 전체 |
 | ⑤ | (부수) **스테이지 타임아웃** — 사람 입력은 아니지만 "기다림 = 프로세스 종료"라는 구조가 같다 | 러너가 `TimeoutExpired` 를 잡아 implement 면 WIP rescue → `checkpoint_push`(`runner.py:1324-1387`). 연속 2회면 파킹(`orchestrator.py:1233-1244`) | 2회째 파킹 때 경보(`:1244`) | 1회째는 `_retry` 가 origin/<branch> 를 이어받는다(`runner.py:1130-1142` "CONTINUE it") | 끊긴 스테이지의 세션 문맥과 그 스테이지의 미커밋 작업(implement 외) |
@@ -151,7 +151,7 @@ related:
   `gh` 쓰기)가 바닥 대상이다.
 - (b) **명령·도구·호스트 패턴표** — publish·deploy·release·주문·결제류 명령과 결제·주문 호스트. 구체 정규식은
   A1 이 테스트와 함께 정한다(형제 §4.2 가 마스킹 정규식을 S2 로 미룬 것과 같은 방식). 파이프라인 자신의 PR
-  생성·머지는 `auto_merge`·UI merge hold 가 이미 게이트라 뺀다(`concepts.md:69-75`).
+  생성·머지는 `auto_merge` 가 이미 게이트라 뺀다(`concepts.md:69-72`).
 - (c) **에이전트 선언** — 되돌리기 어려운 조작 **직전에** `confirm(category=irreversible, summary=…)` 을 부르라는
   규칙. 스테이지 프롬프트는 `.claude/**` 라 헤드리스가 고칠 수 없으므로 메타데이터 줄로 싣는다(브라우저 lease
   규칙 선례 `stages.py:588-597`).
@@ -174,7 +174,7 @@ related:
 | 로그인·2FA | 에이전트에게는 항상 거부, 사람에게는 `human_step` | 카드는 "사람이 해 주세요"라는 요청이지 자격 증명 입력창이 아니다(§5.1) |
 
 **실계좌 auto_merge 게이트는 그대로다.** 카드는 스테이지 안의 조작 **하나**를 허락할 뿐 머지 게이트를 풀지
-않는다. 실계좌 태스크의 자동 분할 거부(`rescope.py:226-227`)와 `auto_merge`·UI merge hold(`concepts.md:69-75`)는
+않는다. 실계좌 태스크의 자동 분할 거부(`rescope.py:226-227`)와 `auto_merge`(`concepts.md:69-72`)는
 손대지 않는다.
 
 ### 2.4 설정 방식 — 태스크 frontmatter · 프로젝트 config · env

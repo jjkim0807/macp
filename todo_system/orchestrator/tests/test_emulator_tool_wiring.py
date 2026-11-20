@@ -112,7 +112,9 @@ class EmulatorToolWiringTest(unittest.TestCase):
                 self.assertIn(stages.EMULATOR_CLI, prompt)
                 self.assertIn("run --repo-dir", prompt)
                 self.assertIn("--seed owner|none", prompt)
-                self.assertIn("blocked_on", prompt)
+                # a device check that cannot run is recorded, never parked
+                self.assertIn("never a merge condition", prompt)
+                self.assertNotIn("naming the missing precondition", prompt)
                 self.assertIn(f"${OWNER_ENV}", prompt)   # owner is injected via env
                 # the 75 (lease busy) / 76 (over budget) contract is documented
                 self.assertIn("75", prompt)

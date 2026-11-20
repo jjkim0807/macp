@@ -826,10 +826,15 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "screenshot paths). SKIP it for a simple/non-visual change; for MANY "
             "changes at once leave it to the beta-sweep smoke gate rather than one "
             "scenario here. Exit 75 = node busy (someone else holds the lease — wait "
-            "or stop), 76 = over the shared monthly budget. On any non-zero exit, or "
-            "if the live node / gcloud / `.macp/remote_gate.json` is unreachable from "
-            "this stage, write `blocked_on:` naming the missing precondition and stop "
-            "— do NOT fake a result. Aggregates only: never copy the seed DB, "
+            "or stop), 76 = over the shared monthly budget. A device check is "
+            "never a merge condition: on any non-zero exit, or if the live node / "
+            "gcloud / `.macp/remote_gate.json` is unreachable from this stage, do NOT "
+            "fake a result and do NOT write `blocked_on:` for it — record the check "
+            "as `UNVERIFIED` (확인 못 함) with the reason under `concerns`, and let "
+            "the other checks decide the verdict. The same holds for any acceptance "
+            "criterion that only a real device, an emulator or real use can check — "
+            "this overrides the prompt's rule that parks such a criterion with "
+            "`blocked_on:`. Aggregates only: never copy the seed DB, "
             "screenshots, or dumps into run.log / the commit / the PR.\n")
     if repo:
         meta.append(f"- repo: `{repo}`\n")

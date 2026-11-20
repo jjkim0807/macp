@@ -89,9 +89,9 @@ A heavy task that may need a **device check** goes only to a remote that also ha
 `emulator` / `screen_check` was asked for, the clone is not on disk yet, or the clone has a
 `gradlew` and one of the repo's screen-check app paths (`app/` by default, widened by the
 repo's `screen_check.app_paths` in the vault's `beta_publish_config.json`). The reason is
-the post-verify screen check: a remote that cannot reach the emulator node would leave an
-app-UI change parked in a merge hold only that remote can see. A Gradle server repo (no
-`app/`) and a non-app long job still go to a plain `heavy` remote. `screen_check: false` is
+the post-verify screen check, which only a remote that can reach the emulator node can
+run. A Gradle server repo (no `app/`) and a non-app long job still go to a plain `heavy`
+remote. `screen_check: false` is
 not an exemption — the runner still checks an app diff.
 
 A task that goes to a remote is not held by this host's per-repo checkout cap or its

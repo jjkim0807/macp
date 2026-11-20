@@ -66,7 +66,7 @@ declares_oversize: yes
    `full_gate`는 argv 목록의 목록이다(셸 문자열 아님, 순서대로 전부 rc 0). 키는 `repos.repo_name(url)`.
 2. **"light/standard"의 뜻 = 러너가 이미 계산하는 `classify_tier(payload)` 결과.** `verify_batch: true`는 heavy도 넣고 `false`는 항상 뺀다.
 3. **대상 경계.** 외부 리포(`repo` 있음) + 5단계 파이프라인 + `worker_mode: auto` + 러너의 `auto_merge` 판정이 True인 경우만. 볼트 태스크, quick·delegate·discover, review, `auto_merge: false`는 지금과 같다.
-4. **emulator 조건의 증거 = 이 런의 `screen_check.has_device_pass(run_dir)`.** `emulator: true`인데 증거가 없거나 UI 확신도 가드(`_ui_merge_hold_fires`)가 걸리면 묶지 않고 바로 개별 전체 Verify로 되돌린다. quick만 통과한 트리는 Report가 머지하지 않고, 머지 보류 기록(`merge_hold.schedule`)도 만들지 않는다.
+4. **emulator 조건의 증거 = 이 런의 `screen_check.has_device_pass(run_dir)`.** `emulator: true`인데 증거가 없으면 묶지 않고 바로 개별 전체 Verify로 되돌린다. quick만 통과한 트리는 Report가 머지하지 않는다.
 5. **ledger 상태는 `assignment.py`에 둔다**(`statuses.py`는 태스크 md 상태 전용). `batch_ready`는 TERMINAL·in-flight·AWAITING_HUMAN 어디에도 넣지 않는다. 묶음 정보는 행의 `payload["batch"]`에 둔다(`last_run_dir` 선례 — dataclass 필드를 늘리지 않아 다른 행의 JSON이 그대로다).
 6. **개별 Verify 복귀 = FAILED + history 마지막 항목 `batch-returned`.** `_ledger_gate`가 이 행을 `checkout_busy`·`job_running`과 같은 deferral로 본다(poison 없음, 5분 재확인, `dispatch()`의 refail 증가 없음). 복귀 표식 `verify_full: true`와 `batch_return_reason`은 `dispatch()`가 기존 행 payload에서 새 payload로 넘긴다. 그 태스크는 done까지 다시 묶이지 않는다.
 7. **통합 브랜치는 로컬 전용.** 공유 클론의 별도 worktree(`<repo>.wt/integ-<ts>`)에 `integ/<repo_name>/<ts>`를 만들고 push하지 않는다. 워커 클론의 pre-push 가드(`stages._PUSH_GUARD_HOOK`)가 원격 ref 삭제를 막기 때문이다.
@@ -98,7 +98,7 @@ declares_oversize: yes
      - `remote_marked(gate, checkout) -> bool`(`remote_gate.decide(shlex.join(argv), checkout) == "remote"`가 하나라도 있으면 True, 예외는 True — 보수적으로 제외).
      - `needs_device(payload) -> bool`(`heavy_signals`에 `emulator`가 있거나 `emulator`가 참).
      - `eligible(payload, *, tier, gate, five_stage, auto_merge, remote_marked=False) -> tuple[bool, str]`. 첫 일치 우선: ① `gate is None` → 제외 ② `repo` 없음 → 제외 ③ `verify_full` 참 → 제외 ④ `five_stage`가 아니거나 `worker_mode != "auto"` → 제외 ⑤ `auto_merge` 거짓 → 제외 ⑥ `remote_marked` → 제외 ⑦ `verify_batch`가 False → 제외, True → 포함 ⑧ `tier in ("light", "standard")` → 포함, 그 밖 → 제외.
-     - `device_ok(payload, *, device_pass, ui_hold) -> bool`(설계 4번).
+     - `device_ok(payload, *, device_pass) -> bool`(설계 4번).
      - `mark_ready(a, result_payload, *, now_iso) -> bool`: `pr_url`·`repo`·`batch.head_sha` 중 하나라도 없으면 아무것도 바꾸지 않고 False. 있으면 `a.state = BATCH_READY`, `a.payload["batch"] = {pr_url, head_sha, branch, ready_ts, run}`(`run`은 run_dir의 basename만), `last_note`, history `batch-ready`.
      - `mark_returned(a, reason, *, now_iso)`: `state = FAILED`, `payload.pop("batch")`, `payload["verify_full"] = True`, `payload["batch_return_reason"] = reason`, `updated_ts = now_iso`, `capacity_limited`·`job_running`·`checkout_busy`·`timed_out` False, `blocked_on = ""`, `last_note`, history `{"type": BATCH_RETURNED, "reason": reason}`. `refail_count`는 건드리지 않는다.
      - `verify_hint(gate, default_branch="") -> str`(quick 지시 줄에 붙일 문구: 미룬 전체 게이트 명령 표시 + `quick_hint`).
@@ -126,14 +126,13 @@ declares_oversize: yes
   3. `runner.py`에 `StagedExecutor._batch_plan(self, payload, tier, repo, repo_url, auto_merge, progress) -> tuple[bool, str]`를 추가한다. `repo_url`이 없거나 `batch_gate.repo_gate(batch_gate.load_config(stages._VAULT_DATA_ROOT), repo_url)`이 None이면 진행 줄 없이 `(False, "")`. 등록된 리포일 때만 `eligible(...)`을 부르고 `progress("batch verify: quick|off (<이유>)")` 한 줄을 남긴다. `five_stage`는 `tuple(self._pipeline_for(payload)) == tuple(stages.STAGES_AUTO)`. 전체를 try/except로 싸서 어떤 오류도 `(False, "")`가 되게 한다.
   4. `_execute` 배선(대상이 아닌 런의 kwargs·흐름은 그대로 둔다):
      - 티어 기록 뒤(L1165): `batch_quick, batch_hint = self._batch_plan(...)`.
-     - `ui_merge_hold` 변수 옆(L1217–1219): `batch_hold = False`, `batch_return = ""`, `batch_head_sha = ""`.
+     - `run_ok` 변수 옆(L1217–1219): `batch_hold = False`, `batch_return = ""`, `batch_head_sha = ""`.
      - 스테이지 호출(L1316–1324): `batch_quick and is_claude and stage in ("verify", "report")`일 때만 `{"batch_mode": stages.BATCH_QUICK, "batch_hint": batch_hint}`를 `**`로 더한다.
-     - verdict 블록(L1614): 기존 `if stage == "verify" and auto_merge and not ui_merge_hold and self._ui_merge_hold_fires(...)`를 `elif`로 바꾸고 그 앞에 새 분기를 둔다.
+     - verdict 블록(L1614): 기존 verify 분기 앞에 새 분기를 둔다.
        ```python
        if stage == "verify" and batch_quick:
-           fires = self._ui_merge_hold_fires(repo, repo_url, payload, run_dir, branch, text, progress)
            sha = self._head_sha(repo)
-           if not batch_gate.device_ok(payload, ui_hold=fires,
+           if not batch_gate.device_ok(payload,
                                        device_pass=screen_check.has_device_pass(run_dir)):
                batch_return = batch_gate.RETURN_NO_DEVICE
            elif not sha:
@@ -142,12 +141,12 @@ declares_oversize: yes
                batch_hold, batch_head_sha = True, sha
            auto_merge = False      # quick만 통과한 트리는 Report가 머지하지 않는다
        ```
-     - 루프 뒤 `pr_url` 계산(L1712)과 `if ui_merge_hold:`(L1721) 사이: `batch_hold`인데 `pr_url`이 없으면 `stages.no_op_run(...)`이 참일 때 기존 no-op 종결(`review = False`, `no_op_close = True`, 같은 merge_note)로, 아니면 `batch_return = RETURN_NO_PR`로 바꾼다. `batch_hold or batch_return`이면 `review = True`(구 오케스트레이터에서는 기존 검토 파킹으로 떨어짐)와 `merge_note`를 정한다.
+     - 루프 뒤 `pr_url` 계산(L1712) 다음: `batch_hold`인데 `pr_url`이 없으면 `stages.no_op_run(...)`이 참일 때 기존 no-op 종결(`review = False`, `no_op_close = True`, 같은 merge_note)로, 아니면 `batch_return = RETURN_NO_PR`로 바꾼다. `batch_hold or batch_return`이면 `review = True`(구 오케스트레이터에서는 기존 검토 파킹으로 떨어짐)와 `merge_note`를 정한다.
      - `extra`(L1733–1750): `batch_hold` → `extra["batch_ready"] = True`, `extra["batch"] = {"head_sha": batch_head_sha}`. `batch_return` → `extra["batch_return"] = batch_return`.
   5. 테스트:
      - `test_agent_backend_golden.py`: 기본 argv 프롬프트에 "Verify mode: QUICK"·"Batch gate"가 없다(전 스테이지). `batch_mode="quick"`이면 verify·report 프롬프트에만 각 줄과 `batch_hint`가 있고 플래그 뼈대는 같다.
      - `test_agent_backend.py`: 새 인자를 주지 않으면 `build_stage_argv`가 받는 kwargs에 `batch_mode`가 없고, 주면 그대로 전달된다.
-     - `test_runner_batch.py`: 기존 `_execute` 수준 테스트의 준비 방식을 `git -C W grep -ln "_ui_merge_hold_fires\|ui_merge_hold" -- todo_system`으로 찾아 그대로 따른다. 경우: (a) 등록 리포 + standard → verify·report 호출에 `batch_mode`, RESULT payload에 `batch_ready`·`batch.head_sha`·`review_required`, Report의 `auto_merge`는 False (b) 미등록 리포 → 호출 kwargs와 payload에 batch 키가 없고 `batch verify:` 진행 줄도 없다 (c) `verify_batch: false`·heavy → 기존 경로 (d) emulator 필요 + 기기 증거 없음 → `batch_return == "no-device-evidence"`이고 `merge_hold.schedule`이 불리지 않는다 (e) `_batch_plan`이 예외를 내도 기존 경로로 간다.
+     - `test_runner_batch.py`: 기존 `_execute` 수준 테스트의 준비 방식을 `git -C W grep -ln "StagedExecutor().execute" -- todo_system`으로 찾아 그대로 따른다. 경우: (a) 등록 리포 + standard → verify·report 호출에 `batch_mode`, RESULT payload에 `batch_ready`·`batch.head_sha`·`review_required`, Report의 `auto_merge`는 False (b) 미등록 리포 → 호출 kwargs와 payload에 batch 키가 없고 `batch verify:` 진행 줄도 없다 (c) `verify_batch: false`·heavy → 기존 경로 (d) emulator 필요 + 기기 증거 없음 → `batch_return == "no-device-evidence"` (e) `_batch_plan`이 예외를 내도 기존 경로로 간다.
   6. 커밋.
 - **Risk**: 러너의 머지 판정부를 건드린다 → 새 분기는 `batch_quick`이 참일 때만 타고 기존 블록은 `elif`로 조건이 같다. (b)·(c)와 golden 테스트로 고정한다.
 
@@ -163,7 +162,7 @@ declares_oversize: yes
   3. `_ledger_gate`(L869): `deferred = job_running or checkout_busy or is_batch_return_pending(existing)`.
   4. `dispatch()`(`_route_decision` 호출 L762 앞): 기존 행 payload에 `batch_gate.CARRY_KEYS`(`verify_full`, `batch_return_reason`)가 있으면 `task = Task(task.slug, {**task.payload, **carry})`로 새 payload에 넘긴다. 호출자의 Task 객체는 바꾸지 않는다.
   5. `reconcile_batch_gate(self, now=None) -> dict`(안전망 판) 추가. `{"started": [], "merged": [], "returned": [], "closed": []}`를 돌려주고, `BATCH_READY` 행이 없으면 I/O 없이 끝난다. 행마다 try/except + `_SkipTally`: 태스크 md가 닫혔으면 `_close_split_parent_row`와 같은 모양으로 DONE 정리(`closed`), 리포가 설정에서 빠졌으면 `mark_returned(..., "not-enabled")`, `ready_ts`가 `EXPIRE_S`를 넘었으면 `mark_returned(..., "expired")` + 알림 1회(`_notify_routed`, event_key `batch-expired:<slug>`). 바깥에도 try/except를 두고 `[orchestrator] batch gate sweep skipped (fail-open): …` 한 줄만 남긴다.
-  6. `tick()`: `reconcile_split_parents`(L3456) 뒤, `reconcile_merge_holds`(L3460) 앞에서 호출하고 결과 dict에 `"batch_gate"` 키를 더한다.
+  6. `tick()`: `reconcile_split_parents`(L3456) 뒤, `reconcile_merged` 앞에서 호출하고 결과 dict에 `"batch_gate"` 키를 더한다.
   7. 상태 소비자 점검: `git -C W grep -n "AWAITING_HUMAN\|_IN_FLIGHT\|is_terminal\|awaiting_human\|in_progress" -- todo_system scripts ':!*tests*'` 결과를 훑어 `batch_ready` 행이 잘못 분류되는 곳이 있는지 run.log에 적는다. 특히 `worker._runner_idle`이 이 상태를 "바쁨"으로 읽지 않는지 확인한다. `todo_system/cli.py`는 수정 금지이므로 문제가 있으면 후속으로만 기록한다.
   8. `test_batch_ready_state.py`: RESULT(`review_required` + `batch_ready` + `pr_url`) → state `batch_ready`, notify 호출 없음 / `pr_url` 없음 → 기존 AWAITING_HUMAN 경로 / `review_required`만 있는 RESULT → 기존과 같음 / `batch_return` → FAILED, `display_state == "deferred"` / 복귀 행 재디스패치: `refail_count` 그대로, 새 행 payload와 envelope에 `verify_full`, refail이 poison 문턱이어도 격리되지 않음 / `batch_ready` 행은 `dispatch()`가 None / 안전망: 만료·설정 제거·md 닫힘 / `tick([])`이 `reconcile_batch_gate`를 실제로 거친다(결과 dict의 `batch_gate` 키).
   9. 하위 ① 마감: Verification strategy의 AC 6 명령 4개를 커밋 뒤에 돌리고 출력을 run.log에 인용한다.
@@ -199,7 +198,7 @@ declares_oversize: yes
   - `W/todo_system/i18n.py` (수정)
   - `W/todo_system/orchestrator/tests/test_batch_gate_job.py` (수정)
 - **Steps**:
-  1. `reconcile_batch_gate`를 넓힌다. `BATCH_READY` 행을 `payload["repo"]`로 묶고, `batch_gate.running_jobs(vault_root)`에만 있는 리포도 포함한다. 리포마다 try/except + `_SkipTally`, `repo_lock` 안에서 Phase 3의 안전망 검사 뒤 `batch_gate.step(...)`. hooks: `close` = `_close_with_evidence(a)` + DONE + `job_running`·`checkout_busy` 해제 + history `batch-merged` + save(`reconcile_merge_holds` L3371–3380과 같은 모양) / `returned` = `mark_returned` + save / `park` = AWAITING_HUMAN + note + save / `alert` = `_notify_routed`.
+  1. `reconcile_batch_gate`를 넓힌다. `BATCH_READY` 행을 `payload["repo"]`로 묶고, `batch_gate.running_jobs(vault_root)`에만 있는 리포도 포함한다. 리포마다 try/except + `_SkipTally`, `repo_lock` 안에서 Phase 3의 안전망 검사 뒤 `batch_gate.step(...)`. hooks: `close` = `_close_with_evidence(a)` + DONE + `job_running`·`checkout_busy` 해제 + history `batch-merged` + save(`reconcile_merged`와 같은 모양) / `returned` = `mark_returned` + save / `park` = AWAITING_HUMAN + note + save / `alert` = `_notify_routed`.
   2. gradle 상한: `_batch_gradle_jobs()`(실행 중 잡 가운데 gradle 체크아웃인 것의 수)를 추가해 `_checkout_gate`의 `gradle_runs`(L1083–1087)에 더한다. `step`에 넘기는 `gradle_busy`는 `max_parallel_gradle_builds > 0`이고 gradle 체크아웃일 때 "in-flight gradle 런 + 실행 중 잡 ≥ 상한". 상한이 0이면 둘 다 기존과 같다.
   3. 알림(`i18n.MESSAGES` ko·en 동시): `alert.batch_gate_failed`("❌ 묶음 통합 게이트 실패 — {repo} {n}건을 개별 전체 Verify로 되돌렸어요", 즉시, event_key `batch-gate-failed:<repo>:<integ 브랜치>`, 멤버 행에 `last_alert_kind = ALERT_BATCH_GATE_FAILED`), `alert.batch_gate_passed`(digest), `alert.batch_restarts`, Phase 3의 만료 문구를 `alert.batch_expired`로 옮긴다. 게이트 로그는 경로만 싣는다.
   4. 통합 테스트(AC 2): tmp 볼트 배치(ledger `Worker/assignments`, `.macp/batch_gate.json`)와 Phase 4 헬퍼의 리포로 a·b·c를 `batch_ready`로 두고 **`orch.tick([])`을 실제로 호출**한다. 가짜 게이트(`batch_gate.default_gate` 패치), 가짜 `stages.merge_pr`·`gh_pr_state`·`gh_pr_merged`, `tasks.mark_done`·`md_fingerprint` 기록기, 클론 루트는 `repos.local_path` 패치. 관계없는 스윕은 `mock.patch.object`로 막는다. 틱 1: 통합 브랜치에 a·b, c는 FAILED + `batch-returned` + `verify_full`, 게이트 시작 1회. 틱 2: `merge_pr`가 `worker/a`, `worker/b` 순서로 `(클론 경로, 브랜치, repo=url)` 호출, a·b는 DONE, `mark_done`이 a → b 순서. 별도 테스트로 상한이 찼을 때 시작 보류와 `_checkout_gate`의 +1, 설정이 없는 호출에서 잡 파일·출력·git 호출이 없음을 확인한다.
