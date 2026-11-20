@@ -640,7 +640,7 @@ def test_sweep_reads_the_config_two_up_from_the_ledger(world, monkeypatch):
 _TICK_STUBS = (
     "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
     "reconcile_rescope", "_dispatch_serial_per_checkout", "collect",
-    "reconcile_split_parents", "reconcile_merge_holds", "reconcile_merged",
+    "reconcile_split_parents", "reconcile_merged",
     "reconcile_closed", "reconcile_unblocked", "reconcile_parents",
     "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
     "_beta_sweep_tick", "_project_stall_tick", "renudge_due",

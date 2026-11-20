@@ -2156,22 +2156,20 @@ def merge_pr(repo_dir: Path, branch: str, repo: str | None = None,
 
 
 def gh_pr_state(branch: str, repo: str | None = None,
-                cwd: Path | str | None = None, *,
-                timeout: float = 30) -> str | None:
+                cwd: Path | str | None = None) -> str | None:
     """The PR state for `branch` as gh's upper-case string, or None.
 
     `"MERGED" | "OPEN" | "CLOSED"`, else None — the same non-committal UNKNOWN
     `gh_pr_merged` keeps: no `gh`, no PR for the branch, unauthenticated, timeout,
     or any parse error. Callers must read None as "cannot tell", never as a
     definite state — so a gh hiccup can never, e.g., alert on a PR as
-    closed-unmerged when it is actually still open. `timeout` (seconds, default
-    30) lets a per-tick sweep ask with a shorter cap."""
+    closed-unmerged when it is actually still open."""
     args = ["gh", "pr", "view", branch, "--json", "state"]
     if repo:
         args += ["--repo", repo]
     try:
         r = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
