@@ -107,18 +107,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR이 머지 없이 닫혔어요 — "
             "다시 열지·재작업할지·접을지 판단해주세요"),
-        # batch verify (orchestrator.reconcile_batch_gate)
-        "alert.batch_expired": (
-            "⌛ 묶음 검증 대기 만료: {title} — {hours}시간 안에 통합 게이트가 돌지 "
-            "않아 개별 전체 Verify로 되돌렸습니다"),
-        "alert.batch_gate_failed": (
-            "❌ 묶음 통합 게이트 실패 — {repo} {n}건을 개별 전체 Verify로 되돌렸어요"),
-        "alert.batch_gate_passed": (
-            "✅ 묶음 통합 게이트 통과 — {repo} {n}건을 차례로 머지했어요"),
-        "alert.batch_restarts": (
-            "🔁 묶음 통합 게이트를 {max}번 다시 시작해도 기본 브랜치가 계속 움직였어요 — "
-            "{repo} {n}건을 개별 전체 Verify로 되돌렸어요"),
-        "alert.batch_gate_log": "게이트 로그: {path}",
         # orchestrator trace view (orchestrator/trace.py render())
         "trace.title": "# 🔎 trace — `{slug}`",
         "trace.summary": "> 런 {n}개 · runs_dir `{runs_dir}` · 읽기 전용 (상태를 바꾸지 않음)",
@@ -262,20 +250,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR was closed without merging — "
             "decide whether to reopen, redo or drop it"),
-        # batch verify (orchestrator.reconcile_batch_gate)
-        "alert.batch_expired": (
-            "⌛ Batch verify wait expired: {title} — no integration gate ran within "
-            "{hours}h, so it went back to an individual full Verify"),
-        "alert.batch_gate_failed": (
-            "❌ Batch integration gate failed — {n} task(s) in {repo} went back to an "
-            "individual full Verify"),
-        "alert.batch_gate_passed": (
-            "✅ Batch integration gate passed — {n} PR(s) in {repo} merged in order"),
-        "alert.batch_restarts": (
-            "🔁 The default branch kept moving through {max} restarts of the batch "
-            "integration gate — {n} task(s) in {repo} went back to an individual "
-            "full Verify"),
-        "alert.batch_gate_log": "gate log: {path}",
         # orchestrator trace view (orchestrator/trace.py render())
         "trace.title": "# 🔎 trace — `{slug}`",
         "trace.summary": "> {n} run(s) · runs_dir `{runs_dir}` · read-only (changes no state)",
@@ -376,7 +350,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.html.later": "시작일 전",
         "dash.html.broken": "깨진 것 · failed·사람대기",
         "dash.html.queue": "큐",
-        "dash.html.batch_ready": "묶음 검증 대기",
         "dash.html.queue_upcoming": "예약됨",
         "dash.html.queue_blocked": "선행 대기",
         "dash.html.system": "시스템 상세",
@@ -416,7 +389,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.qw_gradle_cap": "빌드 상한",
         "dash.js.qw_budget": "예산",
         "dash.js.qw_retry": "재시도 대기",
-        "dash.js.st_batch_ready": "묶음 대기",
         "dash.js.deps_done": "선행 완료 — 언블락 대기",
         "dash.js.count": "건",
         "dash.js.none": "없음",
@@ -476,7 +448,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.cmt.broken": "깨진 것 (failed · 사람 대기)",
         "dash.cmt.active": "지금 실행 중",
         "dash.cmt.queue": "큐: 디스패치 대기 순서·사유 (서버 판정, 읽기 전용). 기본 접힘, 그룹 폴딩 없음.",
-        "dash.cmt.batch_ready": "묶음 검증 대기: quick Verify를 통과하고 통합 게이트 뒤 차례로 머지될 태스크. 0건이면 카드 숨김",
         "dash.cmt.system_1": "이하 이력·참고·계측: 기본 접힘 '시스템 상세' 한 카드로 합침. 안의 기존",
         "dash.cmt.system_2": "는 중첩으로 보존(id·cnt-* 앵커 불변). runs 는 '이력'에",
         "dash.cmt.system_3": "흡수되므로 cnt-runs/#runs 는 숨긴 자리표시로만 남긴다.",
@@ -524,7 +495,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.html.later": "Not started yet",
         "dash.html.broken": "Broken · failed·awaiting human",
         "dash.html.queue": "Queue",
-        "dash.html.batch_ready": "Batch verify queue",
         "dash.html.queue_upcoming": "Scheduled",
         "dash.html.queue_blocked": "Waiting on prerequisites",
         "dash.html.system": "System details",
@@ -563,7 +533,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.qw_gradle_cap": "build cap",
         "dash.js.qw_budget": "budget",
         "dash.js.qw_retry": "retry wait",
-        "dash.js.st_batch_ready": "batch wait",
         "dash.js.deps_done": "prerequisites done — awaiting unblock",
         "dash.js.count": "",
         "dash.js.none": "none",
@@ -622,7 +591,6 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.cmt.broken": "broken (failed · awaiting human)",
         "dash.cmt.active": "running now",
         "dash.cmt.queue": "queue: dispatch wait order·reason (server-judged, read-only). Collapsed by default, no group folding.",
-        "dash.cmt.batch_ready": "batch verify queue: tasks that passed a quick verify and merge in order after the integration gate. Card hidden when empty",
         "dash.cmt.system_1": "history·reference·metrics below: merged into one collapsed 'System details' card. The existing",
         "dash.cmt.system_2": "stay nested inside it (id·cnt-* anchors unchanged). runs are absorbed into 'History',",
         "dash.cmt.system_3": "so cnt-runs/#runs remain only as a hidden placeholder.",

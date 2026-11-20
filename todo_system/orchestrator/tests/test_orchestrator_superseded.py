@@ -481,9 +481,6 @@ class _TickFixture(_Fixture):
         with contextlib.ExitStack() as st:
             for name in _TICK_STUBS:
                 st.enter_context(mock.patch.object(self.orch, name, return_value=[]))
-            st.enter_context(mock.patch.object(
-                self.orch, "reconcile_batch_gate",
-                return_value={"started": [], "merged": [], "returned": [], "closed": []}))
             st.enter_context(mock.patch.object(self.orch, "usage_hold", return_value=None))
             st.enter_context(mock.patch.object(self.orch, "paused", return_value=False))
             st.enter_context(mock.patch.object(self.orch, "budget_exceeded",

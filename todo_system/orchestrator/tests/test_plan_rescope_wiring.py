@@ -281,7 +281,7 @@ def test_parent_the_split_must_not_touch_still_reaches_a_human(vault, tmp_path):
 _TICK_STUBS = (
     "reroute_remote", "reap_stale", "reconcile_resumes",
     "reconcile_rescope", "_dispatch_serial_per_checkout", "collect",
-    "reconcile_split_parents", "reconcile_batch_gate",
+    "reconcile_split_parents",
     "reconcile_merged", "reconcile_closed", "reconcile_parents",
     "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
     "_beta_sweep_tick",
@@ -292,9 +292,7 @@ _LIVE = ("collect", "reconcile_rescope")
 def _tick(orch, live: tuple = _LIVE):
     """`orch.tick([])` with every sweep stubbed except the ones `live` names and
     the three holds answered, so the result says something about the split's place
-    in the tick and nothing about this host. Copied from
-    test_batch_ready_state._tick rather than imported: that module is being
-    changed by a sibling task."""
+    in the tick and nothing about this host."""
     patches = [mock.patch.object(orch, name, return_value=[])
                for name in _TICK_STUBS if name not in live]
     patches += [mock.patch.object(orch, "usage_hold", return_value=None),

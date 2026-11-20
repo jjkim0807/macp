@@ -169,12 +169,6 @@ STAGES_QUICK = ("quick",)   # right-sizing: one combined call for trivial change
 # tree by prompt; the runner closes it on RESULT like any vault task.
 STAGES_DISCOVER = ("discover",)
 
-# The verify MODE of a batch-verified run (batch_gate.py) — not the `quick`
-# pipeline above. The runner passes it to build_stage_argv as `batch_mode` for
-# the verify and report stages of a run whose full gate is left to the repo's
-# integration gate. An in-process keyword value: never stored, never on the wire.
-BATCH_QUICK = "quick"
-
 # The stages the Solar (upstage) harness can run: the single-stage lanes only.
 # `solar_stage.run` has read/write/finish file tools and no shell — so it cannot
 # do quick's self-verify + self-merge + `gh pr` or the 5-stage pipeline's
@@ -730,15 +724,10 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      project_context: str = "", retry_context: str = "",
                      allowed_tools: str | None = None,
                      tier: str | None = None,
-                     max_turns: int | None = None,
-                     batch_mode: str | None = None,
-                     batch_hint: str = "") -> list[str]:
+                     max_turns: int | None = None) -> list[str]:
     """Reproduce worker.build_stage_command: stage prompt + run metadata, with
     the stage's tool whitelist and turn budget. `tier` is the task's model tier
-    (model_select.classify_tier); None means the heavy ladder. `batch_mode`
-    (BATCH_QUICK) adds the batch-verify instruction to the verify and report
-    stages, with `batch_hint` appended to the verify one; None — every run that
-    is not batch-verified — leaves the prompt byte-identical. The plan stage's
+    (model_select.classify_tier); None means the heavy ladder. The plan stage's
     metadata always ends with `plan_split_hint`. A vault task (no `repo`) whose
     `working_dir` is its worktree (`repos.is_vault_worktree`) gets
     `vault_worktree_meta`; any other `working_dir` without a `repo` adds nothing."""
@@ -845,40 +834,6 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         # vault. Only that shape opens this arm: with no `working_dir`, or one
         # that is the vault root itself, the prompt is what it always was.
         meta.extend(vault_worktree_meta(stage, working_dir, branch))
-    if batch_mode == BATCH_QUICK and stage == "verify":
-        # Batch verify (batch_gate.py): this run checks only what it changed and
-        # the repo's full gate runs once, later, for several tasks together. On
-        # the metadata, after the prompt, so it wins over the prompt's Step 2 and
-        # pass rule.
-        meta.append(
-            "- **Verify mode: QUICK — batch gate (overrides Step 2 and the pass "
-            "rule in the prompt above)**: this repo's full gate runs ONCE after "
-            "this stage, on an integration branch that carries several tasks, so "
-            "do NOT run the repo-wide gate here. Run only (1) the compile/build "
-            "of the modules this branch changed and (2) the targeted tests that "
-            "cover the files in `git diff --name-only origin/<default>..."
-            f"{branch}`. List every gate command you deferred in verify.md under "
-            "`## Deferred to the integration gate`. The `overall_status: pass` "
-            "rule (\"every check on the Step 2 list ran and passed\") applies to "
-            "this QUICK set only; an acceptance criterion that only the full gate "
-            "can show is recorded as `DEFERRED (integration gate)` and does not "
-            "block `pass`. Everything else in the Rules still applies (clean "
-            "tree, Step 6b wiring, outcome plausibility, safety-AC evidence). A "
-            "device check (`emulator: true`) is NOT deferred. Write `confidence: "
-            "medium` at most." + (f" {batch_hint}" if batch_hint else "") + "\n")
-    elif batch_mode == BATCH_QUICK and stage == "report":
-        # True whether the runner then holds the PR for the integration gate or
-        # sends the task back to an individual full verify: either way THIS run
-        # does not merge, and the PR is still opened only on a passing verify.
-        meta.append(
-            "- **Batch gate**: Verify ran in QUICK mode, so this run does NOT "
-            "merge — `auto_merge` is `false` for that reason, not because a human "
-            "must review. Open the ready PR exactly as §4 says (only when "
-            "verify.md is `overall_status: pass`), set `merged: n/a`, and stop. "
-            "The PR is merged later: by the orchestrator once the integration "
-            "gate passes, or by a later run of this task after an individual full "
-            "Verify. Unless there is another reason, write `없음` under `사람이 "
-            "검토해야 할 부분`.\n")
     if stage == "plan":
         # How an oversize plan states a split the engine can run without a person
         # (rescope.rescope_from_split_block).
