@@ -95,7 +95,7 @@ If `Worker/planner_policy.yaml` cannot be read, use these built-in defaults:
 - **User-decision-bound**: dropout/leave decisions, which job to apply, blocked items where blocker is user choice
 - **Costs money**: new paid accounts, new credentials
 - **Explicitly deferred**: items the user marked as blocked or "later" (in the vault's language, e.g. "나중에")
-- **Direct implementation**: You only CREATE TASK FILES. Worker pipeline does implementation.
+- **Direct implementation**: you write task files, not code — the worker pipeline implements. Filling in an open task's md (e.g. `allowed_tools`, `touches`, acceptance criteria) is fine while no run holds it: `Worker/assignments/<slug>.json` is absent or its `state` is not `dispatched`, `accepted` or `in_progress`.
 - **Un-mergeable deliverables (git-ignored targets)**: a task whose
   acceptance/deliverable is a git-ignored file — e.g. `Todo/Todo.md`, `Todo/NOW.md`,
   `Todo/FOCUS.md`, `Worker/**` state, generated views. The staged pipeline gates on
@@ -384,9 +384,10 @@ A task whose work happens in a project repo (not the vault) MUST carry:
   vault task: no working_dir, no build, and it parks as `awaiting_human`.
   **macp engine (self-improvement) tasks MUST carry `repo:` = the engine repository's clone URL**
   (the `origin` of the engine checkout these prompts come from) — the vault has no
-  `todo_system/`, `scripts/` or `.claude/commands/`; the engine is its own repository. A macp task without `repo:` dispatches as a
+  `todo_system/` or `scripts/`; the engine is its own repository (these prompts are its
+  `todo_system/prompts/`). A macp task without `repo:` dispatches as a
   vault task and finds nothing to edit. Vault-only ops scripts (remote-control stack, identifier
-  gate) live in the vault's `ops/` and are human-maintained, not worker targets.
+  gate) live in the vault's `ops/`; a task for them is a vault task (no `repo:`).
 - `allowed_tools:` — including the project's build/test runner (e.g. `Bash(./gradlew:*)`).
 - `auto_merge: true` — unless the task genuinely needs human review.
 - `touches:` — REQUIRED for every `repo:` auto/quick task you create: without it the task
