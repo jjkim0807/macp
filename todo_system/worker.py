@@ -56,7 +56,8 @@ from todo_system import daemonctl
 # _ENGINE_ROOT comes from paths.engine_root() — the repo root in a development
 # checkout, todo_system/_engine in an installed wheel — and is immune to
 # MACP_VAULT_ROOT: it anchors the files that ship with the engine —
-# .claude/commands, scripts/kakao_send.sh and scripts/health_report.py. ROOT
+# scripts/kakao_send.sh and scripts/health_report.py (the stage prompts are
+# orchestrator.stages.COMMANDS_DIR, inside the package). ROOT
 # resolves through the vault resolver so vault data (Todo/, Worker/, logs/) is
 # read from a redirected vault. Its start= anchor is paths.vault_search_start():
 # the engine root in a checkout — byte-identical to _ENGINE_ROOT when the env is
@@ -69,7 +70,7 @@ ROOT = paths.vault_root(start=paths.vault_search_start())
 TODO_DIR = ROOT / "Todo"
 ITEMS_DIR = TODO_DIR / "items"
 WORKER_DIR = ROOT / "Worker"
-COMMANDS_DIR = _ENGINE_ROOT / ".claude" / "commands"
+COMMANDS_DIR = _stages.COMMANDS_DIR
 LOGS_DIR = ROOT / "logs"
 
 # ---------------------------------------------------------------------------

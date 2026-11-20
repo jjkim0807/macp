@@ -2,7 +2,7 @@
 # Planner tick — feed the v2 autonomous loop.
 #
 # When the dispatchable auto-queue is below the policy depth limit, invoke the
-# planner agent (.claude/commands/worker-planner.md) to CREATE a few SAFE auto
+# planner agent (todo_system/prompts/worker-planner.md) to CREATE a few SAFE auto
 # tasks for active projects. The orchestrator `auto` tick (every 5 min) then
 # dispatches whatever the planner wrote; the runners execute + auto-merge.
 #
@@ -219,9 +219,8 @@ fi
 [ -n "$MODEL" ] || MODEL="claude-opus-4-8"
 echo "[planner-tick] model: $MODEL"
 
-# Invoke the planner as a SLASH COMMAND. Feeding the raw command markdown as a
-# `-p` prompt just makes claude echo the document; `/worker-planner` loads the
-# command with its execution semantics. --allowed-tools are space-separated
+# Invoke the planner with its prompt body as `-p` (PROMPT, built below by the
+# stage loader), as every stage is invoked. --allowed-tools are space-separated
 # (each its own arg), matching stages.build_stage_argv. The planner reads
 # todo.db + policy + memory and WRITES Todo/items/*.md; the todo-sync daemon
 # syncs those into the DB and the orchestrator dispatches them.
@@ -239,14 +238,17 @@ echo "[planner-tick] model: $MODEL"
 # Durable report follow-ups: pull any UNRESOLVED follow-ups (recorded to
 # Worker/_state/followups.jsonl by the runner's report seam) so a follow-up that
 # missed the run-completed scan window still reaches the planner as extra context.
-# Empty when there are none, so PROMPT stays exactly "/worker-planner" —
-# byte-identical to before on the common path (no planner behaviour change unless
-# something is actually pending). A separate `if` rather than
-# "/worker-planner${CTX:+$'\n\n'$CTX}" because ANSI-C $'...' quoting is NOT
+# Empty when there are none, so PROMPT stays the bare planner prompt on the
+# common path (no planner behaviour change unless something is actually
+# pending). A separate `if` rather than
+# "${PROMPT}${CTX:+$'\n\n'$CTX}" because ANSI-C $'...' quoting is NOT
 # re-evaluated inside a ${:+} expansion — that form would inject the literal
 # characters $'\n\n' instead of two newlines.
 CTX=$($PY -m todo_system.orchestrator.followups emit-context 2>/dev/null)
-PROMPT="/worker-planner"
+# worker-planner.md's body, frontmatter stripped — the loader every stage uses;
+# checkout and wheel alike.
+PROMPT=$($PY -c 'from todo_system.orchestrator import stages; print(stages.strip_frontmatter(stages.load_stage_prompt("planner")))')
+[ -n "$PROMPT" ] || { echo "[planner-tick] planner prompt unreadable; skip"; exit 0; }
 if [ -n "$CTX" ]; then
   echo "[planner-tick] injecting $(printf '%s' "$CTX" | grep -c '^- \[') unresolved follow-up(s) into planner context"
   PROMPT="$PROMPT"$'\n\n'"$CTX"

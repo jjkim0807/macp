@@ -169,7 +169,7 @@ def test_guardrail_in_subtask_files_is_human():
 
 def test_guardrail_in_parent_outcome_is_human():
     d = rescope.can_auto_rescope(
-        _plan(3), _parent(outcome="edit .claude/commands/worker-planner.md safely"))
+        _plan(3), _parent(outcome="edit Worker/planner_policy.yaml safely"))
     assert d.allow is False
     assert "guardrail" in d.reason
 

@@ -45,11 +45,14 @@ with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
                          "MACP_PYTHON": os.environ.get("MACP_PYTHON")}) + "\\n")
 if os.environ.get("SEAM_USAGE_BLOCK") == "1" and "todo_system.usage_guard" in sys.argv and "check" in sys.argv:
     sys.exit(3)
+if "-c" in sys.argv:
+    print("planner prompt")
 '''
 
 
 # MACP_PYTHON and uv: record and exit 0 with no output (every gate passes,
-# every context injection is empty, the lease is "taken").
+# every context injection is empty, the lease is "taken") — except the `-c`
+# planner-prompt loader, which prints a stand-in prompt body.
 _FAKE_PY = f'#!{sys.executable}\nTOOL = "py"\n{_RECORD}'
 _FAKE_UV = f'#!{sys.executable}\nTOOL = "uv"\n{_RECORD}'
 
@@ -184,7 +187,7 @@ def test_installed_layout_uses_macp_python_and_never_uv(tmp_path):
         assert want in argvs, (want, argvs)
     assert _modules(py) == _ENGINE_MODULES, argvs
     for call in py:
-        assert call["argv"][:2] == ["-P", "-m"], call
+        assert call["argv"][0] == "-P" and call["argv"][1] in ("-m", "-c"), call
         assert call["cwd"] == str(h.vault), call
         assert call["MACP_VAULT_ROOT"] == str(h.vault), call
         assert call["PYTHONPATH"] is None, call                 # _engine never on PYTHONPATH
@@ -277,7 +280,7 @@ def test_combined_checkout_keeps_the_old_command_lines(tmp_path):
     assert ["run", "python", "-m", "todo_system.orchestrator.hq_host", "--check"] in [
         c["argv"] for c in uv]
     for call in uv:
-        assert call["argv"][:3] == ["run", "python", "-m"], call
+        assert call["argv"][:2] == ["run", "python"] and call["argv"][2] in ("-m", "-c"), call
         assert "-P" not in call["argv"] and "--project" not in call["argv"], call
         assert call["cwd"] == str(engine), call
         assert call["MACP_VAULT_ROOT"] is None and call["PYTHONPATH"] is None, call

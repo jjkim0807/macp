@@ -64,7 +64,7 @@ def test_engine_paths_ignore_redirected_vault(tmp_path):
     vault_resolved = vault.resolve()
     expected = {
         "_ENGINE_ROOT": engine,
-        "COMMANDS_DIR": engine / ".claude" / "commands",
+        "COMMANDS_DIR": engine / "todo_system" / "prompts",
         "KAKAO_SEND_SCRIPT": engine / "scripts" / "kakao_send.sh",
         "HEALTH_REPORT_SCRIPT": engine / "scripts" / "health_report.py",
     }

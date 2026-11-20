@@ -2,7 +2,7 @@
 (research → plan → implement → verify → report) into the orchestrator.
 
 The intelligence lives in the SAME stage prompts the legacy worker uses
-(.claude/commands/worker-<stage>.md): implement edits code, verify runs the
+(todo_system/prompts/worker-<stage>.md): implement edits code, verify runs the
 project's own checks locally (GitHub Actions is not used) and writes
 overall_status, report opens the PR via gh and merges on that verdict. This
 module only reproduces the light orchestration worker.py did inline — build the
@@ -33,8 +33,7 @@ from .. import paths
 # Two roots, split the way beta_publish._ENGINE_ROOT / _VAULT_DATA_ROOT are.
 # _ENGINE_ROOT comes from paths.engine_root() (the repo root in a development
 # checkout, todo_system/_engine in an installed wheel) and is immune to
-# MACP_VAULT_ROOT: it anchors .claude/commands (the stage prompts that ship with
-# the engine). _VAULT_DATA_ROOT resolves through the vault resolver so a
+# MACP_VAULT_ROOT. _VAULT_DATA_ROOT resolves through the vault resolver so a
 # redirected vault is read from the right place; anchored at
 # paths.vault_search_start() — the engine root in a checkout, byte-identical to
 # _ENGINE_ROOT when the env is unset (the live config); None in an installed
@@ -47,7 +46,9 @@ from .. import paths
 # local).
 _ENGINE_ROOT = paths.engine_root()
 _VAULT_DATA_ROOT = paths.vault_root(start=paths.vault_search_start())
-COMMANDS_DIR = _ENGINE_ROOT / ".claude" / "commands"
+# The stage prompts ship inside the package, so one path holds in a checkout,
+# a git-archive tree and an installed wheel alike (immune to MACP_VAULT_ROOT).
+COMMANDS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 # Worker/runs = stage artifacts; vault-data, redirected via _VAULT_DATA_ROOT to
 # match metrics.RUNS (PR #168) — NOT engine-immune. (Was pinned to the engine root
 # before this leaf; that was the stages-vs-metrics split-brain the outcome closes.)

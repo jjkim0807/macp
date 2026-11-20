@@ -269,6 +269,23 @@ class BuildArgvTest(unittest.TestCase):
         self.assertIn("Edit", argv)                              # implement can edit
         self.assertIn("Bash(git:*)", argv)
 
+    def test_stage_prompts_load_from_the_package_prompts_dir(self):
+        """The stage prompts ship inside the package (todo_system/prompts), where a
+        worker can edit them like any other engine file. Every stage's `-p` starts
+        with that file's body, and the old location keeps no copy."""
+        pkg = Path(stages.__file__).resolve().parents[1]
+        self.assertEqual(stages.COMMANDS_DIR, pkg / "prompts")
+        self.assertEqual(sorted(pkg.parent.joinpath(".claude", "commands").glob("worker-*.md")), [])
+        self.assertTrue((pkg / "prompts" / "worker-planner.md").is_file())
+        for stage in (*stages.STAGES_AUTO, *stages.STAGES_DELEGATE,
+                      *stages.STAGES_QUICK, *stages.STAGES_DISCOVER):
+            body = stages.strip_frontmatter(
+                (pkg / "prompts" / f"worker-{stage}.md").read_text(encoding="utf-8"))
+            self.assertTrue(body.strip(), stage)
+            argv = self._argv(stage)
+            self.assertEqual(argv[:2], ["claude", "-p"], stage)
+            self.assertTrue(argv[2].startswith(body), stage)
+
     def test_model_and_effort(self):
         from todo_system.orchestrator import model_select
         argv = self._argv("implement")
