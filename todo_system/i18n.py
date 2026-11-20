@@ -95,10 +95,6 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⏱️ {n}회 연속 stage timeout으로 대기 전환 — "
             "더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다"),
         "alert.timeout_checkpointed": "작업은 origin worker 브랜치에 checkpoint됨(유실 아님)",
-        "alert.blocker_cancelled": (
-            "🔗 대기하던 상류 태스크가 취소돼 진행 불가 — "
-            "이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다"),
-        "alert.upstream": "상류: {blocker}",
         "alert.propagate": (
             "🔗 상류 '{proj}' 변경으로 하류 통합검증 {n}개를 만들었어요 — "
             "검증 결과를 확인해주세요"),
@@ -165,10 +161,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "\"todo already closed\" 경로로 자동 종결한다 — 재큐 불필요 "
             "(원장 수기 편집도 불필요)"),
         "trace.ledger.unpark": (
-            "  - 해제: 블로커 해소 후 태스크 md의 `worker_mode`를 비-디스패치 "
-            "값(`blocked` 등)으로 바꿨다가 `auto`로 되돌리면 "
-            "`reconcile_unparked()`가 그 전이를 해제 신호로 읽어 자동 재큐한다 "
-            "— 원장 수기 편집 불필요"),
+            "  - 해제: 블로커를 해소하고 태스크 md 수정을 커밋한 뒤 "
+            "`python -m todo_system.cli resume <slug> --after-commit <sha>`로 재개를 "
+            "예약하면 다음 틱에 `reconcile_resumes()`가 재큐한다 — 원장 수기 편집 불필요"),
         "trace.ledger.long_job": "- long_job 실행 중",
         "trace.ledger.checkout_busy": "- 체크아웃 대기 (다른 런이 같은 체크아웃 사용 중 — 끝나면 자동 재시도)",
         "trace.ledger.heavy_routed": (
@@ -257,10 +252,6 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⏱️ Parked after {n} consecutive stage timeouts — "
             "decide whether to split it further or run it as a long_job"),
         "alert.timeout_checkpointed": "work is checkpointed on the origin worker branch (not lost)",
-        "alert.blocker_cancelled": (
-            "🔗 An upstream task this one waited on was cancelled — "
-            "decide whether this task is still needed or should be cancelled too"),
-        "alert.upstream": "upstream: {blocker}",
         "alert.propagate": (
             "🔗 Upstream '{proj}' changed, so {n} downstream integration check(s) "
             "were created — check their results"),
@@ -333,10 +324,10 @@ MESSAGES: dict[str, dict[str, str]] = {
             "`reconcile_merged()` closes the row via the \"todo already closed\" path "
             "— no requeue needed (no hand edit of the ledger either)"),
         "trace.ledger.unpark": (
-            "  - release: once the blocker is resolved, switch the task md's "
-            "`worker_mode` to a non-dispatch value (`blocked` etc.) and back to "
-            "`auto`; `reconcile_unparked()` reads that transition as the release "
-            "signal and requeues automatically — no hand edit of the ledger needed"),
+            "  - release: once the blocker is resolved, commit the task md change and "
+            "reserve a resume with `python -m todo_system.cli resume <slug> --after-commit "
+            "<sha>`; on the next tick `reconcile_resumes()` requeues it — no hand edit "
+            "of the ledger needed"),
         "trace.ledger.long_job": "- long_job running",
         "trace.ledger.checkout_busy": (
             "- waiting for the checkout (another run is using the same checkout "

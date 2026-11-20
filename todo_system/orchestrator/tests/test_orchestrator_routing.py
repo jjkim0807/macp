@@ -95,11 +95,10 @@ class RoutedAlertTest(unittest.TestCase):
         self.assertIn("되감겼", self.sent[0][0].splitlines()[0])
         self.assertEqual(self._queued(), [])
 
-    def test_timeout_park_and_blocker_cancelled_stay_immediate_too(self):
+    def test_timeout_park_stays_immediate_too(self):
         a = self._assign(timeout_streak=2)
         self.orch._notify_timeout_park(a)
-        self.orch._notify_blocker_cancelled(self._assign(task_id="other-task"), "upstream-x")
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.sent), 1)
         self.assertEqual(self._queued(), [])
 
     # -- the merge window on repeated review pings ---------------------------

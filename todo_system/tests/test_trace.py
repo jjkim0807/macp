@@ -140,7 +140,7 @@ def test_en_render_has_no_hangul_in_any_branch(monkeypatch, tmp_path):
     for fragment in ("**unknown origin**", "presumed written by this run",
                      "the {after} later run(s)".format(after=1), "verdict of the latest run",
                      "stored in the ledger as failed", "waiting for the checkout",
-                     "is **parked**", "`reconcile_merged()`", "`reconcile_unparked()`"):
+                     "is **parked**", "`reconcile_merged()`", "`reconcile_resumes()`"):
         assert fragment in joined, fragment
 
 

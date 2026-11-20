@@ -1,8 +1,8 @@
 """reconcile_split_parents: a parent a human split BY HAND into children (no
 `auto_rescoped`, no `is_parent`) is auto-closed once every child is done, and its
-parked ledger row is tidied from AWAITING_HUMAN/FAILED to DONE — so renudge_due
-stops nudging it. An ordinary project umbrella (no oversize-rescope park) is still
-only surfaced, never auto-closed.
+parked ledger row is tidied from AWAITING_HUMAN/FAILED to DONE. An ordinary
+project umbrella (no oversize-rescope park) is still only surfaced, never
+auto-closed.
 
 Reproduces the `dancemirror-unified-projects` situation (2026-10-10~11) but with
 NEUTRAL identifiers only: the parent md omits `repo` / uses a placeholder, because
@@ -33,11 +33,6 @@ from todo_system.orchestrator.orchestrator import (
 )
 from todo_system.orchestrator.mailbox import FileMailbox
 from todo_system.orchestrator.registry import Agent, Registry
-
-# A timestamp far enough ahead that any renudge backoff has elapsed, so a still-parked
-# row WOULD be nudged — which is what makes the "closed parent is not nudged" assertion
-# non-vacuous (it is the DONE transition, not an absent target, that spares it).
-_FAR_FUTURE = 4102444800.0   # 2100-01-01
 
 # The real parked-row wording collect() left on dancemirror-unified-projects —
 # copied verbatim so the predicate is pinned against production shape, not a
@@ -120,8 +115,8 @@ def _orch(root: Path, *, sent: list | None = None, agents=None) -> Orchestrator:
 
 
 def _human_agent() -> Agent:
-    """A registered human so renudge_due can actually resolve a target."""
-    return Agent(id="me", kind="human", projects=["*"], renudge_backoff=["1d"])
+    """A registered human, so the sweeps see a realistic registry."""
+    return Agent(id="me", kind="human", projects=["*"])
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +195,7 @@ def test_child_rollup_no_children_is_not_vacuously_closed(vault):
 def test_manual_split_parent_auto_closed(vault):
     # AC1 + AC2: a hand-split parent (open, worker_mode off, NO is_parent /
     # auto_rescoped) whose children are all done, parked as an oversize re-scope
-    # park, is closed and its ledger row tidied — and renudge_due stops nudging it.
+    # park, is closed and its ledger row tidied.
     root, items, db = vault
     parent = _parent_md(items, "split-parent")
     for i in range(3):
@@ -213,7 +208,7 @@ def test_manual_split_parent_auto_closed(vault):
 
     ledger = Ledger(root / "Worker" / "assignments")
     _parked(ledger, "split-parent")
-    assert ledger.load("split-parent").state == AWAITING_HUMAN   # a live renudge candidate
+    assert ledger.load("split-parent").state == AWAITING_HUMAN
 
     orch = _orch(root, agents=[_human_agent()])
     closed = orch.reconcile_split_parents()
@@ -224,9 +219,6 @@ def test_manual_split_parent_auto_closed(vault):
     assert row.state == DONE                                     # AC2: ledger tidied
     assert any(h.get("type") == "reconciled-manual-split" for h in row.history)
     assert row.last_note == "manual-split parent auto-closed: 3 children done"
-    # AC2: renudge_due no longer nudges it — a human IS registered (so the sweep's
-    # DONE transition, not a missing target, is what spares it).
-    assert all(a.task_id != "split-parent" for a in orch.renudge_due(now=_FAR_FUTURE))
 
 
 def test_md_done_ledger_parked_is_tidied_without_fighting_reconcile_closed(vault):
@@ -377,23 +369,18 @@ def test_parents_with_open_children_missing_db_is_empty(tmp_path):
     assert tasks.parents_with_open_children(tmp_path / "nope.db") == set()
 
 
-def test_worker_split_parent_in_progress_is_not_nudged(vault):
+def test_worker_split_parent_in_progress_is_left_open(vault):
     root, items, db = vault
     parent = _parent_md(items, "self-split")
     _child_md(items, "self-split-0", "self-split", status="done")
     _child_md(items, "self-split-1", "self-split", status="open")
-    _parent_md(items, "plain-parked")           # control: a no-PR leaf, no children
     _import(db)
     ledger = Ledger(root / "Worker" / "assignments")
     _worker_split(ledger, "self-split")
-    _worker_split(ledger, "plain-parked")
 
     orch = _orch(root, agents=[_human_agent()])
     assert orch.reconcile_split_parents() == []          # children still open
     assert _status(parent) == "open"
-    nudged = {a.task_id for a in orch.renudge_due(now=_FAR_FUTURE)}
-    assert "self-split" not in nudged                     # umbrella in progress
-    assert "plain-parked" in nudged                       # an ordinary park still nudges
 
 
 def test_worker_split_parent_closed_when_children_done(vault):
@@ -435,9 +422,8 @@ def test_tick_runs_the_sweep_before_reconcile_merged(vault, monkeypatch):
     orch = _orch(root)
     order: list[str] = []
     monkeypatch.setattr(orch, "usage_hold", lambda: None)
-    for name in ("collect", "reconcile_closed", "reconcile_unblocked",
-                 "reconcile_unparked", "reconcile_queue", "reconcile_parents",
-                 "renudge_due", "reap_stale", "reconcile_resumes", "reconcile_rescope",
+    for name in ("collect", "reconcile_closed", "reconcile_queue", "reconcile_parents",
+                 "reap_stale", "reconcile_resumes", "reconcile_rescope",
                  "_advote_bridge_tick", "_beta_sweep_tick"):
         monkeypatch.setattr(orch, name, lambda *a, **k: [])
     monkeypatch.setattr(orch, "reconcile_split_parents",

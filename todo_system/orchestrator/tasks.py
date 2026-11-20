@@ -466,7 +466,7 @@ def parents_with_open_children(db_path: str | Path = DEFAULT_DB) -> set[str]:
     That row shape is normal when a run's only output was the split itself: the
     0-commit run ends `result-no-pr` ("merge withheld for human review") and the
     children carry the work (mulkko-95-focus-block-implementation, 2026-10-13).
-    renudge_due and the dashboard use this to keep such a parent out of "사람 대기".
+    The dashboard uses this to keep such a parent out of "사람 대기".
 
     Read-only; a missing or unreadable DB is an empty set (fail open to the old
     behavior — the parent shows as parked, which is noisy but never hides work)."""

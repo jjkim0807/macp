@@ -110,9 +110,9 @@ class ParkedUnparkHintTest(unittest.TestCase):
 
     "nudge #3" records that a human was pinged, never what they are supposed to
     do — so a task parked on something already fixed (an API key that got set)
-    just kept nudging. For a row parked on an external blocker the release is
-    self-service: naming `blocked_on` and the `worker_mode` edit that
-    reconcile_unparked() watches for turns the section into an instruction.
+    just sat there. For a row parked on an external blocker the release is
+    self-service: naming `blocked_on` and the `cli resume` reservation
+    reconcile_resumes() acts on turns the section into an instruction.
     Except when the PR already merged (reconcile_merged parked it): there the
     exit is closing the md, and the re-queue recipe would retry merged work.
     """
@@ -153,15 +153,15 @@ class ParkedUnparkHintTest(unittest.TestCase):
         self._parked("worldgraph-26-live-eval", "ANTHROPIC_API_KEY 미설정")
         md = dashboard.render(self.led, self.reg)
         self.assertIn("ANTHROPIC_API_KEY 미설정", md)
-        self.assertIn("worker_mode", md)      # the actionable half
-        self.assertIn("auto", md)
+        # the actionable half
+        self.assertIn("resume worldgraph-26-live-eval --after-commit", md)
 
     def test_parking_without_a_blocker_is_unchanged(self):
         # PR review / NEEDS_INPUT have no self-service exit; inventing one lies
         self._parked("awaiting-review")
         md = dashboard.render(self.led, self.reg)
         self.assertIn("nudge #3", md)
-        self.assertNotIn("worker_mode", md)
+        self.assertNotIn("--after-commit", md)
 
     def test_render_survives_a_row_missing_the_blocker_field(self):
         # a row written by an older build has no blocked_on at all; an exception
@@ -174,13 +174,13 @@ class ParkedUnparkHintTest(unittest.TestCase):
         self.assertIn("legacy", dashboard.render(self.led, self.reg))
 
     def test_merged_park_says_close_the_md_not_requeue(self):
-        # The worker_mode recipe on a merged row makes reconcile_unparked re-queue
-        # it FAILED with the blocker wiped — a retry of work that already merged.
+        # The resume recipe on a merged row re-queues it FAILED with the blocker
+        # wiped — a retry of work that already merged.
         self._parked("dash", "AC4/AC5 need a human on acme-hq", self.MERGED_PARK)
         block = self._block(dashboard.render(self.led, self.reg), "dash")
         self.assertIn("⛔ blocked_on: AC4/AC5", block)
         self.assertIn("status: done", block)
-        self.assertNotIn("worker_mode", block)
+        self.assertNotIn("--after-commit", block)
 
     def test_merged_and_unmerged_blocked_rows_get_their_own_exit(self):
         self._parked("dash", "AC4/AC5 need a human on acme-hq", self.MERGED_PARK)
@@ -188,8 +188,8 @@ class ParkedUnparkHintTest(unittest.TestCase):
         md = dashboard.render(self.led, self.reg)
         dash, ev = self._block(md, "dash"), self._block(md, "eval")
         self.assertIn("status: done", dash)
-        self.assertNotIn("worker_mode", dash)
-        self.assertIn("worker_mode", ev)
+        self.assertNotIn("--after-commit", dash)
+        self.assertIn("--after-commit", ev)
         self.assertNotIn("status: done", ev)
 
     def test_render_survives_malformed_history(self):
@@ -201,8 +201,8 @@ class ParkedUnparkHintTest(unittest.TestCase):
             ' "state": "awaiting_human", "blocked_on": "Y 미설정", "history": null}',
             encoding="utf-8")
         md = dashboard.render(self.led, self.reg)
-        self.assertIn("worker_mode", self._block(md, "strings"))
-        self.assertIn("worker_mode", self._block(md, "nulled"))
+        self.assertIn("--after-commit", self._block(md, "strings"))
+        self.assertIn("--after-commit", self._block(md, "nulled"))
 
 
 class DivergenceSectionTest(unittest.TestCase):

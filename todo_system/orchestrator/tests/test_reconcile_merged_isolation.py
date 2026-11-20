@@ -142,8 +142,8 @@ class ReconcileMergedClosedSpellingTest(_ReconcileHarness, unittest.TestCase):
     tasks.task_status only lowercases the md value, so `status: canceled` (one
     l) arrives as written. Both checks used to look for ("done", "cancelled")
     only, leaving a canceled row parked forever (no-PR branch) or re-parked as
-    merged-but-blocked (blocked_on branch) — unlike reconcile_unblocked and
-    _retry, which already accept all three.
+    merged-but-blocked (blocked_on branch) — unlike _retry, which already accepts
+    all three.
     """
 
     _CLOSED = ("done", "cancelled", "canceled")

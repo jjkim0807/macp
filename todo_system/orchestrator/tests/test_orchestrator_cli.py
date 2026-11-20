@@ -110,11 +110,6 @@ class MainReadonlySubcommandsTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("t2 -> worker-default", out)
 
-    def test_renudge_on_empty_ledger_is_noop(self):
-        rc, out = self._main(["renudge"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(out, "")
-
     def test_lease_held_by_other_blocks_command(self):
         from todo_system.orchestrator.lease import Lease
 
@@ -209,7 +204,7 @@ class MainReadonlySubcommandsTest(unittest.TestCase):
         rc, out = self._main(
             ["serve", "--out", str(out_path), "--db", str(self.tmp / "todo.db")])
         self.assertEqual(rc, 0)
-        self.assertIn("serve: collected=0 renudged=0", out)
+        self.assertIn("serve: collected=0 dashboard=", out)
         self.assertTrue(out_path.exists())
 
     def test_unknown_cmd_is_unreachable_via_argparse(self):
@@ -273,9 +268,8 @@ class MainAutoSubcommandTest(unittest.TestCase):
         dispatched_a = mock.Mock(task_id="t-auto-1", agent_id="worker-default")
         tick_result = {
             "reaped": [], "dispatched": [dispatched_a], "updated": [],
-            "reconciled": [], "closed": [], "unblocked": [], "unparked": [],
+            "reconciled": [], "closed": [],
             "resumed": [], "split_parents": [], "parents": [], "requeued": [],
-            "renudged": [],
             "budget_reached": False, "paused": False, "usage_hold": None,
         }
         with mock.patch("todo_system.orchestrator.hq_host.check",
@@ -289,8 +283,8 @@ class MainAutoSubcommandTest(unittest.TestCase):
             rc, out = self._main(["auto", "--db", "Todo/todo.db"])
         self.assertEqual(rc, 0)
         self.assertIn(
-            "candidates=1 dispatched=1 updated=0 renudged=0 reaped=0 "
-            "reconciled=0 closed=0 unblocked=0 unparked=0 split_parents=0 "
+            "candidates=1 dispatched=1 updated=0 reaped=0 "
+            "reconciled=0 closed=0 split_parents=0 "
             "parents=0 requeued=0",
             out)
         self.assertNotIn("BUDGET-REACHED", out)
@@ -301,8 +295,8 @@ class MainAutoSubcommandTest(unittest.TestCase):
     def test_auto_prints_hold_suffixes(self):
         tick_result = {
             "reaped": [], "dispatched": [], "updated": [],
-            "reconciled": [], "closed": [], "unblocked": [], "unparked": [],
-            "resumed": [], "parents": [], "requeued": [], "renudged": [],
+            "reconciled": [], "closed": [],
+            "resumed": [], "parents": [], "requeued": [],
             "budget_reached": True, "paused": True, "usage_hold": "weekly cap",
         }
         with mock.patch("todo_system.orchestrator.hq_host.check",
@@ -325,8 +319,8 @@ class MainAutoSubcommandTest(unittest.TestCase):
         eta = "2026-10-30T03:00:00+00:00"
         tick_result = {
             "reaped": [], "dispatched": [], "updated": [],
-            "reconciled": [], "closed": [], "unblocked": [], "unparked": [],
-            "resumed": [], "parents": [], "requeued": [], "renudged": [],
+            "reconciled": [], "closed": [],
+            "resumed": [], "parents": [], "requeued": [],
             "budget_reached": False, "paused": False,
             "usage_hold": "session 70% ahead of pace", "usage_hold_eta": eta,
         }
@@ -360,8 +354,8 @@ class MainAutoSubcommandTest(unittest.TestCase):
 
         tick_result = {
             "reaped": [], "dispatched": [], "updated": [],
-            "reconciled": [], "closed": [], "unblocked": [], "unparked": [],
-            "resumed": [], "parents": [], "requeued": [], "renudged": [],
+            "reconciled": [], "closed": [],
+            "resumed": [], "parents": [], "requeued": [],
             "budget_reached": True, "paused": False, "usage_hold": None,
         }
         with mock.patch("todo_system.orchestrator.hq_host.check",
@@ -466,8 +460,8 @@ class MainVaultRelativePathsTest(unittest.TestCase):
     def test_auto_opens_the_vault_db_and_guards_the_vault_repo(self):
         tick_result = {
             "reaped": [], "dispatched": [], "updated": [], "reconciled": [],
-            "closed": [], "unblocked": [], "unparked": [], "resumed": [],
-            "split_parents": [], "parents": [], "requeued": [], "renudged": [],
+            "closed": [], "resumed": [],
+            "split_parents": [], "parents": [], "requeued": [],
             "budget_reached": False, "paused": False, "usage_hold": None,
         }
         with mock.patch("todo_system.orchestrator.hq_host.check",

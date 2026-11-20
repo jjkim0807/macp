@@ -134,13 +134,6 @@ class KakaoAlertRenderTest(unittest.TestCase):
         self.assertLessEqual(len(text), LIMIT)
         self.assertIn("long_job", text.splitlines()[0])
 
-    def test_blocker_cancelled_bounded(self):
-        a = self._assign()
-        self.orch._notify_blocker_cancelled(a, "some-upstream-platform-task")
-        text, _ = self._last()
-        self.assertLessEqual(len(text), LIMIT)
-        self.assertIn("판단", text.splitlines()[0])
-
     def test_parent_complete_worst_input_bounded(self):
         rows = [{"slug": f"parent-task-{i}", "title": "상위 태스크 제목 " * 3,
                  "n_children": 4} for i in range(20)]

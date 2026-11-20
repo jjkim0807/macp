@@ -188,7 +188,7 @@ macp asks only when a decision is really yours, and it says exactly what it need
   question and the blocker (`blocked_on`) are recorded and shown in the daily brief and
   on the dashboard.
 - Tasks that only a person can do (`worker_mode: manual`, or routed to your `human`
-  agent) are tracked in the same ledger. Re-nudges back off over time.
+  agent) are tracked in the same ledger.
 
 Answer from the CLI:
 

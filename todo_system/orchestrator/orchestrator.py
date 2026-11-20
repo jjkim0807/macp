@@ -3,8 +3,8 @@
 Router     : task slug -> owning agent (registry).
 Dispatcher : send TASK_ASSIGN, open an Assignment (dedup against active ones).
 Tracker    : consume replies from the orchestrator inbox, advance assignments.
-Humans     : dispatch parks as awaiting_human, nudged via kakao with a bounded
-             backoff; never timed out to failure.
+Humans     : dispatch parks as awaiting_human (one kakao nudge); never timed
+             out to failure.
 
 Mac-side (uses registry/human). A single-writer Lease guards against two
 orchestrators running at once (cloud-ready seam).
@@ -172,16 +172,6 @@ FAILURE_ALERT_KINDS = frozenset({ALERT_FAILURE_SUSPECTED, ALERT_QUARANTINE})
 # send). Keyed per (framing, task): a REAL state change (blocked → PR open)
 # changes the framing and therefore alerts immediately.
 REVIEW_RENOTIFY_COOLDOWN_S = 6 * 3600.0
-
-_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-
-
-def parse_duration(s: str) -> float:
-    """'1d' -> 86400.0, '30m' -> 1800.0, '45' -> 45.0 (seconds)."""
-    s = str(s).strip()
-    if s and s[-1] in _UNITS:
-        return float(s[:-1]) * _UNITS[s[-1]]
-    return float(s)
 
 
 def _parse_ts(ts) -> float:
@@ -936,9 +926,10 @@ class Orchestrator:
             # a parked task is skipped here no matter what its markdown says. Do
             # NOT relax this (and do not add AWAITING_HUMAN to assignment.TERMINAL)
             # — it is what keeps a PR review or a NEEDS_INPUT question waiting for
-            # the human who owes an answer. Un-parking is reconcile_unparked()'s
-            # job: it moves the row to a terminal state first, on evidence, and
-            # only then does it reach this line as re-dispatchable.
+            # the human who owes an answer. Un-parking goes through `cli resume`
+            # (reconcile_resumes) or `human reply`: each moves the row to a
+            # terminal state first, and only then does it reach this line as
+            # re-dispatchable.
             return LedgerGate("busy")
         if existing and existing.state in (FAILED, REJECTED):
             capacity = getattr(existing, "capacity_limited", False)
@@ -1871,16 +1862,6 @@ class Orchestrator:
         text = human.compose_alert(headline, lines)
         self._notify_routed(text, None, event_key=f"timeout-park:{a.task_id}")
 
-    def _notify_blocker_cancelled(self, a: Assignment, blocker: str) -> None:
-        """An upstream this task was waiting on got cancelled. Nobody is going to
-        deliver the precondition, so the task cannot proceed — but it may also no
-        longer be wanted, and only a human can say which. One ping; never break
-        dispatch on a notify failure."""
-        headline = i18n.t("alert.blocker_cancelled")
-        lines = [f"📋 {self._task_title(a.task_id)}", i18n.t("alert.upstream", blocker=blocker)]
-        text = human.compose_alert(headline, lines)
-        self._notify_routed(text, None, event_key=f"blocker-cancelled:{a.task_id}")
-
     def _notify_close_failed(self, slug: str, note: str | None = None) -> None:
         """mark_done returned False (md missing, or CAS gave up after retries) — the
         close did NOT land, so the ledger and md may disagree. One ping; never break
@@ -2119,81 +2100,15 @@ class Orchestrator:
             mb = self.mb   # agent gone from the registry: fall back, never crash collect
         mb.send(env)
 
-    # -- Human parking / re-nudge (never fail) ----------------------------
-    def _backoff_seconds(self, agent: Agent, idx: int) -> float:
-        sched = agent.renudge_backoff or ["1d", "3d", "7d"]
-        return parse_duration(sched[min(idx, len(sched) - 1)])
-
+    # -- Human parking (never fail) ----------------------------------------
     def _nudge(self, agent: Agent, a: Assignment) -> None:
         env = m.Envelope(to=agent.id, type=m.TASK_ASSIGN, task_id=a.task_id,
                          payload=a.payload)
-        # Immediate on purpose: a re-nudge only fires after a human has sat on the
-        # ask for days (1d/3d/7d backoff) — it IS the escalation. (First delivery
-        # in human.deliver_pending is immediate too since 2026-11-09; it was
-        # digest-tier when this comment was written.) No event key —
-        # last_nudge_ts/backoff already pace it, and the router's window runs on
-        # the wall clock, which would fight the injected-now clock the backoff
-        # (and its tests) are driven by.
+        # The first-dispatch alert to a human agent: immediate tier, once per
+        # dispatch, no event key.
         self._notify_routed(human.compose_kakao(env, agent), None)
         a.last_nudge_ts = m.now_iso()
         a.nudge_index += 1
-
-    @staticmethod
-    def _umbrellas_in_progress() -> set[str]:
-        """Parents with at least one open child (tasks.parents_with_open_children)."""
-        try:
-            from . import tasks
-            from .. import cli
-            return tasks.parents_with_open_children(cli.DB_PATH)
-        except Exception:  # noqa: BLE001 — renudge must never raise into tick()
-            return set()
-
-    def _nudge_target(self, a: Assignment) -> Agent | None:
-        """Which human to nudge about a parked assignment.
-
-        AWAITING_HUMAN is reached two ways: the task was dispatched to a human
-        agent, or an AI agent worked it and handed the remainder back because
-        the rest needs a real device, a credential, or an interactive login.
-        This loop used to filter on the ASSIGNEE being human, which silently
-        covered only the first kind — AI-parked work was skipped on every tick
-        forever. parent-match-app-16b sat 10.4 days that way with its code
-        complete and every reproducible gate green, and nothing ever said so
-        (stale.py does not catch it either: it looks for tasks with NO
-        assignment). Route by who has to act, not by who was assigned.
-        """
-        try:
-            assignee = self.reg.get(a.agent_id)
-        except KeyError:
-            assignee = None
-        if assignee is not None and assignee.is_human:
-            return assignee
-        owner = self.reg.for_project(a.task_id)
-        if owner is not None and owner.is_human:
-            return owner
-        humans = self.reg.humans()
-        return humans[0] if humans else None
-
-    def renudge_due(self, now: float | None = None) -> list[Assignment]:
-        """Re-nudge humans whose backoff has elapsed. Bounded, never fails."""
-        now = now if now is not None else dt.datetime.now().timestamp()
-        nudged: list[Assignment] = []
-        umbrellas: set[str] | None = None
-        for a in self.ledger.all():
-            if a.state != AWAITING_HUMAN:
-                continue
-            if umbrellas is None:          # one DB read per call, only when needed
-                umbrellas = self._umbrellas_in_progress()
-            if a.task_id in umbrellas:
-                continue                   # its children carry the work — nothing to ask
-            agent = self._nudge_target(a)
-            if agent is None:
-                continue
-            since = _parse_ts(a.last_nudge_ts or a.created_ts)
-            if now - since >= self._backoff_seconds(agent, a.nudge_index):
-                self._nudge(agent, a)
-                self.ledger.save(a)
-                nudged.append(a)
-        return nudged
 
     def _queued_task_ids(self) -> set[str]:
         """task_ids whose TASK_ASSIGN is still sitting UNACKED in an agent's inbox.
@@ -2477,7 +2392,7 @@ class Orchestrator:
                         # todo being closed is the authority on "this work is over",
                         # so trust it and stop holding a human slot for it. Both
                         # spellings: task_status returns the md value as written
-                        # (only lowercased) — cf. reconcile_unblocked.
+                        # (only lowercased).
                         if not tasks.is_closed(tasks.task_status(a.task_id)):
                             # Genuinely unfinished → leave it parked. One exception needs
                             # a human: a parked delegate whose PR a person CLOSED without
@@ -2624,192 +2539,6 @@ class Orchestrator:
                 header + section, encoding="utf-8")
         except Exception:
             pass      # diagnostics never break the sweep
-
-    def reconcile_unblocked(self) -> list[Assignment]:
-        """Un-park tasks whose named blocker has since resolved.
-
-        Parking a `blocked_on` failure stops it re-buying the pipeline against an
-        unmet precondition, but on its own it trades a churn bug for a stall bug:
-        nothing was watching the blocker, so a task parked on an upstream PR would
-        sit in AWAITING_HUMAN forever after that PR merged. reconcile_merged only
-        ever asks about a task's OWN PR and OWN todo, never about what it is
-        waiting for.
-
-        The blocker is free text whose first token is the upstream slug
-        (`dripcoffee-bean-cards-1-… (PR #22, OPEN)`). If that names a task the
-        vault knows and it is now done or cancelled, the wait is over: drop back
-        to FAILED so the normal cooldown path re-dispatches it. Anything we cannot
-        resolve to a finished task stays parked — an unrecognizable blocker really
-        is a human's problem, and guessing would resurrect the churn.
-
-        DONE and CANCELLED end the wait for opposite reasons, so they cannot share
-        an exit. A done blocker delivered the precondition — requeue. A cancelled
-        one never will: requeueing then buys a full pipeline run against a
-        precondition nobody is going to meet, and the note it left ("<slug> is
-        done — requeued") was actively false. So a cancellation keeps the task
-        parked and pings a human to decide whether it is still wanted at all.
-        `canceled` (one l) counts too — _retry() already reads all three spellings,
-        and treating it as done here would silently re-dispatch.
-        """
-        out: list[Assignment] = []
-        skips = _SkipTally("reconcile_unblocked")
-        try:
-            from . import tasks
-            for a in self.ledger.all():
-                try:
-                    blocker = getattr(a, "blocked_on", "")
-                    if a.state != AWAITING_HUMAN or not blocker:
-                        continue
-                    slug = blocker.split()[0].strip().rstrip(":,")
-                    if slug == a.task_id:          # self-reference: never resolvable
-                        continue
-                    status = tasks.task_status(slug)
-                    if not tasks.is_closed(status):
-                        continue
-                    if tasks.is_cancelled(status):
-                        # already surfaced: this branch stays true on every tick (the
-                        # task keeps both AWAITING_HUMAN and its blocker), so without
-                        # the guard it would re-ping forever.
-                        if any(h.get("type") == "blocker-cancelled" for h in a.history):
-                            continue
-                        a.updated_ts = m.now_iso()
-                        a.last_note = (f"상류 {slug} 취소됨 — 이 태스크가 아직 필요한지 "
-                                       f"사람이 판단")[:200]
-                        a.history.append({"ts": m.now_iso(), "type": "blocker-cancelled",
-                                          "from": "orchestrator"})
-                        self._notify_blocker_cancelled(a, slug)
-                        self.ledger.save(a)
-                        # deliberately NOT appended to `out`: tick() surfaces that list
-                        # as `unblocked`, which means requeued. This task is still parked.
-                        continue
-                    a.state = FAILED               # re-enters the normal retry path
-                    a.blocked_on = ""
-                    a.updated_ts = m.now_iso()
-                    a.last_note = f"unblocked: {slug} is done — requeued"[:200]
-                    a.history.append({"ts": m.now_iso(), "type": "unblocked",
-                                      "from": "orchestrator"})
-                    self.ledger.save(a)
-                    out.append(a)
-                except Exception as e:
-                    # Per row, so one bad row skips only itself: the rows queued
-                    # behind it used to vanish from the whole tick. `slug` may not
-                    # exist yet (`blocker.split()[0]` raises on a whitespace-only
-                    # blocker), so name the row from the assignment instead.
-                    tid = getattr(a, "task_id", "?") or "?"
-                    skips.record(tid, e)
-            skips.flush()
-        except Exception as e:
-            # Outer net stays: the sweep's own scaffolding (the import,
-            # ledger.all()) can still fail, and this must never raise into tick().
-            print(f"[orchestrator] reconcile_unblocked: sweep aborted: {e}")
-        return out
-
-    def reconcile_unparked(self) -> list[Assignment]:
-        """Un-park a blocked task when the HUMAN signals the blocker is gone.
-
-        reconcile_unblocked above can only resolve a blocker whose first token
-        names a vault task. Most real blockers are not slugs at all — an absent
-        `ANTHROPIC_API_KEY`, "tooling", a console setting nobody made — so those
-        rows park forever. Until now the only exit was a human hand-operating the
-        ledger (`python -m todo_system.orchestrator.human reply --status reject`),
-        i.e. surgery on a git-tracked JSON file to say something the task file
-        already said.
-
-        The signal accepted here is that task file. A human who parks a task
-        edits its `worker_mode:` to something non-dispatchable (`blocked`); when
-        the blocker clears they set it back to `auto`. That transition is a
-        deliberate edit of the source of truth — evidence, not inference — so it
-        is safe to read as "go", and it is the one thing `if_then` asks for.
-
-        The transition must be OBSERVED, not stamped at park time. Parking
-        happens in collect(), and at that moment the md still says `auto`: the
-        human only edits it after seeing the alert. So every tick records the
-        currently observed mode in `parked_worker_mode`, and un-parking needs the
-        PREVIOUS observation to be non-dispatchable and the current one
-        dispatchable.
-
-        Deliberately narrow, so parking that a human really must answer keeps
-        waiting. `blocked_on` non-empty AND `last_alert_kind == ALERT_BLOCKED`
-        structurally excludes PR-review waits, result-no-pr, failure-suspected,
-        poison quarantine and NEEDS_INPUT. Every unknown fails SAFE (stay
-        parked): no stamp yet (a row written by an older build), no `task_path`,
-        a file that is gone, or an md whose `worker_mode` cannot be read.
-        A missing observation is not evidence of a transition.
-
-        Un-parks to FAILED — the normal retry path — and deliberately does NOT
-        raise `refail_count`: an external blocker was never this task's defect.
-        It also does NOT refresh `updated_ts`, which is what dispatch() anchors
-        its cooldown on (:266); refreshing it would charge the human's explicit
-        "go" a fresh cooldown, so the un-park would not take effect for another
-        window. The un-park time is recorded honestly in `history` instead.
-        (reconcile_unblocked deliberately differs and does refresh.)
-
-        Re-stamping the new mode is what CONSUMES the signal. Without it the pair
-        (stamped `blocked`, md `auto`) stays true forever, and a task that
-        re-parks on the same blocker would be un-parked again on the very next
-        tick — an infinite un-park loop.
-
-        Note `AWAITING_HUMAN` stays OUT of assignment.TERMINAL. Putting it there
-        would let dispatch() re-run every parked row, including the PR reviews
-        and NEEDS_INPUT questions this method goes out of its way to leave alone.
-        """
-        out: list[Assignment] = []
-        skips = _SkipTally("reconcile_unparked")
-        try:
-            from . import repos, tasks
-            # ledger.root is Worker/assignments -> the vault root is two up.
-            # `task_path` is stored vault-relative (Todo/items/<slug>.md).
-            vault_root = Path(self.ledger.root).parent.parent
-            for a in self.ledger.all():
-                try:
-                    if a.state != AWAITING_HUMAN:
-                        continue
-                    if not getattr(a, "blocked_on", ""):
-                        continue
-                    if getattr(a, "last_alert_kind", "") != ALERT_BLOCKED:
-                        continue
-                    raw = (a.payload or {}).get("task_path") or ""
-                    if not raw:
-                        continue
-                    p = Path(raw)
-                    if not p.is_absolute():
-                        p = vault_root / p
-                    if not p.is_file():
-                        continue
-                    mode = repos.read_task_worker_mode(p)
-                    if mode is None:      # unreadable/absent field — no evidence
-                        continue
-                    prev = getattr(a, "parked_worker_mode", "")
-                    if prev and prev not in tasks.DISPATCHABLE_MODES \
-                            and mode in tasks.DISPATCHABLE_MODES:
-                        a.state = FAILED               # re-enters the normal retry path
-                        a.blocked_on = ""
-                        a.parked_worker_mode = mode    # consume the signal — see above
-                        a.last_note = (f"blocker 해소 신호: worker_mode {prev}→{mode} "
-                                       f"— 재큐")[:200]
-                        a.history.append({"ts": m.now_iso(), "type": "unparked-worker-mode",
-                                          "from": "orchestrator",
-                                          "prev_mode": prev, "mode": mode})
-                        self.ledger.save(a)
-                        out.append(a)
-                    elif mode != prev:
-                        # Only an observation: record what the md says now so a later
-                        # tick can see the transition. State is untouched.
-                        a.parked_worker_mode = mode
-                        self.ledger.save(a)
-                except Exception as e:
-                    # Per row: an unreadable md or a non-string `task_path` is one
-                    # row's defect, not the sweep's. Before this, the row raising
-                    # here silently parked every row sorted after it, forever.
-                    tid = getattr(a, "task_id", "?") or "?"
-                    skips.record(tid, e)
-            skips.flush()
-        except Exception as e:
-            # Outer net stays: the sweep's own scaffolding (the imports,
-            # vault_root, ledger.all()) can still fail, and this must never raise
-            # into tick().
-            print(f"[orchestrator] reconcile_unparked: sweep aborted: {e}")
-        return out
 
     def _parent_seen_path(self) -> Path:
         return self.ledger.root.parent / "_state" / "parent_reconcile.json"
@@ -3192,15 +2921,15 @@ class Orchestrator:
         child `parent: "[[<parent>]]"`, with NO `auto_rescoped`/`is_parent` stamp —
         nothing closed the parent once every child finished:
         `parents_needing_review` only sees `is_parent=1` bundles (cause ①), so the
-        parent's ledger row sat AWAITING_HUMAN forever, re-nudged by renudge_due and
-        stuck in the dashboard's "awaiting human" list. That is exactly what happened to
+        parent's ledger row sat AWAITING_HUMAN forever, stuck in the dashboard's
+        "awaiting human" list. That is exactly what happened to
         dancemirror-unified-projects (2026-10-10~11).
 
         This is the ledger-DRIVEN, gh-INDEPENDENT twin of reconcile_merged's "todo
         already closed" path. Per row (AWAITING_HUMAN/FAILED, non-human):
 
           - AC3 — md already done/cancelled (a human closed it directly): tidy the
-            ledger row to DONE so renudge_due stops and it drops out of "awaiting human".
+            ledger row to DONE so it drops out of "awaiting human".
             This generalizes reconcile_merged's close but without the `gh` call, so a
             `gh` hiccup can no longer abort it mid-tick.
           - AC1/AC2 — md still open: close the parent md AND tidy the ledger, but
@@ -3218,7 +2947,7 @@ class Orchestrator:
         gh-gated sweep iterates and its state guard skips it (no double close). An
         ordinary project umbrella has no parked re-scope row at all, so it is never
         seen here and stays surfaced-only (reconcile_parents). Never raises into
-        tick(): outer net + per-row isolation, like reconcile_unblocked/unparked.
+        tick(): outer net + per-row isolation, like the other reconcile sweeps.
         Lazy sibling imports only (engine isolation).
         """
         out: list[str] = []
@@ -3802,17 +3531,12 @@ class Orchestrator:
             for t in runnable:
                 print(f"[orchestrator] {t.slug}: bypass_guard — dispatching despite "
                       f"hold ({usage_hold or 'daily budget'})")
-        # BEFORE dispatch on purpose. This is the only reconcile that can make a
-        # row dispatchable *this* tick: it leaves updated_ts at the park time, so
-        # the fail cooldown is already spent and the freed task goes out below
-        # instead of waiting a whole extra tick. Runs even under a hold — it only
-        # edits ledger state, and the hold below still gates the actual dispatch.
-        unparked = self.reconcile_unparked()   # human cleared the blocker -> requeue
-        # Same reason, same placement: the reservation back-dates `updated_ts` past
+        # BEFORE dispatch on purpose: the reservation back-dates `updated_ts` past
         # the fail cooldown, so the freed task goes out in THIS tick's dispatch
-        # below instead of waiting another whole window.
+        # below instead of waiting another whole window. Runs even under a hold —
+        # the hold below still gates the actual dispatch.
         resumed = self.reconcile_resumes()     # `cli resume` condition met -> requeue
-        # Same placement as the two sweeps above: run BEFORE dispatch so the parent
+        # Same placement as the resume sweep above: run BEFORE dispatch so the parent
         # is tidied and the first sub-task's DB row is written this tick (dispatch
         # picks it up next tick). Fail-open — never raises into the tick.
         rescoped = self.reconcile_rescope()    # parked rescope plan -> auto-split
@@ -3835,7 +3559,6 @@ class Orchestrator:
         batch_gate_res = self.reconcile_batch_gate(now)  # quick-verified PRs -> gate / back to full verify
         reconciled = self.reconcile_merged()   # #5: close merged-but-open PR tasks
         closed = self.reconcile_closed(now)     # ledger done but todo open -> close
-        unblocked = self.reconcile_unblocked()  # blocker resolved -> stop waiting
         parents = self.reconcile_parents()     # children all done -> tell a human
         # Beside reconcile_parents on purpose — both answer "what does a PERSON
         # now have to do". Runs AFTER collect/reconcile_closed so a dep closed in
@@ -3845,18 +3568,16 @@ class Orchestrator:
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         self._server_deploy_watch_tick()       # merged server change not in production → one alert (fail-open, 10-min throttle)
-        nudged = self.renudge_due(now)
         return {"rerouted": rerouted,
                 "reaped": reaped, "dispatched": dispatched, "updated": updated,
-                "reconciled": reconciled, "closed": closed, "unblocked": unblocked,
-                "unparked": unparked,
+                "reconciled": reconciled, "closed": closed,
                 "resumed": resumed,
                 "rescoped": rescoped,
                 "split_parents": split_parents,
                 "batch_gate": batch_gate_res,
                 "parents": parents,
                 "human_ready": human_ready,
-                "requeued": requeued, "renudged": nudged,
+                "requeued": requeued,
                 "budget_reached": self.budget_exceeded(), "paused": self.paused(),
                 "usage_hold": usage_hold,
                 "usage_hold_eta": ((self.usage_hold_info or {}).get("release_eta")
@@ -4278,7 +3999,6 @@ def _main(argv: list[str] | None = None) -> int:
     pd.add_argument("--payload", default="{}")
 
     sub.add_parser("collect", help="Process agent replies into the ledger")
-    sub.add_parser("renudge", help="Re-nudge parked humans whose backoff elapsed")
     sub.add_parser("status", help="List assignments")
     sub.add_parser("agents", help="Show agent liveness (health)")
 
@@ -4314,7 +4034,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     ps = sub.add_parser(
         "serve",
-        help="Coexistence tick: collect + renudge + dashboard, NO AI dispatch "
+        help="Coexistence tick: collect + dashboard, NO AI dispatch "
              "(safe to run alongside the legacy worker).")
     ps.add_argument("--out", default="Todo/Orchestrator.md")
     ps.add_argument("--db", default="Todo/todo.db")
@@ -4391,11 +4111,6 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"{a.task_id} -> {a.agent_id} [{a.state}]")
         return 0
 
-    if args.cmd == "renudge":
-        for a in orch.renudge_due():
-            print(f"re-nudged {a.task_id} -> {a.agent_id} (nudge #{a.nudge_index})")
-        return 0
-
     if args.cmd == "status":
         for a in orch.ledger.all():
             print(status_line(a))
@@ -4450,12 +4165,10 @@ def _main(argv: list[str] | None = None) -> int:
         budget += " PAUSED" if result.get("paused") else ""
         budget += _usage_hold_suffix(result)
         print(f"candidates={len(cands)} dispatched={len(result['dispatched'])} "
-              f"updated={len(result['updated'])} renudged={len(result['renudged'])} "
+              f"updated={len(result['updated'])} "
               f"reaped={len(result['reaped'])} "
               f"reconciled={len(result['reconciled'])} "
               f"closed={len(result.get('closed', []))} "
-              f"unblocked={len(result.get('unblocked', []))} "
-              f"unparked={len(result.get('unparked', []))} "
               f"split_parents={len(result.get('split_parents', []))} "
               f"parents={len(result.get('parents', []))} "
               f"requeued={len(result['requeued'])} "
@@ -4488,10 +4201,9 @@ def _main(argv: list[str] | None = None) -> int:
         from . import dashboard
         out = base / args.out
         updated = orch.collect()
-        nudged = orch.renudge_due()
         dashboard.write(orch.ledger, orch.reg, out, base / args.db,
                         base / args.decisions_dir, base / args.items_dir)
-        print(f"serve: collected={len(updated)} renudged={len(nudged)} "
+        print(f"serve: collected={len(updated)} "
               f"dashboard={out} (coexistence — no AI dispatch)")
         return 0
 

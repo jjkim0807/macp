@@ -330,8 +330,6 @@ def _misc_alert_texts(orch, sent) -> dict[str, str]:
     out["poison_no_note"] = sent.pop()[0]
     orch._notify_timeout_park(_row(timeout_streak=2))
     out["timeout_park"] = sent.pop()[0]
-    orch._notify_blocker_cancelled(_row(), "up-task")
-    out["blocker_cancelled"] = sent.pop()[0]
     out["propagate"] = orch._compose_propagate_alert("core", ["a-check", "b-check"])
     orch._notify_parent_complete([{"slug": "p1", "title": "Parent one"}, {"slug": "p2"}])
     out["parent_complete"] = sent.pop()[0]
@@ -397,9 +395,6 @@ def test_ko_other_orchestrator_alerts_are_byte_identical(monkeypatch, tmp_path):
     assert got["timeout_park"] == (
         "⏱️ 2회 연속 stage timeout으로 대기 전환 — 더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다\n"
         f"📋 {SLUG}\n작업은 origin worker 브랜치에 checkpoint됨(유실 아님)")
-    assert got["blocker_cancelled"] == (
-        "🔗 대기하던 상류 태스크가 취소돼 진행 불가 — 이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다\n"
-        f"📋 {SLUG}\n상류: up-task")
     assert got["propagate"] == (
         "🔗 상류 'core' 변경으로 하류 통합검증 2개를 만들었어요 — 검증 결과를 확인해주세요\n"
         "a-check, b-check")
@@ -514,7 +509,6 @@ def test_en_other_orchestrator_alerts_have_no_hangul(monkeypatch, tmp_path):
     assert got["orphaned"].startswith("🧨 2 unpushed commit(s) from an earlier attempt")
     assert got["timeout_park"].splitlines()[-1] == (
         "work is checkpointed on the origin worker branch (not lost)")
-    assert got["blocker_cancelled"].splitlines()[-1] == "upstream: up-task"
     assert got["propagate"].startswith("🔗 Upstream 'core' changed, so 2 downstream")
     assert got["parent_complete"].startswith("🧭 2 parent task(s) have all subtasks finished")
     for kind, text in got.items():

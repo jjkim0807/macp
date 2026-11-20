@@ -27,21 +27,18 @@ from todo_system.orchestrator.assignment import Assignment, Ledger
 from todo_system.orchestrator.lease import Lease
 from todo_system.orchestrator.mailbox import FileMailbox
 from todo_system.orchestrator.orchestrator import (
-    ALERT_BLOCKED,
     ALERT_CLOSED_UNMERGED,
-    ALERT_QUARANTINE,
-    ALERT_REVIEW_PR,
     ALERT_TIMEOUT_PARK,
     Orchestrator,
     Task,
     _CLOSED_UNMERGED,
+    _SkipTally,
     _check_divergence,
     _globs_overlap,
     _parse_ts,
     _pull_main,
     _static_prefix,
     _touches_disjoint,
-    parse_duration,
 )
 from todo_system.orchestrator.registry import Agent, Registry
 from todo_system.orchestrator.runner import BackgroundClaudeExecutor, make_executor
@@ -67,11 +64,6 @@ def _hermetic_tick(orch, tasks, *, usage_hold=None, paused=False,
       5. reconcile_queue()   :829-868  live Worker/queue.json + takes the live lock at
                                        :854, which the running daemon also holds
       6. reconcile_merged()  :639-693  live `gh`, but only if the ledger has rows
-      7. reconcile_unparked()          reads each parked row's task markdown off
-                                       disk (payload `task_path`, resolved against
-                                       the ledger root's grandparent) -> live
-                                       Todo/items/ for any fixture row that
-                                       carries a real task_path
 
     2/3 were hermetic by luck (the tests point the ledger at a tempdir); the rest were
     not. Injecting all of them keeps a verdict a statement about the code under test.
@@ -85,9 +77,8 @@ def _hermetic_tick(orch, tasks, *, usage_hold=None, paused=False,
     making that sweep's reads hermetic.
     """
     stubs = tuple(name for name in (
-        "collect", "reconcile_merged", "reconcile_unblocked",
-        "reconcile_unparked", "reconcile_closed",
-        "reconcile_queue", "reconcile_parents", "renudge_due", "reap_stale")
+        "collect", "reconcile_merged", "reconcile_closed",
+        "reconcile_queue", "reconcile_parents", "reap_stale")
         if name not in live)
     guards = {"paused": paused, "budget_exceeded": budget_exceeded}
     if usage_hold is not _INHERIT:
@@ -198,14 +189,6 @@ class AssignmentTest(unittest.TestCase):
         self.assertEqual(c.timeout_streak, 0)
 
 
-class ParseDurationTest(unittest.TestCase):
-    def test_units(self):
-        self.assertEqual(parse_duration("1d"), 86400)
-        self.assertEqual(parse_duration("30m"), 1800)
-        self.assertEqual(parse_duration("2h"), 7200)
-        self.assertEqual(parse_duration("45"), 45)
-
-
 class OrchestratorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -216,7 +199,7 @@ class OrchestratorTest(unittest.TestCase):
                   projects=["armchair-commander"], capabilities=["godot"],
                   repo="~/x"),
             Agent(id="alice", kind="human", projects=["withdrawal-*"],
-                  notify=["kakao"], renudge_backoff=["1d", "3d"]),
+                  notify=["kakao"]),
         ])
         self.sent: list = []
         self.orch = Orchestrator(self.mb, self.reg, self.ledger,
@@ -559,34 +542,6 @@ class OrchestratorTest(unittest.TestCase):
                             notify=lambda *a, **k: None, stale_timeout_s=1)
         a = orch.dispatch(Task("withdrawal-a2-final-decision"))       # human -> awaiting_human
         self.assertEqual(orch.reap_stale(now=_parse_ts(a.created_ts) + 10**6), [])
-
-    def test_renudge_backoff(self):
-        a = self.orch.dispatch(Task("withdrawal-a2-final-decision"))
-        base = _parse_ts(a.last_nudge_ts)
-        # backoff[nudge_index=1] == '3d' -> not due after 1h
-        self.assertEqual(self.orch.renudge_due(now=base + 3600), [])
-        self.assertEqual(len(self.sent), 1)
-        # due after 4d
-        self.assertEqual(len(self.orch.renudge_due(now=base + 4 * 86400)), 1)
-        self.assertEqual(len(self.sent), 2)
-
-    def test_renudge_reaches_a_human_when_an_ai_parks_the_work(self):
-        # AWAITING_HUMAN is "human parked, OR AI escalated for input" — but this
-        # loop used to require the ASSIGNEE to be human, so work an AI handed
-        # back was skipped on every tick and nobody was ever told.
-        # parent-match-app-16b sat 10.4 days that way, code complete and green.
-        a = self.orch.dispatch(Task("armchair-commander"))   # -> AI agent
-        a.state = A.AWAITING_HUMAN
-        a.last_nudge_ts = None
-        self.ledger.save(a)
-        self.sent.clear()
-        base = _parse_ts(a.created_ts)
-        # alice's backoff[0] is 1d: nothing at 1h, nudged once past a day
-        self.assertEqual(self.orch.renudge_due(now=base + 3600), [])
-        self.assertEqual(self.sent, [])
-        nudged = self.orch.renudge_due(now=base + 2 * 86400)
-        self.assertEqual([n.task_id for n in nudged], ["armchair-commander"])
-        self.assertEqual(len(self.sent), 1)
 
 
 class BackgroundExecTest(unittest.TestCase):
@@ -1601,52 +1556,6 @@ class ReconcileMergedTest(unittest.TestCase):
                     sum(h.get("type") == dashboard._MERGED_BUT_BLOCKED
                         for h in row.history), 1)
 
-    def _parked_on(self, blocker, task_id="t"):
-        a = Assignment(task_id=task_id, agent_id="w", corr_id="C1",
-                       state=A.AWAITING_HUMAN, kind="ai-local", attempts=1)
-        a.blocked_on = blocker
-        self.ledger.save(a)
-        return a
-
-    def test_resolved_blocker_requeues_the_parked_task(self):
-        # parking stops the churn; without this it would trade churn for a stall
-        self._parked_on("upstream-task (PR #22, OPEN)")
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            out = self.orch.reconcile_unblocked()
-        self.assertEqual([x.task_id for x in out], ["t"])
-        reloaded = self.ledger.load("t")
-        self.assertEqual(reloaded.state, A.FAILED)   # back on the normal retry path
-        self.assertEqual(reloaded.blocked_on, "")
-        self.assertIn("upstream-task", reloaded.last_note)
-
-    def test_unresolved_blocker_stays_parked(self):
-        self._parked_on("upstream-task")
-        with mock.patch.object(tasks, "task_status", return_value="open"):
-            self.assertEqual(self.orch.reconcile_unblocked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_unrecognizable_blocker_stays_parked(self):
-        # free text that names no task is genuinely a human's problem; guessing
-        # here would resurrect the churn parking exists to stop
-        self._parked_on("Firebase console secrets")
-        with mock.patch.object(tasks, "task_status", return_value=None):
-            self.assertEqual(self.orch.reconcile_unblocked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_self_referencing_blocker_is_never_resolvable(self):
-        self._parked_on("t is stuck")
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            self.assertEqual(self.orch.reconcile_unblocked(), [])
-
-    def test_parked_without_a_blocker_is_left_alone(self):
-        # ordinary review parking (PR opened, awaiting approval) must not requeue
-        a = Assignment(task_id="t", agent_id="w", corr_id="C1",
-                       state=A.AWAITING_HUMAN, kind="ai-local", attempts=1)
-        self.ledger.save(a)
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            self.assertEqual(self.orch.reconcile_unblocked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
     def test_defaults_branch_to_worker_slug_when_payload_missing(self):
         self._awaiting()   # no branch/repo in payload
         with mock.patch.object(stages, "gh_pr_merged", return_value=True) as gh, \
@@ -1904,514 +1813,42 @@ class ReconcileQueueTest(unittest.TestCase):
             self.assertEqual(self.orch.reconcile_queue(), [])
 
 
-class ReconcileCancelledBlockerTest(unittest.TestCase):
-    """A blocker that was CANCELLED is not a blocker that was DONE.
+class SkipTallyTest(unittest.TestCase):
+    """_SkipTally's print cap, which the remaining reconcile sweeps share.
 
-    reconcile_unblocked treated both as "the wait is over" and dropped the
-    downstream task to FAILED, i.e. straight back onto the re-dispatch path —
-    and left `last_note` claiming "<slug> is done — requeued", which is a lie
-    when the upstream was abandoned. Cancelling upstream work silently bought a
-    fresh pipeline run for every task waiting on it. A cancelled blocker means
-    nobody is going to deliver the precondition, so the honest move is to stay
-    parked and put it in front of a human.
+    One printed line per swallowed exception lets a SYSTEMATIC defect print one
+    line per ledger row on every tick. The cap keeps the first three per cause
+    and folds the rest into one summary line — and stays silent otherwise.
     """
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.mb = FileMailbox(self.tmp / "agents")
-        self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
-        self.pings: list[str] = []
-        self.orch = Orchestrator(self.mb, self.reg, self.ledger,
-                                 notify=lambda text, *a, **k: self.pings.append(text))
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _parked_on(self, blocker, task_id="t"):
-        a = Assignment(task_id=task_id, agent_id="w", corr_id="C1",
-                       state=A.AWAITING_HUMAN, kind="ai-local", attempts=1)
-        a.blocked_on = blocker
-        self.ledger.save(a)
-        return a
-
-    def test_cancelled_blocker_keeps_the_task_parked(self):
-        self._parked_on("upstream-task (PR #22, OPEN)")
-        with mock.patch.object(tasks, "task_status", return_value="cancelled"):
-            out = self.orch.reconcile_unblocked()
-        # `out` means "requeued" — the tick surfaces it under the `unblocked`
-        # key — so a still-parked task must not appear in it.
-        self.assertEqual(out, [])
-        reloaded = self.ledger.load("t")
-        self.assertEqual(reloaded.state, A.AWAITING_HUMAN)
-        self.assertEqual(reloaded.blocked_on, "upstream-task (PR #22, OPEN)")
-        self.assertIn("upstream-task", reloaded.last_note)
-        self.assertNotIn("requeued", reloaded.last_note)
-        self.assertTrue(any(h["type"] == "blocker-cancelled" for h in reloaded.history))
-
-    def test_cancelled_blocker_pings_a_human_once(self):
-        self._parked_on("upstream-task")
-        with mock.patch.object(tasks, "task_status", return_value="cancelled"):
-            self.orch.reconcile_unblocked()
-            self.assertEqual(len(self.pings), 1)
-            self.assertIn("upstream-task", self.pings[0])
-            # every tick re-enters this branch (the task stays parked with its
-            # blocker); re-pinging on each one would be a notification loop.
-            self.orch.reconcile_unblocked()
-        self.assertEqual(len(self.pings), 1)
-
-    def test_american_spelling_is_also_a_cancellation(self):
-        # _retry() already reads ("done", "cancelled", "canceled"); without the
-        # variant here a `canceled` upstream falls through the done branch and
-        # silently re-dispatches.
-        self._parked_on("upstream-task")
-        with mock.patch.object(tasks, "task_status", return_value="canceled"):
-            out = self.orch.reconcile_unblocked()
-        self.assertEqual(out, [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_done_blocker_still_requeues(self):
-        # the discriminating half: requirement 3 says the done path is untouched.
-        # ReconcileMergedTest.test_resolved_blocker_requeues_the_parked_task is
-        # the standing safety net; this pins done-vs-cancelled side by side.
-        self._parked_on("upstream-task")
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            out = self.orch.reconcile_unblocked()
-        self.assertEqual([x.task_id for x in out], ["t"])
-        self.assertEqual(self.ledger.load("t").state, A.FAILED)
-        self.assertEqual(self.pings, [])       # requeue is routine, not news
-
-
-class ReconcileUnparkedTest(unittest.TestCase):
-    """A blocker the human cleared must release the task without ledger surgery.
-
-    reconcile_unblocked only resolves blockers whose first token names a vault
-    task. Real ones usually are not slugs — worldgraph-26-live-eval parked on a
-    missing `ANTHROPIC_API_KEY` — so those rows sat in AWAITING_HUMAN forever and
-    the only exit was `human reply --status reject`, i.e. hand-operating a
-    git-tracked JSON file to restate what the task markdown already said.
-
-    The accepted signal is that markdown: a human flips `worker_mode` to
-    non-dispatchable to park, and back to `auto` once the blocker is gone. Only
-    that OBSERVED transition releases the row, and only for rows parked on an
-    external blocker — everything else keeps waiting for the human who owes an
-    answer.
-    """
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        # ledger.root.parent.parent is the vault root the code resolves relative
-        # task_paths against; keep it inside tmp so nothing can reach the real one
-        self.vault = self.tmp / "vault"
-        self.items = self.vault / "Todo" / "items"
-        self.items.mkdir(parents=True)
-        self.mb = FileMailbox(self.tmp / "agents")
-        self.ledger = Ledger(self.vault / "Worker" / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
-        self.pings: list[str] = []
-        self.orch = Orchestrator(self.mb, self.reg, self.ledger,
-                                 notify=lambda text, *a, **k: self.pings.append(text))
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _md(self, mode, slug="t") -> Path:
-        p = self.items / f"{slug}.md"
-        p.write_text(f"---\nstatus: open\nworker_mode: {mode}\n---\n\n# {slug}\n",
-                     encoding="utf-8")
-        return p
-
-    def _parked(self, *, md_mode="auto", stamp="blocked", blocker="ANTHROPIC_API_KEY 미설정",
-                alert=ALERT_BLOCKED, state=A.AWAITING_HUMAN, slug="t",
-                task_path=..., refail_count=2):
-        """A row parked on an external blocker, plus the task md it points at."""
-        self._md(md_mode, slug)
-        if task_path is ...:
-            task_path = f"Todo/items/{slug}.md"      # vault-relative, as tasks.py writes it
-        a = Assignment(task_id=slug, agent_id="w", corr_id="C1", state=state,
-                       kind="ai-local", attempts=1, refail_count=refail_count,
-                       payload={"task_path": task_path} if task_path is not None else {})
-        a.blocked_on = blocker
-        a.last_alert_kind = alert
-        a.parked_worker_mode = stamp
-        # park it far enough in the past that the fail cooldown is spent — the
-        # point of preserving updated_ts is that dispatch() can act immediately
-        a.updated_ts = "2026-01-01T00:00:00"
-        self.ledger.save(a)
-        return a
-
-    # --- the incident ----------------------------------------------------
-
-    def test_blocked_to_auto_releases_the_parked_task(self):
-        self._parked(stamp="blocked", md_mode="auto")
-        out = self.orch.reconcile_unparked()
-        self.assertEqual([x.task_id for x in out], ["t"])
-        r = self.ledger.load("t")
-        self.assertEqual(r.state, A.FAILED)      # back on the normal retry path
-        self.assertEqual(r.blocked_on, "")
-        self.assertIn("worker_mode", r.last_note)
-        self.assertTrue(any(h["type"] == "unparked-worker-mode" for h in r.history))
-
-    def test_release_neither_blames_the_task_nor_restarts_its_cooldown(self):
-        # An external blocker is not a defect, so refail_count must not move; and
-        # updated_ts is dispatch()'s cooldown anchor, so refreshing it would charge
-        # the human's explicit "go" a fresh window before anything ran.
-        self._parked(refail_count=2)
-        self.assertEqual(len(self.orch.reconcile_unparked()), 1)   # it DID release
-        r = self.ledger.load("t")
-        self.assertEqual(r.refail_count, 2)
-        self.assertEqual(r.updated_ts, "2026-01-01T00:00:00")
-
-    def test_released_task_dispatches_on_the_same_tick(self):
-        # the whole point of preserving updated_ts: no extra tick of latency
-        self._parked()
-        self.orch.reconcile_unparked()
-        self.assertIsNotNone(self.orch.dispatch(Task(slug="t")))
-
-    def test_tick_reconciles_before_dispatching(self):
-        # end-to-end through tick(): a parked row goes out in the SAME tick.
-        # reconcile_unparked is deliberately NOT stubbed here — it is the subject.
-        self._parked()
-        stubs = ("collect", "reconcile_merged", "reconcile_unblocked",
-                 "reconcile_queue", "reconcile_parents", "renudge_due", "reap_stale")
-        with contextlib.ExitStack() as st:
-            for name in stubs:
-                st.enter_context(mock.patch.object(self.orch, name, return_value=[]))
-            for name in ("paused", "budget_exceeded", "usage_hold"):
-                st.enter_context(mock.patch.object(self.orch, name, return_value=False))
-            result = self.orch.tick([Task(slug="t")])
-        self.assertEqual([x.task_id for x in result["unparked"]], ["t"])
-        self.assertEqual([x.task_id for x in result["dispatched"]], ["t"])
-
-    # --- false-positive prevention: normal parking keeps waiting ---------
-
-    def test_still_blocked_md_stays_parked(self):
-        self._parked(stamp="blocked", md_mode="blocked")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_pr_review_parking_stays_parked(self):
-        # a human owes a review; no markdown edit may substitute for it
-        self._parked(alert=ALERT_REVIEW_PR)
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_poison_quarantine_stays_parked(self):
-        self._parked(alert=ALERT_QUARANTINE)
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_needs_input_stays_parked(self):
-        # the AI asked a question; releasing it would drop the question
-        self._parked(state=A.NEEDS_INPUT)
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.NEEDS_INPUT)
-
-    def test_parking_with_no_blocker_stays_parked(self):
-        self._parked(blocker="")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_legacy_row_without_a_stamp_is_only_observed(self):
-        # A row parked by an older build has no observation to compare against.
-        # "No evidence" is not "a transition" — record the mode, stay parked.
-        self._parked(stamp="", md_mode="auto")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        r = self.ledger.load("t")
-        self.assertEqual(r.state, A.AWAITING_HUMAN)
-        self.assertEqual(r.parked_worker_mode, "auto")   # observed, not acted on
-
-    def test_missing_task_path_stays_parked(self):
-        self._parked(task_path=None)
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_task_file_gone_stays_parked(self):
-        self._parked(task_path="Todo/items/does-not-exist.md")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_unreadable_worker_mode_stays_parked(self):
-        # read_task_worker_mode returns None for a blank/placeholder/absent field
-        self._parked(md_mode="-")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    # --- loop prevention --------------------------------------------------
-
-    def test_release_consumes_the_signal_and_does_not_repeat(self):
-        # Without the re-stamp the pair (stamp=blocked, md=auto) stays true and
-        # the row is released again on every single tick — an unpark loop. Re-park
-        # the released row exactly as collect() would and confirm it stays put.
-        self._parked(stamp="blocked", md_mode="auto")
-        self.assertEqual(len(self.orch.reconcile_unparked()), 1)
-        self.assertEqual(self.ledger.load("t").parked_worker_mode, "auto")
-        r = self.ledger.load("t")
-        r.state = A.AWAITING_HUMAN
-        r.blocked_on = "ANTHROPIC_API_KEY 미설정"
-        r.last_alert_kind = ALERT_BLOCKED
-        self.ledger.save(r)
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_observation_alone_never_changes_state(self):
-        # an `auto` -> `blocked` edit is the human PARKING it, not releasing it
-        self._parked(stamp="auto", md_mode="blocked")
-        self.assertEqual(self.orch.reconcile_unparked(), [])
-        r = self.ledger.load("t")
-        self.assertEqual(r.state, A.AWAITING_HUMAN)
-        self.assertEqual(r.parked_worker_mode, "blocked")
-
-    def test_every_dispatchable_mode_counts_as_a_release(self):
-        for mode in tasks.DISPATCHABLE_MODES:
-            with self.subTest(mode=mode):
-                self._parked(stamp="blocked", md_mode=mode)
-                self.assertEqual(len(self.orch.reconcile_unparked()), 1)
-                self.assertEqual(self.ledger.load("t").state, A.FAILED)
-
-    # --- safety -----------------------------------------------------------
-
-    def test_a_raising_reader_never_escapes_into_tick(self):
-        # an exception here would freeze ALL dispatch, not just this row
-        self._parked()
-        with mock.patch.object(repos, "read_task_worker_mode",
-                               side_effect=RuntimeError("boom")):
-            self.assertEqual(self.orch.reconcile_unparked(), [])
-        self.assertEqual(self.ledger.load("t").state, A.AWAITING_HUMAN)
-
-    def test_awaiting_human_is_not_terminal(self):
-        # putting AWAITING_HUMAN in TERMINAL would "fix" this bug by re-dispatching
-        # every parked row, including the PR reviews above
-        self.assertNotIn(A.AWAITING_HUMAN, A.TERMINAL)
-
-    def test_older_json_without_the_field_loads_with_a_default(self):
-        text = json.dumps({"task_id": "t", "agent_id": "w", "corr_id": "C1",
-                           "state": A.AWAITING_HUMAN})
-        self.assertEqual(Assignment.from_json(text).parked_worker_mode, "")
-
-    def test_a_reply_can_never_set_the_stamp(self):
-        # the stamp is an orchestrator observation, not wire data — an agent that
-        # sent one could unpark itself
-        a = self._parked()
-        a.apply_reply(m.Envelope(to="o", type=m.FAIL, task_id="t",
-                                 payload={"parked_worker_mode": "auto"}))
-        self.assertEqual(a.parked_worker_mode, "blocked")
-
-
-class ReconcilePerRowIsolationTest(unittest.TestCase):
-    """One bad ledger row must skip only itself, not the rows behind it.
-
-    Both reconcile sweeps used to wrap the ENTIRE `for a in self.ledger.all()`
-    loop in a single `try/except: pass`. `Ledger.all()` is filename-sorted, so
-    the first row that raised — a whitespace-only `blocked_on`, a `task_path`
-    that is not a string, an md that won't read — silently cancelled the
-    reconcile of every row sorted after it, on every tick, forever, with nothing
-    printed. The rows below use REAL raisers rather than mocks: the point is
-    that these inputs occur, not that an exception can be injected.
-
-    The outer net is deliberately kept, so `tick()` still never sees an
-    exception from here — `test_*_survives_a_broken_ledger` is the only check
-    that goes red if someone deletes it, since per-row handlers alone would let
-    a failing `ledger.all()` propagate.
-    """
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.vault = self.tmp / "vault"
-        self.items = self.vault / "Todo" / "items"
-        self.items.mkdir(parents=True)
-        self.mb = FileMailbox(self.tmp / "agents")
-        # ledger.root.parent.parent must stay inside tmp — reconcile_unparked
-        # resolves relative task_paths against it, and the real vault must never
-        # be reachable from a test.
-        self.ledger = Ledger(self.vault / "Worker" / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
-        self.orch = Orchestrator(self.mb, self.reg, self.ledger, notify=lambda *a, **k: None)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _row(self, slug, *, blocker, task_path=..., md_mode="auto", stamp="blocked"):
-        """A parked row named `slug`; rows are processed in filename order."""
-        (self.items / f"{slug}.md").write_text(
-            f"---\nstatus: open\nworker_mode: {md_mode}\n---\n\n# {slug}\n",
-            encoding="utf-8")
-        if task_path is ...:
-            task_path = f"Todo/items/{slug}.md"
-        a = Assignment(task_id=slug, agent_id="w", corr_id="C1",
-                       state=A.AWAITING_HUMAN, kind="ai-local", attempts=1,
-                       payload={"task_path": task_path})
-        a.blocked_on = blocker
-        a.last_alert_kind = ALERT_BLOCKED
-        a.parked_worker_mode = stamp
-        a.updated_ts = "2026-01-01T00:00:00"
-        self.ledger.save(a)
-        return a
 
     @staticmethod
-    def _capturing(fn):
+    def _run(errors) -> str:
+        tally = _SkipTally("sweep")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            out = fn()
-        return out, buf.getvalue()
+            for tid, e in errors:
+                tally.record(tid, e)
+            tally.flush()
+        return buf.getvalue()
 
-    # --- the incident: row 1 raises, row 2 must still reconcile ------------
-
-    def test_unblocked_row_that_raises_does_not_swallow_the_next_row(self):
-        # "   " is truthy, so it passes the `not blocker` guard, and then
-        # "   ".split()[0] raises IndexError — a real row shape, not a mock.
-        self._row("aaa", blocker="   ")
-        self._row("zzz", blocker="upstream-task (PR #9, MERGED)")
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            out, printed = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual([x.task_id for x in out], ["zzz"])       # NOT swallowed
-        self.assertEqual(self.ledger.load("zzz").state, A.FAILED)  # actually saved
-        self.assertEqual(self.ledger.load("aaa").state, A.AWAITING_HUMAN)  # untouched
-        self.assertIn("reconcile_unblocked", printed)              # at least one line
-        self.assertIn("aaa", printed)                              # naming the row
-
-    def test_unparked_row_that_raises_does_not_swallow_the_next_row(self):
-        # a non-string task_path is truthy, so it survives the `not raw` guard
-        # and Path(123) raises TypeError.
-        self._row("aaa", blocker="ANTHROPIC_API_KEY 미설정", task_path=123)
-        self._row("zzz", blocker="ANTHROPIC_API_KEY 미설정", md_mode="auto",
-                  stamp="blocked")
-        out, printed = self._capturing(self.orch.reconcile_unparked)
-        self.assertEqual([x.task_id for x in out], ["zzz"])
-        self.assertEqual(self.ledger.load("zzz").state, A.FAILED)
-        self.assertEqual(self.ledger.load("aaa").state, A.AWAITING_HUMAN)
-        self.assertIn("reconcile_unparked", printed)
+    def test_caps_each_cause_and_summarises_it_once(self):
+        same = [(s, IndexError("x")) for s in ("aaa", "bbb", "ccc", "ddd", "eee")]
+        other = [(s, RuntimeError("boom")) for s in ("raa", "rbb", "rcc", "rdd")]
+        printed = self._run(same + other)
+        self.assertEqual(printed.count("skipped:"), 6)          # 3 per cause
         self.assertIn("aaa", printed)
+        self.assertNotIn("ddd", printed)
+        self.assertIn("같은 원인으로 2건 추가 skip (IndexError: x)", printed)
+        self.assertIn("같은 원인으로 1건 추가 skip (RuntimeError: boom)", printed)
 
-    # --- the contract the per-row handlers must not replace ----------------
-
-    def test_unblocked_survives_a_broken_ledger_without_raising(self):
-        with mock.patch.object(self.ledger, "all", side_effect=RuntimeError("boom")):
-            out, printed = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual(out, [])                     # never raises into tick()
-        self.assertIn("sweep aborted", printed)       # ...but is not silent
-
-    def test_unparked_survives_a_broken_ledger_without_raising(self):
-        with mock.patch.object(self.ledger, "all", side_effect=RuntimeError("boom")):
-            out, printed = self._capturing(self.orch.reconcile_unparked)
-        self.assertEqual(out, [])
-        self.assertIn("sweep aborted", printed)
-
-    # --- 같은 원인의 반복 skip은 상한 + 요약 한 줄 -------------------------
-    #
-    # Per-row isolation buys one printed line per swallowed exception, so a
-    # SYSTEMATIC defect (task_status raising for every row) prints one line per
-    # ledger row, on every 5-minute tick, burying every other signal. The rows
-    # below lock the VOLUME down; none of them relaxes the isolation above.
-
-    def test_unblocked_caps_repeated_same_cause_skip_lines(self):
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self._row(slug, blocker="   ")   # one identical IndexError, five times
-        out, printed = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual(out, [])
-        self.assertEqual(printed.count("skipped:"), 3)      # capped, not 5
-        self.assertIn("aaa", printed)                       # first ones stay named
-        self.assertNotIn("ddd", printed)                    # the rest are folded in
-        self.assertNotIn("eee", printed)
-        self.assertIn("같은 원인으로 2건 추가 skip", printed)
-        self.assertEqual(printed.count("추가 skip"), 1)      # one summary, not one per row
-        # what was suppressed is the PRINTING; every row is still skipped.
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self.assertEqual(self.ledger.load(slug).state, A.AWAITING_HUMAN)
-
-    def test_unblocked_cap_does_not_stop_a_healthy_row_behind_it(self):
-        # Both halves are asserted in ONE test on purpose, because neither
-        # existing row can catch a suppression bug that gains control flow: the
-        # cap test above has no healthy row to lose, and the isolation test at
-        # the top has a single raiser, so the cap never fires there. Only a sweep
-        # where the cap ACTUALLY fired AND a healthy row sorts behind it pins
-        # "record() decides what gets PRINTED, never whether the loop keeps
-        # reconciling" — the day suppression grows a `continue` or an early
-        # return, this is the row that goes red.
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self._row(slug, blocker="   ")   # five identical IndexErrors
-        self._row("zzz", blocker="upstream-task (PR #9, MERGED)")  # sorts last
-        with mock.patch.object(tasks, "task_status", return_value="done"):
-            out, printed = self._capturing(self.orch.reconcile_unblocked)
-        # (1) the cap really fired — without this, half (2) proves nothing
-        self.assertEqual(printed.count("skipped:"), 3)
-        self.assertIn("같은 원인으로 2건 추가 skip", printed)
-        # (2) ...and the healthy row queued behind it still reconciled AND saved
-        self.assertEqual([x.task_id for x in out], ["zzz"])
-        self.assertEqual(self.ledger.load("zzz").state, A.FAILED)
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self.assertEqual(self.ledger.load(slug).state, A.AWAITING_HUMAN)
-
-    def test_unblocked_distinct_causes_are_tallied_separately(self):
-        # Four rows raise IndexError before task_status is ever reached; four
-        # more get far enough to call it and raise RuntimeError. Two causes must
-        # tally apart — merged, whichever defect is rarer would vanish.
-        for slug in ("aaa", "bbb", "ccc", "ddd"):
-            self._row(slug, blocker="   ")
-        for slug in ("raa", "rbb", "rcc", "rdd"):
-            self._row(slug, blocker="upstream-task (PR #9, MERGED)")
-        with mock.patch.object(tasks, "task_status", side_effect=RuntimeError("boom")):
-            out, printed = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual(out, [])
-        self.assertEqual(printed.count("skipped:"), 6)      # 3 per cause
-        self.assertEqual(printed.count("추가 skip"), 2)      # one line per cause
-        self.assertEqual(printed.count("같은 원인으로 1건 추가 skip"), 2)
-        self.assertIn("IndexError", printed)
-        self.assertIn("RuntimeError: boom", printed)
-
-    def test_no_summary_line_when_nothing_is_suppressed(self):
-        # Under the cap the output stays exactly what it was before this change.
-        # An unconditional summary would make QUIET ticks noisier — the opposite
-        # of the point — so this is the row that fails a naive always-print.
-        self._row("aaa", blocker="   ")
-        self._row("bbb", blocker="   ")
-        out, printed = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual(printed.count("skipped:"), 2)
-        self.assertNotIn("추가 skip", printed)
-
-    def test_skip_tally_is_sweep_local(self):
-        # The tally is rebuilt per sweep. One that outlived the call would stay
-        # silent from the second tick onward — that does not stop the flood, it
-        # stops anyone SEEING it, which is strictly worse than the flood.
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self._row(slug, blocker="   ")
-        _, first = self._capturing(self.orch.reconcile_unblocked)
-        _, second = self._capturing(self.orch.reconcile_unblocked)
-        self.assertEqual(first.count("skipped:"), 3)
-        self.assertEqual(second.count("skipped:"), 3)       # NOT 0
-        self.assertIn("같은 원인으로 2건 추가 skip", second)
-
-    def test_unparked_caps_repeated_same_cause_skip_lines(self):
-        # The other sweep carries its own tally: Path(123) -> TypeError.
-        for slug in ("aaa", "bbb", "ccc", "ddd", "eee"):
-            self._row(slug, blocker="ANTHROPIC_API_KEY 미설정", task_path=123)
-        out, printed = self._capturing(self.orch.reconcile_unparked)
-        self.assertEqual(out, [])
-        self.assertEqual(printed.count("skipped:"), 3)
-        self.assertIn("reconcile_unparked", printed)        # named for ITS sweep
-        self.assertEqual(printed.count("추가 skip"), 1)
-        self.assertIn("같은 원인으로 2건 추가 skip", printed)
-        self.assertNotIn("eee", printed)
-
-    def test_summary_key_is_length_capped(self):
-        # A 500-char exception message quoted in full would re-create the flood
-        # the cap exists to end. Only the SUMMARY key is abridged: the first
-        # three per-row lines keep the whole message, since those are the ones
-        # anyone actually debugs from.
+    def test_silent_under_the_cap_and_the_summary_key_is_length_capped(self):
+        self.assertNotIn("추가 skip", self._run([("aaa", IndexError("x"))] * 2))
         long_msg = "x" * 500
-        for slug in ("aaa", "bbb", "ccc", "ddd"):
-            self._row(slug, blocker="upstream-task (PR #9, MERGED)")
-        with mock.patch.object(tasks, "task_status",
-                               side_effect=RuntimeError(long_msg)):
-            _, printed = self._capturing(self.orch.reconcile_unblocked)
-        summary = [ln for ln in printed.splitlines() if "추가 skip" in ln]
-        self.assertEqual(len(summary), 1)
-        self.assertIn("…", summary[0])                      # abridged...
-        self.assertNotIn(long_msg, summary[0])
-        self.assertLess(len(summary[0]), 200)
-        rows = [ln for ln in printed.splitlines() if "skipped:" in ln]
-        self.assertEqual(len(rows), 3)
-        self.assertIn(long_msg, rows[0])                    # ...but not on the row lines
+        printed = self._run([(s, RuntimeError(long_msg)) for s in "abcd"])
+        [summary] = [ln for ln in printed.splitlines() if "추가 skip" in ln]
+        self.assertIn("…", summary)
+        self.assertLess(len(summary), 200)
+        self.assertIn(long_msg, printed.splitlines()[0])        # row lines stay whole
 
 
 def _make_todo_db(path: Path, rows: list[dict]) -> Path:
@@ -3494,13 +2931,13 @@ class MergedButBlockedTest(_TmpVaultCase):
             return board.split("## ⏳ 사람 대기")[1].split("## ❌")[0]
 
         before = waiting()             # blocked, PR not merged yet: the re-queue recipe
-        self.assertIn("worker_mode", before)
+        self.assertIn("--after-commit", before)
         self.assertNotIn("status: done", before)
         self.assertEqual(self._merged_sweep(), [])
         after = waiting()
         self.assertIn("⛔ blocked_on: AC4/AC5", after)
         self.assertIn("status: done", after)
-        self.assertNotIn("worker_mode", after)
+        self.assertNotIn("--after-commit", after)
 
     def test_real_merged_park_trace_says_close_not_requeue(self):
         # `macp trace` must give the same exit as the dashboard for a row the REAL
@@ -3519,15 +2956,15 @@ class MergedButBlockedTest(_TmpVaultCase):
             return md.split("## 원장")[1].split("## 브랜치")[0]
 
         before = ledger_part()         # blocked, PR not merged yet: the re-queue recipe
-        self.assertIn("worker_mode", before)
+        self.assertIn("--after-commit", before)
         self.assertNotIn("status: done", before)
         self.assertEqual(self._merged_sweep(), [])
         after = ledger_part()
         self.assertIn("- blocked_on: AC4/AC5", after)
         self.assertIn("status: done", after)
         self.assertIn("reconcile_merged()", after)
-        self.assertNotIn("worker_mode", after)
-        self.assertNotIn("reconcile_unparked", after)
+        self.assertNotIn("--after-commit", after)
+        self.assertNotIn("reconcile_resumes", after)
 
 
 class DiscoverMergeDecisionTest(unittest.TestCase):

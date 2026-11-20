@@ -778,7 +778,7 @@ def _fallback_to_human(a, ledger, notify, reason: str, emit) -> None:
     """Auto-rescope not viable → send one ⛔ (immediate) and keep the park.
     collect() may have suppressed the ⛔, so this prevents a silent park.
     Flips the framing to ALERT_BLOCKED to stop re-execution on the next tick
-    and hands off to the reconcile_unparked (human clears the blocker) path."""
+    and hands off to the human (clear the blocker, then `cli resume`)."""
     a.last_alert_kind = _ALERT_BLOCKED
     a.last_note = f"rescope not auto-viable: {reason}"[:200]
     a.history.append({"ts": _now_iso(), "type": "rescope-fallback",

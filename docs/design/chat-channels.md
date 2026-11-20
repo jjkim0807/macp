@@ -469,7 +469,7 @@ GET /api/channels → 200 {"channels": [ {"id": "...", "title": "...", "can_post
 | 발신처 (`KAKAO_ALERTS.md` 행) | 지금 | 채널 출처 태스크일 때 | 이유 |
 |---|---|---|---|
 | 검토요청 `_notify_review` — `review:<framing>:<task>` + 6h (`:41`) | 즉시 | **즉시 유지** + 채널 딥링크 | 사람 판단 |
-| 유실·격리·timeout·상류 취소·상위 점검 `_notify_orphaned_commits`·`_notify_poison`·`_notify_timeout_park`·`_notify_blocker_cancelled`·`_notify_parent_complete` (`:42-46`) · 재촉 `_nudge` (`:49`) | 즉시 | 즉시 유지 + 딥링크 | 수동 처리 |
+| 유실·격리·timeout·상위 점검 `_notify_orphaned_commits`·`_notify_poison`·`_notify_timeout_park`·`_notify_parent_complete` (`:42-45`) · 첫 할당 `_nudge` (`:48`) | 즉시 | 즉시 유지 + 딥링크 | 수동 처리 |
 | human-ready `_notify_human_ready` — `human-ready:<slug>` (`:47`) | 즉시 | 즉시 유지 + 딥링크 | 사람 차례 |
 | TASK_ASSIGN `deliver_pending` — `assign:<task>` (`:50`) | 즉시 | 즉시 유지 + 딥링크 | 채널을 떠난 뒤에도 남는 유일한 "당신 차례" 신호일 수 있다(`:50` 의 번복 이유) |
 | worker fail `_run_next_impl` — `worker-fail:<slug>` (`:60`) | 즉시 | 즉시 유지 + 딥링크 | 런 로그 확인 |

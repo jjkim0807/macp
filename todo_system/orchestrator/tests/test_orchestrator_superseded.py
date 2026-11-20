@@ -55,10 +55,10 @@ TASK_PATH = f"Todo/items/{SLUG}.md"
 PR_URL = "https://github.com/example-org/example-repo/pull/7"
 
 # Sweeps that read live machine state (gh, the real queue file, other repos).
-# The tick tests below stub them; dispatch, collect, reconcile_split_parents,
-# reconcile_closed, reconcile_unblocked and renudge_due run for real.
+# The tick tests below stub them; dispatch, collect, reconcile_split_parents and
+# reconcile_closed run for real.
 _TICK_STUBS = (
-    "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
+    "reroute_remote", "reap_stale", "reconcile_resumes",
     "reconcile_rescope", "reconcile_merged",
     "reconcile_parents", "reconcile_human_ready", "reconcile_queue",
     "_advote_bridge_tick", "_beta_sweep_tick",
@@ -524,7 +524,6 @@ class ExistingSweepTest(_TickFixture):
                   last_note="2회 연속 stage timeout — 이어가기 불가")
         out = self._tick([self._task()])
         self.assertEqual(out["dispatched"], [])
-        self.assertEqual(out["renudged"], [])
         self.assertEqual(self.ledger.load(SLUG).state, A.DONE)
         self.assertEqual(self._assigns(), [])
         self._assert_quiet()
@@ -550,7 +549,6 @@ class TickEndToEndTest(_TickFixture):
         a = self.ledger.load(SLUG)
         self._assert_closed_quietly(a, sup.REASON_MD_CLOSED)
         self.assertEqual(out["dispatched"], [])
-        self.assertEqual(out["renudged"], [])
 
     def test_control_second_timeout_on_an_open_task_alerts_in_that_tick(self):
         self._write_md("open")

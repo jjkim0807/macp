@@ -209,10 +209,9 @@ class TraceTest(unittest.TestCase):
     MERGED_PARK = ({"ts": "2026-09-18T07:00:00+09:00", "type": dashboard._MERGED_BUT_BLOCKED,
                     "from": "orchestrator"},)
     # the unmerged park's release line, byte for byte
-    REQUEUE_RECIPE = ("  - 해제: 블로커 해소 후 태스크 md의 `worker_mode`를 비-디스패치 "
-                      "값(`blocked` 등)으로 바꿨다가 `auto`로 되돌리면 "
-                      "`reconcile_unparked()`가 그 전이를 해제 신호로 읽어 자동 재큐한다 "
-                      "— 원장 수기 편집 불필요")
+    REQUEUE_RECIPE = ("  - 해제: 블로커를 해소하고 태스크 md 수정을 커밋한 뒤 "
+                      "`python -m todo_system.cli resume <slug> --after-commit <sha>`로 재개를 "
+                      "예약하면 다음 틱에 `reconcile_resumes()`가 재큐한다 — 원장 수기 편집 불필요")
 
     def _led(self, state, blocked_on="", history=()):
         led = Ledger(self.tmp / "assignments")
@@ -237,18 +236,18 @@ class TraceTest(unittest.TestCase):
         md = self._render(slug="never-ran",
                           ledger=self._led("awaiting_human", "ANTHROPIC_API_KEY 미설정"))
         self.assertIn("ANTHROPIC_API_KEY 미설정", md)
-        self.assertIn("worker_mode", md)
-        self.assertIn("reconcile_unparked", md)
+        self.assertIn("--after-commit", md)
+        self.assertIn("reconcile_resumes", md)
 
-    def test_an_unparked_row_gets_no_parking_note(self):
+    def test_a_failed_row_gets_no_parking_note(self):
         md = self._render(slug="never-ran", ledger=self._led("failed"))
         self.assertNotIn("파킹", md)
-        self.assertNotIn("worker_mode", md)
+        self.assertNotIn("--after-commit", md)
 
     def test_merged_park_says_close_the_md_not_requeue(self):
         # reconcile_merged parked this row after its PR merged, on a step a human
-        # still owes. The worker_mode recipe would make reconcile_unparked re-queue
-        # it FAILED with the blocker wiped — a retry of work that already merged.
+        # still owes. The resume recipe would re-queue it FAILED with the blocker
+        # wiped — a retry of work that already merged.
         part = self._ledger_part(self._render(
             slug="never-ran", ledger=self._led("awaiting_human",
                                                "AC4/AC5 need a human on acme-hq",
@@ -258,8 +257,8 @@ class TraceTest(unittest.TestCase):
         self.assertIn("- blocked_on: AC4/AC5", part)
         self.assertIn("status: done", part)        # the exit is closing the md
         self.assertIn("reconcile_merged()", part)
-        self.assertNotIn("worker_mode", part)
-        self.assertNotIn("reconcile_unparked", part)
+        self.assertNotIn("--after-commit", part)
+        self.assertNotIn("reconcile_resumes", part)
 
     def test_unmerged_park_keeps_the_requeue_recipe_verbatim(self):
         part = self._ledger_part(self._render(
@@ -292,7 +291,7 @@ class TraceTest(unittest.TestCase):
         self.assertIn("- blocked_on: AC4/AC5", part)
         self.assertNotIn("파킹", part)
         self.assertNotIn("status: done", part)
-        self.assertNotIn("worker_mode", part)
+        self.assertNotIn("--after-commit", part)
 
 
 class TraceCliTest(unittest.TestCase):

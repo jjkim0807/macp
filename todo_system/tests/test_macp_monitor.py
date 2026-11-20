@@ -32,14 +32,14 @@ _SRC = VAULT / "scripts" / "macp_monitor.py"
 # The real orchestrator line this parser has to survive: the hold reason itself
 # contains parentheses, so a `\(([^)]*)\)` regex would truncate at "pace (66%".
 REAL_HOLD_LINE = (
-    "candidates=5 dispatched=0 updated=0 renudged=0 reaped=0 reconciled=0 "
-    "unblocked=0 parents=0 requeued=0 BUDGET-REACHED (runs today=40/40) "
+    "candidates=5 dispatched=0 updated=0 reaped=0 reconciled=0 "
+    "parents=0 requeued=0 BUDGET-REACHED (runs today=40/40) "
     "USAGE-HOLD (weekly 78% ahead of pace (66% elapsed + 12pp allowance))"
 )
 REAL_HOLD_REASON = "weekly 78% ahead of pace (66% elapsed + 12pp allowance)"
 UNHELD_LINE = (
-    "candidates=5 dispatched=1 updated=0 renudged=0 reaped=0 reconciled=0 "
-    "unblocked=0 parents=0 requeued=0"
+    "candidates=5 dispatched=1 updated=0 reaped=0 reconciled=0 "
+    "parents=0 requeued=0"
 )
 
 

@@ -415,7 +415,7 @@ def test_batch_carry_reads_only_the_carry_keys():
 
 # --- a batch_ready row is left alone ----------------------------------------------
 
-def test_batch_ready_row_is_not_dispatched_listed_reaped_or_renudged(world):
+def test_batch_ready_row_is_not_dispatched_listed_or_reaped(world):
     world.ready_row(ready_ts=LONG_AGO)
     row = world.row()
     row.created_ts = LONG_AGO
@@ -427,7 +427,6 @@ def test_batch_ready_row_is_not_dispatched_listed_reaped_or_renudged(world):
     assert world.inbox() == []
     assert world.orch.queue_snapshot([task]) == []
     assert world.orch.reap_stale() == []                 # quiet for years, not in flight
-    assert world.orch.renudge_due() == []                # nobody owes an answer
     assert world.orch._checkout_owners() == {}           # holds no checkout
     assert world.orch._inflight_count("w") == 0
     assert world.row().state == A.BATCH_READY
@@ -638,12 +637,12 @@ def test_sweep_reads_the_config_two_up_from_the_ledger(world, monkeypatch):
 # --- tick() ------------------------------------------------------------------------
 
 _TICK_STUBS = (
-    "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
+    "reroute_remote", "reap_stale", "reconcile_resumes",
     "reconcile_rescope", "_dispatch_serial_per_checkout", "collect",
     "reconcile_split_parents", "reconcile_merged",
-    "reconcile_closed", "reconcile_unblocked", "reconcile_parents",
+    "reconcile_closed", "reconcile_parents",
     "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
-    "_beta_sweep_tick", "renudge_due",
+    "_beta_sweep_tick",
 )
 
 
@@ -707,7 +706,7 @@ def test_tick_survives_a_broken_sweep(world, monkeypatch):
     monkeypatch.setattr(batch_gate, "load_config", boom)
     result = _tick(world.orch)
     assert result["batch_gate"] == EMPTY_SWEEP
-    assert "dispatched" in result and "renudged" in result       # the tick finished
+    assert "dispatched" in result and "requeued" in result       # the tick finished
 
 
 # --- runner → mailbox → collect -----------------------------------------------------
