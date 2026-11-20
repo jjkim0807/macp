@@ -107,18 +107,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR이 머지 없이 닫혔어요 — "
             "다시 열지·재작업할지·접을지 판단해주세요"),
-        # batch verify (orchestrator.reconcile_batch_gate)
-        "alert.batch_expired": (
-            "⌛ 묶음 검증 대기 만료: {title} — {hours}시간 안에 통합 게이트가 돌지 "
-            "않아 개별 전체 Verify로 되돌렸습니다"),
-        "alert.batch_gate_failed": (
-            "❌ 묶음 통합 게이트 실패 — {repo} {n}건을 개별 전체 Verify로 되돌렸어요"),
-        "alert.batch_gate_passed": (
-            "✅ 묶음 통합 게이트 통과 — {repo} {n}건을 차례로 머지했어요"),
-        "alert.batch_restarts": (
-            "🔁 묶음 통합 게이트를 {max}번 다시 시작해도 기본 브랜치가 계속 움직였어요 — "
-            "{repo} {n}건을 개별 전체 Verify로 되돌렸어요"),
-        "alert.batch_gate_log": "게이트 로그: {path}",
         # orchestrator trace view (orchestrator/trace.py render())
         "trace.title": "# 🔎 trace — `{slug}`",
         "trace.summary": "> 런 {n}개 · runs_dir `{runs_dir}` · 읽기 전용 (상태를 바꾸지 않음)",
@@ -262,20 +250,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "alert.closed_unmerged": (
             "⚠️ delegate PR was closed without merging — "
             "decide whether to reopen, redo or drop it"),
-        # batch verify (orchestrator.reconcile_batch_gate)
-        "alert.batch_expired": (
-            "⌛ Batch verify wait expired: {title} — no integration gate ran within "
-            "{hours}h, so it went back to an individual full Verify"),
-        "alert.batch_gate_failed": (
-            "❌ Batch integration gate failed — {n} task(s) in {repo} went back to an "
-            "individual full Verify"),
-        "alert.batch_gate_passed": (
-            "✅ Batch integration gate passed — {n} PR(s) in {repo} merged in order"),
-        "alert.batch_restarts": (
-            "🔁 The default branch kept moving through {max} restarts of the batch "
-            "integration gate — {n} task(s) in {repo} went back to an individual "
-            "full Verify"),
-        "alert.batch_gate_log": "gate log: {path}",
         # orchestrator trace view (orchestrator/trace.py render())
         "trace.title": "# 🔎 trace — `{slug}`",
         "trace.summary": "> {n} run(s) · runs_dir `{runs_dir}` · read-only (changes no state)",

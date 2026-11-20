@@ -135,22 +135,6 @@ on a test, class or method. Limits: a spawned process sees only the env
 redirect, not the fetch or git block, and a test that reloads either module
 (``importlib.reload``) gets the real functions back for the rest of that test.
 
-The batch-gate config (``orchestrator/batch_gate.py``) — every
-``StagedExecutor._execute`` reads ``<vault>/.macp/batch_gate.json`` to decide
-whether the run verifies in QUICK mode, and the orchestrator's sweep reads it
-for waiting rows. A worker stage tests a worktree with ``MACP_VAULT_ROOT`` naming
-the live vault, so once that vault registers a repo, an ``_execute`` test whose
-fake repo happens to share its name would take the batch path.
-``_batch_gate_config_isolated`` wraps ``batch_gate.load_config``: a call for a
-real root (the vault, this checkout) answers ``{}``, a call for any other root —
-a test's own tmp vault — runs the real function. It works only because
-production reads the config as ``batch_gate.load_config(...)``, through the
-module attribute; ``from .batch_gate import load_config`` would bypass it.
-The integration gate itself is a detached job under ``jobs.JOBS_DIR``, which is
-fixed at import to the vault's ``Worker/jobs``. ``_batch_gate_runner_isolated``
-replaces ``batch_gate.default_gate`` with a runner whose ``start`` raises, so no
-test can launch a real gate there; a test that needs one swaps in its own fake.
-
 The vault worktree (``orchestrator/repos.py``) — every ``StagedExecutor._execute``
 of a task with no ``repo:`` cuts a linked worktree of the VAULT repository under
 the worker root (``<worker root>/vault.wt/<slug>``) and runs the task's branch
@@ -173,7 +157,7 @@ closes it in three places:
 
 The runner only rescues, rechecks a merge in, arms its live-HEAD watch for or
 removes a path that still is a worktree (its ``.git`` entry exists), so a stand-in
-directory adds no git call to a run. Like the batch-gate guard, this works only
+directory adds no git call to a run. This works only
 because production reaches all three through the module attribute
 (``repos.x(...)``, ``stages.x(...)``).
 
@@ -206,7 +190,6 @@ from todo_system import (
     worker,
 )
 from todo_system.orchestrator import (
-    batch_gate,
     disk_guard,
     human,
     mailbox,
@@ -442,14 +425,12 @@ _REAL_UG_STATE_PATH = usage_guard._state_path
 _REAL_UG_STATE_DIR = os.path.realpath(usage_guard.ROOT / "Worker" / "_state" / "usage_guard")
 _REAL_PULL_MAIN = _orch_mod._pull_main
 _REAL_CHECK_DIVERGENCE = _orch_mod._check_divergence
-# The batch-gate config reader and the roots whose config no test may read: the
-# vault each module resolved (MACP_VAULT_ROOT can name the live one) and this
-# checkout. Captured at import, like the seams above.
-_REAL_BATCH_LOAD_CONFIG = batch_gate.load_config
-_REAL_BATCH_ROOTS = frozenset(
+# The real roots no test may cut a vault worktree from: the vault each module
+# resolved (MACP_VAULT_ROOT can name the live one) and this checkout.
+# Captured at import, like the seams above.
+_REAL_ROOTS = frozenset(
     os.path.realpath(root) for root in (stages._VAULT_DATA_ROOT, _REPO_ROOT, worker.ROOT))
-# The vault-worktree seams, captured at import like the ones above. The roots no
-# test may cut a worktree from are the same real roots the batch-gate guard uses.
+# The vault-worktree seams, captured at import like the ones above.
 _REAL_VAULT_WORKTREE_PATH = repos.vault_worktree_path
 _REAL_ENSURE_VAULT_WORKTREE = repos.ensure_vault_worktree
 _REAL_REMOVE_WORKTREE = stages.remove_worktree
@@ -635,50 +616,9 @@ def _auto_side_effects_isolated(request, tmp_path_factory, monkeypatch):
         monkeypatch.setattr(_orch_mod, "_check_divergence", _guarded_check_divergence)
 
 
-@pytest.fixture(autouse=True)
-def _batch_gate_config_isolated(monkeypatch):
-    # See the module docstring. A real root answers {} (feature off); any other
-    # root, a test's own tmp vault included, reads through the real function.
-    def _guarded(vault_root, *args, **kwargs):
-        try:
-            real_root = os.path.realpath(vault_root) in _REAL_BATCH_ROOTS
-        except (TypeError, ValueError):
-            real_root = False               # not a path: the real reader answers {}
-        if real_root:
-            return {}
-        return _REAL_BATCH_LOAD_CONFIG(vault_root, *args, **kwargs)
-
-    monkeypatch.setattr(batch_gate, "load_config", _guarded)
-
-
-class _BlockedBatchGate:
-    """The gate runner every test gets unless it brings its own: nothing starts."""
-
-    def start(self, job):
-        raise RuntimeError(
-            "real batch gate blocked by todo_system/conftest.py "
-            "(patch batch_gate.default_gate with a fake)")
-
-    def poll(self, job):
-        return batch_gate.GATE_FAILED
-
-    def stop(self, job):
-        return None
-
-    def cleanup(self, job):
-        return None
-
-
-@pytest.fixture(autouse=True)
-def _batch_gate_runner_isolated(monkeypatch):
-    # See the module docstring. Production builds its runner through
-    # batch_gate.default_gate(), looked up on the module when called.
-    monkeypatch.setattr(batch_gate, "default_gate", _BlockedBatchGate)
-
-
 def _is_real_root(path) -> bool:
     try:
-        return os.path.realpath(path) in _REAL_BATCH_ROOTS
+        return os.path.realpath(path) in _REAL_ROOTS
     except (TypeError, ValueError):
         return False                        # not a path: nothing real to protect
 
@@ -779,16 +719,6 @@ def real_auto_side_effects():
 
 
 @pytest.fixture
-def real_batch_gate_config():
-    """The unguarded batch-gate config reader and the real roots (realpaths) the
-    guard answers ``{}`` for."""
-    return types.MappingProxyType({
-        "load_config": _REAL_BATCH_LOAD_CONFIG,
-        "roots": _REAL_BATCH_ROOTS,
-    })
-
-
-@pytest.fixture
 def real_vault_worktree():
     """The unguarded vault-worktree seams and the real roots (realpaths) the guard
     hands a stand-in directory for."""
@@ -796,7 +726,7 @@ def real_vault_worktree():
         "vault_worktree_path": _REAL_VAULT_WORKTREE_PATH,
         "ensure_vault_worktree": _REAL_ENSURE_VAULT_WORKTREE,
         "remove_worktree": _REAL_REMOVE_WORKTREE,
-        "roots": _REAL_BATCH_ROOTS,
+        "roots": _REAL_ROOTS,
     })
 
 

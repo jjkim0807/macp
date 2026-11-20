@@ -38,25 +38,13 @@ def _fail_line(a) -> str:
     return f"- `{a.task_id}` → **{a.agent_id}**{tries}{why}{where}"
 
 
-def _batch_line(a) -> str:
-    """A `batch_ready` row: passed its quick verify, its ready PR waits for the
-    repo's shared full gate (batch_gate.py). getattr-only — runs in the tick."""
-    note = getattr(a, "last_note", "") or ""
-    why = f" — {note}" if note else ""
-    return (f"- `{getattr(a, 'task_id', '')}` → "
-            f"**{getattr(a, 'agent_id', '')}**{why}")
-
-
 def _deferred_line(a) -> str:
     """A FAILED-but-waiting row (checkout_busy / job_running / scheduled resume): what it is waiting
-    on, no retry count — a deferral never counts against the task. A row the batch
-    gate sent back (A.is_batch_return_pending) waits for its own full verify."""
+    on, no retry count — a deferral never counts against the task."""
     if getattr(a, "job_running", False):
         what = "long_job 실행 중"
     elif getattr(a, "checkout_busy", False):
         what = "체크아웃 대기"
-    elif A.is_batch_return_pending(a):
-        what = "묶음 복귀 — 개별 Verify 대기"
     else:
         what = "예약 재개 — 재디스패치 대기"
     why = f" — {a.last_note}" if a.last_note else ""
@@ -216,10 +204,6 @@ def render(ledger: Ledger, registry: Registry, db_path=None,
     # grouped apart so the failure section and count hold real failures only.
     deferred = [a for a in items if a.is_deferred]
     failed = [a for a in by(A.FAILED, A.REJECTED) if not a.is_deferred]
-    # Passed a quick verify, waiting on the repo's shared full gate. In none of
-    # the groups above (not active, parked, deferred or failed), so its own
-    # section — shown only when there is such a row, leaving the board as before.
-    batch = by(A.BATCH_READY)
 
     out = [
         "---", "tags: [orchestrator, dashboard]", f"updated: {m.now_iso()}", "---",
@@ -231,8 +215,6 @@ def render(ledger: Ledger, registry: Registry, db_path=None,
         # tick's pull is failing and vault state is stranding on one host.
         "", "## 🔀 Divergence (origin/main)", *_divergence_section(ledger),
         "", "## 🏃 진행 중", *([_line(a) for a in active] or ["- 없음"]),
-        *(["", "## 📦 묶음 검증 대기 (통합 게이트 후 머지)",
-           *[_batch_line(a) for a in batch]] if batch else []),
         "", "## ⏳ 사람 대기 (parked)",
         *([_parked_line(a) for a in parked] or ["- 없음"]),
         "", "## 💤 대기 (deferred — 실패 아님, 자동 재시도)",
