@@ -140,49 +140,6 @@ def _check_actions_dependency(fm: dict) -> list[Issue]:
     return issues
 
 
-# Decision-gate fields written by todo_system.orchestrator.project_stall: a
-# project opts out of the quiet-stall sweep with `decision_gate: off`, and the
-# generated decision task carries `decision_gate_for: <project>`. The validator
-# ignored unknown fields, so a typo (`decision_gate: of`) silently did nothing;
-# flag it at authoring time. Both checks fire ONLY when the field is present, so
-# no existing task file changes.
-_DECISION_GATE_VALUES = frozenset({"off", "on"})
-
-
-def _check_decision_gate(fm: dict) -> list[Issue]:
-    issues: list[Issue] = []
-    gate = fm.get("decision_gate")
-    if gate is not None:
-        # yaml.safe_load turns a bare `off`/`on` into a bool; the line parser
-        # keeps the string (and any inline comment). Normalise both.
-        if gate is False:
-            norm = "off"
-        elif gate is True:
-            norm = "on"
-        else:
-            norm = str(gate).split("#")[0].strip().lower()
-        if norm not in _DECISION_GATE_VALUES:
-            issues.append(
-                Issue(
-                    WARN,
-                    "decision_gate",
-                    f"unrecognised value {gate!r}; the only opt-out value is "
-                    "`decision_gate: off` (suppress the project-stall sweep).",
-                )
-            )
-    target = fm.get("decision_gate_for")
-    if target is not None and (not isinstance(target, str) or not target.strip()):
-        issues.append(
-            Issue(
-                WARN,
-                "decision_gate_for",
-                "should be the project slug this decision task belongs to "
-                "(a non-empty string).",
-            )
-        )
-    return issues
-
-
 # if-then-habits (2026-10-17): five candidates were held 201 times with
 # "겹침 미판정 (touches 없음)". Two authoring mistakes produce that: a repo task
 # that declares no touches at all (always serialised), and a glob that puts the
@@ -293,8 +250,7 @@ def _check_human_time_block(fm: dict) -> list[Issue]:
         return []
     if str(fm.get("is_parent", "")).strip().lower() in ("true", "yes", "1"):
         return []
-    # A decision is answered when it is asked, not worked in a block, and the
-    # engine writes decision tasks (project_stall) with no view of the calendar.
+    # A decision is answered when it is asked, not worked in a block.
     raw_tags = fm.get("tags") or []
     tags = raw_tags if isinstance(raw_tags, list) else re.split(r"[,\s\[\]]+", str(raw_tags))
     if "decision" in {str(t).strip().lower() for t in tags} or str(
@@ -511,7 +467,6 @@ def validate_frontmatter(fm: dict, body: str = "") -> list[Issue]:
         )
 
     issues.extend(_check_actions_dependency(fm))
-    issues.extend(_check_decision_gate(fm))
     issues.extend(_check_human_time_block(fm))
 
     for numeric in ("max_turns", "priority"):

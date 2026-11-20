@@ -61,7 +61,7 @@ _TICK_STUBS = (
     "reroute_remote", "reap_stale", "reconcile_unparked", "reconcile_resumes",
     "reconcile_rescope", "reconcile_merged",
     "reconcile_parents", "reconcile_human_ready", "reconcile_queue",
-    "_advote_bridge_tick", "_beta_sweep_tick", "_project_stall_tick",
+    "_advote_bridge_tick", "_beta_sweep_tick",
 )
 
 

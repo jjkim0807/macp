@@ -444,7 +444,7 @@ class TickWiringTest(_Base):
               "reconcile_queue", "reconcile_parents", "reconcile_resumes",
               "reconcile_rescope", "reconcile_split_parents",
               "_dispatch_serial_per_checkout", "_advote_bridge_tick",
-              "_beta_sweep_tick", "_project_stall_tick")
+              "_beta_sweep_tick")
 
     def _tick(self, **kw):
         with contextlib.ExitStack() as st:

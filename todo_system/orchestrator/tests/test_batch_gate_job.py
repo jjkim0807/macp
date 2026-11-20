@@ -1126,7 +1126,7 @@ _TICK_STUBS = (
     "reconcile_split_parents", "reconcile_merged",
     "reconcile_closed", "reconcile_unblocked", "reconcile_parents",
     "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
-    "_beta_sweep_tick", "_project_stall_tick", "renudge_due",
+    "_beta_sweep_tick", "renudge_due",
 )
 
 

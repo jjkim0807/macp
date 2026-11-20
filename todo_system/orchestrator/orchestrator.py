@@ -3472,33 +3472,6 @@ class Orchestrator:
         except Exception as e:
             print(f"[orchestrator] beta sweep tick skipped (fail-open): {e}")
 
-    def _project_stall_tick(self) -> list[str]:
-        """Open ONE human decision task for a project that has quietly stalled.
-
-        Deterministic (no LLM): project_stall.run_once re-derives the dashboard's
-        umbrella/leaf rollup, classifies each live project, and writes a single
-        `<project>-next-direction.md` + one deduped alert when a project has gone
-        quiet (all leaves done, or no auto leaf + no human action + idle 48h+).
-        The 1h throttle, the open-task dedup and the 14-day re-suppression all
-        live inside run_once. Fail-open like the advote/beta sweeps — a stall
-        detector must never stall a tick. Returns the created slugs. See
-        todo_system.orchestrator.project_stall."""
-        try:
-            from . import project_stall
-            # ledger.root is Worker/assignments -> the vault root is two up.
-            vault_root = Path(self.ledger.root).parent.parent
-            return project_stall.run_once(
-                vault_root=vault_root,
-                # A project-direction decision is a human call with no urgency and
-                # the event key already guarantees once-per-project, so route it
-                # like reconcile_parents' surfacing ping (default tier, deduped).
-                notify=lambda msg, *, event_key: self._notify_routed(
-                    msg, None, event_key=event_key),
-            )
-        except Exception as e:
-            print(f"[orchestrator] project stall tick skipped (fail-open): {e}")
-            return []
-
     def _server_deploy_watch_tick(self) -> list[str]:
         """Alert ONCE when a merged server change is not running in production.
 
@@ -3871,7 +3844,6 @@ class Orchestrator:
         human_ready = self.reconcile_human_ready(unblock_flips)
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
-        project_stalls = self._project_stall_tick()  # stalled project → human-decision task (fail-open, 1h throttle)
         self._server_deploy_watch_tick()       # merged server change not in production → one alert (fail-open, 10-min throttle)
         nudged = self.renudge_due(now)
         return {"rerouted": rerouted,
@@ -3884,7 +3856,6 @@ class Orchestrator:
                 "batch_gate": batch_gate_res,
                 "parents": parents,
                 "human_ready": human_ready,
-                "project_stalls": project_stalls,
                 "requeued": requeued, "renudged": nudged,
                 "budget_reached": self.budget_exceeded(), "paused": self.paused(),
                 "usage_hold": usage_hold,

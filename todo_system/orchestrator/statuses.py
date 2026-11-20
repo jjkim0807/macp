@@ -7,8 +7,7 @@ the set, and several copies knew only `cancelled` — so a `canceled` task's fai
 queue entry was auto-retried, and dashboard/metrics counts left it out.
 
 This is a dependency-free leaf on purpose: `tasks` imports `repos` and
-`orchestrator.orchestrator`, and `orchestrator.orchestrator` imports
-`project_stall`, so none of those can import `tasks` for the set without a cycle.
+`orchestrator.orchestrator`, so neither can import `tasks` for the set without a cycle.
 They (and `worker`, `metrics`, `state_store`, the dashboard) import this module
 instead; `tasks` re-exports the names as the public `tasks.CLOSED_STATUSES` /
 `tasks.is_closed`.
