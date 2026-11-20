@@ -1690,7 +1690,6 @@ class GroupStampingHermetic(unittest.TestCase):
                 mock.patch.object(M, "_title_map", return_value={}), \
                 mock.patch.object(M, "_project_map", return_value=pmap), \
                 mock.patch.object(M, "collect_human", return_value=[human_row]), \
-                mock.patch.object(M, "collect_proposals", return_value=[]), \
                 mock.patch.object(M, "collect_runs", return_value=[]), \
                 mock.patch.object(M, "collect_deps", return_value=[]), \
                 mock.patch.object(M, "collect_agents", return_value=[]), \
@@ -1860,8 +1859,7 @@ class HumanTriage(unittest.TestCase):
     def test_status_splits_later_out_of_human(self):
         with mock.patch.object(M, "collect_human",
                                return_value=[{"slug": "a", "later": False},
-                                             {"slug": "b", "later": True}]), \
-                mock.patch.object(M, "collect_proposals", return_value=[]):
+                                             {"slug": "b", "later": True}]):
             d = M.collect_status()
         self.assertEqual([r["slug"] for r in d["human"]], ["a"])
         self.assertEqual([r["slug"] for r in d["human_later"]], ["b"])
@@ -3158,171 +3156,3 @@ class HumanPlannedBlockNotUrgent(unittest.TestCase):
     def test_row_keys_unchanged(self):
         rows = self._rows(dt.datetime(2049, 1, 10, 9, 0))
         self.assertNotIn("planned", rows["block"])
-
-
-class PendingProposalsInStatus(unittest.TestCase):
-    """Unapplied Worker/proposals/<slug>/ prompt proposals surface as human `todo`
-    rows: same key set as a real collect_human row (app compatibility), fail-soft,
-    merged/deduped/sorted with the existing human list."""
-
-    def setUp(self):
-        from todo_system.orchestrator import proposals
-        proposals._CACHE.clear()
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        (self.root / ".claude" / "commands").mkdir(parents=True)
-        d = self.root / "Worker" / "proposals" / "demo-slug" / "commands"
-        d.mkdir(parents=True)
-        (d / "foo.md").write_text("proposed\n", encoding="utf-8")
-        (self.root / ".claude" / "commands" / "foo.md").write_text("live\n",
-                                                                    encoding="utf-8")
-
-    def tearDown(self):
-        from todo_system.orchestrator import proposals
-        proposals._CACHE.clear()
-        self._tmp.cleanup()
-
-    def _human_row(self) -> dict:
-        with mock.patch.object(M, "TODO_DB", self.root / "missing.db"):
-            rows = M.collect_human([{"state": "awaiting_human", "task": "parked-task",
-                                     "note": "n", "todo_status": None}])
-        self.assertEqual(len(rows), 1)
-        return rows[0]
-
-    def test_row_key_set_matches_real_human_row(self):
-        (row,) = M.collect_proposals(self.root)
-        self.assertEqual(set(row), set(self._human_row()))
-        self.assertEqual(row["why"], "todo")
-        self.assertEqual(row["slug"], "demo-slug")
-
-    def test_collect_proposals_is_fail_soft(self):
-        with mock.patch("todo_system.orchestrator.proposals.pending_proposals",
-                        side_effect=RuntimeError("boom")):
-            self.assertEqual(M.collect_proposals(self.root), [])
-
-    def test_merge_sorts_unconditional_first_and_dedupes(self):
-        def row(slug, why, urgent):
-            return {"slug": slug, "why": why, "urgent": urgent, "due": "", "later": False}
-        human = [row("plain-todo", "todo", False), row("dup", "parked", True)]
-        props = [row("dup", "todo", True), row("prop-a", "todo", True),
-                 row("prop-cond", "todo", False)]
-        merged = M._merge_proposals(human, props)
-        slugs = [r["slug"] for r in merged]
-        self.assertEqual(slugs.count("dup"), 1)
-        self.assertEqual(next(r for r in merged if r["slug"] == "dup")["why"], "parked")
-        self.assertLess(slugs.index("prop-a"), slugs.index("plain-todo"))
-        self.assertIn("prop-cond", slugs)
-        self.assertFalse(next(r for r in merged if r["slug"] == "prop-cond")["later"])
-
-    def test_status_includes_proposal_row_in_human(self):
-        (prop,) = M.collect_proposals(self.root)
-        # a partial human row (no urgent/why/due) must not break the merge sort
-        with mock.patch.object(M, "collect_human",
-                               return_value=[{"slug": "a", "later": False}]), \
-                mock.patch.object(M, "collect_proposals", return_value=[prop]):
-            d = M.collect_status()
-        slugs = [r["slug"] for r in d["human"]]
-        self.assertEqual(slugs, ["demo-slug", "a"])
-        self.assertEqual(d["human"][0]["group"], "macp")
-        self.assertEqual(d["human_later"], [])
-
-    def test_merge_without_proposals_is_identity(self):
-        human = [{"slug": "a", "why": "todo", "urgent": False, "due": "", "later": False}]
-        self.assertEqual(M._merge_proposals(human, []), human)
-
-
-class ProposalsScanVaultRootInStatus(unittest.TestCase):
-    """Workers write Worker/proposals/<slug>/ into the VAULT (data root), but
-    collect_proposals() used to scan the ENGINE checkout (_INSTALL_DIR). With
-    MACP_VAULT_ROOT pointing at a separate vault, no proposal ever reached
-    /api/status `human`. Runs through the real collect_status() with
-    collect_proposals NOT stubbed, engine and vault as two distinct temp dirs."""
-
-    def setUp(self):
-        from todo_system.orchestrator import proposals
-        self.proposals = proposals
-        proposals._CACHE.clear()
-        self.addCleanup(proposals._CACHE.clear)
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        self.engine = tmp / "engine"
-        self.vault = tmp / "vault"
-        (self.engine / ".claude" / "commands").mkdir(parents=True)
-        self.vault.mkdir()
-        self._patch_roots(self.vault, self.engine)
-        stubs = {"collect_assignments": [], "_todo_status_map": {}, "_title_map": {},
-                 "_project_map": {}, "collect_human": [], "collect_runs": [],
-                 "collect_deps": [], "collect_agents": [], "collect_todo": {},
-                 "collect_usage": None, "collect_account": {},
-                 "collect_account_runtime": {}, "collect_account_slots": {},
-                 "collect_queue": {}, "_worker_running": []}
-        patches = [mock.patch.object(M, k, return_value=v) for k, v in stubs.items()]
-        patches.append(mock.patch("todo_system.macp.config.load_profile",
-                                  side_effect=RuntimeError("no profile in tests")))
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
-
-    def _patch_roots(self, vault: Path, engine: Path):
-        paths = {"VAULT": vault, "RUNS": vault / "Worker" / "runs",
-                 "ASSIGN": vault / "Worker" / "assignments",
-                 "STATE": vault / "Worker" / "_state",
-                 "TODO_DB": vault / "Todo" / "todo.db",
-                 "ITEMS": vault / "Todo" / "items",
-                 "SESSIONS": vault / "Memory" / "sessions",
-                 "REGISTRY": vault / "Worker" / "agents" / "registry.yaml",
-                 "_INSTALL_DIR": engine}
-        for k, v in paths.items():
-            p = mock.patch.object(M, k, v)
-            p.start()
-            self.addCleanup(p.stop)
-
-    @staticmethod
-    def _propose(root: Path, slug: str, body: str):
-        d = root / "Worker" / "proposals" / slug / "commands"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "foo.md").write_text(body, encoding="utf-8")
-
-    def _human_slugs(self) -> list[str]:
-        return [r["slug"] for r in M.collect_status()["human"]]
-
-    def test_vault_proposal_surfaces_in_human_rows(self):
-        self._propose(self.vault, "vault-prop", "proposed\n")
-        self._propose(self.engine, "engine-only-prop", "x\n")
-        d = M.collect_status()
-        row = next((r for r in d["human"] if r["slug"] == "vault-prop"), None)
-        self.assertIsNotNone(row, [r["slug"] for r in d["human"]])
-        self.assertEqual(row["why"], "todo")
-        self.assertEqual(row["group"], "macp")
-        every = [r["slug"] for r in d["human"] + d["human_later"]]
-        self.assertNotIn("engine-only-prop", every)
-
-    def test_applied_through_symlinked_commands_clears_row(self):
-        # Real deployment: <vault>/.claude/commands is a RELATIVE symlink into the
-        # engine checkout (relative to vault/.claude/, hence two "..").
-        (self.vault / ".claude").mkdir()
-        os.symlink(os.path.join("..", "..", "engine", ".claude", "commands"),
-                   self.vault / ".claude" / "commands")
-        self._propose(self.vault, "linked-prop", "same bytes\n")
-        live = self.engine / ".claude" / "commands" / "foo.md"
-        live.write_text("same bytes\n", encoding="utf-8")
-        self.assertNotIn("linked-prop", self._human_slugs())
-        # Positive control: the live file diverges → the proposal is pending again.
-        live.write_text("different, longer bytes\n", encoding="utf-8")
-        self.proposals._CACHE.clear()
-        self.assertIn("linked-prop", self._human_slugs())
-
-    def test_unset_vault_root_same_dir_unchanged(self):
-        # MACP_VAULT_ROOT unset: vault == engine checkout.
-        self._patch_roots(self.engine, self.engine)
-        self._propose(self.engine, "same-root-prop", "p\n")
-        self.assertIn("same-root-prop", self._human_slugs())
-        (self.engine / ".claude" / "commands" / "foo.md").write_text(
-            "p\n", encoding="utf-8")
-        self.proposals._CACHE.clear()
-        self.assertNotIn("same-root-prop", self._human_slugs())
-
-    def test_collect_proposals_default_root_is_vault(self):
-        # The default must be read at call time (patched VAULT), not bound at def.
-        self._propose(self.vault, "v", "p\n")
-        self.assertEqual([r["slug"] for r in M.collect_proposals()], ["v"])

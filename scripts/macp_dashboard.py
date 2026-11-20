@@ -1259,39 +1259,6 @@ def _human_sort_key(r: dict) -> tuple:
     return (not r["urgent"], WHY_ORDER.get(r["why"], 9), r["due"] or "9999", r["slug"])
 
 
-def collect_proposals(root=None) -> list[dict]:
-    """Unapplied Worker/proposals/<slug>/ prompt proposals as human `todo` rows.
-    Headless workers can't write .claude/**, so a person applies them with one cp;
-    without this row nothing announced them. Fail-soft: any error → [].
-
-    Scans the VAULT (data root, honours MACP_VAULT_ROOT) — workers write their
-    proposals there, not into the engine checkout (_INSTALL_DIR). "Applied" is
-    judged against <VAULT>/.claude/commands, which in the real deployment is a
-    symlink into the engine checkout. Unset MACP_VAULT_ROOT → VAULT == engine
-    root, so that case is unchanged. VAULT is read per call (patchable)."""
-    try:
-        from todo_system.orchestrator.proposals import pending_proposals
-        return pending_proposals(root or VAULT)
-    except Exception:
-        return []
-
-
-def _merge_proposals(human_all: list[dict], proposals: list[dict]) -> list[dict]:
-    """Add proposal rows whose slug isn't already a human row, re-sorted with the
-    same key as collect_human (the human/human_later split and group stamping in
-    collect_status then apply unchanged)."""
-    if not proposals:
-        return human_all
-    try:
-        seen = {r.get("slug") for r in human_all}
-        merged = human_all + [p for p in proposals if p.get("slug") not in seen]
-        merged.sort(key=lambda r: (not r.get("urgent"), WHY_ORDER.get(r.get("why"), 9),
-                                   r.get("due") or "9999", r.get("slug") or ""))
-        return merged
-    except Exception:
-        return human_all                    # never break /api/status over a reminder
-
-
 def _title_map() -> dict:
     """{slug: title} so tables can show a human-readable summary instead of the id."""
     m = {}
@@ -1836,7 +1803,6 @@ def collect_status() -> dict:
     projects_rows = collect_projects(a)
     human_all = collect_human(a, projects={p["slug"] for p in projects_rows},
                               umbrellas=umbrellas)
-    human_all = _merge_proposals(human_all, collect_proposals())
     human = [r for r in human_all if not r.get("later")]
     human_later = [r for r in human_all if r.get("later")]
     for r in (*active, *attention, *batch_ready, *human, *human_later):
