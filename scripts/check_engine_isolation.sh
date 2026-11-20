@@ -4,16 +4,27 @@
 #
 # A script that pins step 5 of the parent [[macp-public-repo-engine-vault-split]]
 # ("does it still run with only the engine split off?") so it can be re-checked in
-# one line. What it does:
+# one line. It also runs the README "Try it in five minutes" loop, so the onboarding
+# a newcomer follows is checked on every run. What it does:
 #
-#   1. Splits off only the engine tree (todo_system/ · scripts/ · .claude/commands/ +
-#      pyproject.toml · uv.lock · README.md · LICENSE — pyproject's readme/license
-#      metadata is needed for the build) into an isolated temp dir (ENGINE_TMP) with
-#      `git archive HEAD`.
-#   2. Creates a separate throwaway vault (VAULT_TMP) with a sample task in
-#      Todo/items/ and an empty skeleton of Memory/·Notes/·Decisions/·Worker/.
+#   1. Splits off only the engine tree (todo_system/ · scripts/ · .claude/commands/ ·
+#      vault-template/ + pyproject.toml · uv.lock · README.md · LICENSE — pyproject's
+#      readme/license metadata is needed for the build) into an isolated temp dir
+#      (ENGINE_TMP) with `git archive HEAD`.
+#   2. Makes two throwaway vaults, each a copy of the archived vault-template/ (the
+#      same skeleton a newcomer copies):
+#        VAULT_TMP — for the prime step and legs A/B/C.
+#        TRY_VAULT — for leg T only, so its hello-world task never reaches leg C.
 #   3. With MACP_VAULT_ROOT pointed at VAULT_TMP, runs 3 read-only CLIs from
 #      cwd=ENGINE_TMP (the engine archive) and judges each rc/observation.
+#   4. Leg T runs the README "Try it in five minutes" commands in the same order
+#      (cli new → set worker_mode: auto + outcome → cli validate → cli import-md →
+#      orchestrator auto → runner --mode shadow --once → orchestrator auto →
+#      orchestrator status). It runs with a fresh HOME, every MACP_* and
+#      USAGE_GUARD_* variable unset, and only MACP_VAULT_ROOT=TRY_VAULT and
+#      USAGE_GUARD_DISABLE=1 set. UV_CACHE_DIR / UV_PYTHON_INSTALL_DIR keep their
+#      real (pre-HOME-swap) locations so uv still works offline. Each step must exit 0
+#      and print the output the README promises.
 #
 # Why the engine (ENGINE_TMP) and the vault (VAULT_TMP) are separated (the key point):
 #   - worker.py's ROOT / usage_guard.py (via PR #167) and orchestrator/human.py ·
@@ -30,10 +41,11 @@
 #     Todo/·Memory/·Worker/) is met automatically by the layout alone. All temp is
 #     under `mktemp -d`, cleaned up by an EXIT trap.
 #
-# Verdict: the 2 migrated legs (cli list · session_log list) rc=0 → RESULT: PASS,
-#       exit 0. The worker leg (run-next --dry-run) is now expected to be rc=0 too,
-#       since all three modules respect paths.vault_root(), but to catch regressions
-#       a rc≠0 there still does not fail the script (recorded only).
+# Verdict: RESULT: PASS (exit 0) only when the 2 migrated legs (cli list ·
+#       session_log list) are rc=0 AND leg T (the README five-minute loop) passes every
+#       step and every expected output. The worker leg C (run-next --dry-run) is
+#       expected to be rc=0 too, since all three modules respect paths.vault_root(),
+#       but a rc≠0 there is recorded only and does not fail the script.
 #
 # Re-run:  bash scripts/check_engine_isolation.sh
 #
@@ -42,11 +54,14 @@ set -euo pipefail
 # All git access is read-only relative to the repo root (`git -C "$REPO"`).
 REPO="$(git rev-parse --show-toplevel)"
 
-# Isolated temp: the engine archive and the throwaway vault are placed separately.
+# Isolated temp: the engine archive and the throwaway vaults are placed separately.
 TMPROOT="$(mktemp -d)"
 ENGINE_TMP="$TMPROOT/engine"
 VAULT_TMP="$TMPROOT/vault"
-mkdir -p "$ENGINE_TMP" "$VAULT_TMP"
+TRY_ROOT="$TMPROOT/try"
+TRY_VAULT="$TRY_ROOT/my-vault"
+TRY_HOME="$TRY_ROOT/home"
+mkdir -p "$ENGINE_TMP" "$VAULT_TMP" "$TRY_VAULT" "$TRY_HOME"
 # Clean up only this specific path — no broad rm/glob.
 trap 'rm -rf "$TMPROOT"' EXIT
 
@@ -54,6 +69,7 @@ echo "== check_engine_isolation =="
 echo "repo:       $REPO"
 echo "engine_tmp: $ENGINE_TMP"
 echo "vault_tmp:  $VAULT_TMP"
+echo "try_vault:  $TRY_VAULT"
 echo
 
 # --- Phase 1: archive only the engine tree (from the HEAD commit tree) ---------
@@ -61,53 +77,18 @@ echo
 # are not what is checked (what is checked = the engine modules at HEAD). Every
 # target path is tracked.
 echo "[phase1] archiving engine tree -> $ENGINE_TMP"
-git -C "$REPO" archive HEAD todo_system scripts .claude/commands pyproject.toml uv.lock README.md LICENSE \
+git -C "$REPO" archive HEAD todo_system scripts .claude/commands vault-template \
+    pyproject.toml uv.lock README.md LICENSE \
   | tar -x -C "$ENGINE_TMP"
 echo "[phase1] engine files extracted: $(find "$ENGINE_TMP" -type f | wc -l)"
 echo
 
-# --- Phase 2: throwaway vault fixture (VAULT_TMP) -----------------------------
-# The minimal redirectable vault that the migrated CLIs (cli/session_log) read via
-# MACP_VAULT_ROOT. The real vault is never touched — everything is a throwaway
-# under mktemp.
-echo "[phase2] building throwaway vault fixture -> $VAULT_TMP"
-mkdir -p \
-  "$VAULT_TMP/Todo/items" \
-  "$VAULT_TMP/Memory/sessions" \
-  "$VAULT_TMP/Memory/episodes" \
-  "$VAULT_TMP/Notes" \
-  "$VAULT_TMP/Decisions" \
-  "$VAULT_TMP/Worker"
-
-# One task with minimal valid frontmatter — what cli import-md/list will read in.
-# (parse_task_file is .get()-based, so it is safe even with missing fields, but this
-#  keeps the documented work-task template shape so it shows up in the list without
-#  regressions.)
-cat > "$VAULT_TMP/Todo/items/sample-isolation-check.md" <<'TASK_EOF'
----
-tags:
-  - todo
-  - infra
-status: open
-due: "-"
-updated: 2026-09-21
-outcome: "격리 검증용 throwaway 태스크 — 엔진이 MACP_VAULT_ROOT 를 읽는지 확인"
-next_action: "cli list 출력에 이 태스크가 나타나면 엔진이 볼트를 존중하는 것"
-if_then: "throwaway 볼트에서만 쓰인다"
-estimate_p50: 5m
-estimate_p90: 10m
-review_cycle: "-"
----
-
-# 격리 검증용 샘플 태스크
-
-- [ ] cli list 에 이 태스크가 나타나는지 확인 (5m)
-
-## Progress Log
-
-- 2026-09-21: check_engine_isolation.sh 픽스처로 생성
-TASK_EOF
-
+# --- Phase 2: throwaway vaults = copies of the archived vault-template ---------
+# The same skeleton the README tells a newcomer to `cp -r`. The real vault is never
+# touched — everything is a throwaway under mktemp.
+echo "[phase2] copying vault-template -> $VAULT_TMP and $TRY_VAULT"
+cp -R "$ENGINE_TMP/vault-template/." "$VAULT_TMP/"
+cp -R "$ENGINE_TMP/vault-template/." "$TRY_VAULT/"
 echo "[phase2] vault fixture ready ($(find "$VAULT_TMP" -type f | wc -l) file(s))"
 echo
 
@@ -151,7 +132,7 @@ last_line() {
 # Prime (not a leg, required first): cli list goes straight to SELECT ... FROM tasks,
 # so without a DB it dies with no-such-table → build VAULT_TMP/Todo/todo.db first
 # with import-md. It is a throwaway, so the side effects (todo.db·NOW/FOCUS
-# creation) are fine.
+# creation) are fine. The template's Todo/items/ is empty, so it imports 0 tasks.
 echo "[phase3] prime: cli import-md (build VAULT_TMP/Todo/todo.db)"
 capture uv run --directory "$ENGINE_TMP" python -m todo_system.cli import-md
 PRIME_RC=$CAP_RC
@@ -181,7 +162,7 @@ echo
 # ([[macp-vault-root-human-stages-modules]]), were all migrated to
 # paths.vault_root() and respect MACP_VAULT_ROOT. rc≠0 is a regression, but this leg
 # only records it and does not fail the script (the exit policy looks only at legs
-# A/B).
+# A/B/T).
 # This leg does not go through worker's engine-file paths (COMMANDS_DIR·
 # KAKAO_SEND_SCRIPT·HEALTH_REPORT_SCRIPT), so that coupling is caught by
 # todo_system/tests/test_worker_engine_root.py (inventory §11.9).
@@ -190,6 +171,133 @@ capture uv run --directory "$ENGINE_TMP" python -m todo_system.worker run-next -
 C_RC=$CAP_RC; C_OUT="$CAP_OUT"; C_OBS="$(last_line "$CAP_OUT")"
 echo "$CAP_OUT" | sed 's/^/    C| /'
 echo "[phase3] leg C rc=$C_RC"
+echo
+
+# --- Leg T (required): the README "Try it in five minutes" loop ----------------
+# Same commands, same order, same shape as the README: the cli commands run with
+# cwd = the engine checkout, the orchestrator/runner with `--project <engine>`.
+# The env is what a newcomer's fresh shell would have: a fresh HOME, no MACP_* /
+# USAGE_GUARD_* variable except the two the README exports. The variable names are
+# listed at run time (compgen -e), not from a fixed list, so a new MACP_* knob in
+# the caller's shell cannot leak in.
+# uv keeps its cache and managed Pythons under HOME. Read their real locations before
+# swapping HOME and pass them through, so the leg works offline (the pytest gate
+# runs this script with UV_OFFLINE=1). If `uv python dir` fails, it is skipped.
+REAL_UV_CACHE="$(uv cache dir 2>/dev/null || true)"
+REAL_UV_PYTHON="$(uv python dir 2>/dev/null || true)"
+TRY_ENV=(env)
+while IFS= read -r name; do
+  case "$name" in
+    MACP_*|USAGE_GUARD_*) TRY_ENV+=(-u "$name") ;;
+  esac
+done < <(compgen -e)
+TRY_ENV+=(-u WORKER_HOST -u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
+          HOME="$TRY_HOME" MACP_VAULT_ROOT="$TRY_VAULT" USAGE_GUARD_DISABLE=1)
+if [ -n "$REAL_UV_CACHE" ]; then TRY_ENV+=(UV_CACHE_DIR="$REAL_UV_CACHE"); fi
+if [ -n "$REAL_UV_PYTHON" ]; then TRY_ENV+=(UV_PYTHON_INSTALL_DIR="$REAL_UV_PYTHON"); fi
+
+capture_try() {
+  set +e
+  CAP_OUT="$("${TRY_ENV[@]}" "$@" 2>&1)"
+  CAP_RC=$?
+  set -e
+}
+
+# Stop at the first failure. A failure is rc≠0 or a missing expected string.
+# Expected strings are matched from a here-string, not a pipe, so `grep -q` exiting
+# early cannot SIGPIPE the producer under pipefail and fake a failure.
+TRY_OK=1
+TRY_FAIL=""
+TRY_STEPS=0
+TRY_EXPECTS=0
+TRY_STEP_TOTAL=8
+TRY_EXPECT_TOTAL=5
+
+# try_step <n> <fixed|regex|none> <needle> <cmd...>
+try_step() {
+  local n="$1" kind="$2" needle="$3"
+  shift 3
+  if [ "$TRY_OK" -ne 1 ]; then return 0; fi
+  echo "[phase3] leg T step $n: $*"
+  capture_try "$@"
+  printf '%s\n' "$CAP_OUT" | sed 's/^/    T| /'
+  echo "[phase3] leg T step $n rc=$CAP_RC"
+  if [ "$CAP_RC" -ne 0 ]; then
+    TRY_OK=0
+    TRY_FAIL="step $n: rc=$CAP_RC"
+    return 0
+  fi
+  TRY_STEPS=$((TRY_STEPS + 1))
+  case "$kind" in
+    fixed)
+      if grep -F -q -- "$needle" <<<"$CAP_OUT"; then
+        TRY_EXPECTS=$((TRY_EXPECTS + 1))
+      else
+        TRY_OK=0
+        TRY_FAIL="step $n: missing '$needle'"
+      fi
+      ;;
+    regex)
+      if grep -E -q -- "$needle" <<<"$CAP_OUT"; then
+        TRY_EXPECTS=$((TRY_EXPECTS + 1))
+      else
+        TRY_OK=0
+        TRY_FAIL="step $n: missing /$needle/"
+      fi
+      ;;
+  esac
+}
+
+# The README's hand edit: write an outcome and switch worker_mode blocked → auto.
+# Portable sed (no -i: GNU and BSD differ). If the scaffold no longer has the lines
+# the README tells the user to change, that is template drift and the leg fails.
+try_edit_task() {
+  if [ "$TRY_OK" -ne 1 ]; then return 0; fi
+  local f="$TRY_VAULT/Todo/items/hello-world.md"
+  echo "[phase3] leg T step 2: edit Todo/items/hello-world.md (outcome, worker_mode: auto)"
+  if [ -f "$f" ] \
+    && sed -e 's/^worker_mode: blocked$/worker_mode: auto/' \
+           -e 's/^outcome: .*/outcome: "hello-world runs through the shadow loop"/' \
+           "$f" > "$f.tmp" \
+    && mv "$f.tmp" "$f" \
+    && grep -q '^worker_mode: auto$' "$f" \
+    && grep -q '^outcome: "hello-world runs through the shadow loop"$' "$f"; then
+    TRY_STEPS=$((TRY_STEPS + 1))
+    echo "[phase3] leg T step 2 ok"
+  else
+    TRY_OK=0
+    TRY_FAIL="step 2: template drift (worker_mode/outcome lines not found)"
+    echo "[phase3] leg T step 2 FAILED: template drift"
+  fi
+}
+
+echo "[phase3] leg T: README five-minute try (clean HOME, MACP_VAULT_ROOT=TRY_VAULT)"
+pushd "$ENGINE_TMP" >/dev/null
+try_step 1 none "" \
+  uv run python -m todo_system.cli new hello-world --template auto-worker
+try_edit_task
+try_step 3 fixed "worker contract OK" \
+  uv run python -m todo_system.cli validate hello-world
+try_step 4 fixed "imported tasks: 1" \
+  uv run python -m todo_system.cli import-md
+try_step 5 fixed "dispatched hello-world -> worker-default" \
+  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator auto
+try_step 6 fixed "shadow run for 'hello-world' (no agent spawned)" \
+  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.runner \
+    --agent worker-default --mode shadow --once
+try_step 7 none "" \
+  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator auto
+try_step 8 regex 'done[[:space:]]+hello-world[[:space:]]+worker-default' \
+  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator status
+popd >/dev/null
+if [ "$TRY_OK" -eq 1 ]; then
+  T_RC=0
+  T_OBS="$TRY_STEPS/$TRY_STEP_TOTAL steps, $TRY_EXPECTS/$TRY_EXPECT_TOTAL expectations"
+else
+  T_RC=1
+  T_OBS="$(printf '%s' "$TRY_FAIL" | tr '|' '/')"
+fi
+echo "[phase3] leg T rc=$T_RC ($T_OBS)"
 echo
 
 # --- rc/observation table (in a form easy to copy into Notes §6) ------------
@@ -202,6 +310,8 @@ printf '| %s | %s | %s | %s |\n' \
   "python -m todo_system.session_log list"          "$B_RC" "예 (paths.vault_root→env, stdlib)"                 "$B_OBS"
 printf '| %s | %s | %s | %s |\n' \
   "python -m todo_system.worker run-next --dry-run" "$C_RC" "예 (worker.py·human.py·stages.py 모두 paths.vault_root→env)"  "$C_OBS"
+printf '| %s | %s | %s | %s |\n' \
+  "README five-minute try (clean HOME)"             "$T_RC" "예 (MACP_VAULT_ROOT=TRY_VAULT, HOME=mktemp)"      "$T_OBS"
 printf '%s\n' "(prime: cli import-md rc=$PRIME_RC)"
 echo "======================================================="
 echo
@@ -212,7 +322,7 @@ if [ "$C_RC" -ne 0 ]; then
   echo "  orchestrator/stages.py 는 모두 paths.vault_root() 로 마이그레이션되어"
   echo "  MACP_VAULT_ROOT 를 존중해야 정상이다(PR #167,"
   echo "  [[macp-vault-root-human-stages-modules]]). rc≠0 은 회귀일 가능성이 높다 —"
-  echo "  스크립트 exit 자체는 영향 없음(레그 A/B 만 판정에 반영)."
+  echo "  스크립트 exit 자체는 영향 없음(레그 A/B/T 만 판정에 반영)."
   echo
 else
   case "$C_OUT" in
@@ -230,11 +340,12 @@ else
   esac
 fi
 
-# --- exit policy: PASS if the 2 migrated legs are rc=0 ---------------------
-if [ "$A_RC" -eq 0 ] && [ "$B_RC" -eq 0 ]; then
+# --- exit policy: PASS if legs A/B are rc=0 and leg T passed -----------------
+if [ "$A_RC" -eq 0 ] && [ "$B_RC" -eq 0 ] && [ "$T_RC" -eq 0 ]; then
   echo "RESULT: PASS"
   exit 0
 else
-  echo "RESULT: FAIL (cli list rc=$A_RC, session_log list rc=$B_RC — 마이그레이션 레그는 rc=0 이어야 함)"
+  echo "RESULT: FAIL (cli list rc=$A_RC, session_log list rc=$B_RC — 마이그레이션 레그는 rc=0 이어야 함;"
+  echo "  README five-minute try rc=$T_RC: ${T_OBS})"
   exit 1
 fi

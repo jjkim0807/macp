@@ -90,7 +90,7 @@ export USAGE_GUARD_DISABLE=1               # nothing to pace yet (see below)
 uv run python -m todo_system.cli new hello-world --template auto-worker
 #   edit ~/my-vault/Todo/items/hello-world.md:
 #   write an outcome, and change `worker_mode: blocked` to `worker_mode: auto`
-uv run python -m todo_system.cli validate hello-world   # → worker contract OK
+uv run python -m todo_system.cli validate hello-world   # → worker contract OK (open tasks)
 uv run python -m todo_system.cli import-md              # → imported tasks: 1
 
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
@@ -100,7 +100,7 @@ uv run --project ~/macp python -m todo_system.orchestrator.runner \
 #   → RESULT: shadow run for 'hello-world' (no agent spawned)
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator status
-#   → done   hello-world   worker-default
+#   → done           hello-world                              worker-default
 ```
 
 That is the whole loop: a task file was imported, routed, dispatched, executed (in
@@ -108,7 +108,17 @@ shadow mode) and collected. `USAGE_GUARD_DISABLE=1` skips usage pacing. Without 
 machine where Claude Code is logged in is paced against that account's real usage,
 and dispatch can be held. [Getting started](docs/getting-started.md) walks through the
 same steps with explanations, then a first **real** run against one of your
-repositories.
+repositories. `bash scripts/check_engine_isolation.sh` runs this loop in a clean HOME
+and fails if any step or expected output above changes.
+
+## Who it's for
+
+macp fits an individual or a small operator who wants coding agents working on several
+repositories all the time. You need a machine or VM where an agent may act with your
+user account's permissions.
+
+It does not fit if you want a hosted SaaS for a team. It also does not fit if you
+expect it to trade real money or deploy to production with nobody watching.
 
 ## Status
 
@@ -125,7 +135,12 @@ personal-scale system, published as-is:
 - Parts of the worker prompts (`.claude/commands/`), code comments and log messages
   are in Korean. Translation is in progress.
 
-Issues and pull requests are welcome.
+## Contributing
+
+Open an issue first, or send a pull request directly. Before you open a pull request,
+run the three commands under [Development](#development) locally. All three must exit
+0. This repository is public: do not commit personal identifiers such as emails,
+hostnames or private paths.
 
 ## Development
 
