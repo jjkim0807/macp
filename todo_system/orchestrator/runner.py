@@ -39,7 +39,6 @@ from . import claims as claims_mod
 from . import disk_guard
 from . import followups
 from . import lease as lease_mod
-from . import merge_hold
 from . import message as m
 from . import repos
 from . import rescope
@@ -1117,47 +1116,14 @@ class StagedExecutor(ClaudeCodeExecutor):
     @staticmethod
     def _head_sha(repo) -> str:
         """The worker branch's current HEAD sha in the checkout, or "" on any
-        failure. Pins the merge hold to the exact tree the verify stage judged, so
-        a later device-check PASS releases only when it is for THIS sha."""
+        failure — the exact tree the verify stage judged (the batch gate pins it)."""
         try:
             r = stages._git(repo, "rev-parse", "HEAD")
             if getattr(r, "returncode", 1) == 0:
                 return (r.stdout or "").strip()
-        except Exception:           # noqa: BLE001 — a missing sha only skips the hold
+        except Exception:           # noqa: BLE001 — a missing sha is read as ""
             pass
         return ""
-
-    def _ui_merge_hold_fires(self, repo, repo_url, payload: dict, run_dir: Path,
-                             branch: str | None, verify_text: str,
-                             progress: ProgressFn) -> bool:
-        """macp#131 turned from a PROMPT rule into an ENGINE gate: a verify stage
-        that declared ``confidence: high`` for an app-UI change this run never saw
-        on a device must not auto-merge. True iff ALL four hold:
-
-        * the stage self-assessed ``confidence: high`` (``parse_verify_confidence``);
-        * the repo is an app repo (``is_app_repo`` — a gradlew at root);
-        * this run's diff touches the app module (``touches_app_paths`` over the
-          repo's configured ``app_paths``);
-        * NO device-pass note (``화면 확인됨``) is in ``verify.md`` — i.e. the
-          ``_app_screen_check`` that ran just above did not capture a screen.
-
-        Any other shape — a non-app repo, a diff that misses the app module,
-        confidence != high, or a device pass present — returns False, leaving the
-        merge path byte-identical. Cheapest checks first so the common case
-        (non-high, or non-app) costs no git/file work. Reuses screen_check's own
-        path predicates (no duplicate app-path logic)."""
-        if stages.parse_verify_confidence(verify_text) != "high":
-            return False
-        if not (repo_url and repo is not None and screen_check.is_app_repo(repo)):
-            return False
-        config = self._screen_check_config(payload)
-        if not screen_check.touches_app_paths(
-                self._changed_paths(repo, branch, progress),
-                screen_check.app_paths(config)):
-            return False
-        if screen_check.has_device_pass(run_dir):
-            return False
-        return True
 
     def _superseded_exit(self, payload: dict, *, repo, repo_url, branch: str,
                          run_dir: Path, completed: list[str], progress: ProgressFn,
@@ -1603,18 +1569,12 @@ class StagedExecutor(ClaudeCodeExecutor):
         # timeout/park. Declared before the `try` so the `finally` never sees it
         # unbound on an exception that escapes mid-pipeline.
         run_ok = False
-        # Confidence guard / UI-unseen merge hold (macp#131, engine-enforced). Set
-        # by the verify-stage block below when a high-confidence app-UI change has
-        # no device evidence; read after the loop to schedule the hold + withhold
-        # the merge. Declared here so the post-loop block always sees a value.
-        ui_merge_hold = False
-        ui_merge_hold_sha = ""
-        ui_merge_hold_reason = ""
         # Batch verify outcome, set by the verify-stage block of a `batch_quick`
         # run and read after the loop. Exactly one of the two ends up set:
         # `batch_hold` (quick verify passed — wait for the integration gate, with
         # the judged sha) or `batch_return` (a batch_gate.RETURN_* reason — go
-        # back to an individual full verify). Declared here like the hold above.
+        # back to an individual full verify). Declared before the `try` so the
+        # post-loop block always sees a value.
         batch_hold = False
         batch_return = ""
         batch_head_sha = ""
@@ -2059,19 +2019,6 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # first-match-only read can't be flipped by it.
                     self._app_screen_check(repo, payload, run_dir, progress,
                                            branch=branch)
-                    # Pin the sha this verify judged, for every app run (hold or
-                    # not): merge_hold.scan_device_evidence reads head_sha.txt to
-                    # tie a LATER device-check PASS back to the exact tree. run_dir
-                    # is gitignored, so this is host-local like the rest of the run.
-                    # Best-effort — a write failure never fails the pipeline.
-                    if screen_check.is_app_repo(repo):
-                        sha = self._head_sha(repo)
-                        if sha:
-                            try:
-                                (run_dir / "head_sha.txt").write_text(
-                                    sha + "\n", encoding="utf-8")
-                            except OSError as e:
-                                progress(f"head_sha.txt skipped ({type(e).__name__})")
                 if stage in ("verify", "quick", "discover"):
                     # all declare overall_status in frontmatter; the quick stage
                     # self-verifies + self-merges, so honor its verdict too, and
@@ -2093,40 +2040,22 @@ class StagedExecutor(ClaudeCodeExecutor):
                         return ExecOutcome(False, f"{stage} FAIL — not merged",
                                            {"branch": branch, "run_dir": str(run_dir),
                                             "verify": "FAIL", "stages": completed})
-                    # Confidence guard (verify only; gated after _app_screen_check
-                    # appended its note so has_device_pass reads it): a high-
-                    # confidence app-UI change with no device evidence is recorded
-                    # medium and its auto-merge WITHHELD. auto_merge is reassigned
-                    # False here so the report stage (next loop iteration) opens a
-                    # ready PR without merging (it reads this var at :1253), and the
-                    # post-loop landed gate naturally skips. The hold record is
-                    # scheduled after the loop, where branch/pr_url are resolved.
-                    # `auto_merge` gates the guard: a task the user already set to
-                    # NOT auto-merge (auto_merge:false / review) follows its own
-                    # review path untouched — holding it here would later auto-merge
-                    # a PR the user explicitly chose to gate (reconcile_merge_holds).
-                    #
-                    # Batch verify comes first and replaces that guard for its
-                    # runs: this verify ran in QUICK mode, so THIS run never
-                    # merges (auto_merge goes False; the report stage opens a
-                    # ready PR and the landed gate below is skipped). Then either
+                    # Batch verify: this verify ran in QUICK mode, so THIS run
+                    # never merges (auto_merge goes False; the report stage opens
+                    # a ready PR and the landed gate below is skipped). Then either
                     # the tree waits for the integration gate (`batch_hold`, with
                     # the sha it was judged at), or the task goes straight back to
                     # an individual full verify (`batch_return`): the quick verdict
                     # was not PASS, a device run the task asked for left no
-                    # evidence, the UI confidence guard would have fired, or the
-                    # sha is unreadable. No confidence downgrade and no merge-hold
-                    # record on this path — a returned task is re-verified in full.
+                    # evidence, or the sha is unreadable.
                     if stage == "verify" and batch_quick:
                         auto_merge = False
                         if verdict != "PASS":
                             batch_return = batch_gate.RETURN_QUICK_NOT_PASS
                         else:
-                            fires = self._ui_merge_hold_fires(
-                                repo, repo_url, payload, run_dir, branch, text, progress)
                             sha = self._head_sha(repo)
                             if not batch_gate.device_ok(
-                                    payload, ui_hold=fires,
+                                    payload,
                                     device_pass=screen_check.has_device_pass(run_dir)):
                                 batch_return = batch_gate.RETURN_NO_DEVICE
                             elif not sha:
@@ -2136,18 +2065,6 @@ class StagedExecutor(ClaudeCodeExecutor):
                         progress("batch verify: hold for the integration gate"
                                  if batch_hold else
                                  f"batch verify: return to full verify ({batch_return})")
-                    elif stage == "verify" and auto_merge and not ui_merge_hold \
-                            and self._ui_merge_hold_fires(
-                                repo, repo_url, payload, run_dir, branch, text, progress):
-                        ui_merge_hold = True
-                        ui_merge_hold_reason = (
-                            "확신도 high→medium 하향 — 앱 UI 변경인데 이 런에 "
-                            "기기 확인 증거(화면 확인됨)가 없어 자동 머지를 보류함")
-                        stages.downgrade_verify_confidence(run_dir, ui_merge_hold_reason)
-                        ui_merge_hold_sha = self._head_sha(repo)
-                        auto_merge = False
-                        progress("confidence guard: 앱 UI 변경 + 기기 증거 없음 — "
-                                 "confidence→medium, 자동 머지 보류")
             merge_note = ""
             # A proven no-op closes instead of parking; this flag rides the RESULT
             # payload (extra["no_op"]) so the orchestrator writes the close note.
@@ -2259,36 +2176,8 @@ class StagedExecutor(ClaudeCodeExecutor):
             elif batch_return:
                 review = True
                 merge_note = f" — 묶음 제외 → 개별 전체 Verify로 복귀 ({batch_return})"
-            # UI-unseen merge hold (macp#131): the confidence guard fired above, so
-            # the report stage opened a READY PR (auto_merge was forced False, the
-            # landed gate skipped). Park the task for review and schedule a
-            # host-local hold pinned to the verified sha — a later same-sha device
-            # PASS releases it (orchestrator.reconcile_merge_holds). The reason
-            # string is the engine's, not the agent's (same discipline as the
-            # rebase-conflict / review-hold notes). Best-effort schedule: a write
-            # failure still parks the task (review=True), it just won't auto-release.
-            if ui_merge_hold:
-                review = True
-                merge_note = (" — UI 미확인 자동 머지 보류 (기기 확인 PASS 대기; "
-                              "PR은 ready)")
-                try:
-                    merge_hold.schedule(
-                        stages._VAULT_DATA_ROOT, msg.task_id,
-                        held_sha=ui_merge_hold_sha, branch=branch, repo=repo_url,
-                        pr_url=pr_url, note=ui_merge_hold_reason)
-                except Exception as e:      # noqa: BLE001 — hold is best-effort
-                    progress(f"merge hold not scheduled ({type(e).__name__}) — "
-                             "parked for review anyway")
             extra = {"branch": branch, "run_dir": str(run_dir), "stages": completed,
                      "review_required": review, "repo": repo_url}
-            if ui_merge_hold:
-                # The orchestrator RESULT path reads these to route a SINGLE
-                # dedicated alert (not the generic review ping). Deliberately NOT
-                # setting blocked_on: this is not an external blocker, and setting
-                # it would make reconcile_merged mis-park a hold that a human later
-                # merges by hand as "merged but still blocked" instead of closing.
-                extra["ui_merge_hold"] = True
-                extra["ui_merge_hold_reason"] = ui_merge_hold_reason
             if batch_hold:
                 # The orchestrator's RESULT path (collect → _batch_result) reads
                 # these BEFORE review_required: the row becomes batch_ready with

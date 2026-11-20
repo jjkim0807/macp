@@ -29,7 +29,7 @@ from unittest import mock
 
 import pytest
 
-from todo_system.orchestrator import batch_gate, beta_publish, merge_hold, repos
+from todo_system.orchestrator import batch_gate, beta_publish, repos
 from todo_system.orchestrator import message as m
 from todo_system.orchestrator import screen_check, stages
 from todo_system.orchestrator.registry import Agent
@@ -122,11 +122,7 @@ class _Sandbox:
         monkeypatch.setattr(stages, "build_stage_argv", self._stub_argv)
 
         self.merge_landed = mock.Mock(return_value=True)
-        self.schedule_hold = mock.Mock()
-        self.downgrade = mock.Mock(return_value=True)
         monkeypatch.setattr(stages, "merge_landed", self.merge_landed)
-        monkeypatch.setattr(merge_hold, "schedule", self.schedule_hold)
-        monkeypatch.setattr(stages, "downgrade_verify_confidence", self.downgrade)
         monkeypatch.setattr(repos, "ensure_worktree", lambda *a, **k: self.clone)
         monkeypatch.setattr(stages, "remove_worktree", mock.Mock(return_value=False))
         monkeypatch.setattr(stages, "record_related", lambda *a, **k: None)
@@ -253,8 +249,6 @@ def _assert_batch_return(box: _Sandbox, out, reason: str) -> None:
     assert out.payload["review_required"] is True
     assert box.kw("report")["auto_merge"] is False               # a quick-only tree never merges
     box.merge_landed.assert_not_called()
-    box.schedule_hold.assert_not_called()
-    box.downgrade.assert_not_called()
     assert reason in out.summary
 
 
@@ -377,17 +371,6 @@ def test_emulator_task_with_device_evidence_is_held(box):
                                f"- {screen_check.OK_NOTE_PREFIX} — screens/a.png\n")
     out = box.execute(heavy_signals=["emulator"])
     _assert_batch_hold(box, out)
-
-
-def test_ui_confidence_guard_sends_the_task_back_without_a_merge_hold(box, monkeypatch):
-    # The guard that would have withheld an ordinary run's merge: in a batch run
-    # it returns the task instead — no confidence downgrade, no hold record.
-    box.write_config()
-    monkeypatch.setattr(StagedExecutor, "_ui_merge_hold_fires",
-                        lambda self, *a, **k: True)
-    out = box.execute()
-    _assert_batch_return(box, out, batch_gate.RETURN_NO_DEVICE)
-    assert "ui_merge_hold" not in out.payload
 
 
 # --- (f) the quick verdict is not PASS ----------------------------------------
