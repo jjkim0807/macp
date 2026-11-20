@@ -340,31 +340,6 @@ def test_append_note_creates_verify_md_when_absent(tmp_path):
     assert "gradlew 없음" in (run_dir / "verify.md").read_text(encoding="utf-8")
 
 
-def _verify_with_note(run_dir: Path, note: str | None) -> Path:
-    run_dir.mkdir()
-    (run_dir / "verify.md").write_text("---\noverall_status: pass\n---\n\n# verify\n",
-                                       encoding="utf-8")
-    if note is not None:
-        screen_check.append_note(run_dir, note)
-    return run_dir
-
-
-def test_has_device_pass_reads_only_the_success_note(tmp_path):
-    ok = _verify_with_note(tmp_path / "ok", f"{screen_check.OK_NOTE_PREFIX} — screens/a.png")
-    failed = _verify_with_note(tmp_path / "failed", "화면 확인 불가(앱 리포 아님 — gradlew 없음)")
-    bare = _verify_with_note(tmp_path / "bare", None)
-    assert screen_check.has_device_pass(ok) is True
-    assert screen_check.has_device_pass(failed) is False
-    assert screen_check.has_device_pass(bare) is False
-    assert screen_check.has_device_pass(tmp_path / "missing") is False
-
-
-def test_ok_note_leads_with_the_prefix_has_device_pass_reads(tmp_path):
-    # Writer and reader share the constant; a drift would hide the real note.
-    note = screen_check._ok_note("/x/screens/a.png", tmp_path)
-    assert note.startswith(screen_check.OK_NOTE_PREFIX)
-
-
 # ---------------------------------------------------------------------------
 # Phase 3 wiring — StagedExecutor._app_screen_check (fail-open, verdict-safe)
 # ---------------------------------------------------------------------------

@@ -1033,18 +1033,6 @@ class StagedExecutor(ClaudeCodeExecutor):
         except Exception as e:      # noqa: BLE001 — a screen check never flips verify
             progress(f"screen check skipped ({type(e).__name__})")
 
-    @staticmethod
-    def _head_sha(repo) -> str:
-        """The worker branch's current HEAD sha in the checkout, or "" on any
-        failure — the exact tree the verify stage judged (the batch gate pins it)."""
-        try:
-            r = stages._git(repo, "rev-parse", "HEAD")
-            if getattr(r, "returncode", 1) == 0:
-                return (r.stdout or "").strip()
-        except Exception:           # noqa: BLE001 — a missing sha is read as ""
-            pass
-        return ""
-
     def _superseded_exit(self, payload: dict, *, repo, repo_url, branch: str,
                          run_dir: Path, completed: list[str], progress: ProgressFn,
                          where: str) -> ExecOutcome | None:
