@@ -27,8 +27,12 @@
 
 macp는 **특정 코딩 에이전트에 묶이지 않는 운영 계층**을 지향합니다. 코드는 에이전트가
 쓰고, 무엇을 어떤 자원으로 언제 할지는 macp가 정합니다. 에이전트는 `Executor`
-인터페이스 뒤에 있고, 현재 실행기는 [Claude Code](https://code.claude.com)(`claude -p`)를
-구동합니다. 다른 코딩 에이전트 지원도 계획 중입니다.
+인터페이스 뒤에 있고, 스테이지 실행은 특정 회사에 묶이지 않는 `AgentBackend` 뒤에 있습니다.
+[Claude Code](https://code.claude.com)(`claude -p`)가 모든 스테이지를 돌립니다. 태스크의
+`agent:` frontmatter나 계정으로 스테이지를 다른 에이전트에 보낼 수 있습니다. 현재는
+`quick` 레인에서 Gemini CLI를 쓸 수 있습니다. 디스패치 때 능력 게이트가 스테이지에
+필요한 것(예: 읽기 전용 스테이지가 기대는 허용 도구 목록)을 지킬 수 없는 백엔드를
+거절합니다. 조용히 제약을 약하게 만들지 않습니다.
 
 **실사용** — 2026-07-20부터 2026-10-20까지 저자의 인스턴스가 **22개 독립 저장소**에서
 **태스크 1,080개**를 자동으로 완료했습니다. 2026년 10월 기준으로 하루 평균 약 25개입니다
@@ -59,7 +63,7 @@ export USAGE_GUARD_DISABLE=1               # 체험 중에는 사용량 페이�
 uv run python -m todo_system.cli new hello-world --template auto-worker
 #   ~/my-vault/Todo/items/hello-world.md 를 열어 outcome을 쓰고
 #   `worker_mode: blocked` 를 `worker_mode: auto` 로 바꿉니다
-uv run python -m todo_system.cli validate hello-world   # → worker contract OK
+uv run python -m todo_system.cli validate hello-world   # → worker contract OK (open tasks)
 uv run python -m todo_system.cli import-md              # → imported tasks: 1
 
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
@@ -69,13 +73,22 @@ uv run --project ~/macp python -m todo_system.orchestrator.runner \
 #   → RESULT: shadow run for 'hello-world' (no agent spawned)
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
 uv run --project ~/macp python -m todo_system.orchestrator.orchestrator status
-#   → done   hello-world   worker-default
+#   → done           hello-world                              worker-default
 ```
 
 태스크 파일이 가져오기 → 라우팅 → 디스패치 → 실행(shadow) → 수집까지 한 바퀴 돌았습니다.
 실제 저장소에 대한 첫 실행은 [시작하기](docs/getting-started.md) 2부를 보세요. 실제
 실행 전에는 반드시 [SECURITY.md](SECURITY.md)를 읽으세요. 워커는 사용자 권한으로 코드를
-실행하고 GitHub에 push할 수 있습니다.
+실행하고 GitHub에 push할 수 있습니다. `bash scripts/check_engine_isolation.sh`가 이 과정을
+깨끗한 HOME에서 그대로 돌립니다. 위의 명령이나 기대 출력이 하나라도 바뀌면 실패합니다.
+
+## 누구에게 맞는가
+
+여러 저장소에서 코딩 에이전트를 상시로 돌리려는 개인이나 소규모 운영자에게 맞습니다.
+에이전트가 사용자 계정 권한으로 일해도 되는 자기 머신이나 VM이 있어야 합니다.
+
+팀용 호스팅 SaaS를 원하면 맞지 않습니다. 사람 없이 실계좌로 거래하거나 프로덕션에
+배포하기를 기대해도 맞지 않습니다.
 
 ## 상태
 
@@ -87,4 +100,23 @@ macp는 저자의 프로젝트들을 매일 운영하고 있습니다. 핵심(�
   있습니다. 설정 파일이 있을 때만 켜집니다.
 - 워커 프롬프트(`.claude/commands/`), 코드 주석, 로그 메시지 일부가 한국어입니다.
 
-이슈와 PR을 환영합니다. 라이선스는 MIT입니다.
+## 기여하기
+
+이슈를 먼저 열어도 되고, 바로 PR을 보내도 됩니다. PR을 열기 전에 [개발](#개발) 절의
+세 명령을 로컬에서 돌리세요. 셋 다 0으로 끝나야 합니다. 이 저장소는 공개 저장소입니다.
+이메일·호스트명·개인 경로 같은 개인 식별자를 커밋하지 마세요.
+
+## 개발
+
+```bash
+MACP_VAULT_ROOT=vault-template uv run --with pytest python -m pytest -q todo_system scripts/systemd
+uv run --with ruff ruff check .
+bash scripts/check_engine_isolation.sh
+```
+
+GitHub Actions는 쓰지 않습니다. 검사는 로컬에서 돌립니다. 전체 테스트는 몇 분 걸립니다.
+저장소 지도는 [docs/concepts.md](docs/concepts.md#repository-map)에 있습니다.
+
+## 라이선스
+
+MIT — [`LICENSE`](LICENSE)를 보세요.
