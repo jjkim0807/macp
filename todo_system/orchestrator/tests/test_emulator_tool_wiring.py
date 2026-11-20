@@ -6,8 +6,7 @@ PATH-wrapper rule, stages.EMULATOR_TOOL_RULE == `Bash(macp-emulator:*)`. These
 tests pin which stages get it (implement/verify/quick — NOT delegate, unlike
 SMS/BROWSER/REMOTE_GATE), that verify stays read-only, that research/plan stay
 read-only, that a task's own list keeps it, that the rule is a single safe
-token, that build_stage_argv injects the usage metadata (the worker-*.md prompts
-under .claude/** are unwriteable headless, so it rides on metadata like the
+token, that build_stage_argv injects the usage metadata (on the metadata like the
 BROWSER line), that with_emulator_owner injects the run_id owner on exactly the
 three stages, and that the wrapper runs `status` from any cwd.
 """

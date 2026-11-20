@@ -224,7 +224,7 @@ acceptance_criteria:
 # 프로젝트 탐색 — {name} ({d})
 
 > 플래너가 `exhausted`(만들 일이 없음)를 판정해 discovery 케이던스로 자동 생성된 태스크.
-> 워커는 `discover` 단일 스테이지(`.claude/commands/worker-discover.md`)로 실행한다.
+> 워커는 `discover` 단일 스테이지(`todo_system/prompts/worker-discover.md`)로 실행한다.
 
 ## 작업 명세 (Spec)
 

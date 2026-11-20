@@ -273,7 +273,7 @@ def render_context(open_recs: list[dict]) -> str:
     """The planner-context block for a set of open follow-ups, or "" when empty.
 
     Empty in → empty out is load-bearing: planner_tick only appends this after
-    `/worker-planner` when it is non-empty, so on the common (no-follow-up) path
+    the planner prompt when it is non-empty, so on the common (no-follow-up) path
     the planner invocation stays byte-identical to before. The block also carries
     the resolve protocol inline — worker-planner.md says nothing about follow-ups,
     so this text is the planner's ONLY source for it, the `route: human` marker

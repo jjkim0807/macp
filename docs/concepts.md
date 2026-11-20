@@ -170,7 +170,7 @@ same `auto_merge` / `human_gate` guards apply. Each subtask then gets its own
 ## Keeping the queue full
 
 When there is nothing dispatchable, the **planner** tick (`scripts/planner_tick.sh`,
-prompt `.claude/commands/worker-planner.md`) reads the vault and the projects and files
+prompt `todo_system/prompts/worker-planner.md`) reads the vault and the projects and files
 new tasks that are safe to run without confirmation. It works harder while
 subscription tokens are going unused and the queue is idle (`orchestrator/planner_mode.py`).
 **Discovery** goes further: it clones a project, runs its tests, build and a smoke
@@ -209,7 +209,7 @@ Reservations made before this was added (no stored patch-id) keep the strict anc
 
 | | Engine (this repository) | Vault (yours, private) |
 |---|---|---|
-| Contains | code, prompts (`.claude/commands/`), unit generators, the vault skeleton | tasks, ledger, runs, memory, notes, decisions, secrets, host identity |
+| Contains | code, prompts (`todo_system/prompts/`), unit generators, the vault skeleton | tasks, ledger, runs, memory, notes, decisions, secrets, host identity |
 | Updated by | `git pull` / your PRs | the daemons and you |
 | Found via | the install location | `MACP_VAULT_ROOT`, else the nearest `.macp/config.toml` |
 
@@ -233,7 +233,8 @@ workers.
 | `todo_system/usage_guard.py` | subscription usage pacing |
 | `todo_system/macp/` | profiles and accounts (`python -m todo_system.macp`) |
 | `todo_system/paths.py` | how the engine finds the vault and itself |
-| `.claude/commands/` | the stage prompts (`worker-research.md`, `worker-implement.md`, …) and interactive skills |
+| `todo_system/prompts/` | the stage prompts (`worker-research.md`, `worker-implement.md`, …) and the planner prompt |
+| `.claude/commands/` | interactive skills (`/brief`, `/todo`, …) |
 | `scripts/` | daemons, the dashboard, unit installers and integrations — see [scripts/README.md](../scripts/README.md) |
 | `vault-template/` | the vault skeleton |
 | `docs/design/` | design notes |

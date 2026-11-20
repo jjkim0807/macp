@@ -62,7 +62,7 @@
 | `scripts/claude_auth_watch.py:check_accounts` | 🔐 Claude Code 인증 이상 | 즉시 | 방치하면 자동화 전체 정지 — /login 필요 |
 | `scripts/macp_dashboard.py:_run_ingest_alert` | 📵 SMS 릴레이 수신 거부 (HTTP 401/429/400/413) | 즉시 | 사람 조치 필요(토큰 재적용·앱 확인). 종류별(auth/bad_payload/too_large) 6h 자체 쿨다운(`sms.should_alert`, 파일 상태라 재시작에도 유지). 호출원은 `do_POST` |
 | `scripts/claude_auth_watch.py:check_remote_control_binary` | 🔐 자동 복구됨 | **요약** | 이미 자가 회복 — `KAKAO_LEVEL=digest` env 옵트인 |
-| `.claude/commands/worker-planner.md` `[Planner] 태스크 N개 적재` | [Planner] 적재 | **요약** | FYI. 2026-10-11 적용(`KAKAO_LEVEL=digest`). 단 `planner_policy.yaml`의 `kakao_on_tasks_created: false`라 현재는 발송 안 됨. 마크다운 프롬프트 안의 셸 커맨드라 함수 앵커 없음 — grep `KAKAO_LEVEL=digest.*Planner` |
+| `todo_system/prompts/worker-planner.md` `[Planner] 태스크 N개 적재` | [Planner] 적재 | **요약** | FYI. 2026-10-11 적용(`KAKAO_LEVEL=digest`). 단 `planner_policy.yaml`의 `kakao_on_tasks_created: false`라 현재는 발송 안 됨. 마크다운 프롬프트 안의 셸 커맨드라 함수 앵커 없음 — grep `KAKAO_LEVEL=digest.*Planner` |
 | `scripts/notify_kakao.sh` 아침 브리프 | 데일리 브리프 | (등급 밖) | 자체가 일 1회 요약 채널 — 라우팅 대상 아님. 셸 스크립트라 함수 앵커 없음 |
 
 ## 발신처 전수 표 — 외부 리포 (권고 등급, 코드는 후속 태스크로)
