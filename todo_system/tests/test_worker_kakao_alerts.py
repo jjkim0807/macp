@@ -5,7 +5,7 @@ No subprocess / no real send — the composers return strings only
 fixes: length <= budget, the action/identity survives in the headline, and the
 free-form tail (a failure message, a stall file list, a planner reason) is
 clipped rather than blind-cut. Covers the AC-named kinds: Worker 시작/실패/완료,
-정체(silence), 유휴(starvation), plus migration drift and the commit-stall page.
+정체(silence), 유휴(starvation), plus the commit-stall page.
 """
 
 from __future__ import annotations
@@ -31,12 +31,6 @@ def test_worker_start_and_done_stay_within_budget_and_name_the_task():
         text = fn(LONG_SLUG, "auto", 5)
         assert len(text) <= KAKAO_TEXT_LIMIT
         assert LONG_SLUG in text
-
-
-def test_migration_drift_clips_the_warning():
-    text = worker._compose_migration_drift(LONG)
-    assert len(text) <= KAKAO_TEXT_LIMIT
-    assert "마이그레이션" in text.splitlines()[0]
 
 
 def test_dispatch_silence_keeps_the_pending_count():

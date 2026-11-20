@@ -651,8 +651,8 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
     # while todo.db still said open, which is the dispatch source, so the task
     # stayed dispatchable and got re-run on an empty diff. The leaked connection
     # also kept a write lock, making the NEXT writer fail with "database is
-    # locked". Both sibling closers (worker.py review-autoclose, cli.py complete)
-    # already commit; this one did not.
+    # locked". The sibling closer (cli.py complete) already commits; this one did
+    # not.
     try:
         con = cli.db_connect(db_path or cli.DB_PATH)
         try:

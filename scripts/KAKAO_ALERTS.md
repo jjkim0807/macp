@@ -47,7 +47,6 @@
 | `todo_system/orchestrator/orchestrator.py:_propagate_downstream` | 🔗 하류 통합검증 N개 생성 | **요약** | 자동 생성 FYI — 검증 결과는 별도 알림이 옴 |
 | `todo_system/orchestrator/orchestrator.py:_nudge` | 🙋 사람 에이전트에 첫 할당 | 즉시 | 디스패치마다 1회 — 사람이 할 차례라는 신호. event_key 없음(재촉 백오프는 2026-11-20 삭제) |
 | `todo_system/orchestrator/human.py:deliver_pending` TASK_ASSIGN | 🙋 새 할당 도착 (구 `[할당]`) | 즉시 | 2026-11-09 번복(종전: **요약**). 2026-09-16 감사의 "5건 전부 직전 검토요청과 중복인 FYI"는 **모든 TASK_ASSIGN이 다른 알림을 뒤따를 때만** 성립한다 — dep 체인이 닫혀 사람에게 할당된 태스크엔 동반 알림이 없고 이 TASK_ASSIGN이 "당신 차례"라는 유일한 신호다. 소음은 등급이 아니라 event_key `assign:<task>`(10분 창)가 막는다: 같은 할당의 연타는 1건으로 합쳐지고 다른 태스크는 따로 울린다. QUERY/CANCEL/WAKE/PING은 종전처럼 즉시 |
-| `todo_system/worker.py:cmd_maintenance` | ⚠️ 마이그레이션 미적용 | 즉시 | DB 스키마 확인 필요. `check_unapplied_migrations`가 판정, `cmd_maintenance`가 발송 |
 | `todo_system/worker.py:check_dispatch_silence` | 🤖⚠️ macp 정체 | 즉시 | 파이프라인 침묵의 유일한 감지기. SILENCE_COOLDOWN 자체 쿨다운 |
 | `todo_system/worker.py:check_work_starvation` | 🤖💤 macp 유휴 | 즉시 | 새 태스크 투입 필요. 일 1회 자체 쿨다운 |
 | `todo_system/worker.py:restart_stale_daemons` | 🤖⚠️ 재기동 후에도 구코드 | 즉시 | 수동 확인 필요. escalated 1회성(자체 쿨다운) |

@@ -187,68 +187,6 @@ uv run --project $HOME/macp python -m todo_system.maintenance_disk --dry-run
 uv run --project $HOME/macp python -m todo_system.orchestrator.disk_guard --dry-run
 ```
 
-## Public-repo issues and PRs
-
-If the engine lives in a public GitHub repo, outsiders open issues and PRs there, and
-GitHub's notification mail is easy to miss. The maintenance tick has a step,
-`todo_system/maintenance_repo_watch.py`, that turns each external item still waiting
-for a reply into a human task on the dashboard ("직접 할 일"). It runs on the primary
-host only and reads GitHub **once a day**.
-
-What it watches, first match wins:
-
-1. `MACP_REPO_WATCH_REPOS`: a comma-separated list of `<owner>/<repo>`.
-2. `repo_watch_repos = "<owner>/<repo>, …"` in the nearest `.macp/config.toml`.
-3. The engine checkout's `git remote get-url origin`, if it is a GitHub URL.
-4. The installed package's `Repository` project URL (for a wheel install with no `.git`).
-
-If none of these gives a repo, the step prints one skip line a day and does nothing.
-
-The maintainer is whoever `gh` is logged in as (`gh api user`). An item is
-**external** unless one of these is true:
-
-- The maintainer opened it.
-- It is a PR whose head branch starts with `worker/`.
-- It is a PR from a branch in the same repo, not a fork.
-
-Each external item with no comment or review from the maintainer yet becomes
-`Todo/items/ops-repo-issue-<n>.md` or `ops-repo-pr-<n>.md`. A second or later watched
-repo adds its name to the key, as in `repo-issue-<n>-<repo>`. The task holds the
-title, author, link, created date, the first 200 characters of the body, and the action
-"확인·답글·머지 여부 결정". No more of the body is copied.
-
-The task closes by itself when:
-
-- the maintainer comments on the item or reviews the PR, or
-- the item is closed or merged, so it no longer appears in the open list.
-
-A later comment from the outside author does not reopen a closed task. If you mark a
-task done yourself without replying, it stays done.
-
-**Fail-safe.** If `gh` fails (auth, network, timeout, bad JSON or a GraphQL error), the
-step prints one `repo-watch: … gh 실패 …` line and **closes nothing**. It treats an
-item as closed only when the fetch for that repo succeeded and the open list was
-complete (no more than 100 items). A failed run is retried after an hour, not on every
-5-minute tick.
-
-**Cost.** Each run makes one `gh api user` call plus one `gh api graphql` call per
-repo, so never more than 2 calls per repo.
-
-Environment (read at call time):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MACP_REPO_WATCH` | on | `0` switches the step off |
-| `MACP_REPO_WATCH_REPOS` | (see above) | comma-separated `<owner>/<repo>` list |
-| `MACP_REPO_WATCH_STATE_DIR` | `~/.local/share/macp/repo-watch` | last run and last attempt stamps |
-
-To see what it would watch and when it next runs, without calling `gh` or writing
-anything:
-
-```bash
-uv run --project $HOME/macp python -m todo_system.maintenance_repo_watch --dry-run
-```
-
 ## The dashboard
 
 `scripts/macp_dashboard.py` serves the queue, running stages, parked tasks and recent
