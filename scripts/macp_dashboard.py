@@ -980,8 +980,7 @@ def _umbrellas_in_progress() -> set[str]:
 
     Such a parent's ledger row can read awaiting_human (a 0-commit run whose only
     output was the split ends `result-no-pr`), but nobody has anything to do on it
-    until its children finish; the orchestrator closes it then. Same query the
-    orchestrator's renudge uses, so the page and the nudges agree."""
+    until its children finish; the orchestrator closes it then."""
     try:
         from todo_system.orchestrator.tasks import parents_with_open_children
         return parents_with_open_children(TODO_DB)

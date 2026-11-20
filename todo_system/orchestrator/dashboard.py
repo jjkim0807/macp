@@ -78,21 +78,21 @@ def _merged_park(a) -> bool:
 
 def _parked_line(a) -> str:
     """Parked task, plus — when it is parked on an external blocker — the blocker
-    itself and the one edit that releases it.
+    itself and the one step that releases it.
 
     "nudge #3" alone says a human was pinged, never what they are supposed to do,
     so a task parked on something already fixed (an API key that got set, a
-    console toggle someone flipped) just kept nudging. Naming `blocked_on` and the
-    release recipe makes this section actionable: the recipe is exactly the signal
-    reconcile_unparked() watches for, so following it re-queues the task by itself
-    — no ledger surgery. Rows with no blocker (PR review, NEEDS_INPUT) render
-    unchanged; there is no self-service exit for those and inventing one would be
-    a lie.
+    console toggle someone flipped) just sat there. Naming `blocked_on` and the
+    release recipe makes this section actionable: the recipe is the `cli resume`
+    reservation reconcile_resumes() acts on, so following it re-queues the task by
+    itself — no ledger surgery. Rows with no blocker (PR review, NEEDS_INPUT)
+    render unchanged; there is no self-service exit for those and inventing one
+    would be a lie.
 
     A row whose PR already merged (reconcile_merged parked it on the blocker
-    instead of closing it) gets a different exit. The recipe is wrong there:
-    reconcile_unparked would flip the row to FAILED and clear the blocker, sending
-    work that already merged back down the retry path. Its exit is the md — once
+    instead of closing it) gets a different exit. The recipe is wrong there: a
+    resume would flip the row to FAILED and clear the blocker, sending work that
+    already merged back down the retry path. Its exit is the md — once
     the human step is done, closing the task md as `status: done` lets
     reconcile_merged's "todo already closed" path end it on the next tick.
 
@@ -108,9 +108,9 @@ def _parked_line(a) -> str:
         return (f"{line}\n    ↳ 종결: PR은 이미 머지됨 — 남은 사람 단계를 마친 뒤 "
                 f"태스크 md를 `status: done`으로 닫으면 다음 틱에 자동 종결 (재큐 불필요)")
     return (f"{line}"
-            f"\n    ↳ 해제: 블로커를 해소한 뒤 태스크 md의 `worker_mode`를 "
-            f"`blocked` 등 비-디스패치 값으로 바꿨다가 `auto`로 되돌리면 자동 재큐 "
-            f"(orchestrator가 그 전이를 해제 신호로 읽는다)")
+            f"\n    ↳ 해제: 블로커를 해소하고 태스크 md 수정을 커밋한 뒤 "
+            f"`python -m todo_system.cli resume {a.task_id} --after-commit <sha>` "
+            f"→ 다음 틱에 자동 재큐")
 
 
 def _liveness(ledger: Ledger) -> dict:

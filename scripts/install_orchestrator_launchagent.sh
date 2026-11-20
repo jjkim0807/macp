@@ -1,12 +1,12 @@
 #!/bin/zsh
 # Install a LaunchAgent that runs one orchestrator COEXISTENCE tick every 5 min
-# (scripts/orchestrator_tick.sh: collect + renudge + dashboard, NO AI dispatch).
+# (scripts/orchestrator_tick.sh: collect + dashboard, NO AI dispatch).
 # RunAtLoad=false — first run waits until the interval elapses.
 #
 # Safe to run alongside <prefix>secondbrain.worker: it does not execute or
 # dispatch AI tasks, so it never double-runs the legacy worker's work. It only
-# tracks whatever is dispatched to v2 (humans/remote), re-nudges parked humans
-# via kakao, and regenerates Todo/Orchestrator.md.
+# tracks whatever is dispatched to v2 (humans/remote) and regenerates
+# Todo/Orchestrator.md.
 
 set -euo pipefail
 

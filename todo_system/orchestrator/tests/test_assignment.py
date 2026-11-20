@@ -149,8 +149,7 @@ class TestFlagMirroring(unittest.TestCase):
 
 class TestOrchestratorOnlyFieldsPreserved(unittest.TestCase):
     SIX_FIELDS = dict(timeout_streak=2, refail_count=3, capacity_retry_count=4,
-                       last_alert_kind="quarantine", parked_worker_mode="human",
-                       close_fingerprint="abc123")
+                       last_alert_kind="quarantine", close_fingerprint="abc123")
 
     def test_accept_then_progress_leaves_six_fields(self):
         a = _mk(**self.SIX_FIELDS)
@@ -251,8 +250,7 @@ class TestJsonRoundTrip(unittest.TestCase):
             last_note="한글 노트 확인", capacity_retry_count=1,
             capacity_limited=True, job_running=True, checkout_busy=True,
             blocked_on="upstream", timed_out=True, timeout_streak=1,
-            last_alert_kind="quarantine", parked_worker_mode="human",
-            close_fingerprint="abc123",
+            last_alert_kind="quarantine", close_fingerprint="abc123",
             history=[{"ts": "x", "type": m.ACCEPT, "from": "w1"}],
             payload={"repo": "https://example.com/x.git"},
         )

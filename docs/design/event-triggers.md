@@ -62,10 +62,9 @@ source — 의존은 명시하되 **블로커로 두지 않는다**.
 | **follow-ups** (report "next steps") | report 스테이지가 남긴 다음 단계를 **읽는 즉시** 내구적으로 픽업 `concepts.md:167-168`; `followups.py:1-14`, 저장 `Worker/_state/followups.jsonl` `followups.py:77`, 파서 `parse_report_followups():150` | 내부(런 종료) 구동 | ≤ 1 틱 |
 | **수동·조건부 재개 (resume-when)** | 사람이 `cli resume <slug> --after-commit <sha>` → 볼트가 그 커밋을 담으면 재디스패치 `concepts.md:190-193`; 예약 `Worker/_state/pending_resumes/<slug>.json` (host-local, gitignored) `resume.py:15-19`, 순수 판정 `evaluate():122`(불확실→WAIT `:131-135`), 틱 재검 `consume():307` | manual + 조건(커밋) | 사람 조작 + ≤ 1 틱 |
 | **`not_before` 게이트 (예약된 1회 시각)** | 태스크가 미래 시각까지 **지연**되었다가 그 시각 이후 틱에 통과. 유일한 "지연 판정 지점" `not_before.py:1`; 허용 형식 `YYYY-MM-DD[THH:MM]` `not_before.py:3-11`; `is_deferred()` 를 모든 dispatch/NOW/stale/대시보드가 호출 `not_before.py:13,63-76`; 게이트 자리 `concepts.md:60` | 시각 구동(1회) | ≤ 1 틱(시각 도달 후) |
-| **project_stall → 결정 태스크** | 조용히 멈춘 umbrella 프로젝트에 침묵 대신 **결정 태스크 하나** `concepts.md:179-180`; `project_stall.py:1`, 판정 `classify_project():198` | periodic 판정 | (결정 태스크 생성; 사람 몫) |
 
 **읽는 법**: 위 어느 경로도 "외부에서 들어온 이벤트가 깨우는" 것이 아니다. 전부 **주기 타이머**
-(틱·플래너·discovery·stall), **내부 런 종료**(follow-ups), 또는 **사람**(resume)이다. `not_before` 는
+(틱·플래너·discovery), **내부 런 종료**(follow-ups), 또는 **사람**(resume)이다. `not_before` 는
 이벤트처럼 보이지만 실은 **시각 게이트** — "이 시각이 지날 때까지 기다려라"를 **한 번** 푸는 primitive
 이고(반복·겹침·횟수 상한 없음), §2 의 스케줄 트리거가 이것을 일반화한다.
 

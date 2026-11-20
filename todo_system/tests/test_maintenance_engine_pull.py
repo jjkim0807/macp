@@ -229,11 +229,9 @@ def test_cmd_maintenance_rc_on_failure(monkeypatch):
     monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
     monkeypatch.setattr(worker, "pull_engine_checkout", lambda: ["engine-pull: boom"])
     # Neutralise every other upkeep step so rc == 1 can only come from engine-pull.
-    monkeypatch.setattr(worker, "autoclose_stale_reviews_local", lambda: 0)
     monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
     monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     monkeypatch.setattr(worker, "rotate_logs", lambda: [])
-    monkeypatch.setattr(worker, "check_unapplied_migrations", lambda: [])
     monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: [])
     monkeypatch.setattr(worker, "sync_wrappers", lambda: [])
     monkeypatch.setattr(worker, "restart_stale_daemons", lambda: [])

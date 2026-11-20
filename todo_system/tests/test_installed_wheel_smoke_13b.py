@@ -14,9 +14,8 @@ What it pins, from site-packages, with ``python -P`` and ``PYTHONPATH`` /
 * ``python -m todo_system.engine_script worker_run_next.sh`` **really runs** to
   rc 0 (AC2). The script ignores its arguments and runs ``maintenance`` against
   the throwaway vault (primed with ``cli import-md`` so the queue readers find
-  a ``todo.db``). ``HOME`` is tmp for two reasons: the migration-drift check
-  looks for repos and credential files under ``$HOME`` (and ``psql`` exists on
-  the host), and the script prepends ``$HOME/.local/bin`` to ``PATH``, where a
+  a ``todo.db``). ``HOME`` is tmp because the script prepends
+  ``$HOME/.local/bin`` to ``PATH``, where a
   ``uv`` tripwire sits — if the installed branch were not taken the old
   ``uv run --project .../_engine`` line would hit the tripwire (rc 97) instead
   of the real uv, so "no tripwire log" proves the branch, not just the rc.

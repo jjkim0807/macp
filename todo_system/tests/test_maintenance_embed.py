@@ -374,10 +374,9 @@ def _quiet_tick(monkeypatch):
     from todo_system import worker
 
     monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
-    for name in ("autoclose_stale_reviews_local", "sweep_remote_completed_runs",
-                 "sync_vault_state"):
+    for name in ("sweep_remote_completed_runs", "sync_vault_state"):
         monkeypatch.setattr(worker, name, lambda *_a, **_k: 0)
-    for name in ("rotate_logs", "check_unapplied_migrations", "pull_engine_checkout",
+    for name in ("rotate_logs", "pull_engine_checkout",
                  "bump_vault_engine_pin", "sync_wrappers", "pull_browser_checkout",
                  "restart_stale_daemons"):
         monkeypatch.setattr(worker, name, lambda *_a, **_k: [])

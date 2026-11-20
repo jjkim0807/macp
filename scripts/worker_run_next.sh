@@ -15,7 +15,7 @@
 # its branch and `git clean -fd`'d leaf 16's long_job artifact.
 #
 # `maintenance` is the post-cutover subcommand built for exactly this slot: vault
-# upkeep only (stale review autoclose + remote-run sweep), no dispatch, no
+# upkeep only (remote-run sweep, vault sync and the other upkeep steps), no dispatch, no
 # execution. Planning is NOT lost — the planner has its own LaunchAgent
 # (<prefix>secondbrain.planner -> scripts/planner_tick.sh, every 30m).
 

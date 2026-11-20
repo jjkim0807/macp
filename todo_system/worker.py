@@ -42,7 +42,6 @@ from . import browser_watch
 from . import kakao_format
 from . import maintenance_disk
 from . import maintenance_embed
-from . import maintenance_repo_watch
 from . import not_before as nb_gate
 from . import paths
 from .frontmatter_lists import parse_inline_list
@@ -854,10 +853,6 @@ def _compose_worker_fail(slug: str, stage: str, message: str) -> str:
                          tail=message)
 
 
-def _compose_migration_drift(warning: str) -> str:
-    return compose_alert("⚠️ 마이그레이션 미적용 — 확인이 필요합니다", tail=warning)
-
-
 def _compose_dispatch_silence(pending_n: int, idle_h: float, threshold_h: float) -> str:
     return compose_alert(
         f"🤖⚠️ macp 정체: 대기 {pending_n}건인데 {idle_h:.1f}시간째 디스패치 없음 "
@@ -930,82 +925,6 @@ STUCK_IN_PROGRESS_THRESHOLD = dt.timedelta(hours=3)
 # (network/lint timing) without nagging the user. `auto_retry_count` is bumped
 # on each automatic retry; >0 means doctor already retried it.
 AUTO_RETRY_LIMIT = 1
-
-
-# ---------------------------------------------------------------------------
-# Review autoclose (stale review todos sweep)
-# ---------------------------------------------------------------------------
-
-
-
-def _extract_parent_slug_from_review(review_slug: str) -> str | None:
-    """Extract parent task slug from a review todo slug.
-
-    Patterns:
-    - review-<slug>-<timestamp> (e.g., review-my-task-20260612T2010)
-    - review-<slug> (fallback, no timestamp)
-
-    Returns the parent slug or None if extraction fails.
-    """
-    # Pattern 1: review-<slug>-YYYYMMDDTHHMMSS (timestamp suffix)
-    m = re.match(r"^review-(.+?)-\d{8}T\d{4,6}$", review_slug)
-    if m:
-        return m.group(1)
-
-    # Pattern 2: review-<slug> (no timestamp)
-    m = re.match(r"^review-(.+)$", review_slug)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-def autoclose_stale_reviews_local() -> int:
-    """Close open review-<slug> todos whose parent task is already done.
-
-    Reads the vault markdown files, which are the only source of task state.
-    Returns the count of closed review todos.
-    """
-    tasks_by_slug = {t.slug: t for t in iter_worker_tasks_vault()}
-
-    closable: list[WorkerTask] = []
-    for slug, task in tasks_by_slug.items():
-        if not slug.startswith("review-") or is_closed(task.status):
-            continue
-        parent_slug = _extract_parent_slug_from_review(slug)
-        if parent_slug is None:
-            print(f"[review-autoclose] warning: cannot parse parent from {slug}")
-            continue
-        parent = tasks_by_slug.get(parent_slug)
-        if parent is None or parent.status != "done":
-            continue
-        closable.append(task)
-
-    if not closable:
-        return 0
-
-    # Deferred import: cli.py imports worker.py at module scope, so importing
-    # cli.py at worker.py module scope would be circular.
-    from . import cli as _cli
-
-    con = _cli.db_connect(_cli.DB_PATH)
-    _cli.init_db(con)
-    today = dt.date.today().isoformat()
-    closed_count = 0
-    for task in closable:
-        _cli.update_markdown_checkboxes(task.path, mode="complete")
-        content = task.path.read_text(encoding="utf-8")
-        content = _cli.update_frontmatter_value(content, "updated", today)
-        content = _cli.update_frontmatter_value(content, "status", "done")
-        task.path.write_text(content, encoding="utf-8")
-        _cli.refresh_single_task(con, task.path)
-        closed_count += 1
-
-    _cli.sync_now_note(con)
-    _cli.sync_focus_note(con)
-    _cli.sync_dashboard_note(con)
-    con.commit()
-    return closed_count
 
 
 # ---------------------------------------------------------------------------
@@ -2188,8 +2107,6 @@ def cmd_maintenance() -> int:
     running both is what produced the duplicate-dispatch loop), but the upkeep half
     still has to run somewhere:
 
-      - autoclose_stale_reviews_local: closes review-<slug> todos whose parent is
-        done, so they stop piling up in the dashboard's "to-do for human" list.
       - sweep_remote_completed_runs: surfaces finished remote-host (Windows/sc1)
         runs as review todos + kakao — the only path by which remote work is
         reported back at all.
@@ -2206,22 +2123,12 @@ def cmd_maintenance() -> int:
         (content-hash diff — unchanged docs are skipped), so query_related's
         semantic half does not answer from a stale snapshot; silent when nothing
         changed, one throttled line when sqlite-vec is absent.
-      - maintenance_repo_watch.watch_tick: once a day, external issues/PRs on
-        the watched public repos with no maintainer reply become ops human
-        tasks (resolved on reply, close or merge); silent when nothing changed.
 
     doctor_recover_queue is deliberately NOT here: it heals Worker/queue.json,
     which is exactly the store the cutover retires.
     """
     rc = 0
     if not IS_REMOTE_HOST:
-        try:
-            closed = autoclose_stale_reviews_local()
-            if closed > 0:
-                print(f"review-autoclose: {closed} closed")
-        except Exception as exc:
-            print(f"review-autoclose: error — {exc}")
-            rc = 1
         try:
             surfaced = sweep_remote_completed_runs()
             if surfaced > 0:
@@ -2242,18 +2149,6 @@ def cmd_maintenance() -> int:
                 print(f"log-rotate: {name} truncated")
         except Exception as exc:
             print(f"log-rotate: error — {exc}")
-            rc = 1
-        # Merging a migration is not applying it. Twice on Pairent a task closed
-        # green with the live database untouched; only a direct query noticed.
-        try:
-            for warning in check_unapplied_migrations():
-                print(f"migration-drift: {warning}")
-                try:
-                    kakao_notify(_compose_migration_drift(warning))
-                except Exception:  # noqa: BLE001 - the print already surfaced it
-                    pass
-        except Exception as exc:
-            print(f"migration-drift: error — {exc}")
             rc = 1
         # Pull macp's own merged PRs into the engine checkout *before* the
         # restart below, so the daemons kickstart onto the new code in one tick.
@@ -2347,36 +2242,15 @@ def cmd_maintenance() -> int:
         except Exception as exc:
             print(f"embed-tick: error — {exc}")
             rc = 1
-        # An external contributor's issue on the public repo once sat 17 days
-        # unseen; nothing looked at the repo's issue/PR list at all.
-        try:
-            line = maintenance_repo_watch.watch_tick()
-            if line:
-                print(line)
-        except Exception as exc:
-            print(f"repo-watch: error — {exc}")
-            rc = 1
     return rc
 
 
 def scan_queue() -> int:
     queue = load_queue()
 
-    # Remote hosts skip all primary-host maintenance (review autoclose, parent
-    # tree backfill, remote sweep) — their data source is just their inbox.
-    if IS_REMOTE_HOST:
-        pass
-    # Review autoclose sweep: close stale review todos before other operations.
-    else:
-        try:
-            closed = autoclose_stale_reviews_local()
-            if closed > 0:
-                print(f"review-autoclose: {closed} closed")
-        except Exception as exc:
-            print(f"review-autoclose: error — {exc}")
-
     # Primary host: surface finished remote-host runs (git-synced queue files)
-    # as review todos + kakao notifications.
+    # as review todos + kakao notifications. Remote hosts skip it — their data
+    # source is just their inbox.
     if not IS_REMOTE_HOST:
         try:
             surfaced = sweep_remote_completed_runs()
@@ -2896,85 +2770,6 @@ def _sync_vault_state_locked(paths: tuple[str, ...], _run) -> int:
     except (subprocess.SubprocessError, OSError) as exc:
         print(f"vault-sync: error — {exc}")
         return 0
-
-
-# Repos whose migrations must actually reach a live database, and where to find
-# the connection details. The password is NOT stored here — it is read at run time
-# from the file that already holds it, so this check adds no second copy of a
-# credential. `pw_file`/`pw_key` describe how to pull it out of that file.
-#
-# Why this check exists: on Pairent the same thing happened twice. leaf 7 (schema
-# + RLS) and leaf 14 (realtime publication) both merged, both closed as done, and
-# neither migration was ever applied to the live project. leaf 14 in particular
-# looked finished for a day while realtime chat was still dead, because the fix
-# was real — it just wasn't anywhere the app could see it. Nothing in CI catches
-# this: CI has no live database, and merging is not applying.
-MIGRATION_TARGETS = {
-    "Pairent": {
-        # Under the configured clone root (MACP_WORKER_ROOT / `worker_root`,
-        # default ~/Worker). Frozen at import like the rest of this table — it
-        # is read by one hand-run check, not by a long-lived daemon.
-        "repo": paths.worker_root() / "Pairent",
-        "pw_file": Path.home() / "Documents" / "pairent-supabase" / "credentials.txt",
-        "pw_key": "DB password:",
-        "dsn": ("postgresql://postgres.qyxlikbhntvnrruacrzs:{pw}"
-                "@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"),
-    },
-}
-PSQL_CANDIDATES = ("/opt/homebrew/opt/libpq/bin/psql", "/usr/local/opt/libpq/bin/psql", "psql")
-
-
-def _psql() -> str | None:
-    for c in PSQL_CANDIDATES:
-        if c == "psql" or Path(c).exists():
-            return c
-    return None
-
-
-def check_unapplied_migrations(targets: dict | None = None) -> list[str]:
-    """Migrations that exist in a repo but never reached its live database.
-
-    Returns one human-readable line per repo that has drift; empty when everything
-    is applied. Never raises — a missing password file or an unreachable database
-    means "can't tell", and "can't tell" must not take down maintenance.
-    """
-    warnings: list[str] = []
-    psql = _psql()
-    if psql is None:
-        return warnings
-    for name, cfg in (targets or MIGRATION_TARGETS).items():
-        try:
-            mig_dir = Path(cfg["repo"]) / "supabase" / "migrations"
-            local = sorted(p.name.split("_", 1)[0] for p in mig_dir.glob("*.sql"))
-            if not local:
-                continue
-            pw_file = Path(cfg["pw_file"])
-            if not pw_file.exists():
-                continue
-            pw = ""
-            for line in pw_file.read_text(encoding="utf-8").splitlines():
-                if line.startswith(cfg["pw_key"]):
-                    pw = line.split(cfg["pw_key"], 1)[1].strip()
-                    break
-            if not pw:
-                continue
-            proc = subprocess.run(
-                [psql, cfg["dsn"].format(pw=pw), "-Atc",
-                 "select version from supabase_migrations.schema_migrations"],
-                capture_output=True, text=True, timeout=45,
-            )
-            if proc.returncode != 0:
-                continue  # unreachable -> can't tell, stay quiet
-            applied = {v.strip() for v in proc.stdout.splitlines() if v.strip()}
-            missing = [v for v in local if v not in applied]
-            if missing:
-                warnings.append(
-                    f"{name}: {len(missing)} migration(s) merged but NOT applied to "
-                    f"the live database — {', '.join(missing)}"
-                )
-        except Exception as exc:  # noqa: BLE001 - a check must not break maintenance
-            print(f"migration-drift: {name} check failed — {exc}")
-    return warnings
 
 
 SILENCE_THRESHOLD_S = 6 * 3600
@@ -5197,7 +4992,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "maintenance",
-        help="Vault upkeep only (stale review autoclose + remote-run sweep) — no dispatch. "
+        help="Vault upkeep only (remote-run sweep, vault sync and the other upkeep steps) — no dispatch. "
              "Used after the v2 cutover, when the legacy queue worker is no longer loaded.",
     )
 

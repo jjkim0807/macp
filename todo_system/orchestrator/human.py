@@ -5,12 +5,11 @@ module (Mac-side) does two things:
 
   deliver: pull the human's inbox and nudge them via KakaoTalk (kakao_send.sh).
            The assignment is NOT considered done — it just got delivered. Humans
-           are never timed out to failure; parking/re-nudge is the tracker's job.
+           are never timed out to failure; parking is the tracker's job.
   reply  : the human runs this to answer an assignment; it emits a RESULT /
            PROGRESS / NEEDS_INPUT message back to the orchestrator's inbox.
 
-Delivery is idempotent-ish: a message is nudged once then acked. Re-nudge with
-backoff (P3 tracker) is separate from first delivery.
+Delivery is idempotent-ish: a message is nudged once then acked.
 """
 
 from __future__ import annotations

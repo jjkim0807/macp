@@ -30,7 +30,7 @@ NEEDS_INPUT = "needs_input"
 #     is never dispatched again while it waits;
 #   * not in-flight (orchestrator._IN_FLIGHT) — it owns no checkout and the
 #     stale reaper must not fail it for being quiet;
-#   * not AWAITING_HUMAN — nobody owes an answer, so it is never re-nudged.
+#   * not AWAITING_HUMAN — nobody owes an answer.
 # Lands in the git-tracked assignment JSON: treat the string as wire format.
 BATCH_READY = "batch_ready"
 
@@ -196,19 +196,6 @@ class Assignment:
                                          # not touch it. reconcile_merged compares
                                          # it with how the task finally closes to
                                          # self-detect false alarms.
-    parked_worker_mode: str = ""          # the task md's `worker_mode:` as last
-                                         # OBSERVED while this row sat parked.
-                                         # reconcile_unparked compares it against
-                                         # the current md to spot the one signal
-                                         # that means "the human cleared the
-                                         # blocker": a non-dispatchable ->
-                                         # dispatchable edit. Stamped by the
-                                         # orchestrator's sweep, never from a
-                                         # reply payload — apply_reply must not
-                                         # touch it. Empty = never observed (a
-                                         # row from an older build), which is
-                                         # read as "no evidence", never as a
-                                         # transition.
     close_fingerprint: str = ""           # sha256 of the task md's bytes just
                                          # BEFORE the orchestrator closed it
                                          # (tasks.md_fingerprint). reconcile_closed

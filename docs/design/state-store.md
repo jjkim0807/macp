@@ -56,7 +56,7 @@ HEAD 기준 `파일:줄`.
 | mailbox 메시지 `Worker/agents/<agent>/inbox/<msg>.json` | `Worker/agents/` | 전송(transport) — durable, 멱등 | ack까지(소비=파일 삭제, 커밋은 안 함) | **추적** (`.gitignore:114` "message files ARE tracked (git = the transport)") | `mailbox.py:81` `Mailbox`(`_inbox`:88, `send`:145, `receive`:154, `ack`:172); 팩토리 `open_mailbox`:341; `GitMailbox`:226 / `FileMailbox`:217 |
 | reader 커서 + ack 틈브스톤 `Worker/agents/_state/<agent>/cursor.json` | `Worker/agents/_state/` | reader-local 소비집합(`seen`+`acked`) | 런타임(틈브스톤 TTL 14d, cap 20000 — `mailbox.py:54-55`) | **비추적** (`.gitignore:116`) | `mailbox.py:91-92` `_cursor_path`; 틈브스톤 근거·핵 `mailbox.py:47-55`(이 태스크가 은퇴시키려는 git-restore 부활 방어) |
 | 실행 큐 `Worker/queue.json` | `Worker/queue.json`(호스트 스코프 `_STATE_DIR`) | 아니오 — **파생 뷰**, ledger가 SoT ([[macp-queue-json-is-derived-view]]) | 런타임(매 틱 변경) | **비추적** (`.gitignore:109` "mutated every tick — tracking breaks branch checkout") | `worker.py:110` `QUEUE_PATH` |
-| planner kv `Worker/planner_state.json` | `Worker/planner_state.json`(호스트 스코프) | planner scratch(`verdict`+`todo_state_hash`[+queue]) | 런타임 | **비추적** (`.gitignore:110`) | 경로 `worker.py:111` `PLANNER_STATE_PATH`; 읽기 `load_planner_state` `worker.py:364`; 쓰기 `save_planner_state` `worker.py:377`(write 393–394). **추가 리더**(kv 표면이 흡수해야 함): `worker.py:2332` `PLANNER_STATE_FILE` + `_read_planner_state` `worker.py:2409`; `discovery.py:56` `PLANNER_STATE_PATH`·`planner_verdict` `discovery.py:271`; `project_stall.py:355-360` |
+| planner kv `Worker/planner_state.json` | `Worker/planner_state.json`(호스트 스코프) | planner scratch(`verdict`+`todo_state_hash`[+queue]) | 런타임 | **비추적** (`.gitignore:110`) | 경로 `worker.py:111` `PLANNER_STATE_PATH`; 읽기 `load_planner_state` `worker.py:364`; 쓰기 `save_planner_state` `worker.py:377`(write 393–394). **추가 리더**(kv 표면이 흡수해야 함): `worker.py:2332` `PLANNER_STATE_FILE` + `_read_planner_state` `worker.py:2409`; `discovery.py:56` `PLANNER_STATE_PATH`·`planner_verdict` `discovery.py:271` |
 | per-run 산출물 `Worker/runs/<run-id>/` | `Worker/runs/` | run 감사 추적(requirements/plan/verify/run.log 등) | ephemeral | **비추적** (`.gitignore:75` — 디렉토리 전체; `*.log`는 전역 규칙 `.gitignore:25`로도 제외) | `worker.py:109` `RUNS_DIR`; `metrics.py:30` `RUNS` |
 
 **8행**(요구 최소 7행 충족). 추가로 확인한 git-비추적 호스트 로컬 상태(참고, 표에는 생략):
@@ -73,7 +73,7 @@ HEAD 기준 `파일:줄`.
 - **틈브스톤 핵(`mailbox.py:47-55`)의 존재 이유 = mailbox 메시지가 추적되는데
   ack-삭제는 커밋되지 않음.** external 백엔드로 메시지를 트리 밖으로 옮기면 삭제가
   곧 영구 소비가 되어 틈브스톤 보정 자체가 불필요해진다.
-- **`planner_state.json`은 리더가 최소 넷**(worker 두 상수 + discovery + project_stall).
+- **`planner_state.json`은 리더가 최소 셋**(worker 두 상수 + discovery).
   kv 표면은 이들을 전부 거쳐가게 하거나, 최소한 전부가 같은 백엔드를 읽도록 배선해야
   한다(§6 leaf ③의 범위).
 

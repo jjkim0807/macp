@@ -19,36 +19,27 @@ in `followups_rejected.jsonl` — is reconciled back so it stops re-appearing
 (reconcile). An unhandled follow-up simply stays open across ticks, which is the
 whole point: durable-until-resolved beats silently-gone.
 
-A rejection, though, was the end of the line, and that reopened the same leak one
-step later. By 2026-09-19, 75 of 170 rejection lines mentioned a human or a
-decision, and nobody was told: the three improvement proposals from the
-2026-09-16 stage cost-benefit audit were rejected as "a human decision", and the
-person found out three days later by asking. So there is a third path: a
-rejection line carrying `"route": "human"` parks the follow-up as
-`awaiting_human` instead of closing it. It drops out of the planner injection
-(nothing to re-judge every tick), queues ONE kakao digest line (the daily-summary
-tier, never an immediate ping), and waits for a person at
-`python -m todo_system.orchestrator.followups human`.
-`approve <id>` hands it back to the planner as open + approved, in its own
-"사람 승인됨" (human-approved) block; `dismiss <id> --reason …` closes it. Rejections written
-before this existed are never backfilled — `reroute <id>` revives one at a time.
+A rejection that needed a person used to vanish the same way (by 2026-09-19, 75
+of 170 rejection lines mentioned a human or a decision and nobody was told), so
+from 2026-09-19 a line carrying `"route": "human"` parked the row behind a kakao
+digest and a human-decision CLI. The 2026-11-20 decision (ask a person only about
+irreversible actions) turned that park into a record: the line now closes the row
+like any rejection and leaves one "확인 못 함" line in the source task's Progress
+Log (_record_unverified) — no alert, no waiting.
 
 Because the rejections file is append-only and read last-wins, each row keeps a
-`rejections_seen` watermark and reconcile reads only the lines past it. Without
-it, the very line that parked a row would re-park or close it on the first
-reconcile after the human approved it. Rows written before the field existed
-count as 0, so old state reconciles exactly as it always did.
+`rejections_seen` watermark and reconcile reads only the lines past it, so a line
+already consumed (including one that parked a row under the old human path) is
+never applied twice. Rows written before the field existed count as 0.
 
 Stdlib-only and best-effort throughout — recording a follow-up must never break a
 pipeline that otherwise finished, so every write swallows OSError and every read
-of a corrupt line skips it rather than raising. That includes the digest notice:
-a failed queue is retried on the next reconcile, never sent immediately instead.
+of a corrupt line skips it rather than raising.
 
 Paths are module globals (not import-time-frozen defaults) so tests can
-monkeypatch `FOLLOWUPS_PATH` / `ITEMS_DIR` / `REJECTIONS_PATH` / `DIGEST_PATH` /
-`ROUTE_LOG_PATH` onto a tempdir — the same idiom `stages.RUNS_DIR` uses, and
-necessary because the real paths are gitignored live state that a test must
-never touch.
+monkeypatch `FOLLOWUPS_PATH` / `ITEMS_DIR` / `REJECTIONS_PATH` onto a tempdir —
+the same idiom `stages.RUNS_DIR` uses, and necessary because the real paths are
+gitignored live state that a test must never touch.
 """
 
 from __future__ import annotations
@@ -61,7 +52,7 @@ import re
 import sys
 from pathlib import Path
 
-from .. import i18n, kakao_format, paths
+from .. import paths
 
 # Live runtime state, under Worker/_state/ (gitignored) and Todo/items/ (git-tracked but host-local).
 # Reassigned wholesale by tests; every function that defaults to one reads the
@@ -77,29 +68,7 @@ _ROOT = paths.vault_root(start=paths.vault_search_start())
 FOLLOWUPS_PATH = _ROOT / "Worker" / "_state" / "followups.jsonl"
 REJECTIONS_PATH = _ROOT / "Worker" / "_state" / "followups_rejected.jsonl"
 ITEMS_DIR = _ROOT / "Todo" / "items"
-# Where the one-line "decision needed" notice is queued. None (production) lets
-# kakao_format.route() resolve KAKAO_VAULT_DIR or the vault's logs/ — the SAME
-# queue scripts/kakao_digest_send.py drains — and keeps conftest's KAKAO_VAULT_DIR
-# safety net in force. Tests pin both onto a tempdir.
-DIGEST_PATH: Path | None = None
-ROUTE_LOG_PATH: Path | None = None
-
-# A follow-up the planner parked for a person (`"route": "human"` on its
-# rejection line) instead of closing it. Only a created task, `approve` or
-# `dismiss` moves it on; rejection lines never do.
-STATUS_HUMAN = "awaiting_human"
-# First line of the digest notice. The fixed `…:` prefix is what compose_digest
-# groups on, so several parked items fold into one "×N" line, and the CLI hint
-# lives inside that key so it survives even the folded form. The notice itself
-# uses human_digest_head() (the active language, resolved per call); this
-# constant stays the ko value for importers.
-HUMAN_DIGEST_HEAD = i18n.MESSAGES["ko"]["followup.digest_head"]
 CLI = "python -m todo_system.orchestrator.followups"
-
-
-def human_digest_head() -> str:
-    """HUMAN_DIGEST_HEAD in the active UI language."""
-    return i18n.t("followup.digest_head")
 
 # The report.md sections whose bullets are follow-ups. Both are captured on
 # purpose (Research Open-Q): "다음 단계" is the obvious one, but a
@@ -215,11 +184,6 @@ def open_followups(path: Path | None = None) -> list[dict]:
     return [r for r in _load_raw(path) if r.get("status") == "open"]
 
 
-def awaiting_followups(path: Path | None = None) -> list[dict]:
-    """The follow-ups parked for a human decision (`route: human`)."""
-    return [r for r in _load_raw(path) if r.get("status") == STATUS_HUMAN]
-
-
 def append_followups(text: str, *, source_task: str, source_run: str,
                      path: Path | None = None, ts: str | None = None) -> list[str]:
     """Append this report's NEW follow-ups to the jsonl; return the ids added.
@@ -312,14 +276,13 @@ def render_context(open_recs: list[dict]) -> str:
     `/worker-planner` when it is non-empty, so on the common (no-follow-up) path
     the planner invocation stays byte-identical to before. The block also carries
     the resolve protocol inline — worker-planner.md says nothing about follow-ups,
-    so this text is the planner's ONLY source for it, `route: human` included.
+    so this text is the planner's ONLY source for it, the `route: human` marker
+    included.
 
-    Parked (awaiting_human) and done rows are dropped even if a caller passes
-    them: a parked item waits on a person, and re-showing it would have the
-    planner re-judge it every tick. Approved rows (a person ran `approve`) get
-    their own block saying the decision is already made."""
-    recs = [r for r in (open_recs or [])
-            if r.get("status") not in (STATUS_HUMAN, "done")]
+    Only open rows are listed, even if a caller passes others: a done row is
+    settled, and a row the old human path parked (`awaiting_human`) is not
+    re-judged."""
+    recs = [r for r in (open_recs or []) if r.get("status") == "open"]
     if not recs:
         return ""
     lines = [
@@ -332,31 +295,14 @@ def render_context(open_recs: list[dict]) -> str:
         '`{"id":"<id>","reason":"..."}`를 append 하라. 아무것도 안 하면 다음',
         "tick에도 그대로 다시 보인다(의도된 durable 동작).",
         "",
-        "단, 사람 판단이 필요한 항목 — 사용자 결정, 또는 콘솔·배포·sudo·실기기처럼 사람만",
-        "할 수 있는 조치 — 이면서 사람에게 알리는 다른 채널이 아직 없을 때만 그 줄에",
-        '`"route":"human"`을 붙여라: `{"id":"<id>","reason":"...","route":"human"}`.',
-        "그러면 done이 아니라 사람 결정 대기로 남아 하루 1회 카톡 요약과 `followups human`",
-        "목록으로 사람에게 가고, 이 주입에서는 빠진다. route 금지: auto_merge:false PR",
-        "리뷰처럼 [검토요청]이 이미 가는 것, 정보성, 이미 처리됐거나 다른 태스크가 커버하는",
-        "것, 중복 — 이런 건 지금처럼 route 없이 기각하라.",
+        "판단 기준: 되돌릴 수 없는 일(실계좌·결제/유료 리소스, 외부 제출·발송, 공개 전환,",
+        "되살릴 수 없는 삭제, 사용자 명의 행위)만 사람 몫이다 — 그런 항목은 `worker_mode: manual`",
+        "태스크(`from_followup: <id>`)로 만든다. 사람 확인이 필요하지만 되돌릴 수 있는 항목은 그 줄에",
+        '`"route":"human"`을 붙여 기각하라: `{"id":"<id>","reason":"...","route":"human"}` — 원',
+        "태스크 Progress Log에 「확인 못 함」 한 줄로 남고 알림·대기는 없다. 그 밖의 부적합 항목은 route 없이 기각하라.",
         "",
     ]
-    regular = [r for r in recs if not r.get("approved")]
-    approved = [r for r in recs if r.get("approved")]
-    lines.extend(_context_line(r) for r in regular)
-    if approved:
-        if regular:
-            lines.append("")
-        lines += [
-            "### 사람 승인됨 — 태스크화 대상",
-            "",
-            "사람이 `followups approve`로 이미 결정한 항목이다. user_decision_bound로 다시",
-            "기각하지 말고 `from_followup: <id>` 태스크로 만들어라. 승인이 푸는 것은 사용자",
-            "결정 게이트뿐이다 — external_action·costs_money·destructive_irreversible 등 다른",
-            "blocked_patterns는 그대로이니, 그 사유라면 route 없이 기각하라.",
-            "",
-        ]
-        lines.extend(_context_line(r) for r in approved)
+    lines.extend(_context_line(r) for r in recs)
     return "\n".join(lines)
 
 
@@ -398,12 +344,12 @@ def _tasks_from_followup(items_dir: Path) -> dict:
 def _rejection_entries(path: Path | None = None) -> dict:
     """{followup_id: [{"reason", "human"}, ...]} — every rejection line, in order.
 
-    The file is append-only and one id can collect several lines over its life
-    (parked, approved, rejected again), so reconcile needs the whole per-id
-    history to tell a line it already consumed from a fresh one (see
-    `rejections_seen`). `human` is True only for `"route": "human"`, ignoring
-    case and surrounding whitespace; any other value, or none, is a plain
-    rejection exactly as before."""
+    The file is append-only and one id can collect several lines over its life,
+    so reconcile needs the whole per-id history to tell a line it already
+    consumed from a fresh one (see `rejections_seen`). `human` is True only for
+    `"route": "human"`, ignoring case and surrounding whitespace — the marker
+    that also records the rejection on the source task (_record_unverified); any
+    other value, or none, is a plain rejection."""
     p = Path(path) if path else REJECTIONS_PATH
     out: dict = {}
     try:
@@ -434,85 +380,67 @@ def _seen(rec: dict) -> int:
         return 0
 
 
-def _now() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
+def _record_unverified(rec: dict, reason: str, items_dir: Path) -> bool:
+    """Leave one "확인 못 함" line in the source task's Progress Log; True if written.
 
-
-def _digest_message(rec: dict) -> str:
-    """The digest notice for one parked follow-up, ≤ KAKAO_TEXT_LIMIT.
-
-    The id comes right after the fixed prefix, before the slug, so the 60-char
-    clip compose_digest applies to a singleton line keeps it. The slug is capped
-    at 60 and the reason is the word-clipped tail, so the memo fits by
-    construction."""
-    task = kakao_format.clip_words(str(rec.get("source_task") or "-"), 60)
-    return kakao_format.compose_alert(
-        f"{human_digest_head()}: [{rec.get('id')}] {task}",
-        [f"→ {CLI} human"],
-        tail=i18n.t("alert.reason", reason=rec.get("human_reason") or "-"))
-
-
-def _notify_awaiting(recs: list[dict]) -> bool:
-    """Queue ONE digest line per parked follow-up not yet notified; True if any.
-
-    route()'s digest tier does no dedup of its own, so the marker lives on the
-    record (`human_notified`) and is permanent: one line per id, ever — a
-    re-park after an approve shows only in `followups human`. Only a "digest"
-    verdict marks the row. Anything else — route() failing open to "send", or
-    raising — leaves it unmarked for the next reconcile to retry. It is never
-    sent immediately, and it never breaks the caller."""
-    marked = False
-    for rec in recs:
-        if rec.get("status") != STATUS_HUMAN or rec.get("human_notified"):
-            continue
-        try:
-            verdict, _ = kakao_format.route(
-                _digest_message(rec), level=kakao_format.LEVEL_DIGEST,
-                event_key=f"followup-human:{rec.get('id')}",
-                digest_path=DIGEST_PATH, log_path=ROUTE_LOG_PATH)
-        except Exception:
-            continue
-        if verdict == "digest":
-            rec["human_notified"] = _now()
-            marked = True
-    return marked
+    The 2026-11-20 decision (C2): a follow-up that needs a person's check but is
+    reversible is recorded, not parked — no alert, no waiting. Same shape as
+    task_deps.apply_unblocks' progress note (newest first under the
+    `## Progress Log` header, a new section at the end when there is none), kept
+    here rather than imported because task_deps pulls in the cli and this module
+    stays stdlib-only. Best-effort: an empty or path-like slug, a missing md or an
+    OSError returns False and leaves the follow-up closed."""
+    slug = str(rec.get("source_task") or "").strip()
+    if not slug or "/" in slug or slug.startswith("."):
+        return False
+    why = " ".join(str(reason or "").split())
+    tail = f"followup {rec.get('id')}: {why}" if why else f"followup {rec.get('id')}"
+    line = (f"- {dt.date.today().isoformat()}: 확인 못 함 — "
+            f"{' '.join(str(rec.get('text') or '').split())} ({tail})")
+    path = Path(items_dir) / f"{slug}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+        head = "## Progress Log\n"
+        i = text.find(head)
+        if i == -1:
+            text = text.rstrip() + f"\n\n{head}\n{line}\n"
+        else:
+            j = i + len(head) + (1 if text.startswith("\n", i + len(head)) else 0)
+            text = text[:j] + line + "\n" + text[j:]
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def reconcile(followups_path: Path | None = None, items_dir: Path | None = None,
               rejections_path: Path | None = None) -> list[str]:
-    """Apply what the planner did to the live follow-ups; return the ids moved.
+    """Apply what the planner did to the open follow-ups; return the ids closed.
 
-    Live means open or awaiting_human. Done rows are never reopened here — only
-    `reroute` revives one, which is the no-backfill guard. For each live row:
+    Only open rows are live: done rows are never reopened, and rows the old human
+    path parked (`awaiting_human`) are left as they are. For each open row:
 
-    * a Todo item stamped `from_followup: <id>` closes it as `created: <slug>`.
-      This beats everything, a parked or approved row included;
-    * an awaiting_human row is otherwise left alone — rejection lines never
-      move it, only `approve` / `dismiss` do;
-    * an open row looks only at its FRESH rejection lines (past its
-      `rejections_seen` watermark), and the last one wins: `"route": "human"`
-      parks it as awaiting_human, anything else closes it as
-      `rejected: <reason>` exactly as before.
+    * a Todo item stamped `from_followup: <id>` closes it as `created: <slug>`,
+      which beats any rejection line in the same pass;
+    * otherwise only its FRESH rejection lines count (past its `rejections_seen`
+      watermark), and the last one closes it as `rejected: <reason>`. When that
+      line carries `"route": "human"`, the source task's Progress Log also gets
+      one "확인 못 함" line (_record_unverified) — only after the close is on
+      disk, so a failed write records nothing, and once, since a done row is
+      never live again.
 
-    The watermark is what stops an approve from bouncing. The file is
-    append-only and last-wins, so without it the very line that parked a row
-    would re-park (or close) it on the first reconcile after the human approved
-    it. A row without the field has seen 0 lines, so old state behaves as it
-    always did.
-
-    Newly parked rows then get their one digest line (_notify_awaiting), only
-    after the transition is on disk, so a failed write never notifies. A row
-    whose queueing failed on an earlier pass is retried here even when nothing
-    else changed. Everything it cannot match stays as it is — that is the
-    durable default, not a failure."""
+    Everything it cannot match stays open — that is the durable default, not a
+    failure."""
     fpath = Path(followups_path) if followups_path else FOLLOWUPS_PATH
+    items = Path(items_dir) if items_dir else ITEMS_DIR
     recs = _load_raw(fpath)
-    live = [r for r in recs if r.get("status") in ("open", STATUS_HUMAN)]
+    live = [r for r in recs if r.get("status") == "open"]
     if not live:
         return []
-    created = _tasks_from_followup(Path(items_dir) if items_dir else ITEMS_DIR)
+    created = _tasks_from_followup(items)
     rejections = _rejection_entries(rejections_path)
     changed: list[str] = []
+    to_record: list[tuple[dict, str]] = []
     for rec in live:
         fid = str(rec["id"])
         if fid in created:
@@ -520,179 +448,23 @@ def reconcile(followups_path: Path | None = None, items_dir: Path | None = None,
             rec["resolution"] = f"created: {created[fid]}"
             changed.append(rec["id"])
             continue
-        if rec.get("status") != "open":
-            continue
         entries = rejections.get(fid, [])
         fresh = entries[_seen(rec):]
         if not fresh:
             continue
         rec["rejections_seen"] = len(entries)
         last = fresh[-1]
+        rec["status"] = "done"
+        rec["resolution"] = (f"rejected: {last['reason']}" if last["reason"]
+                             else "rejected")
         if last["human"]:
-            rec["status"] = STATUS_HUMAN
-            rec["human_reason"] = last["reason"]
-        else:
-            rec["status"] = "done"
-            rec["resolution"] = (f"rejected: {last['reason']}" if last["reason"]
-                                 else "rejected")
+            to_record.append((rec, last["reason"]))
         changed.append(rec["id"])
     if changed and not _write_all(recs, fpath):
         return []
-    if _notify_awaiting(recs):
-        _write_all(recs, fpath)
+    for rec, reason in to_record:
+        _record_unverified(rec, reason, items)
     return changed
-
-
-def _transition(fid: str, check, apply, path: Path | None = None,
-                after=None) -> tuple[int, str]:
-    """One human-driven state change: load, find `fid`, validate, mutate, rewrite.
-
-    `check(rec)` returns an error message for a row in the wrong state (or None);
-    `apply(rec)` mutates it. Returns (1, msg) for an unknown id, a refused
-    transition or an unwritable file, else (0, ""). `after(recs)` runs once the
-    change is on disk; if it reports that it touched recs again, they are
-    rewritten once more (reroute's digest marker)."""
-    p = Path(path) if path else FOLLOWUPS_PATH
-    recs = _load_raw(p)
-    hits = [r for r in recs if str(r.get("id")) == fid]
-    if not hits:
-        return 1, f"unknown follow-up id: {fid}"
-    for rec in hits:
-        err = check(rec)
-        if err:
-            return 1, f"{fid}: {err}"
-    for rec in hits:
-        apply(rec)
-    if not _write_all(recs, p):
-        return 1, f"{fid}: could not write {p}"
-    if after is not None and after(recs):
-        _write_all(recs, p)
-    return 0, ""
-
-
-def _state_of(rec: dict) -> str:
-    return f"status={rec.get('status')!r}, resolution={rec.get('resolution')!r}"
-
-
-def approve(fid: str, path: Path | None = None,
-            rejections_path: Path | None = None) -> tuple[int, str]:
-    """awaiting_human → open + approved: a person made the call the planner could
-    not, and the next planner run gets the row under '사람 승인됨 — 태스크화 대상'
-    (human-approved — candidate for task creation).
-
-    Every rejection line already on file for the id counts as seen, so the line
-    that parked it can never re-park or close it; only a line written after the
-    approve can."""
-    seen = len(_rejection_entries(rejections_path).get(fid, []))
-
-    def check(rec):
-        if rec.get("status") != STATUS_HUMAN:
-            return f"{_state_of(rec)} — only an {STATUS_HUMAN} follow-up can be approved"
-        return None
-
-    def apply(rec):
-        rec.update(status="open", approved=True, approved_ts=_now(),
-                   rejections_seen=seen)
-
-    rc, msg = _transition(fid, check, apply, path)
-    if rc:
-        return rc, msg
-    return 0, i18n.t("followup.approved_msg", fid=fid)
-
-
-def dismiss(fid: str, reason: str,
-            path: Path | None = None) -> tuple[int, str]:
-    """awaiting_human → done, resolution `dismissed: <reason>` — a person decided
-    against it. Kept distinct from `rejected:` (the planner's word) on purpose."""
-
-    def check(rec):
-        if rec.get("status") != STATUS_HUMAN:
-            return f"{_state_of(rec)} — only an {STATUS_HUMAN} follow-up can be dismissed"
-        return None
-
-    def apply(rec):
-        rec.update(status="done", resolution=f"dismissed: {reason}",
-                   dismissed_ts=_now())
-
-    rc, msg = _transition(fid, check, apply, path)
-    return (rc, msg) if rc else (0, i18n.t("followup.dismissed_msg", fid=fid, reason=reason))
-
-
-def reroute(fid: str, path: Path | None = None,
-            rejections_path: Path | None = None) -> tuple[int, str]:
-    """done `rejected…` → awaiting_human: re-file ONE old rejection as a human
-    decision. History is never backfilled automatically (that would page for
-    every past rejection at once); this is the manual, one-id-at-a-time path.
-
-    A row closed as `created:` or `dismissed:`, or one still open or parked, is
-    refused. The revived row gets its digest line like any fresh park — unless
-    it was already notified once before (the marker is permanent)."""
-    seen = len(_rejection_entries(rejections_path).get(fid, []))
-
-    def check(rec):
-        if (rec.get("status") != "done"
-                or not str(rec.get("resolution") or "").startswith("rejected")):
-            return f"{_state_of(rec)} — only a rejected follow-up can be rerouted"
-        return None
-
-    def apply(rec):
-        reason = (str(rec.get("resolution") or "").removeprefix("rejected")
-                  .strip().removeprefix(":").strip())
-        rec.update(status=STATUS_HUMAN, human_reason=reason, resolution=None,
-                   rejections_seen=seen, rerouted_ts=_now())
-
-    rc, msg = _transition(fid, check, apply, path, after=_notify_awaiting)
-    return (rc, msg) if rc else (0, i18n.t("followup.rerouted_msg", fid=fid, status=STATUS_HUMAN))
-
-
-def render_human(recs: list[dict]) -> str:
-    """The `followups human` listing: what waits on a person, plus what a person
-    approved that the planner has not turned into a task yet. Read-only."""
-    waiting = [r for r in recs if r.get("status") == STATUS_HUMAN]
-    approved = [r for r in recs if r.get("status") == "open" and r.get("approved")]
-    if not waiting and not approved:
-        return i18n.t("followup.none") + "\n"
-    out = [i18n.t("followup.waiting", n=len(waiting)) if waiting else i18n.t("followup.none")]
-    for r in waiting:
-        text = kakao_format.clip_words(str(r.get("text") or ""), 100)
-        reason = kakao_format.clip_words(str(r.get("human_reason") or "-"), 300)
-        out += [
-            "",
-            f"- [{r.get('id')}] from {r.get('source_task')} ({_section_label(r.get('section'))})",
-            "  " + i18n.t("followup.body", text=text),
-            "  " + i18n.t("alert.reason", reason=reason),
-        ]
-    if approved:
-        out += ["", i18n.t("followup.approved_head", n=len(approved))]
-        out += [f"- [{r.get('id')}] from {r.get('source_task')} "
-                + i18n.t("followup.approved_at", ts=r.get("approved_ts") or "-")
-                for r in approved]
-    out += [
-        "",
-        i18n.t("followup.hint_approve", cli=CLI),
-        i18n.t("followup.hint_dismiss", cli=CLI),
-        i18n.t("followup.hint_reroute", cli=CLI),
-    ]
-    return "\n".join(out) + "\n"
-
-
-# Display names of the recorded (canonical, Korean) section names. The record
-# keeps the canonical name; only the `followups human` listing shows it in the
-# active language. An unknown section is shown as recorded.
-_SECTION_LABEL_KEYS = {
-    NEXT_STEPS_HEADINGS[0]: "followup.section_next_steps",
-    HUMAN_REVIEW_HEADINGS[0]: "followup.section_human_review",
-}
-
-
-def _section_label(section) -> str:
-    key = _SECTION_LABEL_KEYS.get(section)
-    return i18n.t(key) if key else str(section)
-
-
-def _clean_id(raw: str) -> str:
-    """Accept an id pasted with the brackets `human` prints around it."""
-    return raw.strip().strip("[]")
 
 
 def _usage(parser: argparse.ArgumentParser) -> int:
@@ -700,44 +472,22 @@ def _usage(parser: argparse.ArgumentParser) -> int:
     return 2
 
 
-def _reply(rc: int, msg: str) -> int:
-    (sys.stderr if rc else sys.stdout).write(msg + "\n")
-    return rc
-
-
 def _build_parser() -> argparse.ArgumentParser:
-    """The subcommand grammar: emit-context/reconcile/human take no arguments,
-    approve/reroute take one positional id, dismiss takes an id plus a
-    required `--reason` (one or more words, joined with spaces — matches the
-    old hand-rolled `<id> --reason <text…>` / `<id> --reason=<text…>` forms)."""
+    """The subcommand grammar: emit-context and reconcile, no arguments."""
     parser = argparse.ArgumentParser(prog=CLI)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("emit-context")
     sub.add_parser("reconcile")
-    sub.add_parser("human")
-    for name in ("approve", "reroute"):
-        p = sub.add_parser(name)
-        p.add_argument("id")
-    p_dismiss = sub.add_parser("dismiss")
-    p_dismiss.add_argument("id")
-    p_dismiss.add_argument("--reason", nargs="+", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The planner-tick subcommands plus the human-decision CLI.
+    """The two planner-tick subcommands, both called from scripts/planner_tick.sh.
 
-    `emit-context` and `reconcile` are called from scripts/planner_tick.sh.
     emit-context prints the render block (empty when there are none, so
     `CTX=$(...)` comes back empty and no injection happens); reconcile applies
-    what the planner just did.
-
-    The rest are for a person: `human` lists what waits on them (read-only, it
-    never reconciles); `approve <id>` / `dismiss <id> --reason <text>` decide a
-    parked follow-up; `reroute <id>` re-files one old `rejected` follow-up as
-    awaiting a human. Exit codes: 0 done, 1 unknown id / refused transition /
-    write failure, 2 bad usage (including `--help`, which argparse answers
-    with exit 0 instead)."""
+    what the planner just did. Exit codes: 0 done, 2 bad usage (including
+    `--help`, which argparse answers with exit 0 instead)."""
     args = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
     try:
@@ -754,21 +504,6 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(
                 f"reconciled {len(done)} follow-up(s): {' '.join(done)}\n")
         return 0
-    if ns.cmd == "human":
-        sys.stdout.write(render_human(load_followups()))
-        return 0
-    if ns.cmd in ("approve", "reroute"):
-        fid = _clean_id(ns.id)
-        if not fid:
-            return _usage(parser)
-        fn = approve if ns.cmd == "approve" else reroute
-        return _reply(*fn(fid))
-    if ns.cmd == "dismiss":
-        fid = _clean_id(ns.id)
-        reason = " ".join(ns.reason).strip()
-        if not fid or not reason:
-            return _usage(parser)
-        return _reply(*dismiss(fid, reason))
     return _usage(parser)
 
 

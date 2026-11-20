@@ -461,10 +461,9 @@ def consume(ledger, vault_root: str | Path, *, backdate_s: float,
     This function runs **before** the orchestrator tick's dispatch, so a
     single exception raised here would stop that whole tick's dispatch. So
     there's one outer `try/except` and one per record, skips are capped via
-    `_Tally` with only a log left behind (the same structure as
-    `reconcile_unparked`'s per-row isolation — the structure that stopped
-    the incident where one bad row silently starved every row queued after
-    it).
+    `_Tally` with only a log left behind (the same per-row isolation the
+    orchestrator's reconcile sweeps use — the structure that stopped the
+    incident where one bad row silently starved every row queued after it).
 
     When the verdict is `RESUME`, the only fields touched are the
     **4 the acceptance criteria name + 2 history entries**:

@@ -31,8 +31,8 @@ mild half of it:
   behind, which un-skipped two ``test_macp_dashboard.py`` tests from the second
   run on: the skip count depended on how often the checkout had been tested.
 * ``Todo/NOW.md``, ``Todo/FOCUS.md`` and ``Todo/Dashboard.md`` are rewritten by
-  the ``sync_*`` writers, which the ``now``/``focus`` commands and ``worker``'s
-  parent auto-close call. They write through ``cli``'s import-time globals, so
+  the ``sync_*`` writers, which the ``now``/``focus`` commands call. They write
+  through ``cli``'s import-time globals, so
   a test that forgets to rebind them overwrites the live notes.
 
 The live mailbox — ``Worker/agents/`` (``<agent>/inbox/*.json`` envelopes,
@@ -103,16 +103,6 @@ real ``Memory/relations.sqlite`` (or, under the gate command's
 ``VAULT_ROOT``, ``DB_PATH`` and ``STATE_DIR`` into a tmp dir that is never
 created, so a forgotten seam finds an empty vault rather than the live one. The
 module's own tests lift the switch and build a tmp vault there.
-
-The public-repo watch (``todo_system/maintenance_repo_watch.py``) is a third
-``cmd_maintenance`` step, and it talks to the network: an unisolated tick would
-run a real ``gh api user`` and a GraphQL read of the engine's public repo, and
-stamp the real ``~/.local/share/macp/repo-watch`` state so the live host skipped
-its next daily run. ``_repo_watch_isolated`` sets its kill switch
-(``MACP_REPO_WATCH=0``), points ``STATE_DIR`` and the config search anchor
-``CONFIG_START`` into a tmp dir, and replaces ``_run`` with a runner that raises
-on any command, so even a test that lifts the switch and forgets the runner gets
-an error line instead of a network call. The module's own tests inject a fake.
 
 The ``auto`` tick's own side effects — ``orchestrator main auto`` reaches three
 things no test may do for real. ``usage_hold()`` calls ``usage_guard.check()``,
@@ -210,7 +200,6 @@ from todo_system import (
     cli,
     maintenance_disk,
     maintenance_embed,
-    maintenance_repo_watch,
     ops_alerts,
     paths,
     usage_guard,
@@ -600,22 +589,6 @@ def _embed_tick_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(maintenance_embed, "DB_PATH",
                         base / "vault" / "Memory" / "relations.sqlite")
     monkeypatch.setattr(maintenance_embed, "STATE_DIR", base / "state")
-
-
-def _repo_watch_blocked(*_a, **_k):
-    raise RuntimeError("real gh/git blocked by conftest (_repo_watch_isolated)")
-
-
-@pytest.fixture(autouse=True)
-def _repo_watch_isolated(tmp_path_factory, monkeypatch):
-    # Switched off, state in tmp, and no real command can run (see the module
-    # docstring). The module's own `watch` fixture lifts all three.
-    base = tmp_path_factory.mktemp("repo-watch")
-    monkeypatch.setenv(maintenance_repo_watch.KILL_ENV, "0")
-    monkeypatch.setenv(maintenance_repo_watch.STATE_DIR_ENV, str(base / "state"))
-    monkeypatch.setattr(maintenance_repo_watch, "STATE_DIR", base / "state")
-    monkeypatch.setattr(maintenance_repo_watch, "CONFIG_START", base / "cfg")
-    monkeypatch.setattr(maintenance_repo_watch, "_run", _repo_watch_blocked)
 
 
 @pytest.fixture(autouse=True)

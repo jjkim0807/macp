@@ -1,7 +1,7 @@
 """Engine log/CLI, alert and dashboard text in the configured UI language (``paths.ui_language()``).
 
 ``t(key, **fmt)`` is the one entry point for messages — log/CLI lines and the
-Slack/Kakao alert and follow-up texts alike; the dashboard page's fragments live
+Slack/Kakao alert texts alike; the dashboard page's fragments live
 in :data:`DASHBOARD` (see :func:`dashboard_phrases`). Scope is human-facing text
 only — strings a parser reads back (stage-artifact headings, the ``없음``
 sentinel, alert event keys, ledger ``last_note`` texts) stay out of these
@@ -53,7 +53,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.sms.title": "SMS 릴레이 설정",
         # daily digest + route() merge suffix (kakao_format)
         "digest.headline_fyi": "📮 macp 알림 요약 {n}건 — 조치 불필요",
-        "digest.headline_pending": "📮 macp 알림 요약 {n}건 — 결정 {k}건 대기",
         "digest.empty_entry": "(빈 항목)",
         "digest.merged": "외 {n}건 합침",
         # human inbox nudges (orchestrator/human.py)
@@ -64,24 +63,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "human.head.ping": "📡 핑",
         "human.head.other": "✉️ 메시지가 도착했어요",
         "human.headline": "{head} — 확인해주세요",
-        # follow-up digest notice + `followups human|approve|dismiss|reroute`
-        "followup.digest_head": "🙋 사람 결정 대기(followups human)",
-        "followup.none": "사람 결정 대기 없음",
-        "followup.waiting": "사람 결정 대기 {n}건",
-        "followup.section_next_steps": "다음 단계",
-        "followup.section_human_review": "사람이 검토해야 할 부분",
-        "followup.body": "본문: {text}",
-        "followup.approved_head": "승인됨 — planner 태스크화 대기 {n}건",
-        "followup.approved_at": "(승인 {ts})",
-        "followup.hint_approve": "승인:   {cli} approve <id>",
-        "followup.hint_dismiss": "기각:   {cli} dismiss <id> --reason <사유>",
-        "followup.hint_reroute": "재분류: {cli} reroute <id>   (rejected → 사람 결정 대기)",
-        "followup.approved_msg": (
-            "승인: {fid} → open+approved. 다음 planner 실행 때 '사람 승인됨 — "
-            "태스크화 대상'으로 주입된다. planner는 run 완료·태스크 변경·24h "
-            "하트비트 때만 돌므로, 조용한 날엔 최대 약 24시간 걸린다."),
-        "followup.dismissed_msg": "기각: {fid} → done (dismissed: {reason})",
-        "followup.rerouted_msg": "재분류: {fid} → {status}",
         # orchestrator alerts (Orchestrator._notify_* and reconcile_merged)
         "alert.reason": "사유: {reason}",
         "alert.account_switch": (
@@ -114,10 +95,6 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⏱️ {n}회 연속 stage timeout으로 대기 전환 — "
             "더 잘게 쪼개거나 long_job으로 돌릴지 판단이 필요합니다"),
         "alert.timeout_checkpointed": "작업은 origin worker 브랜치에 checkpoint됨(유실 아님)",
-        "alert.blocker_cancelled": (
-            "🔗 대기하던 상류 태스크가 취소돼 진행 불가 — "
-            "이 태스크가 아직 필요한지, 함께 취소할지 판단이 필요합니다"),
-        "alert.upstream": "상류: {blocker}",
         "alert.propagate": (
             "🔗 상류 '{proj}' 변경으로 하류 통합검증 {n}개를 만들었어요 — "
             "검증 결과를 확인해주세요"),
@@ -184,10 +161,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "\"todo already closed\" 경로로 자동 종결한다 — 재큐 불필요 "
             "(원장 수기 편집도 불필요)"),
         "trace.ledger.unpark": (
-            "  - 해제: 블로커 해소 후 태스크 md의 `worker_mode`를 비-디스패치 "
-            "값(`blocked` 등)으로 바꿨다가 `auto`로 되돌리면 "
-            "`reconcile_unparked()`가 그 전이를 해제 신호로 읽어 자동 재큐한다 "
-            "— 원장 수기 편집 불필요"),
+            "  - 해제: 블로커를 해소하고 태스크 md 수정을 커밋한 뒤 "
+            "`python -m todo_system.cli resume <slug> --after-commit <sha>`로 재개를 "
+            "예약하면 다음 틱에 `reconcile_resumes()`가 재큐한다 — 원장 수기 편집 불필요"),
         "trace.ledger.long_job": "- long_job 실행 중",
         "trace.ledger.checkout_busy": "- 체크아웃 대기 (다른 런이 같은 체크아웃 사용 중 — 끝나면 자동 재시도)",
         "trace.ledger.heavy_routed": (
@@ -236,7 +212,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "dash.sms.apply": "Apply settings in the SMS Relay app",
         "dash.sms.title": "SMS relay setup",
         "digest.headline_fyi": "📮 macp digest — {n} alert(s), no action needed",
-        "digest.headline_pending": "📮 macp digest — {n} alert(s), {k} decision(s) pending",
         "digest.empty_entry": "(empty entry)",
         "digest.merged": "+{n} more merged",
         "human.head.assign": "🙋 New assignment arrived",
@@ -246,26 +221,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "human.head.ping": "📡 Ping",
         "human.head.other": "✉️ A message arrived",
         "human.headline": "{head} — please take a look",
-        # No colon, ≤ 41 chars: compose_digest groups on the first ":" and clips a
-        # singleton line to 60, which must still keep the "[<12-hex id>]" after it.
-        "followup.digest_head": "🙋 Decision pending (followups human)",
-        "followup.none": "no human decisions pending",
-        "followup.waiting": "{n} human decision(s) pending",
-        "followup.section_next_steps": "Next steps",
-        "followup.section_human_review": "Needs human review",
-        "followup.body": "text: {text}",
-        "followup.approved_head": "approved — {n} waiting for the planner to file a task",
-        "followup.approved_at": "(approved {ts})",
-        "followup.hint_approve": "approve: {cli} approve <id>",
-        "followup.hint_dismiss": "dismiss: {cli} dismiss <id> --reason <reason>",
-        "followup.hint_reroute": "reroute: {cli} reroute <id>   (rejected → awaiting a human)",
-        "followup.approved_msg": (
-            "approved: {fid} → open+approved. The next planner run injects it in the "
-            "human-approved block. The planner only runs on a run completion, a task "
-            "change or the 24h heartbeat, so on a quiet day this can take up to about "
-            "24 hours."),
-        "followup.dismissed_msg": "dismissed: {fid} → done (dismissed: {reason})",
-        "followup.rerouted_msg": "rerouted: {fid} → {status}",
         "alert.reason": "reason: {reason}",
         "alert.account_switch": (
             "🔁 Claude account switched {frm} → {to} ({reason}) — "
@@ -297,10 +252,6 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⏱️ Parked after {n} consecutive stage timeouts — "
             "decide whether to split it further or run it as a long_job"),
         "alert.timeout_checkpointed": "work is checkpointed on the origin worker branch (not lost)",
-        "alert.blocker_cancelled": (
-            "🔗 An upstream task this one waited on was cancelled — "
-            "decide whether this task is still needed or should be cancelled too"),
-        "alert.upstream": "upstream: {blocker}",
         "alert.propagate": (
             "🔗 Upstream '{proj}' changed, so {n} downstream integration check(s) "
             "were created — check their results"),
@@ -373,10 +324,10 @@ MESSAGES: dict[str, dict[str, str]] = {
             "`reconcile_merged()` closes the row via the \"todo already closed\" path "
             "— no requeue needed (no hand edit of the ledger either)"),
         "trace.ledger.unpark": (
-            "  - release: once the blocker is resolved, switch the task md's "
-            "`worker_mode` to a non-dispatch value (`blocked` etc.) and back to "
-            "`auto`; `reconcile_unparked()` reads that transition as the release "
-            "signal and requeues automatically — no hand edit of the ledger needed"),
+            "  - release: once the blocker is resolved, commit the task md change and "
+            "reserve a resume with `python -m todo_system.cli resume <slug> --after-commit "
+            "<sha>`; on the next tick `reconcile_resumes()` requeues it — no hand edit "
+            "of the ledger needed"),
         "trace.ledger.long_job": "- long_job running",
         "trace.ledger.checkout_busy": (
             "- waiting for the checkout (another run is using the same checkout "

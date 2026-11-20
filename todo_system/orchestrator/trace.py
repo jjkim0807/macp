@@ -176,7 +176,7 @@ def _ledger_section(slug: str, ledger) -> list[str]:
         out.append(i18n.t("trace.ledger.parked"))
         if a.blocked_on and _merged_park(a):
             # reconcile_merged parked this row: its PR merged, a step a human owes
-            # is still open. The recipe below is wrong here — reconcile_unparked
+            # is still open. The resume recipe below is wrong here — resuming
             # would flip the row to FAILED and clear the blocker, sending merged
             # work back down the retry path. The check is dashboard's own function,
             # so this view and Orchestrator.md cannot name different exits.

@@ -364,11 +364,9 @@ def test_npm_bin_next_to_node(tmp_path, monkeypatch):
 def _neutralise_tick(monkeypatch) -> list[str]:
     """Stub every other upkeep step; returns the list restart_stale_daemons appends to."""
     monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
-    monkeypatch.setattr(worker, "autoclose_stale_reviews_local", lambda: 0)
     monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
     monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     monkeypatch.setattr(worker, "rotate_logs", lambda: [])
-    monkeypatch.setattr(worker, "check_unapplied_migrations", lambda: [])
     monkeypatch.setattr(worker, "pull_engine_checkout", lambda: [])
     monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: [])
     monkeypatch.setattr(worker, "sync_wrappers", lambda: [])

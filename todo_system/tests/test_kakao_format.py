@@ -21,7 +21,6 @@ from todo_system.kakao_format import (
 )
 from todo_system import i18n
 from todo_system.kakao_format import compose_digest
-from todo_system.orchestrator import followups
 
 # The 2026-09-16 19:42 [검토요청] macp-dashboard-public-access blocker, verbatim.
 BLOCKER_1942 = (
@@ -183,8 +182,6 @@ def test_kakao_vault_dir_honoured_even_when_macp_vault_root_unset(monkeypatch, t
 # The digest headline, empty-entry marker and route()'s merge suffix, pinned byte
 # for byte as they read before they went through i18n.t().
 
-_KO_HUMAN_HEAD = "🙋 사람 결정 대기(followups human)"
-
 
 def _route_paths(tmp_path: Path) -> dict:
     return {"dedup_path": tmp_path / "dedup.json", "digest_path": tmp_path / "digest.jsonl",
@@ -197,14 +194,13 @@ def test_ko_digest_headline_without_a_pending_decision(monkeypatch):
         "📮 macp 알림 요약 1건 — 조치 불필요\n· ⚠️ beta: built 12")
 
 
-def test_ko_digest_headline_with_a_pending_decision_and_an_empty_entry(monkeypatch):
+def test_ko_digest_headline_with_an_empty_entry(monkeypatch):
     monkeypatch.setenv("MACP_LANGUAGE", "ko")
-    out = kakao_format.compose_digest(
-        [{"msg": f"{_KO_HUMAN_HEAD}: [abcdef012345] demo"}, {"msg": ""}])
+    out = kakao_format.compose_digest([{"msg": "⚠️ beta: built 12"}, {"msg": ""}])
     assert out == (
-        "📮 macp 알림 요약 2건 — 결정 1건 대기\n"
+        "📮 macp 알림 요약 2건 — 조치 불필요\n"
         "· (빈 항목)\n"
-        f"· {_KO_HUMAN_HEAD}: [abcdef012345] demo")
+        "· ⚠️ beta: built 12")
 
 
 def test_ko_route_merge_suffix(monkeypatch, tmp_path):
@@ -221,38 +217,6 @@ def test_ko_route_merge_suffix(monkeypatch, tmp_path):
 # whichever language the engine's own text is in.
 
 _LANGS = pytest.mark.parametrize("lang", ["ko", "en"])
-_LONG_SLUG = " ".join(f"part{i:02d}-of-a-very-long-slug" for i in range(12))   # ~300 chars
-_LONG_REASON = " ".join([BLOCKER_1942] * 15)                                  # > 4000 chars
-_FID = "abcdef012345"
-
-
-def _parked(**kw) -> dict:
-    rec = {"id": _FID, "source_task": _LONG_SLUG, "human_reason": _LONG_REASON,
-           "status": "awaiting_human"}
-    rec.update(kw)
-    return rec
-
-
-@_LANGS
-def test_followup_digest_notice_clips_the_same_in_both_languages(monkeypatch, lang):
-    monkeypatch.setenv("MACP_LANGUAGE", lang)
-    msg = followups._digest_message(_parked())
-    first = msg.splitlines()[0]
-    assert len(msg) <= KAKAO_TEXT_LIMIT
-    assert first.startswith(f"{followups.human_digest_head()}: [{_FID}] ")
-    assert len(first.split(f"[{_FID}] ", 1)[1]) <= 60          # slug capped at 60
-    assert msg.endswith("…")                                    # tail clipped, marked
-    kept = msg.splitlines()[-1][:-1].split()
-    assert kept[1:] == _LONG_REASON.split()[: len(kept) - 1]   # whole words only
-
-
-@_LANGS
-def test_digest_singleton_keeps_the_followup_id_in_both_languages(monkeypatch, lang):
-    monkeypatch.setenv("MACP_LANGUAGE", lang)
-    digest = compose_digest([{"msg": followups._digest_message(_parked())}])
-    line = digest.splitlines()[1]
-    assert len(line) <= 60
-    assert f"[{_FID}]" in line
 
 
 @_LANGS

@@ -1,7 +1,7 @@
 """Stale human-owned tasks — surface work that nothing else is chasing.
 
-The orchestrator nudges its own parked assignments (`renudge_due`), but that
-only reaches tasks which already have a ledger entry. A task a human owns and
+The orchestrator surfaces its own parked assignments, but that only reaches
+tasks which already have a ledger entry. A task a human owns and
 never dispatched has no ledger entry at all, so nothing ever pings it: no
 `due`, no `not_before`, no assignment, no nudge — it just ages out of sight.
 This module finds exactly those and hands them to the dashboard renderer, which

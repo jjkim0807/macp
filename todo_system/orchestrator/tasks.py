@@ -466,7 +466,7 @@ def parents_with_open_children(db_path: str | Path = DEFAULT_DB) -> set[str]:
     That row shape is normal when a run's only output was the split itself: the
     0-commit run ends `result-no-pr` ("merge withheld for human review") and the
     children carry the work (mulkko-95-focus-block-implementation, 2026-10-13).
-    renudge_due and the dashboard use this to keep such a parent out of "사람 대기".
+    The dashboard uses this to keep such a parent out of "사람 대기".
 
     Read-only; a missing or unreadable DB is an empty set (fail open to the old
     behavior — the parent shows as parked, which is noisy but never hides work)."""
@@ -651,8 +651,8 @@ def mark_done(slug: str, items_dir: str | Path | None = None,
     # while todo.db still said open, which is the dispatch source, so the task
     # stayed dispatchable and got re-run on an empty diff. The leaked connection
     # also kept a write lock, making the NEXT writer fail with "database is
-    # locked". Both sibling closers (worker.py review-autoclose, cli.py complete)
-    # already commit; this one did not.
+    # locked". The sibling closer (cli.py complete) already commits; this one did
+    # not.
     try:
         con = cli.db_connect(db_path or cli.DB_PATH)
         try:

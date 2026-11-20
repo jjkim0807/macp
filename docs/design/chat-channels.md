@@ -469,13 +469,13 @@ GET /api/channels → 200 {"channels": [ {"id": "...", "title": "...", "can_post
 | 발신처 (`KAKAO_ALERTS.md` 행) | 지금 | 채널 출처 태스크일 때 | 이유 |
 |---|---|---|---|
 | 검토요청 `_notify_review` — `review:<framing>:<task>` + 6h (`:41`) | 즉시 | **즉시 유지** + 채널 딥링크 | 사람 판단 |
-| 유실·격리·timeout·상류 취소·상위 점검 `_notify_orphaned_commits`·`_notify_poison`·`_notify_timeout_park`·`_notify_blocker_cancelled`·`_notify_parent_complete` (`:42-46`) · 재촉 `_nudge` (`:49`) | 즉시 | 즉시 유지 + 딥링크 | 수동 처리 |
+| 유실·격리·timeout·상위 점검 `_notify_orphaned_commits`·`_notify_poison`·`_notify_timeout_park`·`_notify_parent_complete` (`:42-45`) · 첫 할당 `_nudge` (`:48`) | 즉시 | 즉시 유지 + 딥링크 | 수동 처리 |
 | human-ready `_notify_human_ready` — `human-ready:<slug>` (`:47`) | 즉시 | 즉시 유지 + 딥링크 | 사람 차례 |
 | TASK_ASSIGN `deliver_pending` — `assign:<task>` (`:50`) | 즉시 | 즉시 유지 + 딥링크 | 채널을 떠난 뒤에도 남는 유일한 "당신 차례" 신호일 수 있다(`:50` 의 번복 이유) |
 | worker fail `_run_next_impl` — `worker-fail:<slug>` (`:60`) | 즉시 | 즉시 유지 + 딥링크 | 런 로그 확인 |
 | worker start `_run_next_impl` — `worker-start:<slug>` (`:59`) | 요약 | **무음** | 스레드의 `progress` 가 같은 사실을 보인다 |
 | worker done `_run_next_impl` — `worker-done:<slug>` (`:61`) | 요약 | **무음** | 스레드의 `result` 가 같은 사실을 보인다 |
-| 하류 전파 `_propagate_downstream` (`:48`) · followups 결정 대기 `_notify_awaiting` (`:51`) | 요약 | 요약 유지 | 새로 생긴 하류·후속 태스크는 채널 출처가 아니라 채널에 뜨지 않는다 |
+| 하류 전파 `_propagate_downstream` (`:48`) | 요약 | 요약 유지 | 새로 생긴 하류·후속 태스크는 채널 출처가 아니라 채널에 뜨지 않는다 |
 | 실계좌 알림 전부 (`:82`) | 즉시 | **하향 금지** | 돈 — 채널과 무관 |
 | 그 밖의 발신처(`:52-58,62-69` — 정체·유휴·재기동·미커밋 정지·베타·헬스·인증·SMS 수신 거부 등; 외부 리포의 나머지 행 `:78-85`) | 지금 등급 | 그대로 | 채널 출처와 무관한 시스템·외부 경보이거나 이미 행동이 필요한 즉시 등급이다 |
 | (새) 즉답 · 라우팅 판정 · `note` | — | **보내지 않는다** | 채널에서 시킨 일의 응답은 채널에만 |

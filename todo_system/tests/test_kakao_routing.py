@@ -171,18 +171,7 @@ def test_compose_digest_groups_repeats_and_stays_within_budget():
     assert "[Planner]" in text                    # the singleton keeps its first line
 
 
-def test_compose_digest_headline_flags_pending_human_decisions():
-    entries = (
-        [{"msg": f"🤖 Worker 시작: task-{i} (mode=auto, 5 stage) — 조치 불필요"} for i in range(3)]
-        + [{"msg": "🙋 사람 결정 대기(followups human): [abc123] some-slug"},
-           {"msg": "🙋 사람 결정 대기(followups human): [def456] other-slug"}]
-    )
-    headline = compose_digest(entries).splitlines()[0]
-    assert "결정 2건 대기" in headline
-    assert "조치 불필요" not in headline
-
-
-def test_compose_digest_headline_keeps_no_action_wording_without_human_entries():
+def test_compose_digest_headline_keeps_no_action_wording():
     entries = [{"msg": f"🤖 Worker 시작: task-{i} (mode=auto, 5 stage) — 조치 불필요"} for i in range(3)]
     headline = compose_digest(entries).splitlines()[0]
     assert "조치 불필요" in headline

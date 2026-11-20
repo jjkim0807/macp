@@ -188,9 +188,7 @@ macp asks only when a decision is really yours, and it says exactly what it need
   question and the blocker (`blocked_on`) are recorded and shown in the daily brief and
   on the dashboard.
 - Tasks that only a person can do (`worker_mode: manual`, or routed to your `human`
-  agent) are tracked in the same ledger. Re-nudges back off over time.
-- A project that quietly stalls gets **one** decision task instead of silence
-  (`orchestrator/project_stall.py`).
+  agent) are tracked in the same ledger.
 
 Answer from the CLI:
 
@@ -230,7 +228,7 @@ workers.
 | `todo_system/orchestrator/model_select.py` | model tiers and ladders |
 | `todo_system/orchestrator/assignment.py`, `mailbox.py`, `message.py`, `registry.py` | the ledger, mailboxes, message types and agent registry |
 | `todo_system/orchestrator/rescope.py`, `followups.py`, `discovery.py`, `planner_mode.py` | splitting, follow-ups, discovery, planner intensity |
-| `todo_system/orchestrator/human.py`, `resume.py`, `project_stall.py`, `decisions.py` | the human side: replies, conditional resume, stall and decision surfacing |
+| `todo_system/orchestrator/human.py`, `resume.py`, `decisions.py` | the human side: replies, conditional resume, decision surfacing |
 | `todo_system/orchestrator/trace.py`, `metrics.py`, `dashboard.py` | read-only views of the system |
 | `todo_system/usage_guard.py` | subscription usage pacing |
 | `todo_system/macp/` | profiles and accounts (`python -m todo_system.macp`) |

@@ -330,7 +330,6 @@ class SyncVaultStateTest(unittest.TestCase):
         def maintenance_tick():
             buf = io.StringIO()
             with mock.patch.object(worker, "IS_REMOTE_HOST", False), \
-                 mock.patch.object(worker, "autoclose_stale_reviews_local", return_value=0), \
                  mock.patch.object(worker, "sweep_remote_completed_runs", return_value=0), \
                  mock.patch.object(worker, "rotate_logs", side_effect=_Stop), \
                  mock.patch.object(worker, "VAULT_SYNC_LOCK_TIMEOUT_S", 0.2), \

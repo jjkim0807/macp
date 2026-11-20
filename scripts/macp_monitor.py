@@ -87,7 +87,6 @@ ISSUE_MARKER = "[macp-monitor]"                     # title tag => auto-filed by
 
 POISON_THRESHOLD = 3
 STALE_PENDING_HOURS = 48                            # pending, no assignment, this old
-UNNUDGED_PARKED_HOURS = 48                          # awaiting_human, never nudged, this old
 LOG_SIZE_WARN_MB = 200                              # unrotated single-file threshold
 LOG_DELTA_ERR_MIN = 8                               # min occurrences of a NEW signature
 UNMERGED_BRANCH_STALE_HOURS = 12                    # done assignment, branch still unmerged
@@ -586,55 +585,6 @@ def check_stale_pending(findings: list, q_runs: list, assigns: dict,
         })
 
 
-def check_unnudged_parked(findings: list, assigns: dict) -> None:
-    """Parked for a human but never actually nudged — the escalation is mute.
-
-    `awaiting_human` means "human parked, or AI escalated for input"
-    (assignment.py). `renudge_due` is what turns that state into a kakao ping on
-    a 1d/3d/7d/14d backoff, so a parked assignment two days old that still has
-    `nudge_index == 0` means the notification path never fired at all: the work
-    is not merely waiting on someone, it is invisible to them.
-
-    Deliberately narrow. It does NOT flag parked work as such — waiting on a
-    human is a legitimate resting state that can last weeks, and firing on age
-    alone would turn every correctly-nudged task into a false positive. The
-    defect being detected is the *silence*, so any nudge at all (`nudge_index >
-    0`) clears it no matter how old the assignment gets. Poisoned assignments
-    are left to `check_poison`, which already reports them on their own path.
-
-    Motivated by 2026-09-06: `renudge_due` filtered on the ASSIGNEE being human,
-    which skipped everything an AI agent had escalated — those assignments name
-    the AI, not the person. parent-match-app-16b sat 10.4 days, code complete
-    and every gate green, without a single nudge; `stale.py` missed it too
-    because it only looks for tasks with NO assignment.
-    """
-    now = _now()
-    mute = []
-    for a in assigns.values():
-        if a.get("state") != "awaiting_human" or a.get("nudge_index", 0) > 0:
-            continue
-        if a.get("refail_count", 0) >= POISON_THRESHOLD:
-            continue                                  # check_poison owns these
-        since = _parse_ts(a.get("updated_ts") or a.get("created_ts"))
-        if not since:
-            continue
-        age_h = (now - since).total_seconds() / 3600
-        if age_h >= UNNUDGED_PARKED_HOURS:
-            mute.append({"slug": a.get("task_id"), "age_h": round(age_h, 1),
-                         "agent_id": a.get("agent_id"),
-                         "blocked_on": (a.get("blocked_on") or "")[:160]})
-    if mute:
-        findings.append({
-            "fingerprint": "unnudged-parked:" + ",".join(sorted(x["slug"] for x in mute)),
-            "severity": "bug",
-            "title": f"{len(mute)}개 파킹 태스크가 {UNNUDGED_PARKED_HOURS}h+ 동안 한 번도 nudge되지 않음",
-            "evidence": mute,
-            "detail": "awaiting_human인데 nudge_index=0 → renudge 경로가 아예 안 돌았다는 뜻. "
-                      "사람이 기다리는 상태가 아니라 사람이 모르는 상태다. "
-                      "registry projects 라우팅과 renudge_due 필터부터 확인할 것.",
-        })
-
-
 def check_poison(findings: list, assigns: dict) -> None:
     """Tasks quarantined (awaiting_human, refail>=threshold). These self-notify
     via kakao, but a recurring poison on macp's OWN repos is worth a tracked
@@ -1066,7 +1016,6 @@ def scan(show_all: bool = False, baseline: bool = False, daemon: bool = False) -
     check_unmerged_delegate_branch(findings, assigns)
     check_stale_pending(findings, q_runs, assigns, usage_hold_reason())
     check_poison(findings, assigns)
-    check_unnudged_parked(findings, assigns)
     check_pre_poison(findings, assigns)
     check_orchestrator_noop(findings, assigns)
     check_usage_guard(findings)

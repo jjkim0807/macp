@@ -47,12 +47,11 @@ REPO = "https://example.invalid/acme/heavy-app.git"
 # The tick reads machine state through these; the routing/reroute logic is the
 # subject here, so every other sweep is stubbed (same seam as
 # test_orchestrator._hermetic_tick, plus a `now` the reroute clock needs).
-_STUBBED = ("collect", "reconcile_merged", "reconcile_unblocked",
-            "reconcile_unparked", "reconcile_closed", "reconcile_queue",
-            "reconcile_parents", "renudge_due", "reap_stale",
+_STUBBED = ("collect", "reconcile_merged", "reconcile_closed", "reconcile_queue",
+            "reconcile_parents", "reap_stale",
             "reconcile_resumes", "reconcile_rescope", "reconcile_split_parents",
             "reconcile_human_ready",
-            "_advote_bridge_tick", "_beta_sweep_tick", "_project_stall_tick")
+            "_advote_bridge_tick", "_beta_sweep_tick")
 
 
 def _tick(orch, task_list, *, now=None, live=()):

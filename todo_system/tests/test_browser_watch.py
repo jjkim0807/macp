@@ -245,11 +245,9 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
         return _f
 
     monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
-    monkeypatch.setattr(worker, "autoclose_stale_reviews_local", rec("autoclose", 0))
     monkeypatch.setattr(worker, "sweep_remote_completed_runs", rec("sweep", 0))
     monkeypatch.setattr(worker, "sync_vault_state", rec("sync", 0))
     monkeypatch.setattr(worker, "rotate_logs", rec("rotate", []))
-    monkeypatch.setattr(worker, "check_unapplied_migrations", rec("migrations", []))
     monkeypatch.setattr(worker, "bump_vault_engine_pin", rec("vault-pin", []))
     monkeypatch.setattr(worker, "sync_wrappers", rec("wrappers", []))
     monkeypatch.setattr(worker, "restart_stale_daemons", rec("restart", []))
@@ -262,16 +260,15 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
     monkeypatch.setattr(worker.browser_watch, "check_login_watch", boom)
     monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", rec("disk-prune", None))
     assert worker.cmd_maintenance() == 1
-    assert called == ["autoclose", "sweep", "sync", "rotate", "migrations",
+    assert called == ["sweep", "sync", "rotate",
                       "vault-pin", "wrappers", "restart", "silence", "starvation",
                       "disk-prune"]
 
 
 def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
-    for name in ("autoclose_stale_reviews_local", "sweep_remote_completed_runs",
-                 "sync_vault_state"):
+    for name in ("sweep_remote_completed_runs", "sync_vault_state"):
         monkeypatch.setattr(worker, name, lambda: 0)
-    for name in ("rotate_logs", "check_unapplied_migrations", "restart_stale_daemons",
+    for name in ("rotate_logs", "restart_stale_daemons",
                  "sync_wrappers", "bump_vault_engine_pin"):
         monkeypatch.setattr(worker, name, lambda: [])
     for name in ("check_dispatch_silence", "check_work_starvation"):

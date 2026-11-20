@@ -39,7 +39,6 @@ class Agent:
     notify: list[str] = field(default_factory=list)
     reply_via: list[str] = field(default_factory=list)
     sla: str | None = None
-    renudge_backoff: list[str] = field(default_factory=list)
     wake: str | None = None
     concurrency: int = 1
     capabilities: list[str] = field(default_factory=list)

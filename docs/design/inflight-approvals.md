@@ -317,7 +317,7 @@ V3 에서 결정에 쓰인 사실을 더 적는다. ⓐ 한 턴에 호출이 여
 - **재개 송신.** `reconcile_approvals` 는 `dispatch()` 를 거치지 않는다. AWAITING_HUMAN 은 거기서 busy 이고, FAILED
   분기를 타면 `refail_count += 1`(`:734-736`)이 된다. `_retry` 의 송신 모양(`:1755-1767` — 새 corr_id, 에이전트 자기
   전송로)을 쓰되 `attempts`·`refail_count` 는 바꾸지 않는다. `approval_resume{run_id, stage, approval_id,
-  session_id}` 는 봉투에만 싣는다 — `envelope_extra` 가 원장 payload 를 오염시키지 않게 한 선례(`:658-660`)와 같다.
+  session_id}` 는 봉투에만 싣는다 — heavy 라우팅의 `requires` 가 원장 payload 를 오염시키지 않게 한 선례(`dispatch()`)와 같다.
 - **러너 재개.** run_id 를 새로 만들지 않는다(`runner.py:1091-1093` 대신 기존 run dir 을 검증해 재사용 — 그
   태스크의 dir 인가, 저장소의 카드가 answered 인가). 브랜치 준비는 그대로다(외부 리포는 origin/<branch> 를 이어 감
   `:1042`, 볼트 `:1070`). `stages.json` 의 완료 스테이지는 상속과 같은 모양으로 건너뛰고(`:1235-1238`), 멈췄던
