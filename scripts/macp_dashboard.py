@@ -2045,6 +2045,20 @@ border-radius:8px;cursor:pointer;font-size:13px;padding:7px 12px;width:100%}
 .amode{background:color-mix(in srgb,var(--card),var(--bd));border:1px solid var(--bd);color:var(--blu);
 border-radius:8px;cursor:pointer;font-size:12px;padding:3px 9px;margin-left:8px;white-space:nowrap}
 .amode:hover{border-color:var(--blu)}.amode:disabled{opacity:.5;cursor:wait}
+/* Triage card under an attention / parked row: reason, evidence, advice, the server's
+   buttons, a one-line instruction box and the result sentence (tokens only). */
+.tri{margin-top:6px;border-left:2px solid var(--bd);padding-left:8px}
+.treason{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.tadv{font-size:13px;margin-top:3px;overflow-wrap:anywhere}
+.tacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.tbtn{background:color-mix(in srgb,var(--card),var(--bd));border:1px solid var(--bd);color:var(--blu);
+border-radius:8px;cursor:pointer;font-size:12px;padding:3px 9px;white-space:nowrap}
+.tbtn:hover{border-color:var(--blu)}.tbtn:disabled{opacity:.5;cursor:wait}
+.tin{display:flex;gap:6px;margin-top:6px}
+.tri-in{flex:1;min-width:0;background:var(--bg);color:var(--fg);border:1px solid var(--bd);
+border-radius:6px;font:inherit;font-size:13px;padding:3px 8px}
+.tmsg{font-size:13px;margin-top:4px;overflow-wrap:anywhere}
+.tmsg.ok{color:var(--grn)}.tmsg.err{color:var(--red)}
 .empty{color:var(--mut);font-size:13px;padding:5px 0}
 .mut{color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
@@ -2081,6 +2095,7 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
       <div class="m"><b id="mv-human">–</b><span>@@dash.html.decide@@</span></div>
       <div class="m"><b id="mv-active">–</b><span>@@dash.html.in_progress@@</span></div>
     </div>
+    <div class="tmsg" id="tri-toast" role="status" hidden></div>
   </section>
 
   <!-- @@dash.cmt.projects@@ -->
@@ -2221,8 +2236,8 @@ const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
 // `⛓ N` = N unfinished depends_on (title lists them). A symbol + a count, so no
 // new i18n key is needed and the ko/en DASHBOARD parity test is untouched.
-const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div></div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
-const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div></div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
+const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div>${triBlock(r.slug,r.triage)}</div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
+const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div>${triBlock(r.task,r.triage)}</div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
 const projRow=r=>{const t=r.leaves_total||0,dn=r.leaves_done||0,pc=t?Math.round(dn*100/t):0,st=PST[r.status];
@@ -2244,6 +2259,52 @@ async function setAgentMode(btn){
     if(!r.ok)throw new Error(String(r.status));
     await tick();
   }catch(_){btn.disabled=false;btn.textContent='✗ @@dash.js.agent_mode_failed@@'}
+}
+// Triage card (orchestrator/triage.py; the server judges, this only renders): reason,
+// evidence, advice and the buttons the server offers (labels included). A click posts
+// {task, action[, text]} to /api/action and shows the reply message as-is, never an HTTP
+// status. No confirm dialog: the click is the approval. Per-slug UI state survives the poll.
+const triState={};
+const ts=s=>triState[s]||(triState[s]={});
+function triBlock(slug,t){
+  if(!t)return '';
+  const st=ts(slug),s=esca(slug),dis=st.busy?' disabled':'';
+  const ev=(t.evidence||[]).map(e=>`<div class="note">${esc(e)}</div>`).join('');
+  const btns=(t.actions||[]).map(a=>`<button class="tbtn" data-act="${esca(a.id)}" data-slug="${s}"${dis}>${esc(a.label)}</button>`).join('');
+  const box=st.open?`<div class="tin"><input class="tri-in" data-slug="${s}" maxlength="500" placeholder="@@dash.js.tri_placeholder@@" value="${esca(st.draft)}"><button class="tbtn" data-act="instruct-send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>`:'';
+  const msg=st.busy?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.msg?`<div class="tmsg ${st.ok?'ok':'err'}">${esc(st.msg)}</div>`:'');
+  return `<div class="tri"><div class="treason">${esc(t.reason)}</div>${ev}${t.advice?`<div class="tadv">${esc(t.advice)}</div>`:''}${btns?`<div class="tacts">${btns}</div>`:''}${box}${msg}</div>`;
+}
+// The result also lands on the status card for 15 s: a cancel or merge removes the row.
+let triToastTimer=null;
+function triToast(msg,ok){const el=$('tri-toast');if(!el)return;el.textContent=msg;el.className='tmsg '+(ok?'ok':'err');el.hidden=false;
+  clearTimeout(triToastTimer);triToastTimer=setTimeout(()=>{el.hidden=true},15000)}
+async function triAct(slug,action,text){
+  const st=ts(slug);if(st.busy)return;
+  st.busy=true;st.msg='';if(last)update(last);
+  let ok=false,msg='@@dash.js.tri_net_fail@@';
+  try{
+    const r=await fetch('/api/action',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(text==null?{task:slug,action}:{task:slug,action,text})});
+    const j=await r.json();
+    if(j&&typeof j.message==='string'&&j.message){msg=j.message;ok=j.ok===true}
+  }catch(_){}
+  st.busy=false;st.msg=msg;st.ok=ok;
+  if(ok){st.open=false;st.draft=''}
+  triToast(msg,ok);
+  await tick();
+}
+function triSend(slug){const st=ts(slug),v=(st.draft||'').trim();
+  if(!v){st.msg='@@dash.js.tri_need_text@@';st.ok=false;if(last)update(last);return}
+  triAct(slug,'instruct',v)}
+function triClick(btn){
+  const slug=btn.dataset.slug||'',act=btn.dataset.act||'',st=ts(slug);
+  if(act==='instruct'){st.open=!st.open;st.msg='';if(last)update(last);
+    if(st.open){const el=[...document.querySelectorAll('.tri-in')].find(x=>x.dataset.slug===slug);if(el)el.focus()}
+    return}
+  if(act==='instruct-send'){triSend(slug);return}
+  triAct(slug,act,null);
 }
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
 
@@ -2410,16 +2471,21 @@ function update(d){
   $('mv-open').textContent=(d.todo&&d.todo.open)||0;
   setUsage(d.usage);
 
+  // While a triage instruction is being typed, the lists that hold its input box keep
+  // their rows (counts still update): a re-render every 3 s would drop the caret.
+  const typing=!!(document.activeElement&&document.activeElement.classList.contains('tri-in'));
   const blocked=rest.filter(r=>r.why==='blocked'),open=rest.filter(r=>r.why!=='blocked');
   const life=open.filter(r=>r.category!=='dev'),dev=open.filter(r=>r.category==='dev');
   $('cnt-blocked').textContent=blocked.length;
-  foldFill('human-blocked','human-blocked',blocked,humanRow,'@@dash.js.none@@');
+  if(!typing)foldFill('human-blocked','human-blocked',blocked,humanRow,'@@dash.js.none@@');
   $('cnt-urgent').textContent=urgent.length;$('cnt-later').textContent=later.length;
   $('cnt-life').textContent=life.length;$('cnt-dev').textContent=dev.length;
-  foldFill('human-urgent','human-urgent',urgent,humanRow,'@@dash.js.nothing_urgent@@');
-  foldFill('human-life','human-life',life,humanRow,'@@dash.js.none@@');
-  foldFill('human-dev','human-dev',dev,humanRow,'@@dash.js.none@@');
-  foldFill('human-later','human-later',later,humanRow,'@@dash.js.none@@');
+  if(!typing){
+    foldFill('human-urgent','human-urgent',urgent,humanRow,'@@dash.js.nothing_urgent@@');
+    foldFill('human-life','human-life',life,humanRow,'@@dash.js.none@@');
+    foldFill('human-dev','human-dev',dev,humanRow,'@@dash.js.none@@');
+    foldFill('human-later','human-later',later,humanRow,'@@dash.js.none@@');
+  }
   // empty sub-blocks fold away (human-urgent keeps its ✓ empty line; c-human stays).
   $('d-humanlife').hidden=!life.length;
   $('d-humandev').hidden=!dev.length;
@@ -2440,7 +2506,7 @@ function update(d){
 
   $('cnt-attn').textContent=d.attention.length;
   $('c-attention').hidden=!d.attention.length;   // @@dash.cmt.hide_broken@@
-  foldFill('attention','attention',d.attention,attnRow,'@@dash.js.nothing_attention@@');
+  if(!typing)foldFill('attention','attention',d.attention,attnRow,'@@dash.js.nothing_attention@@');
 
   // @@dash.html.in_progress@@: top ACTLIM on the first screen (folded by project), rest behind @@dash.html.more@@.
   // cnt-active stays the full count; foldFill keeps its grouping on the shown slice.
@@ -2539,6 +2605,9 @@ function mount(){
     const tb=e.target.closest('#theme');if(tb){const i=THEMES.indexOf(themeGet());themeSet(THEMES[(i+1)%3]);return}
     const c=e.target.closest('.cp');if(c){e.stopPropagation();cp(c);return}
     const am=e.target.closest('[data-amode]');if(am){e.stopPropagation();setAgentMode(am);return}
+    // triage buttons first: they sit inside a row whose data-open would open the detail
+    const ta=e.target.closest('[data-act]');if(ta){e.stopPropagation();triClick(ta);return}
+    if(e.target.closest('.tri'))return;
     if(e.target.closest('#dv-back')){history.back();return}
     if(e.target.closest('#dv-reload')){if(dstack.length)showDetail(dstack[dstack.length-1]);return}
     const gh=e.target.closest('[data-grp]');   // group header (no data-open) → toggle fold
@@ -2549,7 +2618,11 @@ function mount(){
     const m=e.target.closest('.more');if(m){const sec=m.dataset.sec;showAll[sec]=!showAll[sec];
       if(last){if(sec==='recent')renderHistory(last);else update(last)}}
   });
-  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&dstack.length)history.back()});
+  document.addEventListener('keydown',e=>{
+    const ti=e.target.closest&&e.target.closest('.tri-in');
+    if(ti&&e.key==='Enter'&&!e.isComposing){e.preventDefault();const s=ti.dataset.slug||'';ts(s).draft=ti.value;ti.blur();triSend(s);return}
+    if(e.key==='Escape'&&dstack.length)history.back()});
+  document.addEventListener('input',e=>{const ti=e.target.closest&&e.target.closest('.tri-in');if(ti)ts(ti.dataset.slug||'').draft=ti.value});
   mounted=true;
 }
 

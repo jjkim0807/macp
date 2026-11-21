@@ -2917,8 +2917,13 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # 2026-11-17: +432 bytes = tick()'s 45 s disconnect grace (DISCONNECT_AFTER_MS /
 # lastOk / showDisconnected / 401 branch, macp-dashboard-status-background-refresh);
 # no new i18n key; the rest of the page is byte-identical.
-_KO_HTML_SHA256 = "7607063afc672173f3007cd171d0ba819239f7ab33809731be03cb673cbb2df8"
-_KO_HTML_LEN = 46481
+# 2026-11-21: +4911 bytes = the attention triage card (macp-attention-triage-and-actions):
+# its CSS, the #tri-toast line, triBlock/triToast/triAct/triSend/triClick, the
+# triBlock() call in attnRow and humanRow, the [data-act]/.tri click guard, the
+# keydown/input handlers and update()'s typing guard (five new i18n keys); the rest of
+# the page is byte-identical.
+_KO_HTML_SHA256 = "9e191ce52955d15dbf62d58b0e7b1f0e0b1192dbb578a461e0ea63befeab815e"
+_KO_HTML_LEN = 51392
 _HANGUL = re.compile("[가-힣]")
 
 

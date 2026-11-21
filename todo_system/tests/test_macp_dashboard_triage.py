@@ -440,5 +440,92 @@ class ActionRoute(_GitTriageVault):
         self.assertIn("status: open", (self.items / f"{self.ORPHAN}.md").read_text(encoding="utf-8"))
 
 
+# --- the web card (static page, no browser) -------------------------------------------
+
+class TriageCardShell(unittest.TestCase):
+    """The card renders what the server sends and nothing else; the live look (390 px,
+    no horizontal scroll) is a run-log screenshot, not a gate."""
+
+    T = M._HTML_TEMPLATE
+
+    def block(self) -> str:
+        return self.T[self.T.index("const triState={};"):self.T.index("const depRow=")]
+
+    def line(self, prefix: str) -> str:
+        return next(ln for ln in self.T.splitlines() if ln.startswith(prefix))
+
+    def test_attention_and_human_rows_render_the_card(self):
+        self.assertIn("${triBlock(r.task,r.triage)}", self.line("const attnRow="))
+        self.assertIn("${triBlock(r.slug,r.triage)}", self.line("const humanRow="))
+        self.assertNotIn("triBlock(", self.line("const activeRow="))
+        self.assertNotIn("triBlock(", self.line("const recentRow="))
+
+    def test_the_card_renders_only_server_fields(self):
+        b = self.block()
+        for tok in ("esc(t.reason)", "t.evidence", "esc(t.advice)", "t.actions",
+                    "esc(a.label)", 'data-act="${esca(a.id)}"'):
+            self.assertIn(tok, b)
+        # no verdict on the client: it never reads the rule id or ledger fields
+        for tok in ("t.rule", "r.state", "r.note", "last_alert_kind", "pr_url"):
+            self.assertNotIn(tok, b)
+
+    def test_buttons_post_to_the_action_route(self):
+        b = self.block()
+        for tok in ("fetch('/api/action'", "method:'POST'", "credentials:'same-origin'",
+                    "'Content-Type':'application/json'", "{task:slug,action}",
+                    "{task:slug,action,text}"):
+            self.assertIn(tok, b)
+
+    def test_busy_disables_and_the_box_is_one_line_of_500(self):
+        b = self.block()
+        self.assertIn("dis=st.busy?' disabled':''", b)
+        self.assertEqual(b.count("${dis}>"), 2)                  # every button, incl. send
+        self.assertIn('<input class="tri-in"', b)
+        self.assertIn('maxlength="500"', b)
+
+    def test_the_result_is_the_server_message_never_a_status(self):
+        b = self.block()
+        act = b[b.index("async function triAct"):b.index("function triSend")]
+        self.assertNotIn("status", act)
+        self.assertIn("msg=j.message", act)
+        self.assertIn("'@@dash.js.tri_net_fail@@'", act)
+
+    def test_triage_clicks_never_open_the_detail_and_never_confirm(self):
+        m = self.T[self.T.index("function mount()"):]
+        self.assertLess(m.index("closest('[data-act]')"), m.index("closest('[data-open]')"))
+        self.assertLess(m.index("closest('.tri')"), m.index("closest('[data-open]')"))
+        self.assertNotIn("confirm(", self.T)
+
+    def test_toast_and_no_external_url(self):
+        self.assertIn('<div class="tmsg" id="tri-toast" role="status" hidden></div>', self.T)
+        self.assertNotIn("http://", self.T)
+        self.assertNotIn("https://", self.T)
+
+    def test_no_button_for_an_irreversible_step(self):
+        b = self.block().lower()
+        for word in ("deploy", "submit", "publish", "delete", "--admin"):
+            self.assertNotIn(word, b)
+        # the only action ids the client names are its own instruction-box controls
+        self.assertEqual(sorted(set(re.findall(r"act==='([a-z-]+)'", self.block()))),
+                         ["instruct", "instruct-send"])
+
+    def test_typing_keeps_the_rows_that_hold_the_box(self):
+        self.assertIn("document.activeElement.classList.contains('tri-in')", self.T)
+        for sec in ("human-urgent", "human-life", "human-dev", "human-later"):
+            self.assertIn(f"foldFill('{sec}','{sec}'", self.T)
+        self.assertIn("if(!typing)foldFill('attention','attention'", self.T)
+        self.assertIn("if(!typing)foldFill('human-blocked','human-blocked'", self.T)
+        self.assertIn("!e.isComposing", self.T)              # Enter that ends a Korean IME syllable
+
+    def test_both_languages_render_the_card_strings(self):
+        en, ko = M.render_html("en"), M.render_html("ko")
+        for s in ("Working…", "Could not send the request", "One-line instruction (max 500 chars)",
+                  "Write a one-line instruction first", ">Send</button>"):
+            self.assertIn(s, en)
+        self.assertIsNone(_HANGUL_RE.search(en))
+        for s in ("처리 중…", "요청을 보내지 못했어요", "지시 한 줄 (500자 이하)", ">보내기</button>"):
+            self.assertIn(s, ko)
+
+
 if __name__ == "__main__":
     unittest.main()
