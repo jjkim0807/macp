@@ -2925,6 +2925,13 @@ def _registry_agent(agent_id: str):
     return next((a for a in _registry_mode_agents() if a.id == agent_id), None)
 
 
+# POST /api/action runs gh/git through this callable (None = subprocess.run).
+# Seam for the route tests, looked up at call time.
+_ACTION_RUN = None
+# An instruction is one line: no control characters (newlines included).
+_ACTION_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 class _StatusCache:
     """Single-flight, short-TTL cache for the /api/status body.
 
@@ -3346,7 +3353,91 @@ class Handler(BaseHTTPRequestHandler):
         self._status_cache.invalidate()
         self._reply_json(200, res, extra)
 
+    # -- triage card actions (orchestrator/triage_actions.py) -----------------
+    # Behind the DASHBOARD token: a click on a card is the human's approval. The
+    # card is diagnosed again here and only an action it still offers runs.
+    ACTION_MAX_BYTES = 4096
+    ACTION_TEXT_MAX = 500
+
+    def _post_action(self):
+        extra = self._dashboard_gate()
+        if extra is None:
+            return
+
+        def refuse(code: int, key: str) -> None:
+            self._reply_json(code, {"ok": False, "message": i18n.t(f"triage.result.{key}")},
+                             extra)
+
+        # application/json only, like /api/agent-mode: no cross-site form POST.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            refuse(415, "bad_request")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length <= 0 or length > self.ACTION_MAX_BYTES:
+            refuse(413 if length > 0 else 400, "bad_request")
+            return
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            refuse(400, "bad_request")
+            return
+        if not isinstance(data, dict):
+            refuse(400, "bad_request")
+            return
+        slug, action, text = data.get("task"), data.get("action"), data.get("text")
+        from todo_system.orchestrator import triage as _tri
+        from todo_system.orchestrator import triage_actions as _acts
+        # the action id set is closed: an irreversible step has no id to ask for
+        if not isinstance(slug, str) or not SLUG_RE.match(slug) or action not in _tri.ACTIONS:
+            refuse(400, "bad_request")
+            return
+        if action == "instruct":
+            if (not isinstance(text, str) or _ACTION_CTRL_RE.search(text)
+                    or not 1 <= len(text.strip()) <= self.ACTION_TEXT_MAX):
+                refuse(400, "bad_text")
+                return
+            text = text.strip()
+        else:
+            text = None
+        try:
+            facts = _tri.gather(slug, assign_dir=ASSIGN, items_dir=ITEMS, runs_dir=RUNS,
+                                vault_root=VAULT, registry=_registry_or_none())
+            card = _tri.diagnose(facts)
+        except Exception as e:
+            logger.warning("dashboard action diagnosis failed task=%s err=%s", slug,
+                           type(e).__name__)
+            refuse(500, "internal")
+            return
+        if facts is None:
+            refuse(404, "unknown_task")
+            return
+        offered = {a["id"] for a in (card or {}).get("actions", [])}
+        if action not in offered or slug in _umbrellas_in_progress():
+            logger.info("dashboard action refused task=%s action=%s rule=%s (not offered)",
+                        slug, action, (card or {}).get("rule"))
+            refuse(409, "not_offered")
+            return
+        try:
+            ok, message = _acts.run_action(action, slug, facts, vault_root=VAULT,
+                                           items_dir=ITEMS, text=text, run=_ACTION_RUN)
+        except Exception as e:
+            logger.warning("dashboard action crashed task=%s action=%s err=%s", slug, action,
+                           type(e).__name__)
+            ok, message = False, i18n.t("triage.result.internal")
+        # the instruction text itself stays out of the log (length only)
+        logger.info("dashboard action task=%s action=%s rule=%s ok=%s text_len=%d",
+                    slug, action, card["rule"], ok, len(text or ""))
+        self._status_cache.invalidate()
+        self._reply_json(200, {"ok": ok, "message": message}, extra)
+
     def do_POST(self):
+        if urlparse(self.path).path == "/api/action":
+            self._post_action()
+            return
         if urlparse(self.path).path == "/api/agent-mode":
             self._post_agent_mode()
             return

@@ -261,6 +261,37 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.ev.resume_reserved": "재개 예약됨 — 다음 틱에 다시 디스패치돼요",
         "triage.ev.human_gate": "human_gate: 되돌릴 수 없는 단계가 남은 태스크",
         "triage.ev.md_missing": "태스크 md가 없어요",
+        # what a card's button did (orchestrator/triage_actions.py, POST /api/action)
+        "triage.result.merged": "머지했어요 — 다음 틱(5분 안)에 태스크가 닫혀요",
+        "triage.result.already_merged": "이미 머지된 PR이에요 — 다음 틱에 태스크가 정리돼요",
+        "triage.result.pr_closed": "PR이 닫혀 있어 머지하지 않았어요 — 다시 열거나 재개하세요",
+        "triage.result.pr_not_task": "이 태스크의 PR이 아니라서 머지하지 않았어요",
+        "triage.result.pr_lookup_failed": "PR 상태를 확인하지 못했어요 — gh 로그인이나 네트워크를 확인하세요",
+        "triage.result.merge_conflict": (
+            "충돌이 있어 머지하지 못했어요 — [지시 추가]로 리베이스를 지시하고 재개하세요"),
+        "triage.result.merge_failed": "머지하지 못했어요 — 상세를 열어 PR 상태를 확인하세요",
+        "triage.result.resumed": "재개를 예약했어요 — 다음 틱(5분 안)에 다시 디스패치돼요",
+        "triage.result.resume_failed": "재개 예약을 만들지 못했어요 — 태스크 파일이나 원장 행이 없어요",
+        "triage.result.cancelled": "취소했어요 — 태스크를 cancelled로 닫고 커밋했어요",
+        "triage.result.instructed": "지시를 남기고 재개를 예약했어요 — 다음 틱에 반영돼요",
+        "triage.result.instructed_no_resume": (
+            "지시는 커밋했지만 재개 예약은 못 했어요 — [재개]를 다시 눌러 주세요"),
+        "triage.result.vault_busy": "볼트가 다른 git 작업 중이에요 — 잠시 뒤 다시 눌러 주세요",
+        "triage.result.vault_not_main": (
+            "볼트 체크아웃이 main이 아니라 지금은 바꿀 수 없어요 — 잠시 뒤 다시 눌러 주세요"),
+        "triage.result.md_missing": "태스크 파일이 없어 바꾸지 못했어요",
+        "triage.result.md_untracked": "태스크 파일이 아직 커밋되지 않았어요 — 잠시 뒤 다시 눌러 주세요",
+        "triage.result.md_changed": (
+            "태스크 파일이 계속 바뀌는 중이라 쓰지 않았어요 — 잠시 뒤 다시 눌러 주세요"),
+        "triage.result.commit_failed": "커밋하지 못해 변경을 되돌렸어요 — 볼트 상태를 확인하세요",
+        "triage.result.not_offered": "지금 상태에서는 할 수 없는 처리예요 — 화면을 새로고침하세요",
+        "triage.result.bad_request": "요청 형식이 잘못됐어요",
+        "triage.result.bad_text": "지시는 한 줄, 500자 이하로 적어 주세요",
+        "triage.result.unknown_task": "그런 태스크가 없어요",
+        "triage.result.internal": "처리 중 오류가 났어요 — 대시보드 로그를 확인하세요",
+        # Progress Log lines a click writes into the task md
+        "triage.md.cancel": "- {today}: 대시보드에서 취소(사용자)",
+        "triage.md.instruction": "- {today}: 사용자 지시(대시보드): {text}",
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -520,6 +551,41 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.ev.resume_reserved": "resume reserved — it dispatches again on the next tick",
         "triage.ev.human_gate": "human_gate: an irreversible step is left",
         "triage.ev.md_missing": "the task md is missing",
+        "triage.result.merged": "Merged — the task closes on the next tick (within 5 minutes)",
+        "triage.result.already_merged": "That PR is already merged — the next tick tidies the task up",
+        "triage.result.pr_closed": "The PR is closed, so nothing was merged — reopen it or resume",
+        "triage.result.pr_not_task": "That PR is not this task's, so nothing was merged",
+        "triage.result.pr_lookup_failed": "Could not check the PR — check the gh login or the network",
+        "triage.result.merge_conflict": (
+            "Could not merge because of a conflict — [Add instruction] to ask for a rebase, "
+            "then it resumes"),
+        "triage.result.merge_failed": "Could not merge — open the details and check the PR",
+        "triage.result.resumed": (
+            "Resume reserved — it dispatches again on the next tick (within 5 minutes)"),
+        "triage.result.resume_failed": (
+            "Could not reserve the resume — the task file or its ledger row is missing"),
+        "triage.result.cancelled": "Cancelled — the task is closed as cancelled and committed",
+        "triage.result.instructed": (
+            "Instruction recorded and resume reserved — it applies on the next tick"),
+        "triage.result.instructed_no_resume": (
+            "The instruction is committed, but the resume could not be reserved — press "
+            "[Resume]"),
+        "triage.result.vault_busy": "The vault is busy with another git operation — try again in a moment",
+        "triage.result.vault_not_main": (
+            "The vault checkout is not on main, so nothing can change now — try again in a "
+            "moment"),
+        "triage.result.md_missing": "The task file is missing, so nothing changed",
+        "triage.result.md_untracked": "The task file is not committed yet — try again in a moment",
+        "triage.result.md_changed": (
+            "The task file kept changing, so nothing was written — try again in a moment"),
+        "triage.result.commit_failed": "Could not commit, so the change was rolled back — check the vault",
+        "triage.result.not_offered": "That is not available in the current state — refresh the page",
+        "triage.result.bad_request": "The request was malformed",
+        "triage.result.bad_text": "Write the instruction as one line of at most 500 characters",
+        "triage.result.unknown_task": "No such task",
+        "triage.result.internal": "Something went wrong — check the dashboard log",
+        "triage.md.cancel": "- {today}: cancelled from the dashboard (user)",
+        "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
     },
 }
 

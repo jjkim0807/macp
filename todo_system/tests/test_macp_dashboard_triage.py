@@ -1,10 +1,12 @@
 """Dashboard wiring of the attention triage (orchestrator/triage.py).
 
-Phase 3: `/api/status` attaches `triage` to attention rows and human parked
-rows — through the real `serve()` server and the real `collect_status()` over a
-tmp vault (todo.db with the real schema, ledger rows and run dirs taken from the
-real-case fixtures). Only the collectors that would reach outside the vault
-(queue, usage, accounts, process list) are stubbed.
+`/api/status` attaches `triage` to attention rows and human parked rows, and
+`POST /api/action` runs a card's action — both through the real `serve()`
+server and the real `collect_status()` over a tmp vault (todo.db with the real
+schema, ledger rows and run dirs taken from the real-case fixtures, a real git
+repo for the md commits). Only the collectors that would reach outside the
+vault (queue, usage, accounts, process list) are stubbed, and only `gh` is
+faked (through the `_ACTION_RUN` seam); git runs for real.
 
 The dashboard module is loaded under its own name so patches here never leak
 into test_macp_dashboard's instance.
@@ -15,13 +17,17 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from todo_system.orchestrator import resume
 
 _REPO = Path(__file__).resolve().parents[2]
 _SRC = _REPO / "scripts" / "macp_dashboard.py"
@@ -145,8 +151,8 @@ class _TriageVault(unittest.TestCase):
         finally:
             c.close()
 
-    def status(self) -> dict:
-        code, body = self.request(self.serve(), "GET", "/api/status",
+    def status(self, port: int | None = None) -> dict:
+        code, body = self.request(port or self.serve(), "GET", "/api/status",
                                   headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(code, 200)
         return json.loads(body)
@@ -229,6 +235,209 @@ class StatusCarriesTriage(_TriageVault):
             M._attach_triage(attention, parked)
         self.assertEqual(attention[0]["triage"]["rule"], "review_pr")
         self.assertEqual(parked[0]["triage"]["rule"], "orphan_redelivery")
+
+
+# --- POST /api/action ---------------------------------------------------------------
+
+_HANGUL_RE = re.compile("[가-힣]")
+_RAW_RE = re.compile(r"HTTP \d{3}|http_\d|rc=|Traceback|GraphQL|stderr|/tmp/")
+
+
+class _GitTriageVault(_TriageVault):
+    """The same vault as a git repo on main (todo.db, runs and _state ignored, as
+    in the real vault), served once per test; gh answers through _ACTION_RUN."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".gitignore").write_text("Todo/todo.db\nWorker/_state/\nWorker/runs/\n",
+                                              encoding="utf-8")
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "init")
+        self.gh_calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "gh":
+                self.gh_calls.append(list(argv))
+                if argv[:3] == ["gh", "pr", "view"]:
+                    out = json.dumps({"state": "OPEN", "headRefName": f"worker/{self.REVIEW}"})
+                    return subprocess.CompletedProcess(argv, 0, out, "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+
+        p = mock.patch.object(M, "_ACTION_RUN", fake_run)
+        p.start()
+        self.addCleanup(p.stop)
+        self.port = self.serve()
+
+    def git(self, *args) -> str:
+        return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True,
+                              text=True, check=True).stdout
+
+    def post(self, body=None, *, token=TOKEN, ctype="application/json", raw=None):
+        data = raw if raw is not None else json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": ctype} if ctype else {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        code, out = self.request(self.port, "POST", "/api/action", body=data, headers=headers)
+        try:
+            return code, json.loads(out)
+        except ValueError:
+            return code, out
+
+    def assertSentence(self, res: dict, ok: bool):
+        self.assertEqual(sorted(res), ["message", "ok"])
+        self.assertIs(res["ok"], ok)
+        self.assertTrue(_HANGUL_RE.search(res["message"]), res)
+        self.assertIsNone(_RAW_RE.search(res["message"]), res)
+
+    def head_files(self) -> list[str]:
+        return [f for f in self.git("log", "-1", "--format=", "--name-only").splitlines() if f]
+
+    def card(self, slug: str, port: int | None = None) -> dict | None:
+        rows = {r["task"]: r for r in self.status(port)["attention"]}
+        return rows[slug].get("triage")
+
+
+class ActionRoute(_GitTriageVault):
+    def nothing_ran(self):
+        self.assertEqual(self.gh_calls, [])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-list", "--count", "HEAD").strip(), "1")
+        for slug in (self.REVIEW, self.ORPHAN):
+            self.assertFalse(resume.record_path(self.root, slug).exists(), slug)
+
+    def test_refusals_run_nothing(self):
+        review, orphan = self.REVIEW, self.ORPHAN
+        cases = [
+            (dict(body={"task": review, "action": "merge"}, token=None), 401),
+            (dict(body={"task": review, "action": "merge"}, token="wrong"), 401),
+            (dict(body={"task": review, "action": "merge"}, ctype="text/plain"), 415),
+            (dict(raw=b"x" * 4097), 413),
+            (dict(raw=b""), 400),
+            (dict(raw=b"{not json"), 400),
+            (dict(raw=b"[1]"), 400),
+            (dict(body={"task": "../etc", "action": "merge"}), 400),
+            (dict(body={"task": review}), 400),
+            # irreversible steps have no action id at all
+            (dict(body={"task": review, "action": "deploy"}), 400),
+            (dict(body={"task": review, "action": "submit"}), 400),
+            (dict(body={"task": review, "action": "publish"}), 400),
+            (dict(body={"task": review, "action": "delete"}), 400),
+            (dict(body={"task": "no-such-task", "action": "cancel"}), 404),
+            # actions the fresh card does not offer
+            (dict(body={"task": orphan, "action": "merge"}), 409),
+            (dict(body={"task": review, "action": "resume"}), 409),
+            (dict(body={"task": self.ACTIVE, "action": "cancel"}), 409),
+            # an instruction is one line of 1..500 chars
+            (dict(body={"task": review, "action": "instruct"}), 400),
+            (dict(body={"task": review, "action": "instruct", "text": "  "}), 400),
+            (dict(body={"task": review, "action": "instruct", "text": "a\nb"}), 400),
+            (dict(body={"task": review, "action": "instruct", "text": "x" * 501}), 400),
+            (dict(body={"task": review, "action": "instruct", "text": 5}), 400),
+        ]
+        for kw, want in cases:
+            code, res = self.post(**kw)
+            self.assertEqual(code, want, kw)
+            if code != 401:                      # the gate's own reply is unchanged
+                self.assertSentence(res, ok=False)
+        self.nothing_ran()
+
+    def test_an_umbrella_in_progress_is_refused(self):
+        with mock.patch.object(M, "_umbrellas_in_progress", return_value={self.ORPHAN}):
+            code, res = self.post({"task": self.ORPHAN, "action": "cancel"})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+        self.nothing_ran()
+
+    def test_merge_is_gh_squash_on_the_cards_pr(self):
+        with self.assertLogs("macp.dashboard", level="INFO") as logs:
+            code, res = self.post({"task": self.REVIEW, "action": "merge"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn("머지했어요", res["message"])
+        self.assertEqual(self.gh_calls, [
+            ["gh", "pr", "view", "312", "--repo", "example/app", "--json", "state,headRefName"],
+            ["gh", "pr", "merge", "312", "--repo", "example/app", "--squash"]])
+        self.assertEqual(self.git("status", "--porcelain"), "")    # reconcile_merged closes it
+        self.assertTrue(any(f"dashboard action task={self.REVIEW} action=merge rule=review_pr "
+                            "ok=True" in line for line in logs.output), logs.output)
+
+    def test_resume_reserves_like_cli_resume(self):
+        code, res = self.post({"task": self.ORPHAN, "action": "resume"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn("재개를 예약했어요", res["message"])
+        record = json.loads(resume.record_path(self.root, self.ORPHAN).read_text(encoding="utf-8"))
+        self.assertEqual((record["note"], record["after_commit"]), ("dashboard", ""))
+        card = self.card(self.ORPHAN, self.port)
+        self.assertNotIn("resume", [a["id"] for a in card["actions"]])   # not offered twice
+        self.assertEqual(self.post({"task": self.ORPHAN, "action": "resume"})[0], 409)
+
+    def test_cancel_commits_the_md_and_the_next_poll_drops_the_card(self):
+        self.assertEqual(self.card(self.ORPHAN, self.port)["rule"], "orphan_redelivery")
+        code, res = self.post({"task": self.ORPHAN, "action": "cancel"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn("취소했어요", res["message"])
+        md = (self.items / f"{self.ORPHAN}.md").read_text(encoding="utf-8")
+        self.assertIn("\nstatus: cancelled\n", md)
+        self.assertIn("대시보드에서 취소(사용자)", md)
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.ORPHAN}.md"])
+        self.assertEqual(self.git("log", "-1", "--format=%s").strip(),
+                         f"chore: cancel {self.ORPHAN} (dashboard)")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.gh_calls, [])
+        # the POST invalidated the status cache: this poll is recomputed at once
+        self.assertIsNone(self.card(self.ORPHAN, self.port))
+
+    def test_instruct_commits_the_user_instruction_then_reserves_resume(self):
+        with self.assertLogs("macp.dashboard", level="INFO") as logs:
+            code, res = self.post({"task": self.REVIEW, "action": "instruct",
+                                   "text": "  비밀 지시: 리베이스하고 다시 돌려  "})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn("지시를 남기고", res["message"])
+        md = (self.items / f"{self.REVIEW}.md").read_text(encoding="utf-8")
+        self.assertRegex(md, r"\n- \d{4}-\d{2}-\d{2}: 사용자 지시\(대시보드\): "
+                             r"비밀 지시: 리베이스하고 다시 돌려\n$")
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.REVIEW}.md"])
+        record = json.loads(resume.record_path(self.root, self.REVIEW).read_text(encoding="utf-8"))
+        self.assertEqual(record["after_commit"], self.git("rev-parse", "HEAD").strip())
+        self.assertEqual(self.gh_calls, [])
+        # the log keeps the length, never the instruction itself
+        self.assertTrue(any("action=instruct" in line and "text_len=" in line
+                            for line in logs.output), logs.output)
+        self.assertFalse(any("비밀 지시" in line for line in logs.output), logs.output)
+
+    def test_human_gate_leaves_only_cancel(self):
+        md = self.items / f"{self.REVIEW}.md"
+        md.write_text(md.read_text(encoding="utf-8").replace(
+            "status: open\n", "status: open\nhuman_gate: true\n"), encoding="utf-8")
+        self.git("commit", "-q", "-am", "human gate")
+        card = self.card(self.REVIEW, self.port)
+        self.assertEqual([a["id"] for a in card["actions"]], ["cancel"])
+        for action, text in (("merge", None), ("resume", None), ("instruct", "go on")):
+            body = {"task": self.REVIEW, "action": action, **({"text": text} if text else {})}
+            code, res = self.post(body)
+            self.assertEqual(code, 409, action)
+            self.assertSentence(res, ok=False)
+        self.assertEqual(self.gh_calls, [])
+        code, res = self.post({"task": self.REVIEW, "action": "cancel"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+
+    def test_a_failed_action_is_a_sentence_too(self):
+        self.git("checkout", "-q", "-b", "worker/other")         # live vault off main
+        code, res = self.post({"task": self.ORPHAN, "action": "cancel"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=False)
+        self.assertIn("main이 아니라", res["message"])
+        self.assertIn("status: open", (self.items / f"{self.ORPHAN}.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
