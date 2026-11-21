@@ -1,0 +1,225 @@
+{
+  "case": "⑦",
+  "source": "2026-11-17 vault ledger @cc9de9c8af (blocked park: verify failed only on the emulator AC (needs adb); no PR yet); anonymised",
+  "slug": "app-162-usage-record",
+  "ledger": {
+    "task_id": "app-162-usage-record",
+    "agent_id": "worker-default",
+    "corr_id": "01M7M3VV47K8D7QKBC8EGMM7K2",
+    "state": "awaiting_human",
+    "kind": "ai-local",
+    "attempts": 2,
+    "refail_count": 1,
+    "created_ts": "2026-11-17T11:49:58+09:00",
+    "updated_ts": "2026-11-17T16:43:49+09:00",
+    "last_note": "blocked on AC 8 emulator check (Asia/Seoul AVD: link an app → use it ~2 min → calendar box '앱 사용으로 적음' screenshot → pm clear) needs a human with adb — the macp-emulator DSL cannot tap the textless set",
+    "capacity_limited": false,
+    "job_running": false,
+    "checkout_busy": false,
+    "blocked_on": "AC 8 emulator check (Asia/Seoul AVD: link an app → use it ~2 min → calendar box '앱 사용으로 적음' screenshot → pm clear) needs a human with adb — the macp-emulator DSL cannot tap the textless settings Switch, cannot bring another app to the front, and cannot clear the v44 app data off the shared AVD",
+    "timed_out": false,
+    "timeout_streak": 0,
+    "last_alert_kind": "blocked",
+    "history": [
+      {
+        "ts": "2026-11-17T13:43:46+09:00",
+        "type": "ACCEPT",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:46+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:49:01+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T13:49:01+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T14:05:45+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T14:05:45+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T14:26:54+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T14:26:54+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T14:26:55+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:42:13+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:42:14+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:42:14+09:00",
+        "type": "FAIL",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:08+09:00",
+        "type": "ACCEPT",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:08+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:09+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:09+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:10+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:10+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:11+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T15:47:11+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:38:04+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:38:04+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:48+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:49+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:49+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-17T16:43:49+09:00",
+        "type": "FAIL",
+        "from": "worker-default"
+      }
+    ],
+    "payload": {
+      "worker_mode": "auto",
+      "auto_merge": true,
+      "branch": "worker/app-162-usage-record",
+      "repo": "https://github.com/example/app.git"
+    }
+  },
+  "task_md": "---\ntags:\n  - todo\n  - feature\nstatus: open\nworker_mode: auto\nauto_merge: true\n---\n\n# app-162-usage-record\n",
+  "run": {
+    "name": "20261117T154229-app-162-usage-record",
+    "files": {
+      "verify.md": "---\nstage: verify\nrun_id: 20261117T154229-app-162-usage-record\nslug: app-162-usage-record\nbranch: worker/app-162-usage-record\ngenerated: 2026-11-17T16:45:00+09:00\noverall_status: fail\nconfidence: medium\nverified_by: local\nblocked_on: \"AC 8 emulator check (Asia/Seoul AVD: link an app → use it ~2 min → calendar box '앱 사용으로 적음' screenshot → pm clear) needs a human with adb — the macp-emulator DSL cannot tap the textless settings Switch, cannot bring another app to the front, and cannot clear the v44 app data off the shared AVD\"\n---\n",
+      "run.log": "**What you need to do:** verify.md has the step-by-step `adb` recipe:\n- Set the emulator to Asia/Seoul and link an app to an action.\n- Turn on the switch and grant access.\n- Use the linked app for about 2 minutes, then go back to 앱.\n- Take the three screenshots.\n- Run `pm clear` and restore the time zone.\n\nAfter that, the branch (already pushed at `52a1ffb1`) can be merged and the beta published.\n\n**Follow-ups noted, not changed here:**\n- Routine learning, ranking and energy still read auto blocks.\n- The 15-minute job never ends a running block.\n- Auto blocks aren't written to the device calendar.\n- So future emulator checks can run unattended, either the emulator tool gets a cleanup step and a way to open other apps, or the app exposes test tags in debug builds.\n\nverify complete: /home/user/vault/Worker/runs/20261117T154229-app-162-usage-record/verify.md overall=fail\n\n"
+    }
+  },
+  "registry": null,
+  "expect": {
+    "rule": "device_unverified",
+    "actions": [
+      "instruct",
+      "resume",
+      "cancel"
+    ],
+    "reason_has": [
+      "머지 조건이 아니"
+    ],
+    "advice_has": [
+      "확인 못 함"
+    ]
+  }
+}

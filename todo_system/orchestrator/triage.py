@@ -99,9 +99,18 @@ import time, like trace.py.
 
 from __future__ import annotations
 
+import datetime as dt
+import fnmatch
+import json
+import os
 import re
+from pathlib import Path
+from types import SimpleNamespace
 
 from .. import i18n
+from ..session_log import parse_frontmatter
+from . import assignment, resume, stages
+from .dashboard import _merged_park     # the predicate only — shared with trace, never copied
 from .statuses import is_closed
 
 # The one-click actions, a closed set (see the contract above). The dashboard
@@ -443,3 +452,233 @@ def diagnose(f) -> dict | None:
         if hit is not None:
             return _post_filter(f, hit)
     return None    # unreachable: _r_fallback always matches
+
+
+# --- gathering the facts from local files ----------------------------------------
+
+_RUN_NAME_RE = re.compile(r"^(\d{8}T\d{6})-(.+)$")
+_RESULT_ARTIFACTS = ("report.md", "quick.md", "delegate.md")   # first present wins
+_RESULT_MAX = 40_000      # chars of a result artifact / verify.md read
+_LOG_TAIL = 4_000         # chars from the END of run.log
+# A run dir named before this dispatch (ledger created_ts) belongs to an earlier
+# attempt. A small allowance absorbs the second-level naming.
+_RUN_SLACK = dt.timedelta(minutes=2)
+_TRUE = ("true", "yes", "1", "on")
+_FALSE = ("false", "no", "0", "off")
+
+# (path) -> (mtime_ns, size, parsed value). /api/status recomputes every few
+# seconds over files that rarely change, so each is parsed once per change.
+# Bounded by a blunt clear; tests call _CACHE.clear().
+_CACHE: dict[str, tuple[int, int, object]] = {}
+_CACHE_MAX = 512
+
+
+def _cached(path: Path, load):
+    """`load(path)`, re-run only when the file's mtime or size changed. None for
+    a missing file. Loaders swallow their own read errors and return None."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _CACHE.pop(key, None)
+        return None
+    hit = _CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
+    value = load(path)
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[key] = (st.st_mtime_ns, st.st_size, value)
+    return value
+
+
+def _load_json(path: Path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_frontmatter(path: Path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    fm, _ = parse_frontmatter(text)
+    return fm
+
+
+def _load_head(path: Path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(_RESULT_MAX)
+    except OSError:
+        return None
+
+
+def _load_tail(path: Path):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - _LOG_TAIL * 4))   # utf-8: <= 4 bytes a char
+            data = fh.read()
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace")[-_LOG_TAIL:]
+
+
+def latest_runs(runs_dir) -> dict[str, str]:
+    """`{slug: newest run dir name}` from ONE listing of `runs_dir` ({} on error).
+
+    The slug is everything after the `<timestamp>-` prefix, so `…-api-poc` is
+    `api-poc`'s run, never `poc`'s (the trap stages.runs_for documents)."""
+    out: dict[str, str] = {}
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return out
+    for name in names:
+        m = _RUN_NAME_RE.match(name)
+        if m and name > out.get(m.group(2), ""):
+            out[m.group(2)] = name
+    return out
+
+
+def _run_is_current(run_name: str, created_ts) -> bool:
+    """False when the run dir was started before this dispatch's ledger row was
+    created: its artifacts describe an earlier attempt, not this park.
+
+    A run name is the runner host's local wall clock and `created_ts` carries the
+    offset of the host that wrote it; for a local run both are this machine, so
+    the name is read in that offset. Unparseable either side -> True (use it)."""
+    try:
+        started = dt.datetime.strptime(str(run_name)[:15], "%Y%m%dT%H%M%S")
+        created = dt.datetime.fromisoformat(str(created_ts))
+    except (TypeError, ValueError):
+        return True
+    if created.tzinfo is not None:
+        started = started.replace(tzinfo=created.tzinfo)
+    return started >= created - _RUN_SLACK
+
+
+def _run_facts(slug: str, runs_dir, latest_run, created_ts) -> dict:
+    out = {"run": "", "verdict": None, "verify_blocked_on": None, "pr_url": None,
+           "merged": None, "recommendation": None, "rebase_conflict": False,
+           "result_text": "", "log_tail": ""}
+    if latest_run is None:
+        runs = stages.runs_for(slug, Path(runs_dir))
+        latest_run = runs[-1].name if runs else ""
+    if not latest_run or not _run_is_current(latest_run, created_ts):
+        return out
+    rd = Path(runs_dir) / latest_run
+    result = ""
+    for name in _RESULT_ARTIFACTS:
+        text = _cached(rd / name, _load_head)
+        if text is not None:
+            result = text
+            break
+    verify = _cached(rd / stages.STAGE_ARTIFACT["verify"], _load_head)
+    judged = verify if verify is not None else result
+    out.update({
+        "run": latest_run,
+        "verdict": stages.parse_verify_verdict(judged),
+        "verify_blocked_on": stages.parse_blocked_on(judged),
+        "pr_url": stages.parse_report_pr_url(result),
+        "merged": stages.parse_report_merged(result),
+        "recommendation": stages.parse_report_worker_mode(result),
+        "rebase_conflict": stages.parse_report_rebase_conflict(result),
+        "result_text": result,
+        "log_tail": _cached(rd / "run.log", _load_tail) or "",
+    })
+    return out
+
+
+def _flag(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    s = str(value if value is not None else "").strip().lower()
+    return True if s in _TRUE else False if s in _FALSE else None
+
+
+def _tags(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(t).strip() for t in value]
+    return [t.strip() for t in str(value or "").split(",") if t.strip()]
+
+
+def _human_owner(registry, agent_id: str, slug: str) -> tuple[bool, str]:
+    """(the registry lists `agent_id` as a person, the first of its projects
+    that matches `slug` — the glob that sent the task there)."""
+    for agent in getattr(registry, "agents", None) or []:
+        if getattr(agent, "id", None) != agent_id:
+            continue
+        if getattr(agent, "kind", "") != "human":
+            return False, ""
+        pats = [p for p in (getattr(agent, "projects", None) or []) if isinstance(p, str)]
+        return True, next((p for p in pats if fnmatch.fnmatch(slug, p)), "")
+    return False, ""
+
+
+def gather(slug: str, *, assign_dir, items_dir, runs_dir, vault_root, registry=None,
+           latest_run: str | None = None) -> dict | None:
+    """The facts diagnose() reads for one task, from local files only.
+
+    None when the ledger row is missing or not a JSON object. A missing or
+    unreadable task md leaves the md facts empty (md_exists False). `registry`
+    is any object with `.agents` (registry.Registry); None skips the human
+    lookup. `latest_run` is the newest run dir name when the caller listed
+    runs_dir already (latest_runs(); "" = none), None = look it up here."""
+    row = _cached(Path(assign_dir) / f"{slug}.json", _load_json)
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    fm = _cached(Path(items_dir) / f"{slug}.md", _load_frontmatter)
+    md = fm if isinstance(fm, dict) else {}
+
+    def md_text(key: str) -> str:
+        v = md.get(key)
+        return v.strip() if isinstance(v, str) else ""
+
+    mode = (md_text("worker_mode") or str(payload.get("worker_mode") or "")).strip().lower()
+    auto_merge = _flag(md.get("auto_merge"))
+    if auto_merge is None:
+        auto_merge = _flag(payload.get("auto_merge"))
+    history = row.get("history") if isinstance(row.get("history"), list) else []
+    agent, kind = str(row.get("agent_id") or ""), str(row.get("kind") or "")
+    reg_human, pattern = _human_owner(registry, agent, slug)
+    facts = {
+        "slug": slug,
+        "state": str(row.get("state") or ""),
+        "deferred": assignment.is_deferred(row),
+        "todo_status": md_text("status").lower() or None,
+        "md_exists": isinstance(fm, dict),
+        "md_worker_mode": mode or None,
+        "human_gate": _flag(md.get("human_gate")) is True,
+        "needs_decision": (_flag(md.get("needs_decision")) is True
+                           or "decision" in _tags(md.get("tags"))),
+        "auto_merge": auto_merge,
+        "agent": agent,
+        "agent_kind": kind,
+        "agent_is_human": kind == "human" or reg_human,
+        "human_pattern": pattern,
+        "last_note": str(row.get("last_note") or ""),
+        "last_alert_kind": str(row.get("last_alert_kind") or ""),
+        "blocked_on": str(row.get("blocked_on") or ""),
+        "timeout_streak": _int(row.get("timeout_streak")),
+        "refail_count": _int(row.get("refail_count")),
+        "history_types": [str(h.get("type") or "") for h in history if isinstance(h, dict)],
+        "merged_park": _merged_park(SimpleNamespace(history=row.get("history"))),
+        "resume_reserved": resume.record_path(vault_root, slug).is_file(),
+    }
+    facts.update(_run_facts(slug, runs_dir, latest_run, row.get("created_ts")))
+    return facts
+
+
+def triage_for(slug: str, **kw) -> dict | None:
+    """diagnose(gather(slug, **kw)), or None on any error — a card is optional,
+    a broken /api/status is not."""
+    try:
+        return diagnose(gather(slug, **kw))
+    except Exception:  # noqa: BLE001 - fail-soft by contract
+        return None

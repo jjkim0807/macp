@@ -10,13 +10,18 @@ Every test pins MACP_LANGUAGE itself (the reason/advice text is i18n).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from todo_system import i18n
-from todo_system.orchestrator import triage
+from todo_system.orchestrator import resume, triage
+from todo_system.orchestrator.registry import Agent, Registry
 
 _HANGUL = re.compile("[가-힣]")
 PR = "https://github.com/example/app/pull/12"
@@ -379,6 +384,264 @@ class EnglishCards(_Lang):
             for s in texts:
                 self.assertIsNone(_HANGUL.search(s), (name, s))
                 self.assertNotIn("triage.", s, (name, s))      # no missing key
+
+
+# --- the real cases of the week: tmp vault -> gather() -> diagnose() --------------
+# triage_cases/*.json are the eight parked/failed rows of 2026-11-17..20 rebuilt
+# from the vault's git history at park time (ledger row, md fields, the run
+# artifacts this host had), anonymised. Each names its origin in `source`.
+
+_CASES_DIR = Path(__file__).resolve().parent / "triage_cases"
+_CASE_FILES = ("review_pr.json", "nonff_push.json", "remote_workflow.json",
+               "orphan_redelivery.json", "human_misroute.json", "ui_merge_hold.json",
+               "device_unverified.json", "reaped_off.json")
+
+
+def _load_case(name: str) -> dict:
+    return json.loads((_CASES_DIR / name).read_text(encoding="utf-8"))
+
+
+class _TmpVault(_Lang):
+    def setUp(self):
+        super().setUp()
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for d in ("Worker/assignments", "Todo/items", "Worker/runs", "Worker/_state"):
+            (self.root / d).mkdir(parents=True)
+        self.registry = None
+        triage._CACHE.clear()
+        self.addCleanup(triage._CACHE.clear)
+
+    def install(self, case: dict) -> str:
+        slug = case["slug"]
+        self.write_row(slug, case["ledger"])
+        (self.root / "Todo/items" / f"{slug}.md").write_text(case["task_md"], encoding="utf-8")
+        if case.get("run"):
+            rd = self.root / "Worker/runs" / case["run"]["name"]
+            rd.mkdir()
+            for name, text in case["run"]["files"].items():
+                (rd / name).write_text(text, encoding="utf-8")
+        reg = case.get("registry")
+        self.registry = Registry([Agent.from_dict(a) for a in reg["agents"]]) if reg else None
+        return slug
+
+    def write_row(self, slug: str, row) -> Path:
+        p = self.root / "Worker/assignments" / f"{slug}.json"
+        p.write_text(row if isinstance(row, str) else json.dumps(row, ensure_ascii=False),
+                     encoding="utf-8")
+        return p
+
+    def gather(self, slug: str, **kw):
+        kw.setdefault("registry", self.registry)
+        return triage.gather(slug, assign_dir=self.root / "Worker/assignments",
+                             items_dir=self.root / "Todo/items",
+                             runs_dir=self.root / "Worker/runs", vault_root=self.root, **kw)
+
+
+class RealCasesKo(_TmpVault):
+    def check(self, name: str) -> dict:
+        case = _load_case(name)
+        self.assertTrue(case["source"].endswith("anonymised"), name)
+        self.assertIn("vault ledger @", case["source"], name)
+        slug = self.install(case)
+        t = triage.diagnose(self.gather(slug))
+        exp = case["expect"]
+        self.assertCard(t, exp["rule"], exp["actions"], exp.get("reason_has", ()),
+                        exp.get("advice_has", ()))
+        for s in exp.get("evidence_has", ()):
+            self.assertTrue(any(s in e for e in t["evidence"]), (s, t["evidence"]))
+        # the dashboard path lists runs_dir once and passes the name in
+        latest = triage.latest_runs(self.root / "Worker/runs")
+        self.assertEqual(triage.diagnose(self.gather(slug, latest_run=latest.get(slug, ""))), t)
+        return t
+
+    def test_case1_review_pr_auto_merge_off_real(self):
+        t = self.check("review_pr.json")
+        self.assertIn(i18n.t("triage.ev.pr", pr="https://github.com/example/app/pull/312"),
+                      t["evidence"])
+
+    def test_case2_nonff_push_real(self):
+        t = self.check("nonff_push.json")
+        self.assertIn("worker/app-171-preview-skip-r2", t["advice"])
+
+    def test_case3_remote_runner_workflow_scope_real(self):
+        t = self.check("remote_workflow.json")
+        self.assertIn(i18n.t("triage.ev.remote_artifacts"), t["evidence"])
+
+    def test_case3_remote_workflow_text_when_the_note_carries_it(self):
+        # the same row once the refusal reaches the ledger (a remote FAIL reason)
+        case = _load_case("remote_workflow.json")
+        case["ledger"]["last_note"] = WORKFLOW_PUSH
+        t = triage.diagnose(self.gather(self.install(case)))
+        self.assertEqual(t["rule"], "workflow_scope")
+
+    def test_case4_orphan_redelivery_real(self):
+        self.check("orphan_redelivery.json")
+
+    def test_case5_human_glob_misroute_real(self):
+        t = self.check("human_misroute.json")
+        self.assertIn(i18n.t("triage.ev.agent_human", agent="owner"), t["evidence"])
+
+    def test_case6_ui_merge_hold_real(self):
+        self.check("ui_merge_hold.json")
+
+    def test_case7_emulator_ac_not_run_real(self):
+        self.check("device_unverified.json")
+
+    def test_case8_reaped_stale_while_off_real(self):
+        self.check("reaped_off.json")
+
+    def test_every_fixture_has_a_named_test(self):
+        self.assertEqual(sorted(p.name for p in _CASES_DIR.glob("*.json")), sorted(_CASE_FILES))
+        cases = {_load_case(n)["case"] for n in _CASE_FILES}
+        self.assertEqual(cases, set("①②③④⑤⑥⑦⑧"))
+
+
+class GatherKo(_TmpVault):
+    def test_facts_of_a_real_row(self):
+        slug = self.install(_load_case("review_pr.json"))
+        f = self.gather(slug)
+        self.assertEqual((f["state"], f["agent"], f["agent_kind"], f["last_alert_kind"]),
+                         ("awaiting_human", "worker-default", "ai-local", "review-pr"))
+        self.assertEqual((f["todo_status"], f["md_exists"], f["md_worker_mode"], f["auto_merge"]),
+                         ("open", True, "auto", False))
+        self.assertEqual((f["run"], f["verdict"], f["merged"]),
+                         ("20261120T154935-demo-review-pr", "PASS", None))
+        self.assertEqual(f["pr_url"], "https://github.com/example/app/pull/312")
+        self.assertFalse(f["deferred"] or f["merged_park"] or f["resume_reserved"])
+        self.assertEqual(set(f), {
+            "slug", "state", "deferred", "todo_status", "md_exists", "md_worker_mode",
+            "human_gate", "needs_decision", "auto_merge", "agent", "agent_kind",
+            "agent_is_human", "human_pattern", "last_note", "last_alert_kind", "blocked_on",
+            "timeout_streak", "refail_count", "history_types", "merged_park",
+            "resume_reserved", "run", "verdict", "verify_blocked_on", "pr_url", "merged",
+            "recommendation", "rebase_conflict", "result_text", "log_tail"})
+
+    def test_cache_rereads_a_changed_file(self):
+        case = _load_case("orphan_redelivery.json")
+        slug = self.install(case)
+        self.assertEqual(self.gather(slug)["last_note"], case["ledger"]["last_note"])
+        p = self.write_row(slug, dict(case["ledger"], last_note="changed"))
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        self.assertEqual(self.gather(slug)["last_note"], "changed")
+
+    def test_cache_skips_an_unchanged_file(self):
+        slug = self.install(_load_case("orphan_redelivery.json"))
+        calls = []
+        real = triage._load_json
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        with mock.patch.object(triage, "_load_json", counting):
+            self.gather(slug)
+            self.gather(slug)
+        self.assertEqual(len(calls), 1)
+
+    def test_corrupt_or_missing_ledger_row_is_none(self):
+        self.assertIsNone(self.gather("no-such-task"))
+        for bad in ("{not json", "[1, 2]", ""):
+            triage._CACHE.clear()
+            self.write_row("broken", bad)
+            self.assertIsNone(self.gather("broken"), bad)
+        self.assertIsNone(triage.triage_for(
+            "broken", assign_dir=self.root / "Worker/assignments",
+            items_dir=self.root / "Todo/items", runs_dir=self.root / "Worker/runs",
+            vault_root=self.root))
+
+    def test_unreadable_md_leaves_the_md_facts_empty(self):
+        case = _load_case("orphan_redelivery.json")
+        slug = case["slug"]
+        self.write_row(slug, case["ledger"])
+        (self.root / "Todo/items" / f"{slug}.md").mkdir()        # a directory: read fails
+        f = self.gather(slug)
+        self.assertEqual((f["md_exists"], f["todo_status"], f["human_gate"]), (False, None, False))
+        self.assertEqual(f["md_worker_mode"], "auto")               # from the ledger payload
+        t = triage.diagnose(f)
+        self.assertEqual(t["actions"], [])
+        self.assertIn(i18n.t("triage.ev.md_missing"), t["evidence"])
+
+    def test_latest_runs_keeps_suffix_slugs_apart(self):
+        runs = self.root / "Worker/runs"
+        for name in ("20261119T101010-poc", "20261120T101010-api-poc",
+                     "20261118T101010-poc", "notes.txt", "20261120T1010-poc"):
+            (runs / name).mkdir()
+        got = triage.latest_runs(runs)
+        self.assertEqual(got["poc"], "20261119T101010-poc")
+        self.assertEqual(got["api-poc"], "20261120T101010-api-poc")
+        self.assertEqual(triage.latest_runs(self.root / "missing"), {})
+
+    def test_a_run_older_than_the_dispatch_is_not_this_park(self):
+        case = _load_case("review_pr.json")
+        case["run"]["name"] = "20261120T091500-demo-review-pr"   # created_ts is 10:42:44
+        slug = self.install(case)
+        f = self.gather(slug)
+        self.assertEqual((f["run"], f["pr_url"], f["verdict"]), ("", None, None))
+        t = triage.diagnose(f)
+        self.assertEqual((t["rule"], _ids(t)), ("review_pr", ["instruct", "resume", "cancel"]))
+
+    def test_run_freshness_reads_the_name_in_the_row_offset(self):
+        self.assertTrue(triage._run_is_current("20261120T104300-x", "2026-11-20T10:42:44+09:00"))
+        self.assertTrue(triage._run_is_current("20261120T104100-x", "2026-11-20T10:42:44+09:00"))
+        self.assertFalse(triage._run_is_current("20261120T103000-x", "2026-11-20T10:42:44+09:00"))
+        self.assertTrue(triage._run_is_current("20261120T103000-x", "garbage"))
+        self.assertTrue(triage._run_is_current("garbage", "2026-11-20T10:42:44+09:00"))
+        self.assertTrue(triage._run_is_current("20261120T104300-x", "2026-11-20T10:42:44"))
+
+    def test_resume_reservation_is_seen(self):
+        slug = self.install(_load_case("orphan_redelivery.json"))
+        resume.schedule(self.root, slug, note="t")
+        t = triage.diagnose(self.gather(slug))
+        self.assertEqual(_ids(t), ["cancel"])
+        self.assertIn(i18n.t("triage.ev.resume_reserved"), t["evidence"])
+
+    def test_merged_but_blocked_history(self):
+        case = _load_case("review_pr.json")
+        case["ledger"]["history"].append({"type": "merged-but-blocked", "from": "orchestrator"})
+        case["ledger"]["blocked_on"] = "publish the beta by hand"
+        t = triage.diagnose(self.gather(self.install(case)))
+        self.assertEqual((t["rule"], t["actions"]), ("merged_blocked", []))
+
+    def test_closed_md_drops_the_card(self):
+        case = _load_case("review_pr.json")
+        case["task_md"] = case["task_md"].replace("status: open", "status: done")
+        self.assertIsNone(triage.diagnose(self.gather(self.install(case))))
+
+    def test_md_flags(self):
+        case = _load_case("orphan_redelivery.json")
+        case["task_md"] = ("---\ntags:\n  - todo\n  - decision\nstatus: open\n"
+                           "human_gate: yes\nauto_merge: maybe\n---\n\n# x\n")
+        f = self.gather(self.install(case))
+        self.assertTrue(f["needs_decision"] and f["human_gate"])
+        self.assertEqual(f["md_worker_mode"], "auto")          # md has none: payload's
+        self.assertTrue(f["auto_merge"])                       # unparseable md: payload's
+        case["task_md"] = "---\ntags: todo, x\nstatus: open\nneeds_decision: true\n---\n"
+        triage._CACHE.clear()
+        self.assertTrue(self.gather(self.install(case))["needs_decision"])
+
+    def test_delegate_artifact_is_the_result_when_there_is_no_report(self):
+        case = _load_case("review_pr.json")
+        files = case["run"]["files"]
+        files["delegate.md"] = files.pop("report.md").replace("stage: report", "stage: delegate")
+        f = self.gather(self.install(case))
+        self.assertEqual(f["pr_url"], "https://github.com/example/app/pull/312")
+
+    def test_registry_names_the_matching_glob(self):
+        slug = self.install(_load_case("human_misroute.json"))
+        f = self.gather(slug)
+        self.assertEqual((f["agent_is_human"], f["human_pattern"]), (True, "prep-*"))
+        self.assertEqual(self.gather(slug, registry=None)["human_pattern"], "")
+        self.assertTrue(self.gather(slug, registry=None)["agent_is_human"])   # ledger kind
+
+    def test_triage_for_is_fail_soft(self):
+        slug = self.install(_load_case("review_pr.json"))
+        kw = dict(assign_dir=self.root / "Worker/assignments", items_dir=self.root / "Todo/items",
+                  runs_dir=self.root / "Worker/runs", vault_root=self.root)
+        self.assertEqual(triage.triage_for(slug, **kw)["rule"], "review_pr")
+        with mock.patch.object(triage, "gather", side_effect=RuntimeError("boom")):
+            self.assertIsNone(triage.triage_for(slug, **kw))
 
 
 if __name__ == "__main__":

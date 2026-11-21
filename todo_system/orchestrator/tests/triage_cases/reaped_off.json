@@ -1,0 +1,52 @@
+{
+  "case": "⑧",
+  "source": "2026-11-19 vault ledger @c6beb16e21 (dispatched, then the md was set worker_mode off; the runner skipped the envelope without a reply and reap_stale failed the row); anonymised",
+  "slug": "engine-rate-1-shadow",
+  "ledger": {
+    "task_id": "engine-rate-1-shadow",
+    "agent_id": "worker-default",
+    "corr_id": "01M7SR0X23163G9NGKKMDJ52BM",
+    "state": "failed",
+    "kind": "ai-local",
+    "attempts": 1,
+    "refail_count": 0,
+    "created_ts": "2026-11-19T20:10:44+09:00",
+    "updated_ts": "2026-11-19T23:27:06+09:00",
+    "last_note": "",
+    "capacity_limited": false,
+    "job_running": false,
+    "checkout_busy": false,
+    "blocked_on": "",
+    "timed_out": false,
+    "timeout_streak": 0,
+    "last_alert_kind": "",
+    "history": [
+      {
+        "ts": "2026-11-19T23:27:06+09:00",
+        "type": "reaped-stale",
+        "from": "orchestrator"
+      }
+    ],
+    "payload": {
+      "worker_mode": "auto",
+      "auto_merge": true,
+      "branch": "worker/engine-rate-1-shadow",
+      "repo": "https://github.com/example/app.git"
+    }
+  },
+  "task_md": "---\ntags:\n  - todo\n  - feature\nstatus: open\nworker_mode: off\nauto_merge: true\n---\n\n# engine-rate-1-shadow\n",
+  "run": null,
+  "registry": null,
+  "expect": {
+    "rule": "reaped_off",
+    "actions": [
+      "cancel"
+    ],
+    "reason_has": [
+      "실행된 적 없음"
+    ],
+    "advice_has": [
+      "[취소]"
+    ]
+  }
+}

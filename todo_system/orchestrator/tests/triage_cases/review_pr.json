@@ -1,0 +1,168 @@
+{
+  "case": "①",
+  "source": "2026-11-20 vault ledger @339b5d640d (review-pr park with payload auto_merge false; local run report pr_url + verify pass); anonymised",
+  "slug": "demo-review-pr",
+  "ledger": {
+    "task_id": "demo-review-pr",
+    "agent_id": "worker-default",
+    "corr_id": "01M7VP03PCYWRRVC0WR3N6ACN0",
+    "state": "awaiting_human",
+    "kind": "ai-local",
+    "attempts": 2,
+    "refail_count": 0,
+    "created_ts": "2026-11-20T10:42:44+09:00",
+    "updated_ts": "2026-11-20T16:26:44+09:00",
+    "last_note": "staged pipeline complete (5 stages)",
+    "capacity_limited": false,
+    "job_running": false,
+    "checkout_busy": false,
+    "blocked_on": "",
+    "timed_out": false,
+    "timeout_streak": 0,
+    "last_alert_kind": "review-pr",
+    "history": [
+      {
+        "ts": "2026-11-20T13:14:13+09:00",
+        "type": "ACCEPT",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:15+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:18+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:19+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:19+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:21+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T13:14:21+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T14:13:49+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T14:13:50+09:00",
+        "type": "FAIL",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:53:50+09:00",
+        "type": "ACCEPT",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:53:51+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:53:56+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:53:57+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:53:59+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:54:00+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:54:01+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:54:03+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T15:54:04+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T16:26:43+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T16:26:43+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T16:26:44+09:00",
+        "type": "PROGRESS",
+        "from": "worker-default"
+      },
+      {
+        "ts": "2026-11-20T16:26:44+09:00",
+        "type": "RESULT",
+        "from": "worker-default"
+      }
+    ],
+    "payload": {
+      "worker_mode": "auto",
+      "auto_merge": false,
+      "branch": "worker/demo-review-pr",
+      "repo": "https://github.com/example/app.git"
+    }
+  },
+  "task_md": "---\ntags:\n  - todo\n  - feature\nstatus: open\nworker_mode: auto\nauto_merge: false\n---\n\n# demo-review-pr\n",
+  "run": {
+    "name": "20261120T154935-demo-review-pr",
+    "files": {
+      "report.md": "---\nstage: report\nrun_id: 20261120T154935-demo-review-pr\nslug: demo-review-pr\nbranch: worker/demo-review-pr\ngenerated: 2026-11-20\noverall_status: pass\npr_url: https://github.com/example/app/pull/312\nmerged: n/a\nno_op: false\n---\n\n# Worker Run Report — app dependency bump\n\n## TL;DR (한 줄)\n\n`uv.lock`만 바꿔 dep-a 2026.10.23, dep-b 2.8.0으로 올렸고 로컬 검증은 전부 통과했다. `auto_merge: false`라 PR은 사람이 머지한다.\n",
+      "verify.md": "---\nstage: verify\nrun_id: 20261120T154935-demo-review-pr\nslug: demo-review-pr\nbranch: worker/demo-review-pr\ngenerated: 2026-11-20\noverall_status: pass\nconfidence: high\nverified_by: local\n---\n"
+    }
+  },
+  "registry": null,
+  "expect": {
+    "rule": "review_pr",
+    "actions": [
+      "merge",
+      "instruct",
+      "cancel"
+    ],
+    "reason_has": [
+      "머지만 남았"
+    ],
+    "advice_has": [
+      "[머지]"
+    ],
+    "evidence_has": [
+      "auto_merge: false"
+    ]
+  }
+}
