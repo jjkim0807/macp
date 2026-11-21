@@ -166,6 +166,132 @@ MESSAGES: dict[str, dict[str, str]] = {
         "trace.branch.pr_merged": "- PR: 머지됨",
         "trace.branch.pr_open": "- PR: 존재하지만 아직 머지 안 됨 (open/closed)",
         "trace.branch.pr_unknown": "- PR: unknown (gh 없음/미인증/PR 없음 — 실패가 아님)",
+        # attention triage cards (orchestrator/triage.py): why a parked/failed task
+        # stopped and what one click can do. Data values (notes, URLs) stay raw.
+        "triage.action.merge": "머지",
+        "triage.action.resume": "재개",
+        "triage.action.cancel": "취소",
+        "triage.action.instruct": "지시 추가",
+        "triage.merged_blocked.reason": "PR은 이미 머지됐고 사람이 할 단계만 남았어요",
+        "triage.merged_blocked.advice": (
+            "남은 단계를 마친 뒤 태스크 md를 status: done으로 닫으면 다음 틱에 자동 종결돼요 "
+            "— 재개하면 머지된 작업이 다시 돌아요"),
+        "triage.orphan_redelivery.reason": (
+            "러너가 재시작되거나 꺼지면서 실행 중이던 런이 끊겼어요 — 사람이 판단할 것은 없어요"),
+        "triage.orphan_redelivery.advice": (
+            "[재개]하면 다음 틱에 다시 디스패치되고 푸시된 브랜치를 이어받아요"),
+        "triage.workflow_scope.reason": (
+            "gh 토큰에 workflow 권한이 없어 .github/workflows를 바꾼 push가 거부됐어요"),
+        "triage.workflow_scope.advice": (
+            "본부(HQ)에서 그 브랜치를 push·머지하거나, 그 기기에서 gh auth refresh -s workflow를 "
+            "승인한 뒤 [재개]하세요"),
+        "triage.nonff_push.reason": (
+            "원격 worker 브랜치에 이전 런 커밋이 남아 push가 거부됐어요(non-fast-forward)"),
+        "triage.nonff_push.advice": (
+            "옛 원격 브랜치는 그대로 두고 worker/{slug}-r2 같은 새 브랜치로 push해 PR을 여세요"
+            "(force push 금지) — [지시 추가]로 그렇게 지시하고 재개할 수 있어요"),
+        "triage.remote_no_pr.reason": (
+            "원격 러너 {agent}에서 끝났지만 PR이 없어요 — 산출물은 그 기기에만 있어요"),
+        "triage.remote_no_pr.advice": (
+            "원격 러너는 gh workflow 권한이 없어 .github/workflows를 바꾼 push가 거부되곤 해요 "
+            "— 본부(HQ)에서 브랜치를 push·머지하거나 [재개]로 다시 돌리세요"),
+        "triage.human_misroute.reason": "워커가 할 태스크인데 사람 담당 패턴에 걸려 사람에게 배정됐어요",
+        "triage.human_misroute.advice": (
+            "[재개]하면 다시 라우팅돼 워커에게 가요 — 또 사람에게 가면 registry.yaml 워커 "
+            "projects에 이 slug를 정확히 넣으세요"),
+        "triage.reaped_off.reason": (
+            "일시정지(worker_mode: {mode})된 태스크라 러너가 건너뛰었고 오래돼 정리됐어요 "
+            "— 실행된 적 없음"),
+        "triage.reaped_off.advice": (
+            "할 일은 없어요 — 다시 돌리려면 md worker_mode를 auto로 바꾸고, 접으려면 [취소]하세요"),
+        "triage.ui_merge_hold.reason": (
+            "UI 미확인 머지 보류는 폐지된 규칙이에요 — 기기 확인은 머지 조건이 아니에요"),
+        "triage.ui_merge_hold.advice": "검증이 통과했으니 [머지]하세요",
+        "triage.ui_merge_hold.advice_nopr": "머지할 PR을 찾지 못했어요 — [재개]로 다시 돌리세요",
+        "triage.device_unverified.reason": (
+            "기기·에뮬레이터 확인만 남아 멈췄어요 — 기기 확인은 머지 조건이 아니에요"),
+        "triage.device_unverified.advice": "[머지]하고 기기 확인은 「확인 못 함」으로 기록하면 돼요",
+        "triage.device_unverified.advice_nopr": (
+            "[지시 추가]로 '기기 확인은 확인 못 함으로 기록하고 진행'을 적고 재개하세요"),
+        "triage.review_pr.reason": "PR이 열려 있고 머지만 남았어요",
+        "triage.review_pr.advice": "검토하고 [머지]하세요",
+        "triage.review_pr.advice_blocked": (
+            "검증이 통과하지 않았거나 충돌이 있어 머지 버튼을 두지 않았어요 — [지시 추가]로 "
+            "고칠 방향을 적고 재개하세요"),
+        "triage.review_pr.advice_nopr": (
+            "PR 주소를 찾지 못해 머지 버튼을 두지 않았어요 — 상세에서 PR을 확인하거나 [재개]로 "
+            "다시 돌리세요"),
+        "triage.rescope_pending.reason": "한 스테이지를 넘는 일이라 분할 계획이 준비됐어요",
+        "triage.rescope_pending.advice": "다음 틱에 자동으로 나눠져요 — 기다리면 돼요",
+        "triage.timeout_park.reason": (
+            "스테이지가 {n}번 연속 시간 초과로 멈췄어요 — 작업은 원격 브랜치에 체크포인트됐어요"),
+        "triage.timeout_park.advice": (
+            "더 잘게 나누거나 long_job으로 돌리세요 — [지시 추가]로 방향을 적고 재개할 수 있어요"),
+        "triage.blocked.reason": "선행 조건이 막혀 멈췄어요",
+        "triage.blocked.advice": "막힌 것을 해결한 뒤 [재개]하세요 — 방향을 바꾸려면 [지시 추가]",
+        "triage.result_no_pr.reason": "정상 끝났지만 머지할 PR이 없어요(0커밋)",
+        "triage.result_no_pr.advice": (
+            "결과를 보고 남은 일이 있으면 [지시 추가]로 다시 시키고, 끝난 일이면 [취소]로 접으세요"),
+        "triage.fallback.reason": "멈춘 이유: {note}",
+        "triage.fallback.reason_none": "멈춘 이유가 기록되지 않았어요",
+        "triage.fallback.advice": "상세에서 최신 실행을 확인하세요 — 다시 돌리려면 [재개]",
+        "triage.gate.advice": (
+            "되돌릴 수 없는 단계가 남은 태스크(human_gate)라 버튼으로 진행하지 않아요 — 직접 처리하세요"),
+        "triage.ev.note": "워커 메모: {note}",
+        "triage.ev.blocked_on": "막힌 것: {blocked_on}",
+        "triage.ev.pr": "PR: {pr}",
+        "triage.ev.pr_merged": "PR 머지됨",
+        "triage.ev.verify": "검증: {verdict} ({run})",
+        "triage.ev.agent": "실행 기기: {agent}",
+        "triage.ev.redelivered": "재전달 판정: {verdict}",
+        "triage.ev.workflow": ".github/workflows를 바꾼 push에는 workflow 권한이 필요해요",
+        "triage.ev.nonff": "원격 브랜치가 로컬 HEAD의 조상이 아님",
+        "triage.ev.remote_artifacts": "산출물은 원격 기기의 Worker/runs에만 있어요",
+        "triage.ev.agent_human": "배정: {agent}(사람)",
+        "triage.ev.pattern": "걸린 패턴: {pattern}",
+        "triage.ev.worker_mode": "md worker_mode: {mode}",
+        "triage.ev.reaped": "러너가 응답 없이 건너뛰어 정리됨(reaped-stale)",
+        "triage.ev.auto_merge_off": "auto_merge: false — 사람 머지를 기다리는 설정",
+        "triage.ev.review_hold": "Report가 사람 검토를 권했어요(review)",
+        "triage.ev.rebase_conflict": "동시 실행 PR과 리베이스 충돌",
+        "triage.ev.timeouts": "연속 시간 초과 {n}회",
+        "triage.ev.refail": "재실패 {n}회",
+        "triage.ev.alert": "마지막 알림: {kind}",
+        "triage.ev.not_dispatchable": "md worker_mode가 {mode}라 재개해도 디스패치되지 않아요",
+        "triage.ev.resume_reserved": "재개 예약됨 — 다음 틱에 다시 디스패치돼요",
+        "triage.ev.human_gate": "human_gate: 되돌릴 수 없는 단계가 남은 태스크",
+        "triage.ev.md_missing": "태스크 md가 없어요",
+        # what a card's button did (orchestrator/triage_actions.py, POST /api/action)
+        "triage.result.merged": "머지했어요 — 다음 틱(5분 안)에 태스크가 닫혀요",
+        "triage.result.already_merged": "이미 머지된 PR이에요 — 다음 틱에 태스크가 정리돼요",
+        "triage.result.pr_closed": "PR이 닫혀 있어 머지하지 않았어요 — 다시 열거나 재개하세요",
+        "triage.result.pr_not_task": "이 태스크의 PR이 아니라서 머지하지 않았어요",
+        "triage.result.pr_lookup_failed": "PR 상태를 확인하지 못했어요 — gh 로그인이나 네트워크를 확인하세요",
+        "triage.result.merge_conflict": (
+            "충돌이 있어 머지하지 못했어요 — [지시 추가]로 리베이스를 지시하고 재개하세요"),
+        "triage.result.merge_failed": "머지하지 못했어요 — 상세를 열어 PR 상태를 확인하세요",
+        "triage.result.resumed": "재개를 예약했어요 — 다음 틱(5분 안)에 다시 디스패치돼요",
+        "triage.result.resume_failed": "재개 예약을 만들지 못했어요 — 태스크 파일이나 원장 행이 없어요",
+        "triage.result.cancelled": "취소했어요 — 태스크를 cancelled로 닫고 커밋했어요",
+        "triage.result.instructed": "지시를 남기고 재개를 예약했어요 — 다음 틱에 반영돼요",
+        "triage.result.instructed_no_resume": (
+            "지시는 커밋했지만 재개 예약은 못 했어요 — [재개]를 다시 눌러 주세요"),
+        "triage.result.vault_busy": "볼트가 다른 git 작업 중이에요 — 잠시 뒤 다시 눌러 주세요",
+        "triage.result.vault_not_main": (
+            "볼트 체크아웃이 main이 아니라 지금은 바꿀 수 없어요 — 잠시 뒤 다시 눌러 주세요"),
+        "triage.result.md_missing": "태스크 파일이 없어 바꾸지 못했어요",
+        "triage.result.md_untracked": "태스크 파일이 아직 커밋되지 않았어요 — 잠시 뒤 다시 눌러 주세요",
+        "triage.result.md_changed": (
+            "태스크 파일이 계속 바뀌는 중이라 쓰지 않았어요 — 잠시 뒤 다시 눌러 주세요"),
+        "triage.result.commit_failed": "커밋하지 못해 변경을 되돌렸어요 — 볼트 상태를 확인하세요",
+        "triage.result.not_offered": "지금 상태에서는 할 수 없는 처리예요 — 화면을 새로고침하세요",
+        "triage.result.bad_request": "요청 형식이 잘못됐어요",
+        "triage.result.bad_text": "지시는 한 줄, 500자 이하로 적어 주세요",
+        "triage.result.unknown_task": "그런 태스크가 없어요",
+        "triage.result.internal": "처리 중 오류가 났어요 — 대시보드 로그를 확인하세요",
+        # Progress Log lines a click writes into the task md
+        "triage.md.cancel": "- {today}: 대시보드에서 취소(사용자)",
+        "triage.md.instruction": "- {today}: 사용자 지시(대시보드): {text}",
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -316,6 +442,150 @@ MESSAGES: dict[str, dict[str, str]] = {
         "trace.branch.pr_merged": "- PR: merged",
         "trace.branch.pr_open": "- PR: exists but not merged yet (open/closed)",
         "trace.branch.pr_unknown": "- PR: unknown (no gh / not authenticated / no PR — not a failure)",
+        "triage.action.merge": "Merge",
+        "triage.action.resume": "Resume",
+        "triage.action.cancel": "Cancel",
+        "triage.action.instruct": "Add instruction",
+        "triage.merged_blocked.reason": "The PR is already merged; only a human step is left",
+        "triage.merged_blocked.advice": (
+            "Finish that step, then close the task md with status: done and the next tick "
+            "ends it — resuming would rerun work that already merged"),
+        "triage.orphan_redelivery.reason": (
+            "The runner restarted or went away mid-run, so the run was cut off — nothing for "
+            "a person to decide"),
+        "triage.orphan_redelivery.advice": (
+            "[Resume] dispatches it again on the next tick and it picks up the pushed branch"),
+        "triage.workflow_scope.reason": (
+            "The push was refused: the gh token has no workflow scope for changes under "
+            ".github/workflows"),
+        "triage.workflow_scope.advice": (
+            "Push and merge that branch from HQ, or approve gh auth refresh -s workflow on "
+            "that machine, then [Resume]"),
+        "triage.nonff_push.reason": (
+            "The push was refused because the remote worker branch still holds an earlier "
+            "run's commits (non-fast-forward)"),
+        "triage.nonff_push.advice": (
+            "Leave the old remote branch alone and push to a new branch such as "
+            "worker/{slug}-r2, then open the PR (no force push) — [Add instruction] can say "
+            "so and resume"),
+        "triage.remote_no_pr.reason": (
+            "It finished on remote runner {agent} without a PR — its artifacts are on that "
+            "machine only"),
+        "triage.remote_no_pr.advice": (
+            "Remote runners lack the gh workflow scope, so pushes that touch "
+            ".github/workflows get refused — push and merge the branch from HQ, or [Resume] "
+            "to run it again"),
+        "triage.human_misroute.reason": (
+            "A worker task matched a human-owned pattern and went to a person"),
+        "triage.human_misroute.advice": (
+            "[Resume] routes it again, to a worker — if it lands on a person again, add the "
+            "exact slug to the worker projects in registry.yaml"),
+        "triage.reaped_off.reason": (
+            "Paused (worker_mode: {mode}), so the runner skipped it and it was cleaned up as "
+            "stale — it never ran"),
+        "triage.reaped_off.advice": (
+            "Nothing to do — set the md worker_mode to auto to run it, or [Cancel] to fold it"),
+        "triage.ui_merge_hold.reason": (
+            "The unverified-UI merge hold is abolished — a device check is not a merge "
+            "condition"),
+        "triage.ui_merge_hold.advice": "Verification passed, so [Merge]",
+        "triage.ui_merge_hold.advice_nopr": "No mergeable PR was found — [Resume] to run it again",
+        "triage.device_unverified.reason": (
+            "It stopped with only a device or emulator check left — a device check is not a "
+            "merge condition"),
+        "triage.device_unverified.advice": "[Merge] and record the device check as not verified",
+        "triage.device_unverified.advice_nopr": (
+            "[Add instruction] saying to record the device check as not verified and go on, "
+            "then it resumes"),
+        "triage.review_pr.reason": "The PR is open and only the merge is left",
+        "triage.review_pr.advice": "Review it and [Merge]",
+        "triage.review_pr.advice_blocked": (
+            "No merge button: verification did not pass or there is a conflict — [Add "
+            "instruction] with how to fix it, then it resumes"),
+        "triage.review_pr.advice_nopr": (
+            "No merge button: the PR address was not found — check the PR in the detail view "
+            "or [Resume] to run it again"),
+        "triage.rescope_pending.reason": "Too big for one stage, so a split plan is ready",
+        "triage.rescope_pending.advice": "The next tick splits it automatically — just wait",
+        "triage.timeout_park.reason": (
+            "A stage timed out {n} times in a row — the work is checkpointed on the remote "
+            "branch"),
+        "triage.timeout_park.advice": (
+            "Split it smaller or run it as a long_job — [Add instruction] can set the "
+            "direction and resume"),
+        "triage.blocked.reason": "Stopped on an unmet precondition",
+        "triage.blocked.advice": (
+            "Clear the blocker, then [Resume] — to change direction, [Add instruction]"),
+        "triage.result_no_pr.reason": "Finished normally, but there is no PR to merge (0 commits)",
+        "triage.result_no_pr.advice": (
+            "Read the result: if work is left, [Add instruction] to run it again; if it is "
+            "done, [Cancel] to fold it"),
+        "triage.fallback.reason": "Why it stopped: {note}",
+        "triage.fallback.reason_none": "No reason was recorded for the stop",
+        "triage.fallback.advice": (
+            "Check the latest run in the detail view — [Resume] to run it again"),
+        "triage.gate.advice": (
+            "An irreversible step is left (human_gate), so no button moves it on — do it by "
+            "hand"),
+        "triage.ev.note": "worker note: {note}",
+        "triage.ev.blocked_on": "blocked on: {blocked_on}",
+        "triage.ev.pr": "PR: {pr}",
+        "triage.ev.pr_merged": "PR merged",
+        "triage.ev.verify": "verify: {verdict} ({run})",
+        "triage.ev.agent": "ran on: {agent}",
+        "triage.ev.redelivered": "redelivery verdict: {verdict}",
+        "triage.ev.workflow": "a push that changes .github/workflows needs the workflow scope",
+        "triage.ev.nonff": "the remote branch is not an ancestor of the local HEAD",
+        "triage.ev.remote_artifacts": "the artifacts are only in Worker/runs on the remote machine",
+        "triage.ev.agent_human": "assigned to: {agent} (a person)",
+        "triage.ev.pattern": "matched pattern: {pattern}",
+        "triage.ev.worker_mode": "md worker_mode: {mode}",
+        "triage.ev.reaped": "the runner skipped it without a reply; reaped as stale (reaped-stale)",
+        "triage.ev.auto_merge_off": "auto_merge: false — set to wait for a human merge",
+        "triage.ev.review_hold": "Report recommended a human review (review)",
+        "triage.ev.rebase_conflict": "rebase conflict with a concurrent PR",
+        "triage.ev.timeouts": "{n} stage timeouts in a row",
+        "triage.ev.refail": "failed again {n} times",
+        "triage.ev.alert": "last alert: {kind}",
+        "triage.ev.not_dispatchable": "md worker_mode is {mode}, so a resume would not dispatch it",
+        "triage.ev.resume_reserved": "resume reserved — it dispatches again on the next tick",
+        "triage.ev.human_gate": "human_gate: an irreversible step is left",
+        "triage.ev.md_missing": "the task md is missing",
+        "triage.result.merged": "Merged — the task closes on the next tick (within 5 minutes)",
+        "triage.result.already_merged": "That PR is already merged — the next tick tidies the task up",
+        "triage.result.pr_closed": "The PR is closed, so nothing was merged — reopen it or resume",
+        "triage.result.pr_not_task": "That PR is not this task's, so nothing was merged",
+        "triage.result.pr_lookup_failed": "Could not check the PR — check the gh login or the network",
+        "triage.result.merge_conflict": (
+            "Could not merge because of a conflict — [Add instruction] to ask for a rebase, "
+            "then it resumes"),
+        "triage.result.merge_failed": "Could not merge — open the details and check the PR",
+        "triage.result.resumed": (
+            "Resume reserved — it dispatches again on the next tick (within 5 minutes)"),
+        "triage.result.resume_failed": (
+            "Could not reserve the resume — the task file or its ledger row is missing"),
+        "triage.result.cancelled": "Cancelled — the task is closed as cancelled and committed",
+        "triage.result.instructed": (
+            "Instruction recorded and resume reserved — it applies on the next tick"),
+        "triage.result.instructed_no_resume": (
+            "The instruction is committed, but the resume could not be reserved — press "
+            "[Resume]"),
+        "triage.result.vault_busy": "The vault is busy with another git operation — try again in a moment",
+        "triage.result.vault_not_main": (
+            "The vault checkout is not on main, so nothing can change now — try again in a "
+            "moment"),
+        "triage.result.md_missing": "The task file is missing, so nothing changed",
+        "triage.result.md_untracked": "The task file is not committed yet — try again in a moment",
+        "triage.result.md_changed": (
+            "The task file kept changing, so nothing was written — try again in a moment"),
+        "triage.result.commit_failed": "Could not commit, so the change was rolled back — check the vault",
+        "triage.result.not_offered": "That is not available in the current state — refresh the page",
+        "triage.result.bad_request": "The request was malformed",
+        "triage.result.bad_text": "Write the instruction as one line of at most 500 characters",
+        "triage.result.unknown_task": "No such task",
+        "triage.result.internal": "Something went wrong — check the dashboard log",
+        "triage.md.cancel": "- {today}: cancelled from the dashboard (user)",
+        "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
     },
 }
 
@@ -383,6 +653,12 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.agent_btn_game": "게임 모드",
         "dash.js.agent_btn_work": "작업 재개",
         "dash.js.agent_mode_failed": "모드 변경 실패",
+        # triage card (attention / parked rows): the card's own sentences come from the server
+        "dash.js.tri_sending": "처리 중…",
+        "dash.js.tri_net_fail": "요청을 보내지 못했어요 — 연결을 확인하세요",
+        "dash.js.tri_send": "보내기",
+        "dash.js.tri_placeholder": "지시 한 줄 (500자 이하)",
+        "dash.js.tri_need_text": "지시를 한 줄 적어 주세요",
         "dash.js.done": " 완료",
         "dash.js.qw_next_tick": "다음 틱",
         "dash.js.qw_checkout_busy": "리포 사용중",
@@ -527,6 +803,11 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.agent_btn_game": "Game mode",
         "dash.js.agent_btn_work": "Resume work",
         "dash.js.agent_mode_failed": "Mode change failed",
+        "dash.js.tri_sending": "Working…",
+        "dash.js.tri_net_fail": "Could not send the request — check the connection",
+        "dash.js.tri_send": "Send",
+        "dash.js.tri_placeholder": "One-line instruction (max 500 chars)",
+        "dash.js.tri_need_text": "Write a one-line instruction first",
         "dash.js.done": " done",
         "dash.js.qw_next_tick": "next tick",
         "dash.js.qw_checkout_busy": "repo busy",

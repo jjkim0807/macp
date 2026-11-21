@@ -1,0 +1,78 @@
+{
+  "case": "⑤",
+  "source": "2026-11-18 vault ledger @2ede109645 (a delegate task matched the human's project glob and was parked on the person (the -31 sibling had already been fixed with an exact worker slug)); anonymised",
+  "slug": "prep-41-batch-agent",
+  "ledger": {
+    "task_id": "prep-41-batch-agent",
+    "agent_id": "owner",
+    "corr_id": "01M7QHWVY08VEPFGF4D4Q4KX6X",
+    "state": "awaiting_human",
+    "kind": "human",
+    "attempts": 1,
+    "refail_count": 0,
+    "created_ts": "2026-11-18T23:45:11+09:00",
+    "updated_ts": "2026-11-18T23:45:11+09:00",
+    "last_note": "",
+    "capacity_limited": false,
+    "job_running": false,
+    "checkout_busy": false,
+    "blocked_on": "",
+    "timed_out": false,
+    "timeout_streak": 0,
+    "last_alert_kind": "",
+    "history": [],
+    "payload": {
+      "worker_mode": "delegate",
+      "auto_merge": true,
+      "branch": "worker/prep-41-batch-agent"
+    }
+  },
+  "task_md": "---\ntags:\n  - todo\n  - work\nstatus: open\nworker_mode: delegate\nauto_merge: true\n---\n\n# prep-41-batch-agent\n",
+  "run": null,
+  "registry": {
+    "agents": [
+      {
+        "id": "owner",
+        "kind": "human",
+        "projects": [
+          "prep",
+          "prep-*"
+        ]
+      },
+      {
+        "id": "worker-default",
+        "kind": "ai-local",
+        "projects": [
+          "*",
+          "prep-31-new-candidates"
+        ]
+      },
+      {
+        "id": "desktop-wsl",
+        "kind": "ai-remote",
+        "projects": []
+      },
+      {
+        "id": "macbook",
+        "kind": "ai-remote",
+        "projects": []
+      }
+    ]
+  },
+  "expect": {
+    "rule": "human_misroute",
+    "actions": [
+      "resume",
+      "cancel"
+    ],
+    "reason_has": [
+      "사람 담당 패턴"
+    ],
+    "advice_has": [
+      "registry.yaml"
+    ],
+    "evidence_has": [
+      "prep-*"
+    ]
+  }
+}

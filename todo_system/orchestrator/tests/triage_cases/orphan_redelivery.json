@@ -1,0 +1,93 @@
+{
+  "case": "④",
+  "source": "2026-11-18 vault ledger @172526891a (game mode stopped the desktop runner mid-run; the redelivered envelope was classified orphan and parked as NEEDS_INPUT); anonymised",
+  "slug": "app-public-1-orphan",
+  "ledger": {
+    "task_id": "app-public-1-orphan",
+    "agent_id": "desktop-wsl",
+    "corr_id": "01M7PYAKPGAJXT46EDP6BSXG43",
+    "state": "awaiting_human",
+    "kind": "ai-remote",
+    "attempts": 1,
+    "refail_count": 0,
+    "created_ts": "2026-11-18T18:03:12+09:00",
+    "updated_ts": "2026-11-18T18:43:40+09:00",
+    "last_note": "redelivered envelope, execution already started (orphan): pid 449 on desktop-host is gone (signal-0 probe failed) — its stage subprocesses died with it (2293s)",
+    "capacity_limited": false,
+    "job_running": false,
+    "checkout_busy": false,
+    "blocked_on": "",
+    "timed_out": false,
+    "timeout_streak": 0,
+    "last_alert_kind": "",
+    "history": [
+      {
+        "ts": "2026-11-18T18:08:06+09:00",
+        "type": "ACCEPT",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:08:06+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:08:06+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:08:07+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:13:01+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:13:02+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:33:34+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:33:35+09:00",
+        "type": "PROGRESS",
+        "from": "desktop-wsl"
+      },
+      {
+        "ts": "2026-11-18T18:43:40+09:00",
+        "type": "NEEDS_INPUT",
+        "from": "desktop-wsl"
+      }
+    ],
+    "payload": {
+      "worker_mode": "auto",
+      "auto_merge": true,
+      "branch": "worker/app-public-1-orphan",
+      "repo": "https://github.com/example/app.git"
+    }
+  },
+  "task_md": "---\ntags:\n  - todo\n  - feature\nstatus: open\nworker_mode: auto\nauto_merge: true\n---\n\n# app-public-1-orphan\n",
+  "run": null,
+  "registry": null,
+  "expect": {
+    "rule": "orphan_redelivery",
+    "actions": [
+      "resume",
+      "cancel"
+    ],
+    "reason_has": [
+      "러너가 재시작"
+    ],
+    "advice_has": [
+      "[재개]"
+    ]
+  }
+}
