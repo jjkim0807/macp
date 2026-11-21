@@ -1752,6 +1752,47 @@ def collect_queue(*, db: Path | None = None, assign: Path | None = None,
         return {k: [] for k in QUEUE_KEYS}
 
 
+def _registry_or_none():
+    """The agent registry, or None when it cannot be read (triage then skips the
+    human-glob lookup instead of failing)."""
+    try:
+        from todo_system.orchestrator.registry import load_registry
+        return load_registry(str(REGISTRY))
+    except Exception:
+        return None
+
+
+def _attach_triage(attention: list[dict], parked: list[dict]) -> None:
+    """Add `triage` to attention rows and human `why == "parked"` rows, in place.
+
+    The contract (shape, rules, action ids) lives in the docstring of
+    todo_system/orchestrator/triage.py. Local reads only (no gh/git/network):
+    runs_dir is listed once and each slug is diagnosed once, so a task on both
+    lists carries the same card. Fail-soft per row: an error leaves that row
+    without the key and logs one line; /api/status never breaks over it."""
+    try:
+        from todo_system.orchestrator import triage as _tri
+    except Exception as e:
+        logger.warning("triage unavailable err=%s", type(e).__name__)
+        return
+    reg = _registry_or_none()
+    latest = _tri.latest_runs(RUNS)
+    cards: dict[str, dict | None] = {}
+    for key, rows in (("task", attention), ("slug", parked)):
+        for r in rows:
+            slug = str(r.get(key) or "")
+            if slug not in cards:
+                try:
+                    cards[slug] = _tri.diagnose(_tri.gather(
+                        slug, assign_dir=ASSIGN, items_dir=ITEMS, runs_dir=RUNS,
+                        vault_root=VAULT, registry=reg, latest_run=latest.get(slug, "")))
+                except Exception as e:
+                    logger.warning("triage failed task=%s err=%s", slug, type(e).__name__)
+                    cards[slug] = None
+            if cards[slug] is not None:
+                r["triage"] = cards[slug]
+
+
 def collect_status() -> dict:
     a = collect_assignments()
     tstatus = _todo_status_map()
@@ -1794,6 +1835,11 @@ def collect_status() -> dict:
                               umbrellas=umbrellas)
     human = [r for r in human_all if not r.get("later")]
     human_later = [r for r in human_all if r.get("later")]
+    # Triage-row contract — SoT: todo_system/orchestrator/triage.py docstring.
+    # Additive: attention rows and human `why == "parked"` rows gain `triage`
+    # {rule, reason, evidence, advice, actions}; recent shares the attention row
+    # objects, so it rides along there too. Fail-soft per row.
+    _attach_triage(attention, [r for r in human if r.get("why") == "parked"])
     for r in (*active, *attention, *human, *human_later):
         r["group"] = _group_of(r)
 
