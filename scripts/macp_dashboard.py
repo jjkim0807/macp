@@ -1793,6 +1793,21 @@ def _attach_triage(attention: list[dict], parked: list[dict]) -> None:
                 r["triage"] = cards[slug]
 
 
+def collect_usage_value() -> dict:
+    """`{"usage_value": model}` for /api/status, or `{}`.
+
+    The contract (shape, counting rules, kinds) lives in the docstring of
+    todo_system/usage_value.py; brief.sh renders the same model. Local file
+    reads only, cached per file (mtime, size): no gh, git or network. Fail-soft:
+    an error drops this one key and logs one line; /api/status never breaks."""
+    try:
+        from todo_system import usage_value as _uv
+        return {"usage_value": _uv.build(runs_dir=RUNS, items_dir=ITEMS, assign_dir=ASSIGN)}
+    except Exception as e:
+        logger.warning("usage_value failed err=%s", type(e).__name__)
+        return {}
+
+
 def collect_status() -> dict:
     a = collect_assignments()
     tstatus = _todo_status_map()
@@ -1907,6 +1922,9 @@ def collect_status() -> dict:
         "account": {**collect_account_runtime(collect_account()),
                     "slots": collect_account_slots()},
         **collect_queue(usage=usage),
+        # Usage vs results — SoT: todo_system/usage_value.py docstring. Additive:
+        # one key, left out when its build fails.
+        **collect_usage_value(),
     }
 
 
@@ -2160,6 +2178,14 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
     </details>
   </section>
 
+  <!-- usage vs results: project x kind (server-aggregated and worded, read-only). Collapsed; hidden until the server sends rows. -->
+  <section class="card" id="c-uv" hidden>
+    <details id="d-uv">
+      <summary><span id="uv-title"></span> <span class="cnt" id="cnt-uv"></span></summary>
+      <div id="uv"></div>
+    </details>
+  </section>
+
   <!-- @@dash.cmt.system_1@@
        <details>/<div id> @@dash.cmt.system_2@@
        @@dash.cmt.system_3@@ -->
@@ -2316,8 +2342,9 @@ const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><di
 const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span></div></div>`;
 const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta qd"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'@@dash.js.deps_done@@'}</span></div></div>`;
 // Open/closed of the queue <details> survives reloads under the contract keys
-// mdash.sec.queue / mdash.sec.queue-upcoming / mdash.sec.queue-blocked.
-const QSEC={'d-queue':'queue','d-queue-upcoming':'queue-upcoming','d-queue-blocked':'queue-blocked'};
+// mdash.sec.queue / mdash.sec.queue-upcoming / mdash.sec.queue-blocked; the
+// usage-vs-results card keeps its own under mdash.sec.usage-value.
+const QSEC={'d-queue':'queue','d-queue-upcoming':'queue-upcoming','d-queue-blocked':'queue-blocked','d-uv':'usage-value'};
 const secKey=s=>'mdash.sec.'+s;
 function secMount(){for(const [id,s] of Object.entries(QSEC)){const el=$(id);if(!el)continue;
   try{el.open=localStorage.getItem(secKey(s))==='1'}catch(_){}
@@ -2458,6 +2485,18 @@ function setUsage(u){
   box.innerHTML=h;
 }
 
+// Usage vs results (todo_system/usage_value.py): the server aggregates and words every cell; this only renders.
+const uvRow=r=>`<div class="row"><div class="main"><div>${pchip(r.project)}<span class="ttl">${esc(r.kind_label)}</span></div><div class="note">${esc(r.text)}</div></div><div class="rmeta"><span class="age mono">${esc(r.out_tokens_text)}</span></div></div>`;
+const uvPeriod=p=>{const t=p.total||{};return `<div class="kv"><div class="k">${esc(p.label)} ${esc(p.range)} · ${esc(t.out_tokens_text)}</div><div class="note">${esc(t.text)}</div></div><div class="list">${(p.rows||[]).map(uvRow).join('')||empty('@@dash.js.none@@')}</div>`};
+function setUsageValue(u){
+  const c=$('c-uv'),ps=(u&&u.periods)||[];
+  if(!ps.some(p=>(p.rows||[]).length)){c.hidden=true;return}
+  c.hidden=false;
+  $('uv-title').textContent=u.title||'';
+  $('cnt-uv').textContent=(ps[0].total&&ps[0].total.out_tokens_text)||'';
+  $('uv').innerHTML=`<div class="note">${esc(u.basis)}</div>`+ps.map(uvPeriod).join('');
+}
+
 function update(d){
   setState(d);
   $('clock').textContent=(d.now||'').split(' ')[1]||d.now||'';
@@ -2542,6 +2581,9 @@ function update(d){
 
   $('cnt-deps').textContent=d.deps.length;
   fill('deps',d.deps,depRow,'@@dash.js.no_deps@@');
+
+  // Last on purpose: the card is optional, so nothing above waits on it.
+  setUsageValue(d.usage_value);
 }
 
 // ---- tap-through detail (run / task) ----
