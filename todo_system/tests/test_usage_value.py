@@ -191,8 +191,32 @@ def test_classify_other_when_no_signal():
     assert uv.classify(None, "weekly-notes") == ("other", "none")
 
 
+@pytest.mark.parametrize("tag,kind", [
+    ("ux", "feature"), ("ui", "feature"), ("eval", "research"), ("spike", "research"),
+    ("chore", "ops"), ("cleanup", "ops"), ("docs", "ops"), ("test", "ops"), ("cost", "ops"),
+])
+def test_classify_hint_tag_places_a_task_with_no_kind_tag(tag, kind):
+    assert uv.classify({"repo": APP, "tags": ["todo", "work", tag]}, "app-something") == (
+        kind, f"hint:{tag}")
+
+
+def test_classify_hint_tags_rank_below_kind_tags_and_slug_prefixes():
+    c = uv.classify
+    assert c({"repo": APP, "tags": ["docs", "feature"]}, "x") == ("feature", "tag:feature")
+    assert c({"repo": APP, "tags": ["ux", "bug"]}, "x") == ("bug", "tag:bug")
+    assert c({"repo": APP, "tags": ["docs"]}, "research-pricing") == ("research", "slug:research-")
+    assert c({"repo": APP, "tags": ["test", "ux"]}, "x") == ("feature", "hint:ux")   # table order
+    # the engine's own work and discovery work stay what they are
+    assert c({"repo": ENGINE, "tags": ["docs"]}, "x") == ("self", "self_repo")
+    assert c({"repo": APP, "tags": ["ux"], "from_discovery": "r"}, "x") == ("discovery", "from_discovery")
+    # hints are whole tags too: project and area tags name no kind
+    assert c({"repo": APP, "tags": ["android", "app", "testing", "costs"]}, "x") == ("other", "none")
+    assert {tag for tag, _ in uv._HINT_KINDS}.isdisjoint({tag for tag, _ in uv._TAG_KINDS})
+
+
 def test_every_rule_names_a_known_kind():
-    kinds = {k for _, k in uv._TAG_KINDS} | {k for _, k in uv._SLUG_PREFIX_KINDS}
+    kinds = ({k for _, k in uv._TAG_KINDS} | {k for _, k in uv._SLUG_PREFIX_KINDS}
+             | {k for _, k in uv._HINT_KINDS})
     assert kinds <= set(uv.KINDS)
     assert uv.KINDS == ("discovery", "self", "feature", "bug", "security", "research",
                         "ops", "other")
@@ -576,7 +600,7 @@ def test_all_cases_together_are_one_table(vault):
     week = _period(vault.raw(), "week")
     assert [(r["project"], r["kind"], r["out_tokens"], r["runs"]) for r in week["rows"]] == [
         ("macp", "self", 466_000, 1), ("app", "discovery", 225_000, 2), ("app", "bug", 70_000, 3),
-        ("vault", "other", 30_000, 1), ("app", "other", 12_000, 1)]
+        ("vault", "ops", 30_000, 1), ("app", "ops", 12_000, 1)]
     assert week["total"] == {"out_tokens": 803_000, "runs": 8, "runs_unmetered": 3,
                              "merged_prs": 3, "done": 6, "cancelled": 0, "failed": 1,
                              "tokens_per_merge": 803_000 // 3}
@@ -1050,6 +1074,9 @@ def test_cli_report_json_equals_build(vault, monkeypatch, capsys):
 
 def test_cli_report_prints_the_full_table_and_explains(vault, monkeypatch, capsys):
     vault.install(*CASE_NAMES)
+    # one task no rule places, so the `other` breakdown has something to show
+    vault.run("20261119T120000-app-settings-screen", {"stages.json": {"usage": {"quick": _usage(9_000)}}})
+    vault.task("app-settings-screen", _task_md(status="open", repo=APP, tags=["todo", "work", "app"]))
     monkeypatch.setenv("MACP_VAULT_ROOT", str(vault.root))
     argv = ["report", "--vault-root", str(vault.root), "--now", NOW.isoformat()]
     table = uv.render_markdown(uv.build(vault_root=vault.root, now=NOW))
@@ -1062,20 +1089,18 @@ def test_cli_report_prints_the_full_table_and_explains(vault, monkeypatch, capsy
     out = capsys.readouterr().out
     assert out.startswith(table + "\n\n")
     lines = out[len(table) + 2:].rstrip("\n").split("\n")
-    assert lines[0] == "explain: this month 2026-11-01..2026-11-22 — 8 run(s) of 8 task(s)"
+    assert lines[0] == "explain: this month 2026-11-01..2026-11-22 — 9 run(s) of 9 task(s)"
     assert lines[1] == "rule hits (tasks):"
-    assert lines[2:7] == ["  tag:bug 3", "  none 2", "  discover_run 1", "  from_discovery 1",
-                          "  self_repo 1"]
-    assert lines[7] == "other: 5.2% of this month's output tokens (42.0k of 803k) in 2 task(s)"
-    assert lines[8] == "  tags on other tasks: todo 2, worker 2, app 1, compute-cost 1, cost 1, docs 1, private 1, work 1"
-    assert lines[9] == "  top other tasks by output tokens:"
-    assert lines[10:12] == [
-        "    30.0k  1 run(s)  vault  cost-review-20261121  [todo, work, worker, cost, compute-cost]",
-        "    12.0k  1 run(s)  app  app-doc-weekly-check  [todo, private, worker, app, docs]"]
-    assert lines[12] == ("PR evidence: 3 run(s) name a PR, 3 say merged: yes, "
+    assert lines[2:9] == ["  tag:bug 3", "  discover_run 1", "  from_discovery 1", "  hint:cost 1",
+                          "  hint:docs 1", "  none 1", "  self_repo 1"]
+    assert lines[9] == "other: 1.1% of this month's output tokens (9.0k of 812k) in 1 task(s)"
+    assert lines[10] == "  tags on other tasks: app 1, todo 1, work 1"
+    assert lines[11] == "  top other tasks by output tokens:"
+    assert lines[12] == "    9.0k  1 run(s)  app  app-settings-screen  [todo, work, app]"
+    assert lines[13] == ("PR evidence: 3 run(s) name a PR, 3 say merged: yes, "
                          "0 PR(s) counted through the done rule only")
-    assert re.fullmatch(r"timing: first build \d+\.\d{3}s, rebuild \d+\.\d{3}s", lines[13])
-    assert len(lines) == 14
+    assert re.fullmatch(r"timing: first build \d+\.\d{3}s, rebuild \d+\.\d{3}s", lines[14])
+    assert len(lines) == 15
 
 
 def test_cli_brief_section_prints_the_section_once_a_week(vault, monkeypatch, capsys):

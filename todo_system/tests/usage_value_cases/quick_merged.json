@@ -83,9 +83,9 @@
     }
   },
   "expect": {
-    "rules": {"app-doc-weekly-check": "none"},
+    "rules": {"app-doc-weekly-check": "hint:docs"},
     "week": [
-      {"project": "app", "kind": "other", "out_tokens": 12000, "runs": 1, "runs_unmetered": 0,
+      {"project": "app", "kind": "ops", "out_tokens": 12000, "runs": 1, "runs_unmetered": 0,
        "merged_prs": 1, "done": 1, "cancelled": 0, "failed": 0, "tokens_per_merge": 12000}
     ]
   }

@@ -204,7 +204,7 @@ def test_status_carries_usage_value_with_both_periods(pv, served):
     assert [(r["project"], r["kind"], r["kind_label"], r["out_tokens"], r["out_tokens_text"])
             for r in week["rows"]] == [("macp", "self", "macp 자기개선", 466_000, "466k"),
                                        ("app", "bug", "버그", 70_000, "70.0k"),
-                                       ("app", "other", "기타", 12_000, "12.0k")]
+                                       ("app", "ops", "운영", 12_000, "12.0k")]
     assert week["rows"][0]["text"] == "런 1 · 머지 PR 1 · 완료 1 · 취소 0 · 실패 0 · 머지당 466k"
     assert week["rows"][1]["text"].endswith(" · 미계측 런 1")
     total = week["total"]

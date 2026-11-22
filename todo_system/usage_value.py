@@ -89,11 +89,16 @@ Kind (first match; `classify` returns `(kind, rule_id)`):
 | 2 | self      | the slug starts with `<SELF_PROJECT>-`                        | `self_slug`      |
 | 3 | by tag    | the first entry of _TAG_KINDS whose tag the task carries      | `tag:<tag>`      |
 | 4 | by slug   | the first entry of _SLUG_PREFIX_KINDS the slug starts with    | `slug:<prefix>`  |
-| 5 | other     | nothing matched                                               | `none`           |
+| 5 | by hint   | the first entry of _HINT_KINDS whose tag the task carries     | `hint:<tag>`     |
+| 6 | other     | nothing matched                                               | `none`           |
 
 So a security fix in the engine repo (repo, `security` tag and `security-fix-`
 prefix all at once) is `self`: `security` means security work in other
-projects.
+projects. A hint tag (`ux`, `docs`, `test`, …) says what a task touches rather
+than what kind it is, so it is read last and never overrides a kind tag or a
+slug prefix. `other` is not a hidden default for "feature": a task that carries
+only project and area tags stays `other`, and `report --explain` lists the
+largest of them.
 
 Import stays as light as paths and i18n: the engine modules that resolve a
 vault root at import (stages, metrics, session_log) are imported inside the
@@ -146,6 +151,16 @@ _SLUG_PREFIX_KINDS = (
     ("ops-", "ops"), ("infra-", "ops"),
     ("feat-", "feature"), ("feature-", "feature"),
 )
+# Rule 5, in this order: tags that say what a task touches, read only when no
+# kind tag and no slug prefix decided. Each entry is here because real tasks
+# carried it with no kind tag (2026-11: 31% of a month's output tokens fell to
+# `other`; these nine brought it to 24%). The rest carried project and area
+# tags only, which name no kind.
+_HINT_KINDS = (
+    ("ux", "feature"), ("ui", "feature"),
+    ("eval", "research"), ("spike", "research"),
+    ("chore", "ops"), ("cleanup", "ops"), ("docs", "ops"), ("test", "ops"), ("cost", "ops"),
+)
 
 _RUN_NAME_RE = re.compile(r"^(\d{8}T\d{6})-(.+)$")
 _RUN_TS_FORMAT = "%Y%m%dT%H%M%S"
@@ -173,18 +188,24 @@ def period_bounds(now: dt.datetime) -> dict[str, tuple[dt.datetime, dt.datetime]
             "month": (midnight.replace(day=1), now)}
 
 
+def _stamp_time(stamp: str) -> dt.datetime | None:
+    """The time a `YYYYMMDDThhmmss` stamp names, or None when it names none.
+    Sliced by hand: strptime costs more than the rest of a rebuild's parsing."""
+    try:
+        return dt.datetime(int(stamp[0:4]), int(stamp[4:6]), int(stamp[6:8]),
+                           int(stamp[9:11]), int(stamp[11:13]), int(stamp[13:15]))
+    except ValueError:
+        return None
+
+
 def parse_run_name(name: str) -> tuple[dt.datetime, str] | None:
     """`(start time, slug)` of a run dir name, or None when it is not one.
 
     The slug is everything after the `<timestamp>-` prefix, so `…-api-poc` is
     a run of `api-poc`, never of `poc`."""
     m = _RUN_NAME_RE.match(name)
-    if not m:
-        return None
-    try:
-        return dt.datetime.strptime(m.group(1), _RUN_TS_FORMAT), m.group(2)
-    except ValueError:
-        return None
+    at = _stamp_time(m.group(1)) if m else None
+    return (at, m.group(2)) if at is not None else None
 
 
 # --- task facts -> project and kind --------------------------------------------------
@@ -241,13 +262,17 @@ def classify(task: dict | None, slug: str) -> tuple[str, str]:
     """`(kind, rule_id)` for a task: the first rule that matches (see the module
     docstring, "Kind"). `task` holds the facts task_facts() reads; None or {}
     for a task with no file left, which leaves only the slug rules."""
-    task = task or {}
+    return _classify(task or {}, slug, project_of(task, slug))
+
+
+def _classify(task: dict, slug: str, project: str) -> tuple[str, str]:
+    """classify() for a caller that already knows the task's project key."""
     if _text(task.get("from_discovery")):
         return "discovery", "from_discovery"
     if _is_discovery_run(task, slug):
         return "discovery", "discover_run"
     tags = _tags(task.get("tags"))
-    if project_of(task, slug) == SELF_PROJECT:
+    if project == SELF_PROJECT:
         return "self", "self_repo"
     if SELF_PROJECT in tags:
         return "self", "self_tag"
@@ -259,6 +284,9 @@ def classify(task: dict | None, slug: str) -> tuple[str, str]:
     for prefix, kind in _SLUG_PREFIX_KINDS:
         if slug.startswith(prefix):
             return kind, f"slug:{prefix}"
+    for tag, kind in _HINT_KINDS:
+        if tag in tags:
+            return kind, f"hint:{tag}"
     return "other", "none"
 
 
@@ -306,17 +334,22 @@ def _cell(counts: dict, urls: set[str]) -> dict:
             "tokens_per_merge": counts["out_tokens"] // merged if merged else None}
 
 
-def _aggregate_period(pid: str, start: dt.datetime, end: dt.datetime,
-                      runs: list[dict], tasks: dict) -> dict:
+def _aggregate_period(pid: str, start: dt.datetime, end: dt.datetime, runs: list[dict],
+                      tasks: dict, placed: dict[str, tuple[str, str]]) -> dict:
+    """One period's rows and total. `runs` is oldest first; `placed` remembers
+    each slug's (project, kind) so the second period does not work it out again."""
     by_slug: dict[str, list[dict]] = {}
-    for run in sorted(runs, key=lambda r: (r["at"], r.get("name") or "")):
+    for run in runs:
         if start <= run["at"] <= end:
             by_slug.setdefault(run["slug"], []).append(run)
     counts: dict[tuple[str, str], dict] = {}
     urls: dict[tuple[str, str], set[str]] = {}
     for slug, slug_runs in by_slug.items():
         task = tasks.get(slug) or {}
-        key = (project_of(task, slug), classify(task, slug)[0])
+        key = placed.get(slug)
+        if key is None:
+            project = project_of(task, slug)
+            key = placed[slug] = (project, _classify(task, slug, project)[0])
         c = counts.setdefault(key, dict.fromkeys(_COUNT_KEYS, 0))
         c["runs"] += len(slug_runs)
         c["out_tokens"] += sum(int(r.get("out_tokens") or 0) for r in slug_runs)
@@ -342,7 +375,10 @@ def aggregate(runs: list[dict], tasks: dict, now: dt.datetime) -> dict:
     slug that is missing counts as a task with no file. present() turns the
     result into the wire model."""
     bounds = period_bounds(now)
-    return {"periods": [_aggregate_period(pid, *bounds[pid], runs, tasks) for pid in PERIODS]}
+    ordered = sorted(runs, key=lambda r: (r["at"], r.get("name") or ""))
+    placed: dict[str, tuple[str, str]] = {}
+    return {"periods": [_aggregate_period(pid, *bounds[pid], ordered, tasks, placed)
+                        for pid in PERIODS]}
 
 
 # --- presentation: the wire model ----------------------------------------------------------
@@ -571,15 +607,15 @@ def scan(runs_dir, items_dir, assign_dir, start: dt.datetime,
             m = _RUN_NAME_RE.match(entry.name)
             if m is None or not lo <= m.group(1) <= hi:
                 continue
-            parsed = parse_run_name(entry.name)
+            at = _stamp_time(m.group(1))
             try:
-                if parsed is None or not entry.is_dir():
+                if at is None or not entry.is_dir():
                     continue
             except OSError:
                 continue
             usage = run_usage(entry.path)
             pr_url, merged = run_result(entry.path)
-            runs.append({"name": entry.name, "slug": parsed[1], "at": parsed[0],
+            runs.append({"name": entry.name, "slug": m.group(2), "at": at,
                          "out_tokens": usage[0] if usage else 0,
                          "unmetered": usage is None or usage[1] == 0 or usage[2] > 0,
                          "pr_url": pr_url, "merged": merged})

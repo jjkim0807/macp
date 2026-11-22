@@ -81,9 +81,9 @@
     }
   },
   "expect": {
-    "rules": {"cost-review-20261121": "none"},
+    "rules": {"cost-review-20261121": "hint:cost"},
     "week": [
-      {"project": "vault", "kind": "other", "out_tokens": 30000, "runs": 1, "runs_unmetered": 0,
+      {"project": "vault", "kind": "ops", "out_tokens": 30000, "runs": 1, "runs_unmetered": 0,
        "merged_prs": 0, "done": 1, "cancelled": 0, "failed": 0, "tokens_per_merge": null}
     ]
   }
