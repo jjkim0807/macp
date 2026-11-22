@@ -1793,6 +1793,38 @@ def _attach_triage(attention: list[dict], parked: list[dict]) -> None:
                 r["triage"] = cards[slug]
 
 
+def _attach_decisions(human: list[dict]) -> None:
+    """Add `decision` to the answerable decision rows of `human`, in place, and
+    move those rows to the front.
+
+    The contract (which rows, the shape, the md-only judgment) lives in the
+    docstring of todo_system/orchestrator/triage.py, "Decision cards". Only
+    `why` owned / parked rows are asked; a row that gets a card also becomes
+    `urgent`, so a decision never waits behind a due date or a time block.
+    The sort is stable: rows with a card first, every other row in the order
+    collect_human gave it. Local md reads only (mtime-cached), no gh/git/
+    network. Fail-soft per row: an error leaves that row untouched and logs
+    one line; /api/status never breaks over it."""
+    try:
+        from todo_system.orchestrator import triage as _tri
+    except Exception as e:
+        logger.warning("decision cards unavailable err=%s", type(e).__name__)
+        return
+    for r in human:
+        if r.get("why") not in ("owned", "parked"):
+            continue
+        slug = str(r.get("slug") or "")
+        try:
+            card = _tri.decision_card(slug, items_dir=ITEMS)
+        except Exception as e:
+            logger.warning("decision card failed task=%s err=%s", slug, type(e).__name__)
+            continue
+        if card is not None:
+            r["decision"] = card
+            r["urgent"] = True
+    human.sort(key=lambda r: "decision" not in r)
+
+
 def collect_usage_value() -> dict:
     """`{"usage_value": model}` for /api/status, or `{}`.
 
@@ -1855,8 +1887,13 @@ def collect_status() -> dict:
     # {rule, reason, evidence, advice, actions}; recent shares the attention row
     # objects, so it rides along there too. Fail-soft per row.
     _attach_triage(attention, [r for r in human if r.get("why") == "parked"])
+    # Decision-card contract — SoT: the same docstring, "Decision cards".
+    # Additive: an answerable decision row of `human` gains `decision`
+    # {question, options}, is urgent and leads the list. Fail-soft per row.
+    _attach_decisions(human)
     for r in (*active, *attention, *human, *human_later):
-        r["group"] = _group_of(r)
+        # a decision is never folded into its project group: it is the thing to answer
+        r["group"] = "" if "decision" in r else _group_of(r)
 
     # ---- worker-state derivation (why "idle"?) ----
     # Gather the pure function's inputs from the same live data the rest of the

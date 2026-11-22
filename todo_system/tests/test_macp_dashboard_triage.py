@@ -440,6 +440,200 @@ class ActionRoute(_GitTriageVault):
         self.assertIn("status: open", (self.items / f"{self.ORPHAN}.md").read_text(encoding="utf-8"))
 
 
+# --- decision cards: /api/status `decision` + POST /api/action answer ------------------
+
+_ROW_KEYS = ["slug", "title", "category", "action", "why", "project", "due", "not_before",
+             "urgent", "later", "waiting_on", "ready_since", "group"]
+
+
+class _DecisionVault(_GitTriageVault):
+    """_GitTriageVault plus decision tasks (all synthetic), committed on main:
+
+    PICK      needs_decision + three options + a time block still ahead; no ledger row
+    TAGGED    the `decision` tag only (also in todo.db), no options
+    HUMAN     assigned to the human agent `owner` (ledger kind human, awaiting_human)
+    GROUPED   a decision inside a project (`demo`), next to GROUPMATE, a plain task
+    PLAIN     an ordinary manual task
+    LATER     a decision whose not_before is still ahead
+    BLOCKED   a decision that is worker_mode: blocked
+    """
+
+    PICK = "pick-budget"
+    TAGGED = "pick-tagged"
+    HUMAN = "prep-pick"
+    GROUPED = "demo-1-pick"
+    GROUPMATE = "demo-2-plain"
+    PLAIN = "plain-manual"
+    LATER = "pick-later"
+    BLOCKED = "pick-blocked"
+    OPTIONS = ["(a) raise the cap to 30", "(b) split a separate budget: API only", "(c) hold"]
+    HUMAN_OPTIONS = ["(a) delete it now", "(b) keep it"]
+
+    def setUp(self):
+        super().setUp()
+        opts = "decision_options:\n" + "".join(f'  - "{o}"\n' for o in self.OPTIONS)
+        human_opts = "decision_options:\n" + "".join(f'  - "{o}"\n' for o in self.HUMAN_OPTIONS)
+        self._task(self.PICK, "manual",
+                   'needs_decision: true\nnext_action: "Pick a budget plan"\n'
+                   f'scheduled: "2099-01-05 10:00~10:30"\n{opts}',
+                   next_action="Pick a budget plan")
+        self._task(self.TAGGED, "manual", 'next_action: "Pick a colour"\n',
+                   tags=("todo", "decision"), next_action="Pick a colour")
+        self._task(self.HUMAN, "delegate",
+                   f'needs_decision: true\nnext_action: "Pick what to do with the export"\n'
+                   f"{human_opts}", next_action="Pick what to do with the export")
+        self._row(self.HUMAN, agent_id="owner", kind="human", corr_id="c-7",
+                  payload={"worker_mode": "delegate"})
+        self._task(self.GROUPED, "manual", 'needs_decision: true\nnext_action: "Pick one"\n',
+                   next_action="Pick one")
+        self._task(self.GROUPMATE, "manual", 'next_action: "Do it"\n', next_action="Do it")
+        self._task(self.PLAIN, "manual", 'next_action: "Do it"\n', next_action="Do it")
+        self._task(self.LATER, "manual",
+                   f'needs_decision: true\nnot_before: 2099-01-01\nnext_action: "Pick later"\n{opts}',
+                   not_before="2099-01-01")
+        self._task(self.BLOCKED, "blocked", f"needs_decision: true\n{opts}")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "decision tasks")
+        self.commits = int(self.git("rev-list", "--count", "HEAD").strip())
+
+    def _task(self, slug: str, mode: str, front: str, *, tags=("todo",), next_action: str = "",
+              not_before: str | None = None) -> None:
+        tag_lines = "".join(f"  - {t}\n" for t in tags)
+        self._md(slug, f"---\ntags:\n{tag_lines}status: open\nupdated: 2026-11-20\n"
+                       f"worker_mode: {mode}\n{front}---\n\n# {slug}\n\n- [ ] step\n\n"
+                       "## Progress Log\n\n- 2026-11-20: created\n")
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO tasks (slug, title, path, status, worker_mode, imported_at, tags, "
+                    "next_action, not_before) VALUES (?,?,?,'open',?,'2026-01-01T00:00:00',?,?,?)",
+                    (slug, slug, str(self.items / f"{slug}.md"), mode, ",".join(tags),
+                     next_action, not_before))
+        con.commit()
+        con.close()
+
+    def human(self, port: int | None = None) -> dict:
+        d = self.status(port)
+        self.last = d
+        return {r["slug"]: r for r in d["human"]}
+
+    def md_text(self, slug: str) -> str:
+        return (self.items / f"{slug}.md").read_text(encoding="utf-8")
+
+
+class DecisionStatus(_DecisionVault):
+    def test_an_owned_decision_row_carries_question_and_options(self):
+        row = self.human()[self.PICK]
+        self.assertEqual(row["why"], "owned")
+        self.assertEqual(row["decision"], {"question": "Pick a budget plan",
+                                           "options": self.OPTIONS})
+        # urgent whatever the due date or the time block still ahead, and never folded
+        self.assertIs(row["urgent"], True)
+        self.assertEqual(row["due"], "")
+        self.assertEqual(row["group"], "")
+        self.assertEqual(sorted(k for k in row if k != "decision"), sorted(_ROW_KEYS))
+
+    def test_decision_rows_come_first(self):
+        self.human()
+        human = self.last["human"]
+        flags = ["decision" in r for r in human]
+        n = flags.count(True)
+        self.assertEqual(n, 4)                                   # PICK, TAGGED, HUMAN, GROUPED
+        self.assertEqual(flags, [True] * n + [False] * (len(human) - n))
+        order = [r["slug"] for r in human]
+        for parked in (self.REVIEW, self.ORPHAN):                # parked rows used to lead
+            self.assertLess(order.index(self.PICK), order.index(parked))
+        self.assertTrue(all(r["urgent"] for r in human[:n]))
+        # the rows behind them keep the order collect_human gave them
+        rest = human[n:]
+        self.assertEqual(rest, sorted(rest, key=M._human_sort_key))
+
+    def test_a_tag_only_decision_has_no_options(self):
+        row = self.human()[self.TAGGED]
+        self.assertEqual(row["why"], "owned")
+        self.assertEqual(row["decision"], {"question": "Pick a colour", "options": []})
+
+    def test_a_human_assigned_decision_carries_both_cards(self):
+        row = self.human()[self.HUMAN]
+        self.assertEqual(row["why"], "parked")
+        self.assertIn("rule", row["triage"])
+        self.assertEqual(row["decision"], {"question": "Pick what to do with the export",
+                                           "options": self.HUMAN_OPTIONS})
+        self.assertEqual(sorted(k for k in row if k not in ("decision", "triage")),
+                         sorted(_ROW_KEYS))
+
+    def test_a_decision_in_a_project_is_not_folded_into_its_group(self):
+        human = self.human()
+        self.assertEqual((human[self.GROUPED]["project"], human[self.GROUPED]["group"]),
+                         ("demo", ""))
+        self.assertIn("decision", human[self.GROUPED])
+        self.assertEqual((human[self.GROUPMATE]["project"], human[self.GROUPMATE]["group"]),
+                         ("demo", "demo"))
+
+    def test_rows_that_are_not_answerable_decisions_have_no_card(self):
+        human = self.human()
+        for slug in (self.REVIEW, self.ORPHAN, self.PLAIN, self.GROUPMATE, self.BLOCKED):
+            self.assertNotIn("decision", human[slug], slug)
+        self.assertEqual(human[self.BLOCKED]["why"], "blocked")
+        self.assertIs(human[self.BLOCKED]["urgent"], False)
+        self.assertIs(human[self.PLAIN]["urgent"], False)
+        later = {r["slug"]: r for r in self.last["human_later"]}
+        self.assertEqual(set(later), {self.LATER})
+        self.assertNotIn("decision", later[self.LATER])
+        self.assertNotIn(self.LATER, human)
+        # the card rides on human rows only
+        for key in ("attention", "active", "recent", "projects"):
+            for r in self.last[key]:
+                self.assertNotIn("decision", r, key)
+
+    def test_the_md_decides_before_the_db_catches_up(self):
+        # answered (or un-tagged) in the md while todo.db still says `decision`
+        md = self.items / f"{self.TAGGED}.md"
+        md.write_text(self.md_text(self.TAGGED).replace("  - decision\n", ""), encoding="utf-8")
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT tags FROM tasks WHERE slug=?",
+                                     (self.TAGGED,)).fetchone(), ("todo,decision",))
+        con.close()
+        row = self.human()[self.TAGGED]            # a fresh server: nothing cached
+        self.assertEqual(row["why"], "owned")      # todo.db still says so
+        self.assertNotIn("decision", row)          # the md no longer does
+        self.assertIs(row["urgent"], False)
+        self.assertIn("decision", self.human()[self.PICK])
+
+    def test_one_failing_card_leaves_the_others(self):
+        from todo_system.orchestrator import triage
+        real = triage.decision_card
+
+        def flaky(slug, **kw):
+            if slug == self.PICK:
+                raise RuntimeError("boom")
+            return real(slug, **kw)
+
+        with mock.patch.object(triage, "decision_card", flaky), \
+                self.assertLogs("macp.dashboard", level="WARNING") as logs:
+            human = self.human()
+        self.assertNotIn("decision", human[self.PICK])
+        self.assertIs(human[self.PICK]["urgent"], False)        # as collect_human left it
+        self.assertIn("decision", human[self.TAGGED])
+        self.assertIn("decision", human[self.HUMAN])
+        self.assertTrue(any(f"decision card failed task={self.PICK} err=RuntimeError" in line
+                            for line in logs.output), logs.output)
+
+    def test_the_decision_path_runs_no_subprocess_and_writes_nothing(self):
+        rows = [{"slug": self.PICK, "why": "owned", "urgent": False},
+                {"slug": self.PLAIN, "why": "manual", "urgent": False},
+                {"slug": self.HUMAN, "why": "parked", "urgent": True},
+                {"slug": self.BLOCKED, "why": "blocked", "urgent": False},
+                {"slug": self.LATER, "why": "owned", "urgent": False}]
+        with mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("no subprocess")):
+            M._attach_decisions(rows)
+        self.assertEqual([r["slug"] for r in rows],
+                         [self.PICK, self.HUMAN, self.PLAIN, self.BLOCKED, self.LATER])
+        self.assertEqual([("decision" in r, r["urgent"]) for r in rows],
+                         [(True, True), (True, True), (False, False), (False, False),
+                          (False, False)])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+
 # --- the web card (static page, no browser) -------------------------------------------
 
 class TriageCardShell(unittest.TestCase):
