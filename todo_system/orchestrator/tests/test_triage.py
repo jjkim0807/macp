@@ -10,6 +10,7 @@ Every test pins MACP_LANGUAGE itself (the reason/advice text is i18n).
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -339,8 +340,17 @@ class NotATargetKo(_Lang):
 
 class FixedValues(unittest.TestCase):
     def test_action_ids_are_a_closed_set(self):
-        self.assertEqual(triage.ACTIONS, ("merge", "resume", "cancel", "instruct"))
+        self.assertEqual(triage.ACTIONS, ("merge", "resume", "cancel", "instruct", "answer"))
         self.assertEqual(triage.TARGET_STATES, ("awaiting_human", "failed"))
+
+    def test_answer_is_never_a_triage_card_button(self):
+        # `answer` belongs to the decision card; no diagnosis rule ever offers it
+        cards = [triage.diagnose(f) for f in CASES.values()]
+        cards.append(triage.diagnose(_facts(needs_decision=True, agent_is_human=True,
+                                            agent_kind="human", md_worker_mode="delegate")))
+        for t in cards:
+            self.assertNotIn("answer", _ids(t))
+        self.assertIn("only records", triage.__doc__)
 
     def test_dispatchable_mirror(self):
         from todo_system.orchestrator import tasks
@@ -642,6 +652,148 @@ class GatherKo(_TmpVault):
         self.assertEqual(triage.triage_for(slug, **kw)["rule"], "review_pr")
         with mock.patch.object(triage, "gather", side_effect=RuntimeError("boom")):
             self.assertIsNone(triage.triage_for(slug, **kw))
+
+
+# --- decision cards: is this task md a decision a person can answer now? -------------
+
+class DecisionCardKo(_TmpVault):
+    """decision_card() judges from the task md alone (no ledger row needed) and
+    is what both /api/status and the click-time check of `answer` call."""
+
+    OPTIONS = ["(a) raise the cap to 30", "(b) split a separate budget: API only", "(c) hold"]
+    NOW = dt.datetime(2026, 11, 23, 9, 0)
+
+    def md(self, front: str, slug: str = SLUG) -> Path:
+        p = self.root / "Todo/items" / f"{slug}.md"
+        p.write_text(f"---\n{front}---\n\n# {slug}\n\n## Progress Log\n\n- 2026-11-20: created\n",
+                     encoding="utf-8")
+        return p
+
+    def card(self, slug: str = SLUG, **kw):
+        kw.setdefault("now", self.NOW)
+        return triage.decision_card(slug, items_dir=self.root / "Todo/items", **kw)
+
+    def decision(self, extra: str = "", options: list[str] | None = None) -> str:
+        opts = self.OPTIONS if options is None else options
+        lines = "".join(f'  - "{o}"\n' for o in opts)
+        return ("status: open\nworker_mode: manual\nneeds_decision: true\n"
+                'next_action: "Pick a budget plan"\n'
+                f"decision_options:\n{lines}{extra}")
+
+    def test_block_list_options_come_back_verbatim(self):
+        self.md(self.decision())
+        self.assertEqual(self.card(), {"question": "Pick a budget plan", "options": self.OPTIONS})
+
+    def test_inline_list_options(self):
+        self.md("status: open\nneeds_decision: true\nnext_action: Pick one\n"
+                'decision_options: ["(a) keep, as is", (b) change, c]\n')
+        self.assertEqual(self.card(), {"question": "Pick one",
+                                       "options": ["(a) keep, as is", "(b) change", "c"]})
+
+    def test_no_list_means_no_options(self):
+        for line in ("", "decision_options: a or b\n", 'decision_options: "[a, b]"\n',
+                     "decision_options:\n"):
+            triage._CACHE.clear()
+            self.md(f"status: open\nneeds_decision: true\nnext_action: Pick one\n{line}")
+            self.assertEqual(self.card(), {"question": "Pick one", "options": []}, line)
+
+    def test_options_are_capped_clipped_and_one_line(self):
+        long = "x" * 201
+        opts = ["one", "", "two   words\there", long, "five", "six", "seven", "eight"]
+        self.md(self.decision(options=opts))
+        got = self.card()["options"]
+        self.assertEqual(len(got), triage.DECISION_OPTIONS_MAX)
+        self.assertEqual(got[:2], ["one", "two words here"])          # the empty item is dropped
+        self.assertEqual(got[2], "x" * 199 + "…")
+        self.assertEqual(len(got[2]), triage.DECISION_OPTION_CHARS)
+        self.assertEqual(got[3:], ["five", "six", "seven"])
+
+    def test_question_is_next_action_one_line_capped(self):
+        self.md("status: open\nneeds_decision: true\n")
+        self.assertEqual(self.card(), {"question": "", "options": []})
+        triage._CACHE.clear()
+        self.md("status: open\nneeds_decision: true\nnext_action: " + "q" * 301 + "\n")
+        q = self.card()["question"]
+        self.assertEqual((len(q), q[-1]), (triage.DECISION_QUESTION_CHARS, "…"))
+
+    def test_the_decision_tag_alone_is_enough(self):
+        for tags in ("tags:\n  - todo\n  - decision\n", "tags: [todo, Decision]\n",
+                     "tags: todo, decision\n"):
+            triage._CACHE.clear()
+            self.md(f"{tags}status: open\nnext_action: Pick one\n")
+            self.assertEqual(self.card(), {"question": "Pick one", "options": []}, tags)
+
+    def test_needs_decision_spellings(self):
+        for raw, want in (("true", True), ("True", True), ("yes", True), ('"true"', True),
+                          ("'true'", True), ("1", True), ("false", False), ("no", False),
+                          ("maybe", False), ("true  # pick one", False)):
+            triage._CACHE.clear()
+            self.md(f"status: open\nneeds_decision: {raw}\n")
+            self.assertEqual(self.card() is not None, want, raw)
+
+    def test_not_answerable_now(self):
+        cases = {
+            "done": "status: done\nneeds_decision: true\n",
+            "cancelled": "status: cancelled\nneeds_decision: true\n",
+            "no marker": "status: open\ntags:\n  - todo\n  - decisions-log\n",
+            "answered": "status: open\nneeds_decision: false\n",
+            "blocked": "status: open\nworker_mode: blocked\nneeds_decision: true\n",
+            "not yet": "status: open\nneeds_decision: true\nnot_before: 2026-11-24\n",
+            "not yet, timed": 'status: open\nneeds_decision: true\nnot_before: "2026-11-23 09:30"\n',
+        }
+        for name, front in cases.items():
+            triage._CACHE.clear()
+            self.md(front)
+            self.assertIsNone(self.card(), name)
+        self.assertIsNone(self.card("no-such-task"))
+        (self.root / "Todo/items" / "a-dir.md").mkdir()               # unreadable md
+        self.assertIsNone(self.card("a-dir"))
+
+    def test_a_passed_not_before_is_answerable(self):
+        self.md("status: open\nneeds_decision: true\nnot_before: 2026-11-23\n")
+        self.assertIsNotNone(self.card())
+        self.assertIsNone(self.card(now=dt.datetime(2026, 11, 22, 23, 59)))
+
+    def test_default_clock_is_the_not_before_clock(self):
+        from todo_system import not_before as nb
+        self.md("status: open\nneeds_decision: true\nnot_before: 2026-11-24\n")
+        with mock.patch.object(nb, "_now", return_value=dt.datetime(2026, 11, 25, 0, 0)):
+            self.assertIsNotNone(triage.decision_card(SLUG, items_dir=self.root / "Todo/items"))
+        with mock.patch.object(nb, "_now", return_value=dt.datetime(2026, 11, 23, 0, 0)):
+            self.assertIsNone(triage.decision_card(SLUG, items_dir=self.root / "Todo/items"))
+
+    def test_an_answered_md_is_reread(self):
+        p = self.md(self.decision())
+        self.assertIsNotNone(self.card())
+        p.write_text(p.read_text(encoding="utf-8").replace("needs_decision: true",
+                                                           "needs_decision: false"),
+                     encoding="utf-8")
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        self.assertIsNone(self.card())
+
+    def test_the_card_needs_no_ledger_row_and_writes_nothing(self):
+        p = self.md(self.decision())
+        before = p.read_bytes()
+        self.assertEqual(list((self.root / "Worker/assignments").iterdir()), [])
+        self.assertIsNotNone(self.card())
+        self.assertEqual(p.read_bytes(), before)
+        self.assertEqual(list((self.root / "Worker/assignments").iterdir()), [])
+
+    def test_md_decision_is_the_gather_fact(self):
+        # one definition: gather()'s needs_decision is md_decision() of the same md
+        case = _load_case("orphan_redelivery.json")
+        for front, want in (("status: open\nneeds_decision: true\n", True),
+                            ("status: open\ntags: [todo, decision]\n", True),
+                            ("status: open\nneeds_decision: false\n", False)):
+            triage._CACHE.clear()
+            case["task_md"] = f"---\n{front}---\n\n# x\n"
+            slug = self.install(case)
+            self.assertIs(self.gather(slug)["needs_decision"], want, front)
+            self.assertIs(triage.md_decision(triage.parse_frontmatter(case["task_md"])[0]),
+                          want, front)
+        self.assertFalse(triage.md_decision({}))
+        self.assertFalse(triage.md_decision({"tags": None, "needs_decision": None}))
 
 
 if __name__ == "__main__":

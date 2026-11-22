@@ -62,6 +62,7 @@ One paragraph restating what success looks like in concrete terms.
 - Korean is fine for descriptive prose if the task itself is in Korean; section headers above stay as-is.
 - Cite each "Relevant file" with the actual path you Read.
 - Keep the document to about one page — it is the Plan stage's input, not a report.
+- A choice only a person can make is not prose to carry forward: write it under "Open questions" as `결정 필요: <question> — 선택지: <a> / <b> / <c>` (the labels in the vault's language), so a later stage raises it as a decision task (`needs_decision: true` + `decision_options:`, no `scheduled:`). This stage edits no task file.
 
 ## After writing
 

@@ -440,6 +440,457 @@ class ActionRoute(_GitTriageVault):
         self.assertIn("status: open", (self.items / f"{self.ORPHAN}.md").read_text(encoding="utf-8"))
 
 
+# --- decision cards: /api/status `decision` + POST /api/action answer ------------------
+
+_ROW_KEYS = ["slug", "title", "category", "action", "why", "project", "due", "not_before",
+             "urgent", "later", "waiting_on", "ready_since", "group"]
+
+
+class _DecisionVault(_GitTriageVault):
+    """_GitTriageVault plus decision tasks (all synthetic), committed on main:
+
+    PICK      needs_decision + three options + a time block still ahead; no ledger row
+    TAGGED    the `decision` tag only (also in todo.db), no options
+    HUMAN     assigned to the human agent `owner` (ledger kind human, awaiting_human)
+    GROUPED   a decision inside a project (`demo`), next to GROUPMATE, a plain task
+    PLAIN     an ordinary manual task
+    LATER     a decision whose not_before is still ahead
+    BLOCKED   a decision that is worker_mode: blocked
+    """
+
+    PICK = "pick-budget"
+    TAGGED = "pick-tagged"
+    HUMAN = "prep-pick"
+    GROUPED = "demo-1-pick"
+    GROUPMATE = "demo-2-plain"
+    PLAIN = "plain-manual"
+    LATER = "pick-later"
+    BLOCKED = "pick-blocked"
+    OPTIONS = ["(a) raise the cap to 30", "(b) split a separate budget: API only", "(c) hold"]
+    HUMAN_OPTIONS = ["(a) delete it now", "(b) keep it"]
+
+    def setUp(self):
+        super().setUp()
+        opts = "decision_options:\n" + "".join(f'  - "{o}"\n' for o in self.OPTIONS)
+        human_opts = "decision_options:\n" + "".join(f'  - "{o}"\n' for o in self.HUMAN_OPTIONS)
+        self._task(self.PICK, "manual",
+                   'needs_decision: true\nnext_action: "Pick a budget plan"\n'
+                   f'scheduled: "2099-01-05 10:00~10:30"\n{opts}',
+                   next_action="Pick a budget plan")
+        self._task(self.TAGGED, "manual", 'next_action: "Pick a colour"\n',
+                   tags=("todo", "decision"), next_action="Pick a colour")
+        self._task(self.HUMAN, "delegate",
+                   f'needs_decision: true\nnext_action: "Pick what to do with the export"\n'
+                   f"{human_opts}", next_action="Pick what to do with the export")
+        self._row(self.HUMAN, agent_id="owner", kind="human", corr_id="c-7",
+                  payload={"worker_mode": "delegate"})
+        self._task(self.GROUPED, "manual", 'needs_decision: true\nnext_action: "Pick one"\n',
+                   next_action="Pick one")
+        self._task(self.GROUPMATE, "manual", 'next_action: "Do it"\n', next_action="Do it")
+        self._task(self.PLAIN, "manual", 'next_action: "Do it"\n', next_action="Do it")
+        self._task(self.LATER, "manual",
+                   f'needs_decision: true\nnot_before: 2099-01-01\nnext_action: "Pick later"\n{opts}',
+                   not_before="2099-01-01")
+        self._task(self.BLOCKED, "blocked", f"needs_decision: true\n{opts}")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "decision tasks")
+        self.commits = int(self.git("rev-list", "--count", "HEAD").strip())
+
+    def _task(self, slug: str, mode: str, front: str, *, tags=("todo",), next_action: str = "",
+              not_before: str | None = None) -> None:
+        tag_lines = "".join(f"  - {t}\n" for t in tags)
+        self._md(slug, f"---\ntags:\n{tag_lines}status: open\nupdated: 2026-11-20\n"
+                       f"worker_mode: {mode}\n{front}---\n\n# {slug}\n\n- [ ] step\n\n"
+                       "## Progress Log\n\n- 2026-11-20: created\n")
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO tasks (slug, title, path, status, worker_mode, imported_at, tags, "
+                    "next_action, not_before) VALUES (?,?,?,'open',?,'2026-01-01T00:00:00',?,?,?)",
+                    (slug, slug, str(self.items / f"{slug}.md"), mode, ",".join(tags),
+                     next_action, not_before))
+        con.commit()
+        con.close()
+
+    def human(self, port: int | None = None) -> dict:
+        d = self.status(port)
+        self.last = d
+        return {r["slug"]: r for r in d["human"]}
+
+    def md_text(self, slug: str) -> str:
+        return (self.items / f"{slug}.md").read_text(encoding="utf-8")
+
+
+class DecisionStatus(_DecisionVault):
+    def test_an_owned_decision_row_carries_question_and_options(self):
+        row = self.human()[self.PICK]
+        self.assertEqual(row["why"], "owned")
+        self.assertEqual(row["decision"], {"question": "Pick a budget plan",
+                                           "options": self.OPTIONS})
+        # urgent whatever the due date or the time block still ahead, and never folded
+        self.assertIs(row["urgent"], True)
+        self.assertEqual(row["due"], "")
+        self.assertEqual(row["group"], "")
+        self.assertEqual(sorted(k for k in row if k != "decision"), sorted(_ROW_KEYS))
+
+    def test_decision_rows_come_first(self):
+        self.human()
+        human = self.last["human"]
+        flags = ["decision" in r for r in human]
+        n = flags.count(True)
+        self.assertEqual(n, 4)                                   # PICK, TAGGED, HUMAN, GROUPED
+        self.assertEqual(flags, [True] * n + [False] * (len(human) - n))
+        order = [r["slug"] for r in human]
+        for parked in (self.REVIEW, self.ORPHAN):                # parked rows used to lead
+            self.assertLess(order.index(self.PICK), order.index(parked))
+        self.assertTrue(all(r["urgent"] for r in human[:n]))
+        # the rows behind them keep the order collect_human gave them
+        rest = human[n:]
+        self.assertEqual(rest, sorted(rest, key=M._human_sort_key))
+
+    def test_a_tag_only_decision_has_no_options(self):
+        row = self.human()[self.TAGGED]
+        self.assertEqual(row["why"], "owned")
+        self.assertEqual(row["decision"], {"question": "Pick a colour", "options": []})
+
+    def test_a_human_assigned_decision_carries_both_cards(self):
+        row = self.human()[self.HUMAN]
+        self.assertEqual(row["why"], "parked")
+        self.assertIn("rule", row["triage"])
+        self.assertEqual(row["decision"], {"question": "Pick what to do with the export",
+                                           "options": self.HUMAN_OPTIONS})
+        self.assertEqual(sorted(k for k in row if k not in ("decision", "triage")),
+                         sorted(_ROW_KEYS))
+
+    def test_a_decision_in_a_project_is_not_folded_into_its_group(self):
+        human = self.human()
+        self.assertEqual((human[self.GROUPED]["project"], human[self.GROUPED]["group"]),
+                         ("demo", ""))
+        self.assertIn("decision", human[self.GROUPED])
+        self.assertEqual((human[self.GROUPMATE]["project"], human[self.GROUPMATE]["group"]),
+                         ("demo", "demo"))
+
+    def test_rows_that_are_not_answerable_decisions_have_no_card(self):
+        human = self.human()
+        for slug in (self.REVIEW, self.ORPHAN, self.PLAIN, self.GROUPMATE, self.BLOCKED):
+            self.assertNotIn("decision", human[slug], slug)
+        self.assertEqual(human[self.BLOCKED]["why"], "blocked")
+        self.assertIs(human[self.BLOCKED]["urgent"], False)
+        self.assertIs(human[self.PLAIN]["urgent"], False)
+        later = {r["slug"]: r for r in self.last["human_later"]}
+        self.assertEqual(set(later), {self.LATER})
+        self.assertNotIn("decision", later[self.LATER])
+        self.assertNotIn(self.LATER, human)
+        # the card rides on human rows only
+        for key in ("attention", "active", "recent", "projects"):
+            for r in self.last[key]:
+                self.assertNotIn("decision", r, key)
+
+    def test_the_md_decides_before_the_db_catches_up(self):
+        # answered (or un-tagged) in the md while todo.db still says `decision`
+        md = self.items / f"{self.TAGGED}.md"
+        md.write_text(self.md_text(self.TAGGED).replace("  - decision\n", ""), encoding="utf-8")
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT tags FROM tasks WHERE slug=?",
+                                     (self.TAGGED,)).fetchone(), ("todo,decision",))
+        con.close()
+        row = self.human()[self.TAGGED]            # a fresh server: nothing cached
+        self.assertEqual(row["why"], "owned")      # todo.db still says so
+        self.assertNotIn("decision", row)          # the md no longer does
+        self.assertIs(row["urgent"], False)
+        self.assertIn("decision", self.human()[self.PICK])
+
+    def test_one_failing_card_leaves_the_others(self):
+        from todo_system.orchestrator import triage
+        real = triage.decision_card
+
+        def flaky(slug, **kw):
+            if slug == self.PICK:
+                raise RuntimeError("boom")
+            return real(slug, **kw)
+
+        with mock.patch.object(triage, "decision_card", flaky), \
+                self.assertLogs("macp.dashboard", level="WARNING") as logs:
+            human = self.human()
+        self.assertNotIn("decision", human[self.PICK])
+        self.assertIs(human[self.PICK]["urgent"], False)        # as collect_human left it
+        self.assertIn("decision", human[self.TAGGED])
+        self.assertIn("decision", human[self.HUMAN])
+        self.assertTrue(any(f"decision card failed task={self.PICK} err=RuntimeError" in line
+                            for line in logs.output), logs.output)
+
+    def test_the_decision_path_runs_no_subprocess_and_writes_nothing(self):
+        rows = [{"slug": self.PICK, "why": "owned", "urgent": False},
+                {"slug": self.PLAIN, "why": "manual", "urgent": False},
+                {"slug": self.HUMAN, "why": "parked", "urgent": True},
+                {"slug": self.BLOCKED, "why": "blocked", "urgent": False},
+                {"slug": self.LATER, "why": "owned", "urgent": False}]
+        with mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("no subprocess")):
+            M._attach_decisions(rows)
+        self.assertEqual([r["slug"] for r in rows],
+                         [self.PICK, self.HUMAN, self.PLAIN, self.BLOCKED, self.LATER])
+        self.assertEqual([("decision" in r, r["urgent"]) for r in rows],
+                         [(True, True), (True, True), (False, False), (False, False),
+                          (False, False)])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+class AnswerRoute(_DecisionVault):
+    """POST /api/action {task, action: "answer", option | text} through the real
+    server: the choice is recorded in the task md (one commit), a waiting human
+    assignment gets one reply, the status cache is dropped — and nothing else runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.inbox = self.root / "Worker" / "agents" / "orchestrator" / "inbox"
+
+    def envelopes(self) -> list[dict]:
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(self.inbox.glob("*.json"))]
+
+    def commit_count(self) -> int:
+        return int(self.git("rev-list", "--count", "HEAD").strip())
+
+    def nothing_ran(self):
+        self.assertEqual(self.gh_calls, [])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.commit_count(), self.commits)
+        self.assertFalse(self.inbox.exists())
+        for slug in (self.PICK, self.TAGGED, self.HUMAN, self.REVIEW):
+            self.assertFalse(resume.record_path(self.root, slug).exists(), slug)
+
+    def serve_cached(self) -> int:
+        """A server whose status body does not expire by age within a test (TTL
+        one minute instead of two seconds), so a changed /api/status can only
+        come from an invalidation. Not longer: invalidate() zeroes the
+        monotonic timestamp, which only reads as expired once the host has
+        been up longer than the TTL."""
+        srv = M.serve("127.0.0.1", 0, TOKEN)
+        srv.RequestHandlerClass._status_cache.ttl = 60.0
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def test_status_carries_options_then_answer_option_2_records_it(self):
+        self.port = self.serve_cached()
+        # 1. the decision row carries the options (this GET fills the cache)
+        row = self.human(self.port)[self.PICK]
+        self.assertEqual(row["decision"]["options"], self.OPTIONS)
+        # the cache really holds: an md edit made behind the server's back is not seen
+        tagged = self.items / f"{self.TAGGED}.md"
+        tagged.write_text(self.md_text(self.TAGGED).replace("  - decision\n", ""), encoding="utf-8")
+        self.git("commit", "-q", "-am", "untag by hand")
+        self.assertIn("decision", self.human(self.port)[self.TAGGED])
+        # 2. answer with option 2
+        with self.assertLogs("macp.dashboard", level="INFO") as logs:
+            code, res = self.post({"task": self.PICK, "action": "answer", "option": 2})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn(self.OPTIONS[1], res["message"])
+        # 3. the md: the chosen option verbatim under a dated Progress Log line, marker down
+        md = self.md_text(self.PICK)
+        self.assertRegex(md, r"\n- \d{4}-\d{2}-\d{2}: 결정\(대시보드\): "
+                             + re.escape(self.OPTIONS[1]) + r"\n$")
+        self.assertIn("\nneeds_decision: false\n", md)
+        self.assertNotIn("decision_options", md)
+        self.assertNotIn(self.OPTIONS[0], md)
+        self.assertIn(f'\nnext_action: "결정 반영 — {self.OPTIONS[1]}"\n', md)
+        self.assertIn("\nstatus: open\n", md)
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.PICK}.md"])
+        self.assertEqual(self.git("log", "-1", "--format=%s").strip(),
+                         f"chore: record decision for {self.PICK} (dashboard)")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.gh_calls, [])
+        self.assertTrue(any(f"dashboard action task={self.PICK} action=answer rule=decision "
+                            "ok=True" in line for line in logs.output), logs.output)
+        # 4. the POST dropped the cached status: the same server recomputes at once
+        human = self.human(self.port)
+        self.assertNotIn("decision", human[self.PICK])
+        self.assertNotIn("decision", human[self.TAGGED])
+
+    def test_a_text_answer_is_trimmed_and_kept_out_of_the_log(self):
+        with self.assertLogs("macp.dashboard", level="INFO") as logs:
+            code, res = self.post({"task": self.PICK, "action": "answer",
+                                   "text": "  둘 다 아님 — 12월에   다시  "})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertRegex(self.md_text(self.PICK),
+                         r"\n- \d{4}-\d{2}-\d{2}: 결정\(대시보드\): 둘 다 아님 — 12월에 다시\n$")
+        self.assertTrue(any("action=answer" in line and "text_len=" in line
+                            for line in logs.output), logs.output)
+        self.assertFalse(any("둘 다 아님" in line for line in logs.output), logs.output)
+        # a tag-only decision has no options, so a line of text is the way to answer it
+        code, res = self.post({"task": self.TAGGED, "action": "answer", "text": "blue"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        md = self.md_text(self.TAGGED)
+        self.assertNotIn("  - decision\n", md)
+        self.assertIn("\nneeds_decision: false\n", md)
+
+    def test_answer_refusals_run_nothing(self):
+        pick = self.PICK
+
+        def ans(task, **kw):
+            return {"task": task, "action": "answer", **kw}
+
+        cases = [
+            (dict(body=ans(pick, option=1), token=None), 401),
+            # not a decision anyone can answer now
+            (dict(body=ans(self.REVIEW, option=1)), 409),
+            (dict(body=ans(self.ACTIVE, text="go")), 409),
+            (dict(body=ans(self.PLAIN, text="go")), 409),
+            (dict(body=ans(self.BLOCKED, option=1)), 409),
+            (dict(body=ans(self.LATER, option=1)), 409),
+            (dict(body=ans("no-such-task", option=1)), 404),
+            (dict(body=ans("../etc", option=1)), 400),
+            # an option is a position in the list the server sent: 1..3 here
+            (dict(body=ans(pick, option=4)), 400),
+            (dict(body=ans(pick, option=0)), 400),
+            (dict(body=ans(pick, option=-1)), 400),
+            (dict(body=ans(pick, option="2")), 400),
+            (dict(body=ans(pick, option=2.5)), 400),
+            (dict(body=ans(pick, option=True)), 400),
+            (dict(body=ans(pick, option=[2])), 400),
+            (dict(body=ans(self.TAGGED, option=1)), 400),          # a card with no options
+            # exactly one of option / text
+            (dict(body=ans(pick, option=2, text="b")), 400),
+            (dict(body=ans(pick)), 400),
+            (dict(body=ans(pick, option=None, text=None)), 400),
+            # a text answer is one line of 1..500 chars
+            (dict(body=ans(pick, text="")), 400),
+            (dict(body=ans(pick, text="   ")), 400),
+            (dict(body=ans(pick, text="a\nb")), 400),
+            (dict(body=ans(pick, text="x" * 501)), 400),
+            (dict(body=ans(pick, text=5)), 400),
+        ]
+        for kw, want in cases:
+            code, res = self.post(**kw)
+            self.assertEqual(code, want, kw)
+            if code != 401:
+                self.assertSentence(res, ok=False)
+        self.nothing_ran()
+        # 500 chars is still one answer
+        code, res = self.post(ans(pick, text="y" * 500))
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+
+    def test_the_same_answer_twice_records_once(self):
+        code, res = self.post({"task": self.PICK, "action": "answer", "option": 1})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        code, res = self.post({"task": self.PICK, "action": "answer", "option": 1})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+        self.assertEqual(self.md_text(self.PICK).count("결정(대시보드)"), 1)
+        self.assertEqual(self.commit_count(), self.commits + 1)
+
+    def test_human_assignment_answer_sends_one_reply(self):
+        ledger = self.assign / f"{self.HUMAN}.json"
+        before = ledger.read_bytes()
+        code, res = self.post({"task": self.HUMAN, "action": "answer", "option": 2})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        (env,) = self.envelopes()
+        self.assertEqual((env["type"], env["to"], env["from"], env["task_id"], env["corr_id"]),
+                         ("NEEDS_INPUT", "orchestrator", "owner", self.HUMAN, "c-7"))
+        self.assertEqual(env["payload"], {"note": f"answered via dashboard: {self.HUMAN_OPTIONS[1]}"})
+        self.assertEqual(ledger.read_bytes(), before)          # the ledger is the orchestrator's
+        self.assertIn(f"결정(대시보드): {self.HUMAN_OPTIONS[1]}", self.md_text(self.HUMAN))
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.HUMAN}.md"])
+        # a second click is refused before anything is sent again
+        code, res = self.post({"task": self.HUMAN, "action": "answer", "option": 1})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+        self.assertEqual(len(self.envelopes()), 1)
+        # an answer to a task nobody was assigned sends nothing
+        code, _ = self.post({"task": self.PICK, "action": "answer", "option": 1})
+        self.assertEqual(code, 200)
+        self.assertEqual(len(self.envelopes()), 1)
+        # with the marker down the parked row offers a resume: handing it to a
+        # worker stays a separate click
+        row = self.human(self.port)[self.HUMAN]
+        self.assertNotIn("decision", row)
+        self.assertEqual(row["triage"]["rule"], "human_misroute")
+        self.assertIn("resume", [a["id"] for a in row["triage"]["actions"]])
+        self.assertFalse(resume.record_path(self.root, self.HUMAN).exists())
+
+    def test_answer_only_records(self):
+        # The boundary of the button: it writes the choice down. A choice that names
+        # an irreversible step (delete, pay, deploy) is recorded and nothing runs.
+        ran: list[list[str]] = []
+        real_run = subprocess.run
+
+        def recording(argv, **kw):
+            ran.append(list(argv))
+            return real_run(argv, **kw)
+
+        files_before = sorted(p.name for p in self.items.iterdir())
+        ledger_before = {p.name: p.read_bytes() for p in self.assign.iterdir()}
+        with mock.patch.object(M, "_ACTION_RUN", recording):
+            code, res = self.post({"task": self.HUMAN, "action": "answer", "option": 1})
+            self.assertEqual(code, 200)
+            self.assertSentence(res, ok=True)
+            code, res = self.post({"task": self.PICK, "action": "answer",
+                                   "text": "merge it, deploy to production and pay the invoice"})
+            self.assertEqual(code, 200)
+            self.assertSentence(res, ok=True)
+        self.assertIn("결정(대시보드): (a) delete it now", self.md_text(self.HUMAN))
+        # every process the two clicks started is git, checking the checkout or committing
+        self.assertTrue(ran)
+        for argv in ran:
+            self.assertEqual(argv[0], "git", argv)
+            self.assertIn(argv[3], ("rev-parse", "ls-files", "commit"), argv)
+        self.assertEqual(self.gh_calls, [])
+        for slug in (self.HUMAN, self.PICK):
+            self.assertFalse(resume.record_path(self.root, slug).exists(), slug)
+            self.assertIn("\nstatus: open\n", self.md_text(slug))        # not closed
+        self.assertEqual(sorted(p.name for p in self.items.iterdir()), files_before)   # none deleted
+        self.assertEqual({p.name: p.read_bytes() for p in self.assign.iterdir()}, ledger_before)
+        self.assertEqual(self.commit_count(), self.commits + 2)          # one md commit per answer
+        changed = self.git("diff", "--name-only", "HEAD~2..HEAD").split()
+        self.assertEqual(sorted(changed), sorted([f"Todo/items/{self.HUMAN}.md",
+                                                  f"Todo/items/{self.PICK}.md"]))
+        # the only untracked thing is the one reply envelope for the human assignment
+        self.assertEqual(self.git("status", "--porcelain").split(), ["??", "Worker/agents/orchestrator/"])
+        self.assertEqual(len(self.envelopes()), 1)
+
+    def test_an_umbrella_in_progress_is_refused(self):
+        with mock.patch.object(M, "_umbrellas_in_progress", return_value={self.PICK}):
+            code, res = self.post({"task": self.PICK, "action": "answer", "option": 1})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+        self.nothing_ran()
+
+    def test_a_vault_off_main_is_a_sentence_and_nothing_is_written(self):
+        before = self.md_text(self.HUMAN)
+        self.git("checkout", "-q", "-b", "worker/other")
+        code, res = self.post({"task": self.HUMAN, "action": "answer", "option": 2})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=False)
+        self.assertIn("main이 아니라", res["message"])
+        self.assertEqual(self.md_text(self.HUMAN), before)
+        self.assertFalse(self.inbox.exists())                   # no reply for an unrecorded answer
+
+    def test_a_card_that_cannot_be_read_is_a_500_sentence(self):
+        from todo_system.orchestrator import triage
+        with mock.patch.object(triage, "decision_card", side_effect=RuntimeError("boom")), \
+                self.assertLogs("macp.dashboard", level="WARNING"):
+            code, res = self.post({"task": self.PICK, "action": "answer", "option": 1})
+        self.assertEqual(code, 500)
+        self.assertSentence(res, ok=False)
+        self.nothing_ran()
+
+    def test_the_triage_actions_are_unchanged_by_the_new_id(self):
+        # `answer` on a triage row is judged by the decision card alone, and the
+        # four triage actions still answer to their own card
+        code, _ = self.post({"task": self.ORPHAN, "action": "answer", "text": "resume it"})
+        self.assertEqual(code, 409)
+        code, _ = self.post({"task": self.PICK, "action": "cancel"})
+        self.assertEqual(code, 404)                             # no ledger row: no triage card
+        code, res = self.post({"task": self.ORPHAN, "action": "resume"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+
+
 # --- the web card (static page, no browser) -------------------------------------------
 
 class TriageCardShell(unittest.TestCase):
@@ -524,6 +975,101 @@ class TriageCardShell(unittest.TestCase):
             self.assertIn(s, en)
         self.assertIsNone(_HANGUL_RE.search(en))
         for s in ("처리 중…", "요청을 보내지 못했어요", "지시 한 줄 (500자 이하)", ">보내기</button>"):
+            self.assertIn(s, ko)
+
+
+class DecisionCardShell(unittest.TestCase):
+    """The decision card renders what the server sends (question, options) plus a
+    one-line box, and posts `answer`. Like the triage card it judges nothing; the
+    live look (390 px, no horizontal scroll) is a run-log note, not a gate."""
+
+    T = M._HTML_TEMPLATE
+
+    def line(self, prefix: str) -> str:
+        return next(ln for ln in self.T.splitlines() if ln.startswith(prefix))
+
+    def render(self) -> str:
+        return self.T[self.T.index("function decBlock"):self.T.index("function decSend")]
+
+    def handlers(self) -> str:
+        return self.T[self.T.index("function decSend"):self.T.index("// @@dash.html.queue@@")]
+
+    def test_only_human_rows_render_the_card_above_the_triage_card(self):
+        row = self.line("const humanRow=")
+        self.assertIn("${decBlock(r.slug,r.decision)}${triBlock(r.slug,r.triage)}", row)
+        for other in ("const attnRow=", "const activeRow=", "const recentRow=", "const projRow="):
+            self.assertNotIn("decBlock(", self.line(other))
+
+    def test_the_card_renders_only_what_the_server_sent(self):
+        b = self.render()
+        for tok in ("if(!d)return ''", "esc(d.question)", "d.options", "${esc(o)}",
+                    'data-dec="opt"', 'data-n="${i+1}"', 'data-dec="send"',
+                    '<input class="tri-in" data-kind="answer"', 'maxlength="500"',
+                    "@@dash.js.dec_placeholder@@", "@@dash.js.tri_send@@"):
+            self.assertIn(tok, b)
+        # no verdict on the client: it never reads why/urgent/state, sorts or filters
+        for tok in ("r.why", "r.urgent", "r.state", "d.rule", ".sort(", ".filter("):
+            self.assertNotIn(tok, b)
+        # the buttons are the server's options, nothing the page invents
+        for word in ("deploy", "submit", "publish", "delete", "pay", "merge", "--admin"):
+            self.assertNotIn(word, b.lower())
+
+    def test_busy_disables_every_button(self):
+        b = self.render()
+        self.assertIn("dis=st.busy?' disabled':''", b)
+        self.assertEqual(b.count("${dis}>"), 2)                  # each option, and send
+        self.assertEqual(b.count("<button"), 2)
+
+    def test_answers_go_to_the_action_route_as_option_or_text(self):
+        h = self.handlers()
+        self.assertIn("triAct(slug,'answer',null,Number(btn.dataset.n))", h)      # an option: 1-based
+        self.assertIn("triAct(slug,'answer',v)", h)                               # a line of text
+        self.assertIn("btn.dataset.dec==='send'", h)
+        self.assertNotIn("fetch(", h)                                             # one sender only
+        act = self.T[self.T.index("async function triAct"):self.T.index("function triSend")]
+        for tok in ("fetch('/api/action'", "{task:slug,action,option}", "{task:slug,action}",
+                    "{task:slug,action,text}", "msg=j.message"):
+            self.assertIn(tok, act)
+        self.assertNotIn("status", act)                          # never an HTTP status
+
+    def test_an_empty_box_is_not_sent(self):
+        h = self.handlers()
+        send = h[:h.index("function decClick")]
+        self.assertIn("(st.adraft||'').trim()", send)
+        self.assertLess(send.index("@@dash.js.dec_need_text@@"), send.index("triAct("))
+        self.assertIn("return}", send[send.index("@@dash.js.dec_need_text@@"):send.index("triAct(")])
+
+    def test_card_clicks_never_open_the_detail_and_never_confirm(self):
+        m = self.T[self.T.index("function mount()"):]
+        self.assertLess(m.index("closest('[data-dec]')"), m.index("closest('[data-open]')"))
+        self.assertLess(m.index("closest('[data-dec]')"), m.index("closest('.tri')"))
+        self.assertIn('<div class="tri dec">', self.render())    # the .tri guard covers the box
+        self.assertNotIn("confirm(", self.T)
+        self.assertNotIn("http://", self.T)
+        self.assertNotIn("https://", self.T)
+
+    def test_enter_and_typing_use_the_answer_draft(self):
+        m = self.T[self.T.index("function mount()"):]
+        self.assertIn("ti.dataset.kind==='answer'", m)
+        self.assertIn("decSend(s)", m)
+        self.assertIn("triSend(s)", m)                           # the instruction box still works
+        self.assertIn("!e.isComposing", m)
+        self.assertIn("adraft", m)
+        # the instruction toggle focuses its own box, not the answer box of the same row
+        self.assertIn("x.dataset.kind!=='answer'", self.T)
+        # typing in the answer box holds the rows too: it is a .tri-in
+        self.assertIn("document.activeElement.classList.contains('tri-in')", self.T)
+
+    def test_long_options_wrap(self):
+        self.assertIn(".dec .tbtn{white-space:normal;text-align:left;overflow-wrap:anywhere}",
+                      self.T)
+
+    def test_both_languages_render_the_card_strings(self):
+        en, ko = M.render_html("en"), M.render_html("ko")
+        for s in ("One-line answer (max 500 chars)", "Write a one-line answer first"):
+            self.assertIn(s, en)
+        self.assertIsNone(_HANGUL_RE.search(en))
+        for s in ("직접 답 한 줄 (500자 이하)", "답을 한 줄 적어 주세요"):
             self.assertIn(s, ko)
 
 

@@ -22,10 +22,12 @@ cards" restates it for the Android app):
   that tests and clients may key on (never shown). `reason`, `evidence`,
   `advice` and every `label` are sentences in the UI language. `actions` may
   be empty, and `evidence` has at most six lines.
-* Action ids are a CLOSED set, ACTIONS = merge | resume | cancel | instruct.
-  No id exists for deploying, submitting, publishing or deleting, and the
-  server refuses any id outside the set, so an irreversible step never gets a
-  button. A task md with `human_gate: true` keeps only `cancel`.
+* Action ids are a CLOSED set, ACTIONS = merge | resume | cancel | instruct |
+  answer. No id exists for deploying, submitting, publishing or deleting, and
+  the server refuses any id outside the set, so an irreversible step never
+  gets a button. A task md with `human_gate: true` keeps only `cancel`.
+  `answer` is never one of a triage card's buttons: no rule offers it. It is
+  the reply to a decision card (below) and it only records.
 * The server decides; the web card and the app only render what they are given
   (labels included) and post `{task, action[, text]}` to `POST /api/action`.
   The server diagnoses again at click time and runs an action only if that
@@ -33,6 +35,42 @@ cards" restates it for the Android app):
 * A click is the approval. There is no confirm dialog.
 * Fail-soft: gather() returns None for a missing or corrupt ledger row, and
   the dashboard leaves `triage` off any row whose diagnosis raises.
+
+Decision cards (source of truth; macp docs/dashboard-parity.md "Decision
+cards" restates it for the Android app):
+
+* A decision task is a task md with `needs_decision` set to a plain true / yes
+  / 1 / on, or with the `decision` tag. md_decision() is the one reading of
+  that marker in this package; gather()'s `needs_decision` fact is the same
+  call.
+* `/api/status` adds `decision` to a `human` row whose `why` is `owned` or
+  `parked` when decision_card() returns a card for its md. Never on `blocked`
+  rows or `human_later` rows (not that person's turn yet), and never on
+  attention / active / recent rows. Additive only.
+* Shape: `{"question": str, "options": [str]}`. `question` is the md's
+  `next_action` as one line (at most 300 chars, may be empty). `options` is
+  the md's `decision_options` list in file order: each item one line of at
+  most 200 chars, at most six items, [] when the field is missing or not a
+  list. Both are the author's words, passed through untranslated.
+* decision_card() reads the md alone, so a decision needs no ledger row. It
+  returns None for a missing md, a closed status, no marker, `worker_mode:
+  blocked`, or a `not_before` still ahead.
+* The server orders and flags: a row with a card is `urgent: true` whatever
+  its due date or time block, comes before every row without one in `human`,
+  and has `group: ""` so no client folds it away.
+* Fail-soft: a card that raises leaves that row exactly as it was.
+* The card is answered with `POST /api/action {task, action: "answer"}` plus
+  exactly one of `option` (the 1-based position in the `options` the server
+  sent) or `text` (one line, 1 to 500 chars). The server calls decision_card()
+  again at click time: no card means 409, an `option` past the end of the
+  fresh list means 400, a task with no md means 404.
+* An answer only records. triage_actions writes the choice to the task md (a
+  Progress Log line, the marker lowered, `next_action` rewritten) in one
+  commit and, when the task is a human assignment still awaiting_human, sends
+  the orchestrator one `needs-input` reply. It never closes, merges, resumes,
+  cancels or dispatches anything, whatever the chosen words say: a choice
+  that names a payment, a commitment, a deletion or a submission is written
+  down, and carrying it out stays with a follow-up task or a person.
 
 Rules — first match wins. `can_merge` = pr_ref(pr_url) is not None and
 verdict == "PASS" and not rebase_conflict. DISPATCHABLE = auto | delegate |
@@ -108,14 +146,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .. import i18n
+from .. import not_before as _nb
 from ..session_log import parse_frontmatter
 from . import assignment, resume, stages
 from .dashboard import _merged_park     # the predicate only — shared with trace, never copied
 from .statuses import is_closed
 
 # The one-click actions, a closed set (see the contract above). The dashboard
-# refuses any other id with a 400 before it diagnoses anything.
-ACTIONS = ("merge", "resume", "cancel", "instruct")
+# refuses any other id with a 400 before it diagnoses anything. The first four
+# are a triage card's buttons; `answer` is the reply to a decision card.
+ACTIONS = ("merge", "resume", "cancel", "instruct", "answer")
 
 # Ledger states that may carry a card: the attention list's own states.
 TARGET_STATES = ("awaiting_human", "failed")
@@ -655,8 +695,7 @@ def gather(slug: str, *, assign_dir, items_dir, runs_dir, vault_root, registry=N
         "md_exists": isinstance(fm, dict),
         "md_worker_mode": mode or None,
         "human_gate": _flag(md.get("human_gate")) is True,
-        "needs_decision": (_flag(md.get("needs_decision")) is True
-                           or "decision" in _tags(md.get("tags"))),
+        "needs_decision": md_decision(md),
         "auto_merge": auto_merge,
         "agent": agent,
         "agent_kind": kind,
@@ -682,3 +721,58 @@ def triage_for(slug: str, **kw) -> dict | None:
         return diagnose(gather(slug, **kw))
     except Exception:  # noqa: BLE001 - fail-soft by contract
         return None
+
+
+# --- decision cards (contract: module docstring, "Decision cards") -------------------
+
+DECISION_TAG = "decision"           # the same marker task_deps.DECISION_TAG names
+DECISION_OPTIONS_MAX = 6            # buttons on one card
+DECISION_OPTION_CHARS = 200         # chars of one option
+DECISION_QUESTION_CHARS = 300       # chars of the question (the md's next_action)
+
+
+def _md_str(md: dict, key: str) -> str:
+    """A scalar frontmatter value as text: "" for a list or a missing key, and
+    one pair of single quotes removed (the parser already drops double ones)."""
+    v = md.get(key)
+    if not isinstance(v, str):
+        return ""
+    s = v.strip()
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        s = s[1:-1].strip()
+    return s
+
+
+def md_decision(md) -> bool:
+    """A task md's frontmatter raises a decision: `needs_decision` is a plain
+    true / yes / 1 / on (quotes allowed), or its tags hold `decision` in any
+    case. Explicit markers only — title and next_action prose are never read."""
+    if not isinstance(md, dict):
+        return False
+    raw = md.get("needs_decision")
+    if not isinstance(raw, bool):
+        raw = str(raw if raw is not None else "").strip().strip("'\"")
+    return _flag(raw) is True or DECISION_TAG in (t.lower() for t in _tags(md.get("tags")))
+
+
+def decision_card(slug: str, *, items_dir, now: dt.datetime | None = None) -> dict | None:
+    """`{"question": str, "options": [str]}` for a decision a person can answer
+    now, else None. Reads Todo/items/<slug>.md only (cached per mtime and size);
+    `now` pins the clock the `not_before` gate is read against.
+
+    None for: no readable md, a closed status, no decision marker,
+    `worker_mode: blocked`, a `not_before` still ahead. /api/status and the
+    click-time check of the `answer` action both call this, so a decision that
+    was just answered stops being answerable as soon as its md says so."""
+    md = _cached(Path(items_dir) / f"{slug}.md", _load_frontmatter)
+    if not isinstance(md, dict) or not md_decision(md):
+        return None
+    if is_closed(_md_str(md, "status")) or _md_str(md, "worker_mode").lower() == "blocked":
+        return None
+    if _nb.is_deferred(md.get("not_before"), now):
+        return None
+    raw = md.get("decision_options")
+    options = [o for o in (_clip(x, DECISION_OPTION_CHARS)
+                           for x in (raw if isinstance(raw, list) else ())) if o]
+    return {"question": _clip(_md_str(md, "next_action"), DECISION_QUESTION_CHARS),
+            "options": options[:DECISION_OPTIONS_MAX]}

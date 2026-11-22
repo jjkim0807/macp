@@ -1793,6 +1793,38 @@ def _attach_triage(attention: list[dict], parked: list[dict]) -> None:
                 r["triage"] = cards[slug]
 
 
+def _attach_decisions(human: list[dict]) -> None:
+    """Add `decision` to the answerable decision rows of `human`, in place, and
+    move those rows to the front.
+
+    The contract (which rows, the shape, the md-only judgment) lives in the
+    docstring of todo_system/orchestrator/triage.py, "Decision cards". Only
+    `why` owned / parked rows are asked; a row that gets a card also becomes
+    `urgent`, so a decision never waits behind a due date or a time block.
+    The sort is stable: rows with a card first, every other row in the order
+    collect_human gave it. Local md reads only (mtime-cached), no gh/git/
+    network. Fail-soft per row: an error leaves that row untouched and logs
+    one line; /api/status never breaks over it."""
+    try:
+        from todo_system.orchestrator import triage as _tri
+    except Exception as e:
+        logger.warning("decision cards unavailable err=%s", type(e).__name__)
+        return
+    for r in human:
+        if r.get("why") not in ("owned", "parked"):
+            continue
+        slug = str(r.get("slug") or "")
+        try:
+            card = _tri.decision_card(slug, items_dir=ITEMS)
+        except Exception as e:
+            logger.warning("decision card failed task=%s err=%s", slug, type(e).__name__)
+            continue
+        if card is not None:
+            r["decision"] = card
+            r["urgent"] = True
+    human.sort(key=lambda r: "decision" not in r)
+
+
 def collect_usage_value() -> dict:
     """`{"usage_value": model}` for /api/status, or `{}`.
 
@@ -1855,8 +1887,13 @@ def collect_status() -> dict:
     # {rule, reason, evidence, advice, actions}; recent shares the attention row
     # objects, so it rides along there too. Fail-soft per row.
     _attach_triage(attention, [r for r in human if r.get("why") == "parked"])
+    # Decision-card contract — SoT: the same docstring, "Decision cards".
+    # Additive: an answerable decision row of `human` gains `decision`
+    # {question, options}, is urgent and leads the list. Fail-soft per row.
+    _attach_decisions(human)
     for r in (*active, *attention, *human, *human_later):
-        r["group"] = _group_of(r)
+        # a decision is never folded into its project group: it is the thing to answer
+        r["group"] = "" if "decision" in r else _group_of(r)
 
     # ---- worker-state derivation (why "idle"?) ----
     # Gather the pure function's inputs from the same live data the rest of the
@@ -2077,6 +2114,8 @@ border-radius:8px;cursor:pointer;font-size:12px;padding:3px 9px;white-space:nowr
 border-radius:6px;font:inherit;font-size:13px;padding:3px 8px}
 .tmsg{font-size:13px;margin-top:4px;overflow-wrap:anywhere}
 .tmsg.ok{color:var(--grn)}.tmsg.err{color:var(--red)}
+/* Decision card: the same box as a triage card; an option is a sentence, so its button wraps. */
+.dec .tbtn{white-space:normal;text-align:left;overflow-wrap:anywhere}
 .empty{color:var(--mut);font-size:13px;padding:5px 0}
 .mut{color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
@@ -2262,7 +2301,7 @@ const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
 // `⛓ N` = N unfinished depends_on (title lists them). A symbol + a count, so no
 // new i18n key is needed and the ko/en DASHBOARD parity test is untouched.
-const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div>${triBlock(r.slug,r.triage)}</div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
+const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div>${decBlock(r.slug,r.decision)}${triBlock(r.slug,r.triage)}</div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div>${triBlock(r.task,r.triage)}</div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
@@ -2298,26 +2337,30 @@ function triBlock(slug,t){
   const ev=(t.evidence||[]).map(e=>`<div class="note">${esc(e)}</div>`).join('');
   const btns=(t.actions||[]).map(a=>`<button class="tbtn" data-act="${esca(a.id)}" data-slug="${s}"${dis}>${esc(a.label)}</button>`).join('');
   const box=st.open?`<div class="tin"><input class="tri-in" data-slug="${s}" maxlength="500" placeholder="@@dash.js.tri_placeholder@@" value="${esca(st.draft)}"><button class="tbtn" data-act="instruct-send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>`:'';
-  const msg=st.busy?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.msg?`<div class="tmsg ${st.ok?'ok':'err'}">${esc(st.msg)}</div>`:'');
+  const msg=(st.busy&&!st.ans)?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.msg?`<div class="tmsg ${st.ok?'ok':'err'}">${esc(st.msg)}</div>`:'');
   return `<div class="tri"><div class="treason">${esc(t.reason)}</div>${ev}${t.advice?`<div class="tadv">${esc(t.advice)}</div>`:''}${btns?`<div class="tacts">${btns}</div>`:''}${box}${msg}</div>`;
 }
 // The result also lands on the status card for 15 s: a cancel or merge removes the row.
 let triToastTimer=null;
 function triToast(msg,ok){const el=$('tri-toast');if(!el)return;el.textContent=msg;el.className='tmsg '+(ok?'ok':'err');el.hidden=false;
   clearTimeout(triToastTimer);triToastTimer=setTimeout(()=>{el.hidden=true},15000)}
-async function triAct(slug,action,text){
+// A decision card answers through the same sender: option (1-based) or text, action 'answer'.
+// Its own reply line (st.amsg) and draft (st.adraft) keep it apart from a triage card on the same row.
+async function triAct(slug,action,text,option){
   const st=ts(slug);if(st.busy)return;
-  st.busy=true;st.msg='';if(last)update(last);
+  st.ans=action==='answer';
+  st.busy=true;st.msg='';st.amsg='';if(last)update(last);
   let ok=false,msg='@@dash.js.tri_net_fail@@';
   try{
     const r=await fetch('/api/action',{method:'POST',credentials:'same-origin',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(text==null?{task:slug,action}:{task:slug,action,text})});
+      body:JSON.stringify(option!=null?{task:slug,action,option}:(text==null?{task:slug,action}:{task:slug,action,text}))});
     const j=await r.json();
     if(j&&typeof j.message==='string'&&j.message){msg=j.message;ok=j.ok===true}
   }catch(_){}
-  st.busy=false;st.msg=msg;st.ok=ok;
-  if(ok){st.open=false;st.draft=''}
+  st.busy=false;
+  if(st.ans){st.amsg=ok?'':msg;if(ok)st.adraft=''}
+  else{st.msg=msg;st.ok=ok;if(ok){st.open=false;st.draft=''}}
   triToast(msg,ok);
   await tick();
 }
@@ -2327,12 +2370,32 @@ function triSend(slug){const st=ts(slug),v=(st.draft||'').trim();
 function triClick(btn){
   const slug=btn.dataset.slug||'',act=btn.dataset.act||'',st=ts(slug);
   if(act==='instruct'){st.open=!st.open;st.msg='';if(last)update(last);
-    if(st.open){const el=[...document.querySelectorAll('.tri-in')].find(x=>x.dataset.slug===slug);if(el)el.focus()}
+    if(st.open){const el=[...document.querySelectorAll('.tri-in')].find(x=>x.dataset.slug===slug&&x.dataset.kind!=='answer');if(el)el.focus()}
     return}
   if(act==='instruct-send'){triSend(slug);return}
   triAct(slug,act,null);
 }
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
+// Decision card (orchestrator/triage.py "Decision cards"; the server judges, this only renders):
+// the question, one button per option exactly as sent, and a one-line box for any other answer.
+// A click posts {task, action:'answer', option} (option = 1-based position) or {task, action:'answer',
+// text} to /api/action and shows the reply message as-is. No confirm dialog. An answer only records:
+// the server writes the choice down and runs nothing, whatever the option says.
+function decBlock(slug,d){
+  if(!d)return '';
+  const st=ts(slug),s=esca(slug),dis=st.busy?' disabled':'';
+  const opts=(d.options||[]).map((o,i)=>`<button class="tbtn" data-dec="opt" data-n="${i+1}" data-slug="${s}"${dis}>${esc(o)}</button>`).join('');
+  const msg=(st.busy&&st.ans)?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.amsg?`<div class="tmsg err">${esc(st.amsg)}</div>`:'');
+  return `<div class="tri dec">${d.question?`<div class="treason">${esc(d.question)}</div>`:''}${opts?`<div class="tacts">${opts}</div>`:''}<div class="tin"><input class="tri-in" data-kind="answer" data-slug="${s}" maxlength="500" placeholder="@@dash.js.dec_placeholder@@" value="${esca(st.adraft)}"><button class="tbtn" data-dec="send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>${msg}</div>`;
+}
+function decSend(slug){const st=ts(slug),v=(st.adraft||'').trim();
+  if(!v){st.amsg='@@dash.js.dec_need_text@@';if(last)update(last);return}
+  triAct(slug,'answer',v)}
+function decClick(btn){
+  const slug=btn.dataset.slug||'';
+  if(btn.dataset.dec==='send'){decSend(slug);return}
+  triAct(slug,'answer',null,Number(btn.dataset.n));
+}
 
 // @@dash.html.queue@@ (docs/dashboard-parity.md "@@dash.html.queue@@"): the server judges `wait`; rows render in the
 // order received (tick order). Existing badge classes only — no new colours.
@@ -2647,7 +2710,8 @@ function mount(){
     const tb=e.target.closest('#theme');if(tb){const i=THEMES.indexOf(themeGet());themeSet(THEMES[(i+1)%3]);return}
     const c=e.target.closest('.cp');if(c){e.stopPropagation();cp(c);return}
     const am=e.target.closest('[data-amode]');if(am){e.stopPropagation();setAgentMode(am);return}
-    // triage buttons first: they sit inside a row whose data-open would open the detail
+    // decision and triage buttons first: they sit inside a row whose data-open would open the detail
+    const da=e.target.closest('[data-dec]');if(da){e.stopPropagation();decClick(da);return}
     const ta=e.target.closest('[data-act]');if(ta){e.stopPropagation();triClick(ta);return}
     if(e.target.closest('.tri'))return;
     if(e.target.closest('#dv-back')){history.back();return}
@@ -2662,9 +2726,11 @@ function mount(){
   });
   document.addEventListener('keydown',e=>{
     const ti=e.target.closest&&e.target.closest('.tri-in');
-    if(ti&&e.key==='Enter'&&!e.isComposing){e.preventDefault();const s=ti.dataset.slug||'';ts(s).draft=ti.value;ti.blur();triSend(s);return}
+    if(ti&&e.key==='Enter'&&!e.isComposing){e.preventDefault();const s=ti.dataset.slug||'';
+      if(ti.dataset.kind==='answer'){ts(s).adraft=ti.value;ti.blur();decSend(s)}else{ts(s).draft=ti.value;ti.blur();triSend(s)}
+      return}
     if(e.key==='Escape'&&dstack.length)history.back()});
-  document.addEventListener('input',e=>{const ti=e.target.closest&&e.target.closest('.tri-in');if(ti)ts(ti.dataset.slug||'').draft=ti.value});
+  document.addEventListener('input',e=>{const ti=e.target.closest&&e.target.closest('.tri-in');if(ti)ts(ti.dataset.slug||'')[ti.dataset.kind==='answer'?'adraft':'draft']=ti.value});
   mounted=true;
 }
 
@@ -3043,7 +3109,7 @@ def _registry_agent(agent_id: str):
 # POST /api/action runs gh/git through this callable (None = subprocess.run).
 # Seam for the route tests, looked up at call time.
 _ACTION_RUN = None
-# An instruction is one line: no control characters (newlines included).
+# An instruction or a text answer is one line: no control characters (newlines included).
 _ACTION_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -3471,6 +3537,7 @@ class Handler(BaseHTTPRequestHandler):
     # -- triage card actions (orchestrator/triage_actions.py) -----------------
     # Behind the DASHBOARD token: a click on a card is the human's approval. The
     # card is diagnosed again here and only an action it still offers runs.
+    # `answer`, the reply to a decision card, is judged by _post_answer instead.
     ACTION_MAX_BYTES = 4096
     ACTION_TEXT_MAX = 500
 
@@ -3510,6 +3577,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(slug, str) or not SLUG_RE.match(slug) or action not in _tri.ACTIONS:
             refuse(400, "bad_request")
             return
+        if action == "answer":
+            # a decision card's reply: judged by the decision card, not a triage card
+            self._post_answer(slug, data.get("option"), text, extra)
+            return
         if action == "instruct":
             if (not isinstance(text, str) or _ACTION_CTRL_RE.search(text)
                     or not 1 <= len(text.strip()) <= self.ACTION_TEXT_MAX):
@@ -3546,6 +3617,72 @@ class Handler(BaseHTTPRequestHandler):
         # the instruction text itself stays out of the log (length only)
         logger.info("dashboard action task=%s action=%s rule=%s ok=%s text_len=%d",
                     slug, action, card["rule"], ok, len(text or ""))
+        self._status_cache.invalidate()
+        self._reply_json(200, {"ok": ok, "message": message}, extra)
+
+    def _post_answer(self, slug: str, option, text, extra: dict) -> None:
+        """`action: "answer"` — record what the person chose on a decision card.
+
+        The body carries exactly one of `option` (the 1-based position in the
+        `options` this server sent) or `text` (one line, 1..ACTION_TEXT_MAX
+        chars). The decision card is read again here (triage.decision_card), so
+        a stale screen cannot answer: no md is 404, an md that is not an
+        answerable decision is 409, an option past the fresh list is 400.
+
+        The answer only records (triage_actions._answer): one md commit and, for
+        a waiting human assignment, one reply to the orchestrator. Nothing is
+        closed, merged, resumed or dispatched here, whatever the choice says."""
+        from todo_system.orchestrator import triage as _tri
+        from todo_system.orchestrator import triage_actions as _acts
+
+        def refuse(code: int, key: str) -> None:
+            self._reply_json(code, {"ok": False, "message": i18n.t(f"triage.result.{key}")},
+                             extra)
+
+        if (option is None) == (text is None):
+            refuse(400, "bad_request")
+            return
+        if text is not None:
+            if (not isinstance(text, str) or _ACTION_CTRL_RE.search(text)
+                    or not 1 <= len(text.strip()) <= self.ACTION_TEXT_MAX):
+                refuse(400, "bad_answer")
+                return
+        elif not isinstance(option, int) or isinstance(option, bool) or option < 1:
+            refuse(400, "bad_option")
+            return
+        if not (ITEMS / f"{slug}.md").is_file():
+            refuse(404, "unknown_task")
+            return
+        try:
+            card = _tri.decision_card(slug, items_dir=ITEMS)
+        except Exception as e:
+            logger.warning("dashboard action answer: card failed task=%s err=%s", slug,
+                           type(e).__name__)
+            refuse(500, "internal")
+            return
+        if card is None or slug in _umbrellas_in_progress():
+            logger.info("dashboard action refused task=%s action=answer (no decision to answer)",
+                        slug)
+            refuse(409, "not_offered")
+            return
+        if option is not None:
+            if option > len(card["options"]):
+                refuse(400, "bad_option")
+                return
+            choice = card["options"][option - 1]
+        else:
+            choice = " ".join(text.split())
+        try:
+            ok, message = _acts.run_action("answer", slug, None, vault_root=VAULT,
+                                           items_dir=ITEMS, text=choice, run=_ACTION_RUN,
+                                           assign_dir=ASSIGN)
+        except Exception as e:
+            logger.warning("dashboard action crashed task=%s action=answer err=%s", slug,
+                           type(e).__name__)
+            ok, message = False, i18n.t("triage.result.internal")
+        # the answer itself stays out of the log (length only), like an instruction
+        logger.info("dashboard action task=%s action=answer rule=decision ok=%s text_len=%d",
+                    slug, ok, len(choice))
         self._status_cache.invalidate()
         self._reply_json(200, {"ok": ok, "message": message}, extra)
 

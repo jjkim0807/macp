@@ -28,6 +28,7 @@ Typical patterns:
 - **Research**: WebSearch + WebFetch the relevant sources, synthesize findings, write a dated findings section into the task body (heading in the vault's language, e.g. "## 조사 결과 (YYYY-MM-DD)" in a Korean vault).
 - **Compare**: gather options, build a comparison table, end with a single concrete recommendation.
 - **Draft**: write the requested document into the task body or into a new note under `Notes/`.
+- **A choice only a person can make is left over**: do not bury the options in the Progress Log. On the task that carries the choice — the human-owned task, or a new `worker_mode: manual` task when there is none — set `needs_decision: true`, list the options under `decision_options:` (one per line, at most 6), put the question in `next_action` and delete `scheduled:`; the dashboard then asks with buttons and the answer comes back as a Progress Log line.
 
 After edits:
 1. Update the task body's open checkboxes that are now satisfied (`- [ ]` → `- [x]`).
