@@ -15,8 +15,19 @@ One wire model, two renderings:
   the Android app only render the strings in it;
 * the brief: `scripts/brief.sh` calls `python -m todo_system.usage_value
   brief-section` after the agent wrote the brief and appends what it prints.
-  `render_brief()` is a pure function of the same model, so both show the same
-  numbers.
+  `render_brief()` reads nothing but the same model, so both show the same
+  numbers. The section goes into one brief a week: `brief_due()` skips it
+  while a brief of the last 7 days carries BRIEF_MARKER. No state file, no
+  switch.
+
+CLI:
+
+    python -m todo_system.usage_value brief-section [--vault-root DIR] [--now ISO]
+    python -m todo_system.usage_value report [--vault-root DIR] [--now ISO] [--json] [--explain]
+
+`brief-section` prints the section or nothing and always exits 0. `report`
+prints every row; `--explain` adds what a person tuning the rules needs (rule
+hits, the share of `other`, PR evidence, timings).
 
 Wire model (source of truth; docs/dashboard-parity.md "Usage vs results"
 restates it for the app). Additive: when `/api/status` has no `usage_value`
@@ -91,10 +102,14 @@ functions that need them, so `--vault-root` can set the root first.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
 import re
+import sys
+import time
+from collections import Counter
 from pathlib import Path
 
 from . import i18n, paths
@@ -106,6 +121,14 @@ SELF_PROJECT = "macp"
 # The project of a task with no repo: it runs in the vault itself.
 VAULT_PROJECT = "vault"
 WEEK_DAYS = 7
+# The brief shows this many rows per period; the dashboard shows them all.
+BRIEF_TOP_ROWS = 5
+# First line of the brief section. brief_due() looks for it (never for the
+# heading, which is translated) to put the table into one brief a week.
+BRIEF_MARKER = "<!-- macp:usage-value -->"
+_COLUMNS = ("row", "out", "runs", "merged", "status", "per_merge")
+_EXPLAIN_TAGS = 15
+_EXPLAIN_TASKS = 10
 
 # Rule 3, in this order: the first entry whose tag the task carries decides.
 _TAG_KINDS = (
@@ -322,6 +345,63 @@ def aggregate(runs: list[dict], tasks: dict, now: dt.datetime) -> dict:
     return {"periods": [_aggregate_period(pid, *bounds[pid], runs, tasks) for pid in PERIODS]}
 
 
+# --- presentation: the wire model ----------------------------------------------------------
+
+def _scaled(n: int, size: int, unit: str, *, last: bool) -> str | None:
+    tenths = (n * 10 + size // 2) // size
+    if tenths < 1000:
+        return f"{tenths // 10}.{tenths % 10}{unit}"
+    whole = (n + size // 2) // size
+    return f"{whole}{unit}" if whole < 1000 or last else None
+
+
+def fmt_tokens(n: int | None) -> str:
+    """A token count in three significant figures or fewer: `950`, `1.5k`,
+    `205k`, `4.1M`, `123M`; `—` for None."""
+    if n is None:
+        return _NO_VALUE
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    return _scaled(n, 1_000, "k", last=False) or _scaled(n, 1_000_000, "M", last=True)
+
+
+def _range_text(start: str, end: str) -> str:
+    a, b = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    return f"{a.month}/{a.day}–{b.month}/{b.day}"
+
+
+def _present_cell(cell: dict) -> dict:
+    per_merge = fmt_tokens(cell["tokens_per_merge"])
+    text = i18n.t("usage_value.cell", runs=cell["runs"], merged=cell["merged_prs"],
+                  done=cell["done"], cancelled=cell["cancelled"], failed=cell["failed"],
+                  per_merge=per_merge)
+    if cell["runs_unmetered"]:
+        text += i18n.t("usage_value.cell_unmetered", n=cell["runs_unmetered"])
+    return {"out_tokens": cell["out_tokens"], "out_tokens_text": fmt_tokens(cell["out_tokens"]),
+            "runs": cell["runs"], "runs_unmetered": cell["runs_unmetered"],
+            "merged_prs": cell["merged_prs"], "done": cell["done"],
+            "cancelled": cell["cancelled"], "failed": cell["failed"],
+            "tokens_per_merge": cell["tokens_per_merge"], "tokens_per_merge_text": per_merge,
+            "text": text}
+
+
+def present(raw: dict) -> dict:
+    """aggregate()'s numbers as the wire model: titles, labels, formatted
+    numbers and one-line cells added, in the UI language of this call."""
+    periods = []
+    for p in raw["periods"]:
+        rows = [{"project": r["project"], "kind": r["kind"],
+                 "kind_label": i18n.t(f"usage_value.kind.{r['kind']}"), **_present_cell(r)}
+                for r in p["rows"]]
+        periods.append({"id": p["id"], "label": i18n.t(f"usage_value.period.{p['id']}"),
+                        "range": _range_text(p["start"], p["end"]),
+                        "start": p["start"], "end": p["end"],
+                        "total": _present_cell(p["total"]), "rows": rows})
+    return {"title": i18n.t("usage_value.title"), "basis": i18n.t("usage_value.basis"),
+            "periods": periods}
+
+
 # --- reading the files -------------------------------------------------------------------
 
 _RESULT_HEAD = 8_000      # chars of report.md / quick.md read: the frontmatter and the summary lines
@@ -509,6 +589,21 @@ def scan(runs_dir, items_dir, assign_dir, start: dt.datetime,
     return runs, tasks
 
 
+def _vault(vault_root) -> Path:
+    return (Path(vault_root) if vault_root is not None
+            else paths.vault_root(start=paths.vault_search_start()))
+
+
+def _dirs(vault_root, runs_dir, items_dir, assign_dir) -> tuple:
+    """(runs, items, assignments): each as given, else its standard place in the vault."""
+    if runs_dir is None or items_dir is None or assign_dir is None:
+        root = _vault(vault_root)
+        runs_dir = runs_dir if runs_dir is not None else root / "Worker" / "runs"
+        items_dir = items_dir if items_dir is not None else root / "Todo" / "items"
+        assign_dir = assign_dir if assign_dir is not None else root / "Worker" / "assignments"
+    return runs_dir, items_dir, assign_dir
+
+
 def build(vault_root=None, *, runs_dir=None, items_dir=None, assign_dir=None,
           now: dt.datetime | None = None) -> dict:
     """The wire model (module docstring) for the vault's run dirs, as of `now`.
@@ -516,70 +611,197 @@ def build(vault_root=None, *, runs_dir=None, items_dir=None, assign_dir=None,
     The three directories default to the standard places under `vault_root`
     (itself defaulting to the resolved vault). Reads local files only, cached
     per file; a missing directory gives two empty periods."""
-    if runs_dir is None or items_dir is None or assign_dir is None:
-        root = (Path(vault_root) if vault_root is not None
-                else paths.vault_root(start=paths.vault_search_start()))
-        runs_dir = runs_dir if runs_dir is not None else root / "Worker" / "runs"
-        items_dir = items_dir if items_dir is not None else root / "Todo" / "items"
-        assign_dir = assign_dir if assign_dir is not None else root / "Worker" / "assignments"
+    dirs = _dirs(vault_root, runs_dir, items_dir, assign_dir)
     now = _local_naive(now if now is not None else dt.datetime.now())
     start = min(b[0] for b in period_bounds(now).values())
-    runs, tasks = scan(runs_dir, items_dir, assign_dir, start, now)
+    runs, tasks = scan(*dirs, start, now)
     return present(aggregate(runs, tasks, now))
 
 
-# --- presentation: the wire model ----------------------------------------------------------
+# --- the brief section ---------------------------------------------------------------------
 
-def _scaled(n: int, size: int, unit: str, *, last: bool) -> str | None:
-    tenths = (n * 10 + size // 2) // size
-    if tenths < 1000:
-        return f"{tenths // 10}.{tenths % 10}{unit}"
-    whole = (n + size // 2) // size
-    return f"{whole}{unit}" if whole < 1000 or last else None
-
-
-def fmt_tokens(n: int | None) -> str:
-    """A token count in three significant figures or fewer: `950`, `1.5k`,
-    `205k`, `4.1M`, `123M`; `—` for None."""
-    if n is None:
-        return _NO_VALUE
-    n = int(n)
-    if n < 1000:
-        return str(n)
-    return _scaled(n, 1_000, "k", last=False) or _scaled(n, 1_000_000, "M", last=True)
-
-
-def _range_text(start: str, end: str) -> str:
-    a, b = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
-    return f"{a.month}/{a.day}–{b.month}/{b.day}"
-
-
-def _present_cell(cell: dict) -> dict:
-    per_merge = fmt_tokens(cell["tokens_per_merge"])
-    text = i18n.t("usage_value.cell", runs=cell["runs"], merged=cell["merged_prs"],
-                  done=cell["done"], cancelled=cell["cancelled"], failed=cell["failed"],
-                  per_merge=per_merge)
+def _md_row(label: str, cell: dict) -> str:
+    runs = str(cell["runs"])
     if cell["runs_unmetered"]:
-        text += i18n.t("usage_value.cell_unmetered", n=cell["runs_unmetered"])
-    return {"out_tokens": cell["out_tokens"], "out_tokens_text": fmt_tokens(cell["out_tokens"]),
-            "runs": cell["runs"], "runs_unmetered": cell["runs_unmetered"],
-            "merged_prs": cell["merged_prs"], "done": cell["done"],
-            "cancelled": cell["cancelled"], "failed": cell["failed"],
-            "tokens_per_merge": cell["tokens_per_merge"], "tokens_per_merge_text": per_merge,
-            "text": text}
+        runs += i18n.t("usage_value.cell_unmetered", n=cell["runs_unmetered"])
+    return (f"| {label} | {cell['out_tokens_text']} | {runs} | {cell['merged_prs']} | "
+            f"{cell['done']}/{cell['cancelled']}/{cell['failed']} | "
+            f"{cell['tokens_per_merge_text']} |")
 
 
-def present(raw: dict) -> dict:
-    """aggregate()'s numbers as the wire model: titles, labels, formatted
-    numbers and one-line cells added, in the UI language of this call."""
-    periods = []
-    for p in raw["periods"]:
-        rows = [{"project": r["project"], "kind": r["kind"],
-                 "kind_label": i18n.t(f"usage_value.kind.{r['kind']}"), **_present_cell(r)}
-                for r in p["rows"]]
-        periods.append({"id": p["id"], "label": i18n.t(f"usage_value.period.{p['id']}"),
-                        "range": _range_text(p["start"], p["end"]),
-                        "start": p["start"], "end": p["end"],
-                        "total": _present_cell(p["total"]), "rows": rows})
-    return {"title": i18n.t("usage_value.title"), "basis": i18n.t("usage_value.basis"),
-            "periods": periods}
+def render_markdown(model: dict, *, top: int | None = None, marker: bool = False) -> str:
+    """The wire model as a markdown section (no trailing newline): a heading,
+    the basis line, then per period a table of its rows and a total row.
+
+    `top` keeps the first N rows of each period and says how many were left
+    out; the total row is always the whole period. `marker` puts BRIEF_MARKER
+    on the first line. Reads nothing but `model`; the column headings and the
+    few fixed words come from i18n in the UI language of this call. No line
+    starts with `>` and the only heading is this section's own, so the brief
+    notification's parser (scripts/_build_brief_message.py) never reads it."""
+    head = "| " + " | ".join(i18n.t(f"usage_value.col.{c}") for c in _COLUMNS) + " |"
+    lines = [BRIEF_MARKER] if marker else []
+    lines += [f"## 📈 {model['title']}", "", f"_{model['basis']}_"]
+    for p in model["periods"]:
+        lines += ["", f"**{p['label']}** ({p['range']})", ""]
+        rows = p["rows"]
+        if not rows:
+            lines.append(i18n.t("usage_value.no_runs"))
+            continue
+        shown = rows if top is None else rows[:top]
+        lines += [head, "|---|---:|---:|---:|---:|---:|"]
+        lines += [_md_row(f"{r['project']} · {r['kind_label']}", r) for r in shown]
+        lines.append(_md_row(f"**{i18n.t('usage_value.total')}**", p["total"]))
+        if len(rows) > len(shown):
+            lines += ["", i18n.t("usage_value.more_rows", n=len(rows) - len(shown))]
+    return "\n".join(lines)
+
+
+def render_brief(model: dict) -> str:
+    """The section brief.sh appends to the brief: the top BRIEF_TOP_ROWS rows
+    of each period, led by BRIEF_MARKER."""
+    return render_markdown(model, top=BRIEF_TOP_ROWS, marker=True)
+
+
+def brief_due(briefings_dir, today: dt.date) -> bool:
+    """True when no brief of the last WEEK_DAYS days (today included) carries
+    BRIEF_MARKER — the table goes into one brief a week.
+
+    The briefs themselves are the record: there is no state file and no fixed
+    weekday, so a day without a brief just moves the table to the next one, and
+    a brief the agent rewrote without the table gets it back on the next run."""
+    for back in range(WEEK_DAYS):
+        day = today - dt.timedelta(days=back)
+        try:
+            with open(os.path.join(briefings_dir, f"{day.isoformat()}.md"),
+                      encoding="utf-8", errors="replace") as fh:
+                if BRIEF_MARKER in fh.read():
+                    return False
+        except OSError:
+            continue
+    return True
+
+
+def brief_section(vault_root=None, *, now: dt.datetime | None = None) -> str:
+    """render_brief() of the vault's table when one is due, else "".
+
+    "" as well when neither period has a run: an empty table is not worth a
+    section."""
+    root = _vault(vault_root)
+    now = _local_naive(now if now is not None else dt.datetime.now())
+    if not brief_due(root / "Todo" / "Briefings", now.date()):
+        return ""
+    model = build(root, now=now)
+    if not any(p["rows"] for p in model["periods"]):
+        return ""
+    return render_brief(model)
+
+
+# --- diagnostics and the CLI ------------------------------------------------------------------
+
+def explain(vault_root=None, *, runs_dir=None, items_dir=None, assign_dir=None,
+            now: dt.datetime | None = None) -> str:
+    """This month's table taken apart, for a person tuning the rules: how many
+    tasks each rule id caught, what share of the output tokens fell to `other`
+    (with its commonest tags and largest tasks), how the merged PRs were
+    evidenced, and how long a cold build and a rebuild took. Names real slugs,
+    so it is printed for the operator and never part of the wire model."""
+    dirs = _dirs(vault_root, runs_dir, items_dir, assign_dir)
+    now = _local_naive(now if now is not None else dt.datetime.now())
+    clear_cache()                      # so "first build" is a cold one
+    t0 = time.perf_counter()
+    build(runs_dir=dirs[0], items_dir=dirs[1], assign_dir=dirs[2], now=now)
+    t1 = time.perf_counter()
+    build(runs_dir=dirs[0], items_dir=dirs[1], assign_dir=dirs[2], now=now)
+    t2 = time.perf_counter()
+
+    start, end = period_bounds(now)["month"]
+    runs, tasks = scan(*dirs, start, end)
+    by_slug: dict[str, list[dict]] = {}
+    for run in runs:
+        by_slug.setdefault(run["slug"], []).append(run)
+    kinds = {slug: classify(tasks.get(slug), slug) for slug in by_slug}
+    tokens = {slug: sum(r["out_tokens"] for r in slug_runs) for slug, slug_runs in by_slug.items()}
+    total = sum(tokens.values())
+    other = sorted((s for s in by_slug if kinds[s][0] == "other"), key=lambda s: (-tokens[s], s))
+    other_tokens = sum(tokens[s] for s in other)
+
+    def by_count(counter: Counter) -> list[tuple[str, int]]:
+        return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    lines = [f"explain: this month {start.date().isoformat()}..{end.date().isoformat()} — "
+             f"{len(runs)} run(s) of {len(by_slug)} task(s)",
+             "rule hits (tasks):"]
+    lines += [f"  {rule} {n}" for rule, n in by_count(Counter(rule for _, rule in kinds.values()))]
+    share = 100 * other_tokens / total if total else 0.0
+    lines.append(f"other: {share:.1f}% of this month's output tokens "
+                 f"({fmt_tokens(other_tokens)} of {fmt_tokens(total)}) in {len(other)} task(s)")
+    if other:
+        tags = Counter(t for s in other for t in (tasks.get(s) or {}).get("tags") or [])
+        lines.append("  tags on other tasks: "
+                     + ", ".join(f"{t} {n}" for t, n in by_count(tags)[:_EXPLAIN_TAGS]))
+        lines.append("  top other tasks by output tokens:")
+        for slug in other[:_EXPLAIN_TASKS]:
+            facts = tasks.get(slug) or {}
+            lines.append(f"    {fmt_tokens(tokens[slug])}  {len(by_slug[slug])} run(s)  "
+                         f"{project_of(facts, slug)}  {slug}  [{', '.join(facts.get('tags') or [])}]")
+    said = {slug: {_pr_key(r["pr_url"]) for r in slug_runs if r["merged"] is True}
+            for slug, slug_runs in by_slug.items()}
+    done_only = sum(len(merged_pr_urls(slug_runs, tasks.get(slug)) - said[slug])
+                    for slug, slug_runs in by_slug.items())
+    lines.append(f"PR evidence: {sum(1 for r in runs if r['pr_url'])} run(s) name a PR, "
+                 f"{sum(1 for r in runs if r['merged'] is True)} say merged: yes, "
+                 f"{done_only} PR(s) counted through the done rule only")
+    lines.append(f"timing: first build {t1 - t0:.3f}s, rebuild {t2 - t1:.3f}s")
+    return "\n".join(lines)
+
+
+def _parse_now(value: str | None) -> dt.datetime | None:
+    return dt.datetime.fromisoformat(value) if value else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`brief-section` prints the section for today's brief, or nothing; it
+    always exits 0, and any error is one stderr line (brief.sh appends the
+    stdout as it is and must never lose a brief over this). `report` prints the
+    whole table (`--json`: the wire model; `--explain`: the diagnostics after
+    it) and lets errors show."""
+    parser = argparse.ArgumentParser(
+        prog="python -m todo_system.usage_value",
+        description="Usage vs results: output tokens, runs and merged PRs per project and "
+                    "kind of task, from the vault's local run dirs.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    brief = sub.add_parser("brief-section",
+                           help="print the weekly brief section (nothing when not due or on error)")
+    report = sub.add_parser("report", help="print the whole table")
+    for p in (brief, report):
+        p.add_argument("--vault-root", default=None,
+                       help="read this vault instead of the resolved one")
+        p.add_argument("--now", default=None, help="compute as of this ISO time (default: now)")
+    report.add_argument("--json", action="store_true", help="print the wire model as JSON")
+    report.add_argument("--explain", action="store_true",
+                        help="add rule hits, the share of `other`, PR evidence and timings")
+    args = parser.parse_args(argv)
+    if args.vault_root:
+        # Before anything else is imported: the engine modules build() borrows
+        # resolve the vault root when they load, and the UI language is read
+        # from that vault's config.
+        os.environ["MACP_VAULT_ROOT"] = os.path.abspath(os.path.expanduser(args.vault_root))
+    if args.cmd == "brief-section":
+        try:
+            text = brief_section(args.vault_root, now=_parse_now(args.now))
+            if text:
+                sys.stdout.write(text + "\n")
+        except Exception as exc:  # noqa: BLE001 - fail safe: print nothing, exit 0
+            print(f"usage-value: error ({type(exc).__name__})", file=sys.stderr)
+        return 0
+    now = _parse_now(args.now)
+    model = build(args.vault_root, now=now)
+    print(json.dumps(model, ensure_ascii=False, indent=1) if args.json else render_markdown(model))
+    if args.explain:
+        print("\n" + explain(args.vault_root, now=now))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

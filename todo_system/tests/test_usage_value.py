@@ -845,3 +845,304 @@ def test_import_is_light(tmp_path):
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout.split("\n")[:2] == ["[]", "False"], r.stdout
+
+
+# --- the brief section ---------------------------------------------------------------------------
+
+
+def _many_rows_model(n: int = 8) -> dict:
+    """A week with `n` rows (one task each, falling token counts) and an empty month."""
+    tasks = {f"t{i}": {"repo": f"https://github.com/example/proj{i}.git", "tags": ["feature"],
+                       "status": "done"} for i in range(n)}
+    runs = [_run(f"20261120T10000{i}-t{i}", (n - i) * 1_000, pr=_pr(i, f"example/proj{i}"),
+                 merged=True) for i in range(n)]
+    raw = uv.aggregate(runs, tasks, NOW)
+    raw["periods"][1] = {**raw["periods"][1], "rows": [],
+                         "total": uv.aggregate([], {}, NOW)["periods"][1]["total"]}
+    return uv.present(raw)
+
+
+def test_render_brief_matches_the_documented_shape():
+    text = uv.render_brief(uv.present(_sample_raw()))
+    assert text.split("\n") == [
+        "<!-- macp:usage-value -->",
+        "## 📈 사용량 대비 결과",
+        "",
+        "_본부 run dir 기준 — 원격 러너 런과 정리된 run dir는 빠져 있어 출력 토큰은 하한이에요_",
+        "",
+        "**지난 7일** (11/16–11/22)",
+        "",
+        "| 프로젝트 · 종류 | 출력 토큰 | 런 | 머지 PR | 완료/취소/실패 | 머지당 토큰 |",
+        "|---|---:|---:|---:|---:|---:|",
+        "| macp · macp 자기개선 | 466k | 1 | 1 | 1/0/0 | 466k |",
+        "| **합계** | 466k | 1 | 1 | 1/0/0 | 466k |",
+        "",
+        "**이번 달** (11/1–11/22)",
+        "",
+        "| 프로젝트 · 종류 | 출력 토큰 | 런 | 머지 PR | 완료/취소/실패 | 머지당 토큰 |",
+        "|---|---:|---:|---:|---:|---:|",
+        "| macp · macp 자기개선 | 466k | 1 | 1 | 1/0/0 | 466k |",
+        "| app · 기능 | 1.2k | 1 · 미계측 런 1 | 0 | 0/0/1 | — |",
+        "| **합계** | 467k | 2 · 미계측 런 1 | 1 | 1/0/1 | 467k |",
+    ]
+    assert not text.endswith("\n")
+
+
+def test_render_brief_is_pure_over_the_wire_model():
+    model = uv.present(_sample_raw())
+    wired = json.loads(json.dumps(model))                    # what a client receives
+    assert uv.render_brief(wired) == uv.render_brief(model)
+    before = json.dumps(model, sort_keys=True)
+    uv.render_brief(model)
+    assert json.dumps(model, sort_keys=True) == before       # rendering does not touch it
+
+
+def test_render_brief_has_no_blockquote_and_no_top3_heading():
+    for model in (uv.present(_sample_raw()), _many_rows_model(), uv.present(uv.aggregate([], {}, NOW))):
+        lines = uv.render_brief(model).split("\n")
+        assert lines[0] == uv.BRIEF_MARKER
+        assert not [ln for ln in lines if ln.startswith(">")], lines
+        assert not [ln for ln in lines if ln.startswith("## 🎯")], lines
+        assert [ln for ln in lines if ln.startswith("## ")] == ["## 📈 사용량 대비 결과"]
+        assert not [ln for ln in lines if re.match(r"\s*\d+\.\s+\*\*", ln)], lines
+
+
+def test_render_brief_cuts_to_top_rows_and_says_how_many_more():
+    model = _many_rows_model(8)
+    lines = uv.render_brief(model).split("\n")
+    week_rows = [ln for ln in lines if ln.startswith("| proj")]
+    assert len(week_rows) == uv.BRIEF_TOP_ROWS == 5
+    assert [ln.split(" · ")[0] for ln in week_rows] == [f"| proj{i}" for i in range(5)]
+    assert "외 3행은 대시보드에 있어요" in lines
+    # the total is the whole period, not the five rows shown
+    assert "| **합계** | 36.0k | 8 | 8 | 8/0/0 | 4.5k |" in lines
+    # an empty period says so instead of drawing an empty table
+    month = lines[lines.index("**이번 달** (11/1–11/22)"):]
+    assert month == ["**이번 달** (11/1–11/22)", "", "런 없음"]
+    # five rows or fewer: nothing is cut and nothing is announced
+    assert not [ln for ln in uv.render_brief(_many_rows_model(5)).split("\n") if ln.startswith("외 ")]
+    # the full table (report) shows every row and carries no marker
+    full = uv.render_markdown(model).split("\n")
+    assert len([ln for ln in full if ln.startswith("| proj")]) == 8
+    assert uv.BRIEF_MARKER not in full
+    assert not [ln for ln in full if ln.startswith("외 ")]
+
+
+def test_render_follows_the_ui_language(monkeypatch):
+    monkeypatch.setenv("MACP_LANGUAGE", "en")
+    text = uv.render_brief(_many_rows_model(8))
+    assert not _HANGUL.search(text)
+    assert "| Project · kind | Output tokens | Runs | Merged PRs | Done/cancelled/failed | Tokens per merge |" in text
+    assert "3 more row(s) on the dashboard" in text
+    assert "no runs" in text.split("\n")
+
+
+def _briefings(tmp_path: Path, marked: dict[str, bool]) -> Path:
+    """Todo/Briefings with one file per ISO date; True = it carries the table."""
+    d = tmp_path / "vault" / "Todo" / "Briefings"
+    d.mkdir(parents=True, exist_ok=True)
+    for day, has_table in marked.items():
+        body = "# Brief\n\n> summary\n"
+        if has_table:
+            body += "\n" + uv.BRIEF_MARKER + "\n## table\n"
+        (d / f"{day}.md").write_text(body, encoding="utf-8")
+    return d
+
+
+def test_brief_section_due_when_no_recent_brief_has_the_marker(tmp_path):
+    today = NOW.date()
+    assert uv.brief_due(tmp_path / "no-such-dir", today) is True
+    d = _briefings(tmp_path, {(today - dt.timedelta(days=n)).isoformat(): False for n in range(1, 7)})
+    assert uv.brief_due(d, today) is True
+    # the agent has just written today's brief, without the table
+    _briefings(tmp_path, {today.isoformat(): False})
+    assert uv.brief_due(d, today) is True
+
+
+@pytest.mark.parametrize("days_ago", [1, 3, 6])
+def test_brief_section_skipped_when_a_brief_of_the_last_six_days_has_it(tmp_path, days_ago):
+    today = NOW.date()
+    d = _briefings(tmp_path, {(today - dt.timedelta(days=days_ago)).isoformat(): True,
+                              today.isoformat(): False})
+    assert uv.brief_due(d, today) is False
+
+
+def test_brief_section_due_again_on_the_seventh_day(tmp_path):
+    today = NOW.date()
+    d = _briefings(tmp_path, {(today - dt.timedelta(days=7)).isoformat(): True,
+                              (today - dt.timedelta(days=30)).isoformat(): True,
+                              (today + dt.timedelta(days=1)).isoformat(): True})
+    assert uv.brief_due(d, today) is True
+
+
+def test_brief_section_skipped_when_todays_file_has_it(tmp_path):
+    today = NOW.date()
+    d = _briefings(tmp_path, {today.isoformat(): True})
+    assert uv.brief_due(d, today) is False
+
+
+def test_brief_section_is_the_rendered_model_when_due(vault):
+    vault.install(*CASE_NAMES)
+    section = uv.brief_section(vault.root, now=NOW)
+    assert section == uv.render_brief(uv.build(vault_root=vault.root, now=NOW))
+    assert section.startswith(uv.BRIEF_MARKER + "\n## 📈 ")
+    # once a brief of the week carries it, nothing more is printed
+    d = vault.root / "Todo" / "Briefings"
+    d.mkdir(parents=True)
+    (d / f"{NOW.date().isoformat()}.md").write_text("# Brief\n\n" + section + "\n", encoding="utf-8")
+    assert uv.brief_section(vault.root, now=NOW) == ""
+    assert uv.brief_section(vault.root, now=NOW + dt.timedelta(days=6)) == ""
+    assert uv.brief_section(vault.root, now=NOW + dt.timedelta(days=7)).startswith(uv.BRIEF_MARKER)
+
+
+def test_brief_section_empty_without_runs(vault):
+    assert uv.brief_section(vault.root, now=NOW) == ""
+    # runs that are all older than both periods are no table either
+    vault.run("20260901T100000-app-old", {"stages.json": {"usage": {"quick": _usage(10)}}})
+    assert uv.brief_section(vault.root, now=NOW) == ""
+
+
+_BUILD_MESSAGE = _REPO / "scripts" / "_build_brief_message.py"
+
+
+def _notification(brief: Path) -> str:
+    env = {"PATH": os.environ.get("PATH", ""), "BRIEF_FILE": str(brief), "TODAY": "2026-11-22",
+           "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    r = subprocess.run([sys.executable, str(_BUILD_MESSAGE)], env=env, capture_output=True,
+                       text=True, encoding="utf-8", timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+@pytest.mark.parametrize("brief", [
+    # the usual brief: a summary line, the mail line, Top 3
+    "# Brief\n\n> 오늘 요약 한 줄\n\n> 📮 메일 3통\n\n## 🎯 Top 3\n\n1. **첫째** — a\n2. **둘째** — b\n"
+    "3. **셋째** — c\n\n## 그 밖\n\n- x\n",
+    # Top 3 is the LAST section and the agent left the summary line out
+    "# Brief\n\n## 🎯 Top 3\n\n1. **첫째** — a\n2. **둘째** — b\n",
+    "# Brief\n",
+], ids=["full", "top3-last-no-summary", "bare"])
+def test_notification_message_is_unchanged_by_the_section(tmp_path, brief):
+    """brief.sh appends the section before it sends the KakaoTalk message. The
+    message builder reads the first `> ` line, the Top 3 block and the `> 📮`
+    line; none of them may come from the appended table."""
+    path = tmp_path / "2026-11-22.md"
+    path.write_text(brief, encoding="utf-8")
+    before = _notification(path)
+    section = uv.render_brief(_many_rows_model(8))
+    path.write_text(brief + "\n" + section + "\n", encoding="utf-8")     # as brief.sh appends it
+    assert _notification(path) == before
+    assert "사용량" not in before and "proj0" not in before
+
+
+# --- the CLI ---------------------------------------------------------------------------------------
+
+
+def test_cli_report_json_equals_build(vault, monkeypatch, capsys):
+    vault.install(*CASE_NAMES)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault.root))   # main() sets it; restore after
+    rc = uv.main(["report", "--json", "--vault-root", str(vault.root), "--now", NOW.isoformat()])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert json.loads(out) == uv.build(vault_root=vault.root, now=NOW)
+    assert os.environ["MACP_VAULT_ROOT"] == str(vault.root)
+
+
+def test_cli_report_prints_the_full_table_and_explains(vault, monkeypatch, capsys):
+    vault.install(*CASE_NAMES)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault.root))
+    argv = ["report", "--vault-root", str(vault.root), "--now", NOW.isoformat()]
+    table = uv.render_markdown(uv.build(vault_root=vault.root, now=NOW))
+    assert uv.main(argv) == 0
+    out = capsys.readouterr().out
+    assert out == table + "\n"
+    assert uv.BRIEF_MARKER not in out
+
+    assert uv.main([*argv, "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(table + "\n\n")
+    lines = out[len(table) + 2:].rstrip("\n").split("\n")
+    assert lines[0] == "explain: this month 2026-11-01..2026-11-22 — 8 run(s) of 8 task(s)"
+    assert lines[1] == "rule hits (tasks):"
+    assert lines[2:7] == ["  tag:bug 3", "  none 2", "  discover_run 1", "  from_discovery 1",
+                          "  self_repo 1"]
+    assert lines[7] == "other: 5.2% of this month's output tokens (42.0k of 803k) in 2 task(s)"
+    assert lines[8] == "  tags on other tasks: todo 2, worker 2, app 1, compute-cost 1, cost 1, docs 1, private 1, work 1"
+    assert lines[9] == "  top other tasks by output tokens:"
+    assert lines[10:12] == [
+        "    30.0k  1 run(s)  vault  cost-review-20261121  [todo, work, worker, cost, compute-cost]",
+        "    12.0k  1 run(s)  app  app-doc-weekly-check  [todo, private, worker, app, docs]"]
+    assert lines[12] == ("PR evidence: 3 run(s) name a PR, 3 say merged: yes, "
+                         "0 PR(s) counted through the done rule only")
+    assert re.fullmatch(r"timing: first build \d+\.\d{3}s, rebuild \d+\.\d{3}s", lines[13])
+    assert len(lines) == 14
+
+
+def test_cli_brief_section_prints_the_section_once_a_week(vault, monkeypatch, capsys):
+    vault.install(*CASE_NAMES)
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault.root))
+    argv = ["brief-section", "--vault-root", str(vault.root), "--now", NOW.isoformat()]
+    assert uv.main(argv) == 0
+    out = capsys.readouterr().out
+    assert out == uv.render_brief(uv.build(vault_root=vault.root, now=NOW)) + "\n"
+    d = vault.root / "Todo" / "Briefings"
+    d.mkdir(parents=True)
+    (d / "2026-11-20.md").write_text("# Brief\n\n" + out, encoding="utf-8")
+    assert uv.main(argv) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_brief_section_prints_nothing_and_exits_zero_on_a_bad_vault(vault, monkeypatch, capsys,
+                                                                       tmp_path):
+    monkeypatch.setenv("MACP_VAULT_ROOT", str(vault.root))
+    # a vault that does not exist, and one that is a plain file
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_text("x", encoding="utf-8")
+    for root in (tmp_path / "no-such-vault", not_a_dir):
+        assert uv.main(["brief-section", "--vault-root", str(root)]) == 0
+        assert capsys.readouterr().out == ""
+    # an unparseable --now
+    vault.install(*CASE_NAMES)
+    assert uv.main(["brief-section", "--vault-root", str(vault.root), "--now", "yesterday"]) == 0
+    assert capsys.readouterr().out == ""
+    # a crash anywhere below: one stderr line with the error type, nothing on stdout
+    def boom(*args, **kwargs):
+        raise RuntimeError("secret detail")
+    monkeypatch.setattr(uv, "build", boom)
+    assert uv.main(["brief-section", "--vault-root", str(vault.root), "--now", NOW.isoformat()]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "usage-value: error (RuntimeError)"
+    # report does not hide errors
+    with pytest.raises(RuntimeError):
+        uv.main(["report", "--vault-root", str(vault.root), "--now", NOW.isoformat()])
+
+
+def test_cli_works_with_only_vault_root(vault, tmp_path):
+    """Verify runs the CLI from the engine checkout against the real vault: no
+    MACP_VAULT_ROOT, a cwd that is no vault, only --vault-root. The language
+    comes from that vault's config."""
+    vault.install(*CASE_NAMES)
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(_REPO), "HOME": str(tmp_path),
+           "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    argv = [sys.executable, "-P", "-m", "todo_system.usage_value", "report", "--json",
+            "--vault-root", str(vault.root), "--now", NOW.isoformat()]
+
+    def run() -> dict:
+        r = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True,
+                           encoding="utf-8", timeout=120)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)
+
+    model = run()                                            # no config: the engine default, en
+    assert model["title"] == "Usage vs results"
+    assert model["periods"][0]["total"]["runs"] == 8
+    (vault.root / ".macp").mkdir()
+    (vault.root / ".macp" / "config.toml").write_text('language = "ko"\n', encoding="utf-8")
+    ko = run()
+    assert ko["title"] == "사용량 대비 결과"
+    assert ko["periods"][0]["rows"][0]["kind_label"] == "macp 자기개선"
+    assert [p["total"]["out_tokens"] for p in ko["periods"]] == [
+        p["total"]["out_tokens"] for p in model["periods"]]
