@@ -21,18 +21,18 @@ class BashBudgetTest(unittest.TestCase):
     def test_stage_env_carries_bash_timeouts_as_ms_strings(self):
         env = stages.stage_env({})
         self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
-        self.assertEqual(int(env["BASH_MAX_TIMEOUT_MS"]), 60 * 60 * 1000)
+        self.assertEqual(int(env["BASH_MAX_TIMEOUT_MS"]), 100 * 60 * 1000)
         self.assertEqual(int(env["BASH_DEFAULT_TIMEOUT_MS"]), 20 * 60 * 1000)
         self.assertEqual(stages.stage_env({"KEEP": "x"})["KEEP"], "x")
 
     def test_one_command_fits_inside_every_non_light_stage(self):
-        # A single build may take the whole hour; the stage must still have room
-        # to write run.log / verify.md after it. light keeps the historical hour
-        # on purpose (a one-liner needing two hours is mis-tiered, not slow).
+        # A single build may take the whole cap; the stage must still have room
+        # to write run.log / verify.md after it. light keeps its historical hour
+        # on purpose (a one-liner needing more is mis-tiered, not slow) — its own
+        # stage timeout ends a longer command, so it is not held to the cap.
         cap_s = stages.BASH_MAX_TIMEOUT_MS // 1000
         for tier in ("standard", "heavy"):
             self.assertGreater(stages.STAGE_TIMEOUTS[tier], cap_s, tier)
-        self.assertGreaterEqual(stages.STAGE_TIMEOUTS["light"], cap_s)
         self.assertLess(stages.BASH_DEFAULT_TIMEOUT_MS, stages.BASH_MAX_TIMEOUT_MS)
 
     def test_tier_ladder(self):

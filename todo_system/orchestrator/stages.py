@@ -3267,13 +3267,16 @@ def stage_env_with_gradle(base: dict | None = None, *,
 # gradle CLIENT at 600 s while the daemon kept building under its lock, the next
 # gradlew blocked on that lock ("Gradle wedged"), Verify wrote `skip`, Report
 # opened no PR, and the task parked for a human — 33 runs in the first 17 days of
-# October. One hour per command fits inside the 2 h standard stage above; the
+# October. 2026-11-22: raised 60 → 100 min — the if-then-habits `:shared` suite
+# alone grew past an hour on HQ (65–70 min, 2200+ tests), so every Verify of that
+# repo hit the cap and wrote `skip` (mulkko-177). 100 min still fits inside the
+# 2 h standard stage (and a light stage simply ends at its own hour); the
 # 20-minute default covers an agent that forgets the `timeout` parameter
 # without letting a hung command eat the stage. Both are plain env strings
 # (ms), read by the CLI at process start, so the stage subprocess env is the
 # one place to set them.
 BASH_DEFAULT_TIMEOUT_MS = 20 * 60 * 1000
-BASH_MAX_TIMEOUT_MS = 60 * 60 * 1000
+BASH_MAX_TIMEOUT_MS = 100 * 60 * 1000
 STAGE_ENV_OVERRIDES = {
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     "BASH_DEFAULT_TIMEOUT_MS": str(BASH_DEFAULT_TIMEOUT_MS),

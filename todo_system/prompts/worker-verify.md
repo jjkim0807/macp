@@ -22,9 +22,9 @@ not.
 The runner starts this stage with background tasks switched off
 (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`), so `run_in_background` just runs in the
 foreground. A slow build needs the Bash `timeout` parameter — the runner raises
-the cap to `3600000` ms (60 min; a call with no `timeout` gets 20 min), and the
+the cap to `6000000` ms (100 min; a call with no `timeout` gets 20 min), and the
 stage itself has 2 h (3 h for heavy-tier tasks). Gradle on a busy host can take
-10–30 min per task under memory contention, so pass `timeout: 3600000` to every
+10–30 min per task under memory contention, so pass `timeout: 6000000` to every
 `./gradlew` call and let it finish; do not split the suite, drop lanes, or stop
 early to fit a smaller budget — a slow, complete check beats a skipped one.
 Use a scoped `--rerun` on the one task you need re-executed, not `--rerun-tasks`,
@@ -32,7 +32,7 @@ which rebuilds the whole graph from scratch (a past run ended its turn waiting o
 exactly that). If a Gradle command does time out, its daemon may still hold the
 build lock: run `./gradlew --stop` (it only reaches this run's own daemon
 registry), retry the command once with the full budget, and record both attempts.
-Only if a check still cannot finish inside the 60-minute cap, write
+Only if a check still cannot finish inside the 100-minute cap, write
 `overall_status: skip` naming it.
 
 ## Policy: local verification — GitHub Actions is not used
@@ -133,7 +133,7 @@ the project's standard test + lint gates (and a build when it is cheap enough).
   nothing — force it (`--rerun`) or name the substitute execution that does cover
   the change (e.g. an Android app module whose `:app:testDebugUnitTest` is NO-SOURCE;
   the real `:app` gate is `:app:compileDebugKotlin --rerun`).
-- Budget the stage (2 h by default, 3 h on heavy-tier tasks, 1 h on light; 60 min per command). Run the AC-named gates first. If you are running
+- Budget the stage (2 h by default, 3 h on heavy-tier tasks, 1 h on light; 100 min per command). Run the AC-named gates first. If you are running
   out of time or turns with checks still pending, write `verify.md` with
   `overall_status: skip` and name exactly what did not run.
 - If a required toolchain is missing on this host or its command is gated, don't
