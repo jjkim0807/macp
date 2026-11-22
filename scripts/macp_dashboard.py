@@ -3080,7 +3080,7 @@ def _registry_agent(agent_id: str):
 # POST /api/action runs gh/git through this callable (None = subprocess.run).
 # Seam for the route tests, looked up at call time.
 _ACTION_RUN = None
-# An instruction is one line: no control characters (newlines included).
+# An instruction or a text answer is one line: no control characters (newlines included).
 _ACTION_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -3508,6 +3508,7 @@ class Handler(BaseHTTPRequestHandler):
     # -- triage card actions (orchestrator/triage_actions.py) -----------------
     # Behind the DASHBOARD token: a click on a card is the human's approval. The
     # card is diagnosed again here and only an action it still offers runs.
+    # `answer`, the reply to a decision card, is judged by _post_answer instead.
     ACTION_MAX_BYTES = 4096
     ACTION_TEXT_MAX = 500
 
@@ -3547,6 +3548,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(slug, str) or not SLUG_RE.match(slug) or action not in _tri.ACTIONS:
             refuse(400, "bad_request")
             return
+        if action == "answer":
+            # a decision card's reply: judged by the decision card, not a triage card
+            self._post_answer(slug, data.get("option"), text, extra)
+            return
         if action == "instruct":
             if (not isinstance(text, str) or _ACTION_CTRL_RE.search(text)
                     or not 1 <= len(text.strip()) <= self.ACTION_TEXT_MAX):
@@ -3583,6 +3588,72 @@ class Handler(BaseHTTPRequestHandler):
         # the instruction text itself stays out of the log (length only)
         logger.info("dashboard action task=%s action=%s rule=%s ok=%s text_len=%d",
                     slug, action, card["rule"], ok, len(text or ""))
+        self._status_cache.invalidate()
+        self._reply_json(200, {"ok": ok, "message": message}, extra)
+
+    def _post_answer(self, slug: str, option, text, extra: dict) -> None:
+        """`action: "answer"` — record what the person chose on a decision card.
+
+        The body carries exactly one of `option` (the 1-based position in the
+        `options` this server sent) or `text` (one line, 1..ACTION_TEXT_MAX
+        chars). The decision card is read again here (triage.decision_card), so
+        a stale screen cannot answer: no md is 404, an md that is not an
+        answerable decision is 409, an option past the fresh list is 400.
+
+        The answer only records (triage_actions._answer): one md commit and, for
+        a waiting human assignment, one reply to the orchestrator. Nothing is
+        closed, merged, resumed or dispatched here, whatever the choice says."""
+        from todo_system.orchestrator import triage as _tri
+        from todo_system.orchestrator import triage_actions as _acts
+
+        def refuse(code: int, key: str) -> None:
+            self._reply_json(code, {"ok": False, "message": i18n.t(f"triage.result.{key}")},
+                             extra)
+
+        if (option is None) == (text is None):
+            refuse(400, "bad_request")
+            return
+        if text is not None:
+            if (not isinstance(text, str) or _ACTION_CTRL_RE.search(text)
+                    or not 1 <= len(text.strip()) <= self.ACTION_TEXT_MAX):
+                refuse(400, "bad_answer")
+                return
+        elif not isinstance(option, int) or isinstance(option, bool) or option < 1:
+            refuse(400, "bad_option")
+            return
+        if not (ITEMS / f"{slug}.md").is_file():
+            refuse(404, "unknown_task")
+            return
+        try:
+            card = _tri.decision_card(slug, items_dir=ITEMS)
+        except Exception as e:
+            logger.warning("dashboard action answer: card failed task=%s err=%s", slug,
+                           type(e).__name__)
+            refuse(500, "internal")
+            return
+        if card is None or slug in _umbrellas_in_progress():
+            logger.info("dashboard action refused task=%s action=answer (no decision to answer)",
+                        slug)
+            refuse(409, "not_offered")
+            return
+        if option is not None:
+            if option > len(card["options"]):
+                refuse(400, "bad_option")
+                return
+            choice = card["options"][option - 1]
+        else:
+            choice = " ".join(text.split())
+        try:
+            ok, message = _acts.run_action("answer", slug, None, vault_root=VAULT,
+                                           items_dir=ITEMS, text=choice, run=_ACTION_RUN,
+                                           assign_dir=ASSIGN)
+        except Exception as e:
+            logger.warning("dashboard action crashed task=%s action=answer err=%s", slug,
+                           type(e).__name__)
+            ok, message = False, i18n.t("triage.result.internal")
+        # the answer itself stays out of the log (length only), like an instruction
+        logger.info("dashboard action task=%s action=answer rule=decision ok=%s text_len=%d",
+                    slug, ok, len(choice))
         self._status_cache.invalidate()
         self._reply_json(200, {"ok": ok, "message": message}, extra)
 

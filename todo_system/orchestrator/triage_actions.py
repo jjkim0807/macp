@@ -17,6 +17,27 @@ already uses:
 * instruct -> a 「사용자 지시」 Progress Log line (and `updated`), committed the
               same way, then resume.schedule(after_commit=<that commit>).
 
+And the one action of a decision card (triage.py, "Decision cards"), which the
+route offers by its own click-time check (triage.decision_card), not by a
+triage card:
+
+* answer   -> a 「결정(대시보드)」 Progress Log line carrying the choice, the
+              decision marker lowered (`needs_decision: false`, the `decision`
+              tag and `decision_options` removed), `next_action` rewritten to
+              say what was chosen, and `updated` — one file, committed the same
+              way. When the ledger row is a human assignment still
+              awaiting_human, one `needs-input` reply goes to the orchestrator
+              (human.reply, what `/decide` sends), so the row carries the
+              answer and stays parked.
+
+              An answer only records. It never closes, merges, resumes,
+              cancels or dispatches, whatever the chosen words say: a choice
+              that names a payment, a commitment, a deletion or a submission is
+              written down like any other, and carrying it out stays with a
+              follow-up task or a person. `status` is left as it is because the
+              server cannot tell a choice that ends the task from one that
+              leaves a step to do.
+
 The md is the source of truth, so nothing here writes todo.db (the todo-sync
 daemon absorbs the md) or pushes (todo-sync pushes the vault). An md write is
 a compare-and-swap like tasks.mark_done, under the vault git lock, only on
@@ -41,7 +62,8 @@ from pathlib import Path
 from .. import i18n
 from ..vault_git_lock import vault_git_lock
 from . import resume
-from .triage import pr_ref
+from .assignment import AWAITING_HUMAN, Ledger
+from .triage import DECISION_TAG, _clip, _tags, md_decision, pr_ref
 
 # The dashboard's audit log: one place to read what a click did.
 logger = logging.getLogger("macp.dashboard")
@@ -67,11 +89,14 @@ def _one_line(text, limit: int = 300) -> str:
 
 def run_action(action: str, slug: str, facts: dict | None, *, vault_root, items_dir,
                text: str | None = None, run=None, schedule=None,
-               today: str | None = None) -> tuple[bool, str]:
-    """Run one triage action for `slug`. `facts` are the click-time facts
-    (triage.gather) the card was diagnosed from. `run` replaces subprocess.run
-    (gh and git), `schedule` replaces resume.schedule and `today` the date —
-    test seams; the defaults are the real paths."""
+               today: str | None = None, reply=None, assign_dir=None) -> tuple[bool, str]:
+    """Run one action for `slug`. `facts` are the click-time facts
+    (triage.gather) a triage card was diagnosed from; `answer` reads none.
+    `text` is the instruction (instruct) or the chosen words (answer). `run`
+    replaces subprocess.run (gh and git), `schedule` replaces resume.schedule,
+    `reply` replaces the reply to the orchestrator and `today` the date — test
+    seams; the defaults are the real paths. `assign_dir` is the ledger
+    directory (default <vault_root>/Worker/assignments)."""
     run = run or subprocess.run
     schedule = schedule or resume.schedule
     today = today or dt.date.today().isoformat()
@@ -83,6 +108,8 @@ def run_action(action: str, slug: str, facts: dict | None, *, vault_root, items_
         return _cancel(slug, vault_root, items_dir, run, today)
     if action == "instruct":
         return _instruct(slug, vault_root, items_dir, text, run, schedule, today)
+    if action == "answer":
+        return _answer(slug, vault_root, items_dir, text, run, today, reply, assign_dir)
     return False, _msg("not_offered")
 
 
@@ -279,3 +306,109 @@ def _instruct(slug: str, vault_root, items_dir, text, run, schedule, today: str
         logger.warning("dashboard action instruct: resume not reserved task=%s err=%s", slug, e)
         return False, _msg("instructed_no_resume")
     return True, _msg("instructed")
+
+
+# --- answer: record a decision (it only records — see the module docstring) ----------
+
+_TAGS_SENTINEL = "\x00"    # stands in for the tags value while the list is rewritten
+_NEXT_ACTION_MAX = 200     # chars of the rewritten next_action; the log line keeps it all
+_REPLY_NOTE_MAX = 200      # assignment.apply_reply keeps 200 chars of a note
+_SAID_MAX = 80             # chars of the choice quoted back in the result sentence
+
+
+def _fm_quote(value: str) -> str:
+    """`value` as a double-quoted one-line frontmatter scalar every line parser
+    here reads back whole: no backslash, inner double quotes made single."""
+    return '"' + value.replace("\\", "").replace('"', "'")[:_NEXT_ACTION_MAX] + '"'
+
+
+def _drop_tag(text: str, fm: dict, tag: str) -> str:
+    """`text` with `tag` (any case) taken out of its frontmatter `tags`. The tags
+    that stay are written back as a block list, whatever form the field had; a
+    list left empty loses the key. Unchanged when the tag is not there."""
+    from todo_system import cli
+
+    tags = [t for t in _tags(fm.get("tags")) if t]
+    keep = [t for t in tags if t.lower() != tag]
+    if len(keep) == len(tags):
+        return text
+    if not keep:
+        return cli.remove_frontmatter_key(text, "tags")
+    out = cli.update_frontmatter_value(text, "tags", _TAGS_SENTINEL)
+    return out.replace(f"tags: {_TAGS_SENTINEL}",
+                       "tags:" + "".join(f"\n  - {t}" for t in keep), 1)
+
+
+def _human_reply(vault_root, row, slug: str, note: str) -> None:
+    """Tell the orchestrator a person answered `slug`: one reply on the row's own
+    corr_id (collect() drops any other), put in the orchestrator's inbox under
+    the vault.
+
+    `needs-input`, on purpose. collect() closes the todo on `done`, and an
+    answer does not know whether the task is over. `progress` would leave a
+    human row in_progress, which nothing reaps and which the checkout gate
+    counts as in flight for good. `needs-input` stores the note and collect()
+    parks the row again (awaiting_human), which is all an answer may do.
+
+    A file mailbox, not the git one: the envelope is a file on this host,
+    where the orchestrator's next tick reads it, and the vault sync commits it
+    with the other mailbox files. Nothing here commits or pushes for it."""
+    from . import human
+    from .mailbox import DEFAULT_ROOT, open_mailbox
+
+    human.reply(open_mailbox(f"file://{DEFAULT_ROOT}", base=Path(vault_root)),
+                row.agent_id, slug, "needs-input", note, row.corr_id)
+
+
+def _answer(slug: str, vault_root, items_dir, choice, run, today: str, reply, assign_dir
+            ) -> tuple[bool, str]:
+    from todo_system import cli
+
+    from ..session_log import parse_frontmatter
+
+    line = " ".join(str(choice or "").split())
+    if not line:
+        return False, _msg("bad_answer")
+    path = Path(items_dir) / f"{slug}.md"
+    if not path.is_file():
+        return False, _msg("md_missing")
+
+    def raises_decision(md: str) -> bool:
+        return _has_frontmatter(md) and md_decision(parse_frontmatter(md)[0])
+
+    if not raises_decision(_read_text(path)):
+        return False, _msg("not_offered")
+    answered_meanwhile = False
+
+    def patch(md: str) -> str:
+        nonlocal answered_meanwhile
+        if not raises_decision(md):
+            answered_meanwhile = True        # answered inside the window: write nothing
+            return md
+        fm, _ = parse_frontmatter(md)
+        out = cli.update_frontmatter_value(md, "needs_decision", "false")
+        out = cli.remove_frontmatter_key(out, "decision_options")
+        out = _drop_tag(out, fm, DECISION_TAG)
+        out = cli.update_frontmatter_value(
+            out, "next_action", _fm_quote(i18n.t("triage.md.answer_next", text=line)))
+        out = cli.update_frontmatter_value(out, "updated", today)
+        return _with_log_line(out, i18n.t("triage.md.answer", today=today, text=line))
+
+    ok, msg, _sha = _md_commit(slug, vault_root, items_dir, run, patch,
+                               f"chore: record decision for {slug} (dashboard)")
+    if not ok:
+        return False, (_msg("not_offered") if answered_meanwhile else msg)
+    # The record is committed. A human assignment that is still waiting hears
+    # about it once; any other row (a worker's, a finished one, none) hears nothing.
+    try:
+        row = Ledger(assign_dir or Path(vault_root) / "Worker" / "assignments").load(slug)
+        if (row is not None and str(row.kind or "").startswith("human")
+                and row.state == AWAITING_HUMAN):
+            (reply or _human_reply)(vault_root, row, slug,
+                                    f"answered via dashboard: {line}"[:_REPLY_NOTE_MAX])
+    except Exception as e:
+        # the answer itself stays out of the log, like an instruction's text
+        logger.warning("dashboard action answer: reply not sent task=%s err=%s", slug,
+                       type(e).__name__)
+        return False, _msg("answered_no_reply")
+    return True, _msg("answered", choice=_clip(line, _SAID_MAX))

@@ -22,10 +22,12 @@ cards" restates it for the Android app):
   that tests and clients may key on (never shown). `reason`, `evidence`,
   `advice` and every `label` are sentences in the UI language. `actions` may
   be empty, and `evidence` has at most six lines.
-* Action ids are a CLOSED set, ACTIONS = merge | resume | cancel | instruct.
-  No id exists for deploying, submitting, publishing or deleting, and the
-  server refuses any id outside the set, so an irreversible step never gets a
-  button. A task md with `human_gate: true` keeps only `cancel`.
+* Action ids are a CLOSED set, ACTIONS = merge | resume | cancel | instruct |
+  answer. No id exists for deploying, submitting, publishing or deleting, and
+  the server refuses any id outside the set, so an irreversible step never
+  gets a button. A task md with `human_gate: true` keeps only `cancel`.
+  `answer` is never one of a triage card's buttons: no rule offers it. It is
+  the reply to a decision card (below) and it only records.
 * The server decides; the web card and the app only render what they are given
   (labels included) and post `{task, action[, text]}` to `POST /api/action`.
   The server diagnoses again at click time and runs an action only if that
@@ -57,6 +59,18 @@ cards" restates it for the Android app):
   its due date or time block, comes before every row without one in `human`,
   and has `group: ""` so no client folds it away.
 * Fail-soft: a card that raises leaves that row exactly as it was.
+* The card is answered with `POST /api/action {task, action: "answer"}` plus
+  exactly one of `option` (the 1-based position in the `options` the server
+  sent) or `text` (one line, 1 to 500 chars). The server calls decision_card()
+  again at click time: no card means 409, an `option` past the end of the
+  fresh list means 400, a task with no md means 404.
+* An answer only records. triage_actions writes the choice to the task md (a
+  Progress Log line, the marker lowered, `next_action` rewritten) in one
+  commit and, when the task is a human assignment still awaiting_human, sends
+  the orchestrator one `needs-input` reply. It never closes, merges, resumes,
+  cancels or dispatches anything, whatever the chosen words say: a choice
+  that names a payment, a commitment, a deletion or a submission is written
+  down, and carrying it out stays with a follow-up task or a person.
 
 Rules — first match wins. `can_merge` = pr_ref(pr_url) is not None and
 verdict == "PASS" and not rebase_conflict. DISPATCHABLE = auto | delegate |
@@ -139,8 +153,9 @@ from .dashboard import _merged_park     # the predicate only — shared with tra
 from .statuses import is_closed
 
 # The one-click actions, a closed set (see the contract above). The dashboard
-# refuses any other id with a 400 before it diagnoses anything.
-ACTIONS = ("merge", "resume", "cancel", "instruct")
+# refuses any other id with a 400 before it diagnoses anything. The first four
+# are a triage card's buttons; `answer` is the reply to a decision card.
+ACTIONS = ("merge", "resume", "cancel", "instruct", "answer")
 
 # Ledger states that may carry a card: the attention list's own states.
 TARGET_STATES = ("awaiting_human", "failed")

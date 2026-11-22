@@ -340,8 +340,17 @@ class NotATargetKo(_Lang):
 
 class FixedValues(unittest.TestCase):
     def test_action_ids_are_a_closed_set(self):
-        self.assertEqual(triage.ACTIONS, ("merge", "resume", "cancel", "instruct"))
+        self.assertEqual(triage.ACTIONS, ("merge", "resume", "cancel", "instruct", "answer"))
         self.assertEqual(triage.TARGET_STATES, ("awaiting_human", "failed"))
+
+    def test_answer_is_never_a_triage_card_button(self):
+        # `answer` belongs to the decision card; no diagnosis rule ever offers it
+        cards = [triage.diagnose(f) for f in CASES.values()]
+        cards.append(triage.diagnose(_facts(needs_decision=True, agent_is_human=True,
+                                            agent_kind="human", md_worker_mode="delegate")))
+        for t in cards:
+            self.assertNotIn("answer", _ids(t))
+        self.assertIn("only records", triage.__doc__)
 
     def test_dispatchable_mirror(self):
         from todo_system.orchestrator import tasks

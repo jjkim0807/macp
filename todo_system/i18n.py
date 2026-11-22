@@ -172,6 +172,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.action.resume": "재개",
         "triage.action.cancel": "취소",
         "triage.action.instruct": "지시 추가",
+        "triage.action.answer": "답하기",
         "triage.merged_blocked.reason": "PR은 이미 머지됐고 사람이 할 단계만 남았어요",
         "triage.merged_blocked.advice": (
             "남은 단계를 마친 뒤 태스크 md를 status: done으로 닫으면 다음 틱에 자동 종결돼요 "
@@ -289,9 +290,19 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.result.bad_text": "지시는 한 줄, 500자 이하로 적어 주세요",
         "triage.result.unknown_task": "그런 태스크가 없어요",
         "triage.result.internal": "처리 중 오류가 났어요 — 대시보드 로그를 확인하세요",
+        # what answering a decision card did (the answer only records)
+        "triage.result.answered": (
+            "결정을 기록했어요: {choice} — 태스크는 열려 있고 다음 행동에 반영했어요"),
+        "triage.result.answered_no_reply": (
+            "결정은 커밋했지만 오케스트레이터 회신은 보내지 못했어요 — 대시보드 로그를 확인하세요"),
+        "triage.result.bad_option": "없는 선택지예요 — 화면을 새로고침하세요",
+        "triage.result.bad_answer": "답은 한 줄, 500자 이하로 적어 주세요",
         # Progress Log lines a click writes into the task md
         "triage.md.cancel": "- {today}: 대시보드에서 취소(사용자)",
         "triage.md.instruction": "- {today}: 사용자 지시(대시보드): {text}",
+        "triage.md.answer": "- {today}: 결정(대시보드): {text}",
+        # the next_action an answered decision task is left with
+        "triage.md.answer_next": "결정 반영 — {text}",
         # usage vs results (usage_value.py): the dashboard card and the brief table
         "usage_value.title": "사용량 대비 결과",
         "usage_value.basis": (
@@ -473,6 +484,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.action.resume": "Resume",
         "triage.action.cancel": "Cancel",
         "triage.action.instruct": "Add instruction",
+        "triage.action.answer": "Answer",
         "triage.merged_blocked.reason": "The PR is already merged; only a human step is left",
         "triage.merged_blocked.advice": (
             "Finish that step, then close the task md with status: done and the next tick "
@@ -611,8 +623,17 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.result.bad_text": "Write the instruction as one line of at most 500 characters",
         "triage.result.unknown_task": "No such task",
         "triage.result.internal": "Something went wrong — check the dashboard log",
+        "triage.result.answered": (
+            "Decision recorded: {choice} — the task stays open and its next action now says so"),
+        "triage.result.answered_no_reply": (
+            "The decision is committed, but the reply to the orchestrator could not be sent — "
+            "check the dashboard log"),
+        "triage.result.bad_option": "That option does not exist — refresh the page",
+        "triage.result.bad_answer": "Write the answer as one line of at most 500 characters",
         "triage.md.cancel": "- {today}: cancelled from the dashboard (user)",
         "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
+        "triage.md.answer": "- {today}: decision (dashboard): {text}",
+        "triage.md.answer_next": "Carry out the decision — {text}",
         "usage_value.title": "Usage vs results",
         "usage_value.basis": (
             "Counted from this host's run dirs — remote-runner runs and pruned run dirs are "
