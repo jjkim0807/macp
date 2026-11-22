@@ -1,6 +1,6 @@
-"""Pins the planner skip-gate + queue I/O + frontmatter parser contracts in
+"""Pins the planner-state + queue I/O + frontmatter parser contracts in
 `todo_system/worker.py`: `compute_todo_state_hash`, `load_planner_state`,
-`is_planner_exhausted`, `count_auto_pending`, `parse_frontmatter`, and
+`parse_frontmatter`, and
 `load_queue`/`save_queue`/`queue_lock`. The sibling state-writer function is
 deliberately out of scope — no call, no assertion (see the originating task's
 acceptance criteria #14).
@@ -8,13 +8,12 @@ acceptance criteria #14).
 This repo's `todo_system/tests/conftest.py` only isolates `graph_memory` /
 `session_log` globals (`isolated_vault`), not `worker`'s. There is no
 `_runtime_paths_isolated` autouse fixture in this codebase, so every test here
-redirects the five relevant `worker` module globals itself via
+redirects the four relevant `worker` module globals itself via
 `mock.patch.object(worker, ...)`, scoped to a fresh `tmp_path` per test.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 from unittest import mock
@@ -26,18 +25,16 @@ from todo_system import worker
 
 @pytest.fixture
 def isolated_paths(tmp_path):
-    """Redirect worker's items/queue/planner-state/lock/logs globals into tmp_path."""
+    """Redirect worker's items/queue/planner-state/lock globals into tmp_path."""
     items_dir = tmp_path / "items"
     queue_path = tmp_path / "queue.json"
     planner_state_path = tmp_path / "planner_state.json"
     queue_lock_path = tmp_path / "queue.lock"
-    logs_dir = tmp_path / "logs"
     with (
         mock.patch.object(worker, "ITEMS_DIR", items_dir),
         mock.patch.object(worker, "QUEUE_PATH", queue_path),
         mock.patch.object(worker, "PLANNER_STATE_PATH", planner_state_path),
         mock.patch.object(worker, "QUEUE_LOCK_PATH", queue_lock_path),
-        mock.patch.object(worker, "LOGS_DIR", logs_dir),
     ):
         yield tmp_path
 
@@ -156,135 +153,6 @@ class TestLoadPlannerState:
         }
         path.write_text(json.dumps(state), encoding="utf-8")
         assert worker.load_planner_state() == state
-
-
-# ---------------------------------------------------------------------------
-# is_planner_exhausted (AC6, AC7)
-# ---------------------------------------------------------------------------
-
-
-def _write_planner_state(isolated_paths, state: dict) -> None:
-    path = isolated_paths / "planner_state.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state), encoding="utf-8")
-
-
-class TestIsPlannerExhausted:
-    def test_no_prior_state(self, isolated_paths):
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert reason == "no prior state"
-
-    def test_verdict_not_exhausted(self, isolated_paths):
-        _write_planner_state(isolated_paths, {"verdict": "has_tasks"})
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert "has_tasks" in reason
-
-    def test_hash_changed(self, isolated_paths):
-        _write_item(isolated_paths / "items", "a.md", "content")
-        stale_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        _write_item(isolated_paths / "items", "a.md", "different content")
-
-        _write_planner_state(
-            isolated_paths,
-            {"verdict": "exhausted", "todo_state_hash": stale_hash, "last_run": worker.now_iso()},
-        )
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert "hash changed" in reason
-
-    def test_no_last_run_timestamp(self, isolated_paths):
-        current_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        _write_planner_state(isolated_paths, {"verdict": "exhausted", "todo_state_hash": current_hash})
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert reason == "no last_run timestamp"
-
-    def test_invalid_last_run_timestamp(self, isolated_paths):
-        current_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        _write_planner_state(
-            isolated_paths,
-            {"verdict": "exhausted", "todo_state_hash": current_hash, "last_run": "not-a-date"},
-        )
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert reason == "invalid last_run timestamp"
-
-    def test_true_within_threshold(self, isolated_paths):
-        current_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        last_run = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat()
-        _write_planner_state(
-            isolated_paths,
-            {"verdict": "exhausted", "todo_state_hash": current_hash, "last_run": last_run},
-        )
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is True
-        assert "exhausted" in reason
-
-    def test_just_under_threshold(self, isolated_paths):
-        current_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        margin_hours = worker.PLANNER_EXHAUSTED_THRESHOLD_HOURS - 0.01
-        last_run = (dt.datetime.now() - dt.timedelta(hours=margin_hours)).isoformat()
-        _write_planner_state(
-            isolated_paths,
-            {"verdict": "exhausted", "todo_state_hash": current_hash, "last_run": last_run},
-        )
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is True
-
-    def test_at_or_over_threshold(self, isolated_paths):
-        current_hash = worker.compute_todo_state_hash(queue={"runs": []})
-        last_run = (
-            dt.datetime.now() - dt.timedelta(hours=worker.PLANNER_EXHAUSTED_THRESHOLD_HOURS)
-        ).isoformat()
-        _write_planner_state(
-            isolated_paths,
-            {"verdict": "exhausted", "todo_state_hash": current_hash, "last_run": last_run},
-        )
-        exhausted, reason = worker.is_planner_exhausted(queue={"runs": []})
-        assert exhausted is False
-        assert "elapsed" in reason
-
-
-# ---------------------------------------------------------------------------
-# count_auto_pending (AC8)
-# ---------------------------------------------------------------------------
-
-
-class TestCountAutoPending:
-    def test_filters_by_mode_and_status(self, isolated_paths):
-        queue = {
-            "runs": [
-                {"status": "pending", "mode": "auto"},
-                {"status": "pending", "mode": "delegate"},
-                {"status": "pending", "mode": "quick"},
-                {"status": "done", "mode": "auto"},
-                {"status": "done", "mode": "delegate"},
-            ]
-        }
-        assert worker.count_auto_pending(queue=queue) == 2
-
-    def test_empty_runs_list(self, isolated_paths):
-        assert worker.count_auto_pending(queue={"runs": []}) == 0
-
-    def test_no_runs_key(self, isolated_paths):
-        assert worker.count_auto_pending(queue={}) == 0
-
-    def test_queue_none_uses_load_queue(self, isolated_paths):
-        queue = {"runs": [{"status": "pending", "mode": "auto"}]}
-        worker.save_queue(queue)
-        assert worker.count_auto_pending() == worker.count_auto_pending(queue=queue)
-
-    def test_missing_mode_or_status_keys_excluded(self, isolated_paths):
-        queue = {
-            "runs": [
-                {"status": "pending"},
-                {"mode": "auto"},
-                {},
-            ]
-        }
-        assert worker.count_auto_pending(queue=queue) == 0
 
 
 # ---------------------------------------------------------------------------

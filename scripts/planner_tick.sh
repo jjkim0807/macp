@@ -15,7 +15,7 @@
 #   1) queue depth < DEPTH_LIMIT  — don't pile on when work is already queued
 #   2) backoff — skip re-invoke while the open-task state is unchanged AND the
 #      last invocation was < EXHAUST_HOURS ago (an exhausted backlog shouldn't
-#      burn a planner run every tick; legacy PLANNER_EXHAUSTED_THRESHOLD_HOURS).
+#      burn a planner run every tick).
 # Both yield to a starved keep-alive project (todo_system/orchestrator/
 # keep_alive.py: a vault-policy prefix with zero actionable open tasks); the
 # earlier gates (HQ host, PAUSED, usage guard, daily budget) never do.

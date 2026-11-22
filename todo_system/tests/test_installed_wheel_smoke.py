@@ -186,7 +186,6 @@ assert worker._ENGINE_ROOT == root, worker._ENGINE_ROOT
 assert human._ENGINE_ROOT == root, human._ENGINE_ROOT
 assert stages._ENGINE_ROOT == root, stages._ENGINE_ROOT
 assert beta_publish._ENGINE_ROOT == root, beta_publish._ENGINE_ROOT
-assert worker.COMMANDS_DIR == stages.COMMANDS_DIR, worker.COMMANDS_DIR
 assert worker.KAKAO_SEND_SCRIPT.is_file(), worker.KAKAO_SEND_SCRIPT
 assert worker.HEALTH_REPORT_SCRIPT.is_file(), worker.HEALTH_REPORT_SCRIPT
 assert human.KAKAO_SCRIPT.is_file(), human.KAKAO_SCRIPT

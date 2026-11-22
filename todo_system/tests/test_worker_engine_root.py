@@ -1,7 +1,7 @@
 """worker.py engine files resolve against the install, not the vault (c-1).
 
-Notes/macp-public-split-inventory.md §11.8 c-1: worker.py used to anchor three
-engine-shipped files — `.claude/commands`, `scripts/kakao_send.sh` and
+Notes/macp-public-split-inventory.md §11.8 c-1: worker.py used to anchor
+engine-shipped files — `scripts/kakao_send.sh` and
 `scripts/health_report.py` — on the vault root. In a split install
 (MACP_VAULT_ROOT pointing at a vault outside the engine tree) that made
 restart_stale_daemons() a silent no-op, because health_report was looked up in a
@@ -10,8 +10,8 @@ vault that does not ship it.
 The check runs in a fresh interpreter: todo_system/conftest.py swaps
 worker.KAKAO_SEND_SCRIPT in-process, and the constants are computed at import
 time, so only a new process sees what the module really resolves. getattr(...,
-None) keeps a pre-fix run failing on the actual path assertion (COMMANDS_DIR /
-KAKAO_SEND_SCRIPT under the tmp vault), not merely on a missing attribute.
+None) keeps a pre-fix run failing on the actual path assertion
+(KAKAO_SEND_SCRIPT under the tmp vault), not merely on a missing attribute.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 from todo_system import worker
 
-NAMES = ("_ENGINE_ROOT", "COMMANDS_DIR", "KAKAO_SEND_SCRIPT", "HEALTH_REPORT_SCRIPT")
+NAMES = ("_ENGINE_ROOT", "KAKAO_SEND_SCRIPT", "HEALTH_REPORT_SCRIPT")
 
 CHILD = (
     "import json\n"
@@ -64,7 +64,6 @@ def test_engine_paths_ignore_redirected_vault(tmp_path):
     vault_resolved = vault.resolve()
     expected = {
         "_ENGINE_ROOT": engine,
-        "COMMANDS_DIR": engine / "todo_system" / "prompts",
         "KAKAO_SEND_SCRIPT": engine / "scripts" / "kakao_send.sh",
         "HEALTH_REPORT_SCRIPT": engine / "scripts" / "health_report.py",
     }

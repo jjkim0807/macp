@@ -40,7 +40,7 @@ from . import maintenance_embed
 from . import not_before as nb_gate
 from . import paths
 from .frontmatter_lists import parse_inline_list
-from .kakao_format import LEVEL_DIGEST, compose_alert
+from .kakao_format import compose_alert
 from .orchestrator import stages as _stages
 from .orchestrator.statuses import is_closed
 from .orchestrator import worktree_sweep as _worktree_sweep
@@ -65,13 +65,9 @@ ROOT = paths.vault_root(start=paths.vault_search_start())
 TODO_DIR = ROOT / "Todo"
 ITEMS_DIR = TODO_DIR / "items"
 WORKER_DIR = ROOT / "Worker"
-COMMANDS_DIR = _stages.COMMANDS_DIR
-LOGS_DIR = ROOT / "logs"
 
-RUNS_DIR = WORKER_DIR / "runs"
 QUEUE_PATH = WORKER_DIR / "queue.json"
 PLANNER_STATE_PATH = WORKER_DIR / "planner_state.json"
-SWEEP_STATE_PATH = WORKER_DIR / "sweep_state.json"
 
 # todo-sync tick heartbeat: written by cli.cmd_daemon around each tick's real
 # work, read by _todo_sync_idle. Present-and-fresh = a sync is mid-write;
@@ -169,38 +165,16 @@ def runner_heartbeat_clear() -> None:
 # stdlib-only too — and adds no cycle: orchestrator/__init__ is a docstring with
 # no imports, and orchestrator/runner.py, the one module that pulls in both,
 # already imports worker.
-DEFAULT_RESEARCH_TOOLS = _stages.STAGE_TOOLS["research"]
-DEFAULT_PLAN_TOOLS = _stages.STAGE_TOOLS["plan"]
 DEFAULT_IMPLEMENT_TOOLS = _stages.STAGE_TOOLS["implement"]
-DEFAULT_VERIFY_TOOLS = _stages.STAGE_TOOLS["verify"]
-DEFAULT_REPORT_TOOLS = _stages.STAGE_TOOLS["report"]
 # Delegate is a single-stage lightweight mode: claude -p reads task + context,
 # edits the task file in place (Progress Log + body), commits on a worker branch.
 DEFAULT_DELEGATE_TOOLS = _stages.STAGE_TOOLS["delegate"]
-
-# Turn budget per stage. A single flat budget starves the implement/delegate
-# stages (which do the actual multi-file editing) while wasting headroom on the
-# read-only stages. research/plan/verify/report rarely need many turns; the
-# implement and delegate stages do the heavy lifting and routinely exceeded the
-# old flat 40 (e.g. todo-area-to-tags-refactor died at "Reached max turns (40)").
-# A task may still override all stages via an explicit `max_turns` frontmatter.
-DEFAULT_STAGE_MAX_TURNS = 40
-STAGE_MAX_TURNS = {
-    "research": 40,
-    "plan": 40,
-    "implement": 200,
-    "verify": 50,
-    "report": 40,
-    "delegate": 200,
-    "discover": 120,
-}
 
 # Pipeline shape per worker_mode.
 # - auto: full 5-stage R-P-I-V-Rep (for code-change tasks)
 # - delegate: single-stage 'delegate' (for research/update-the-task-file tasks)
 STAGES_AUTO = ("research", "plan", "implement", "verify", "report")
 STAGES_DELEGATE = ("delegate",)
-STAGES = STAGES_AUTO  # kept for back-compat references
 STAGES_DISCOVER = _stages.STAGES_DISCOVER
 STAGES_BY_MODE = {
     "auto": STAGES_AUTO,
@@ -234,30 +208,6 @@ FORBIDDEN_TOOL_SUBSTRINGS = (
 # there are no PR checks to wait for unless the task opts in with `ci: actions`.
 # When false, Report leaves a ready PR open for human review.
 AUTO_MERGE_TRUTHY = ("true", "1", "yes", "on")
-
-# Planner exhausted backoff: if hash matches and < this threshold, skip re-invoke.
-PLANNER_EXHAUSTED_THRESHOLD_HOURS = 24
-
-# Auto queue depth limit: if pending auto/delegate tasks >= this, skip planner invoke.
-AUTO_QUEUE_DEPTH_LIMIT = 5
-# Max automatic CI-fix attempts per task before surfacing a human gate.
-MAX_CI_FIX_ATTEMPTS = 2
-
-# Max new tasks the planner can create in a single invocation.
-PLANNER_MAX_NEW_TASKS = 3
-
-# Max turns for planner agent.
-PLANNER_MAX_TURNS = 15
-
-# Stage → artifact filename that must exist after the stage completes.
-STAGE_ARTIFACT = {
-    "research": "requirements.md",
-    "plan": "implementation_plan.md",
-    "implement": "run.log",
-    "verify": "verify.md",
-    "report": "report.md",
-    "delegate": "delegate.md",
-}
 
 # Heuristic dispatcher: keywords that indicate human-only steps (skip task).
 # Korean-first since the vault is primarily Korean.
@@ -353,65 +303,6 @@ def save_planner_state(verdict: str, queue: dict[str, Any] | None = None) -> Non
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-
-
-def is_planner_exhausted(queue: dict[str, Any] | None = None) -> tuple[bool, str]:
-    """Check if planner is in exhausted state and todo hasn't changed.
-
-    Args:
-        queue: pre-fetched queue dict to reuse (see compute_todo_state_hash).
-
-    Returns (is_exhausted, reason).
-    """
-    state = load_planner_state()
-    if not state:
-        return False, "no prior state"
-
-    if state.get("verdict") != "exhausted":
-        return False, f"verdict={state.get('verdict')}"
-
-    # Check hash
-    current_hash = compute_todo_state_hash(queue=queue)
-    if state.get("todo_state_hash") != current_hash:
-        return False, f"hash changed: {state.get('todo_state_hash')} → {current_hash}"
-
-    # Check time
-    last_run_raw = state.get("last_run")
-    if not last_run_raw:
-        return False, "no last_run timestamp"
-
-    last_run = _parse_iso_timestamp(last_run_raw)
-    if last_run is None:
-        return False, "invalid last_run timestamp"
-    age_hours = (dt.datetime.now() - last_run).total_seconds() / 3600
-    if age_hours >= PLANNER_EXHAUSTED_THRESHOLD_HOURS:
-        return False, f"exhausted but {age_hours:.1f}h elapsed (threshold={PLANNER_EXHAUSTED_THRESHOLD_HOURS}h)"
-
-    return True, f"exhausted {age_hours:.1f}h ago, hash unchanged"
-
-
-def count_auto_pending(queue: dict[str, Any] | None = None) -> int:
-    """Count pending queue entries with mode=auto or mode=delegate.
-
-    Args:
-        queue: pre-fetched queue dict to reuse (see compute_todo_state_hash).
-    """
-    if queue is None:
-        queue = load_queue()
-    return sum(
-        1
-        for r in queue.get("runs", [])
-        if r.get("status") == "pending" and r.get("mode") in ("auto", "delegate")
-    )
-
-
-def log_planner(msg: str) -> None:
-    """Append a planner log line to logs/worker.out.log."""
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS_DIR / "worker.out.log"
-    timestamp = now_iso()
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] [planner] {msg}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -782,8 +673,8 @@ def kakao_notify(message: str, link: str | None = None, *,
 
 # -- Self-limiting composers for the worker's own kakao alerts ----------------
 # Every worker alert leads with an emoji headline (what happened + what to do or
-# "no action needed"); free-form detail (a failure message, a stall file list, an
-# English planner reason) rides as a word-clipped tail so nothing is blind-cut.
+# "no action needed"); free-form detail (an English planner reason) rides as a
+# word-clipped tail so nothing is blind-cut.
 # All go through compose_alert → length is <= KAKAO_TEXT_LIMIT by construction.
 
 def _compose_dispatch_silence(pending_n: int, idle_h: float, threshold_h: float) -> str:
@@ -797,15 +688,6 @@ def _compose_starvation(since: str, why: str, parked_n: int) -> str:
     return compose_alert(
         f"🤖💤 macp 유휴: 큐 비어있고 진행 0건 — 새 태스크를 넣어주세요{extra}",
         tail=f"플래너 exhausted({since}), 디스커버리 불가: {why}")
-
-
-def _compose_worker_stall(count: int, bad_files: list[str]) -> str:
-    shown = ", ".join(bad_files[:5])
-    if len(bad_files) > 5:
-        shown += f" 외 {len(bad_files) - 5}건"
-    return compose_alert(
-        f"⚠️ Worker 정지: 커밋 안 된 파일 때문에 {count}회 연속 중단 — 커밋/정리하면 자동 재개됩니다",
-        tail=shown)
 
 
 def _compose_daemon_restart_escalated(label: str, attempts: int) -> str:
@@ -1749,21 +1631,6 @@ def reclaim_stale_worktrees(repo_root: Path = ROOT,
         return []
 
 
-def _parse_iso_timestamp(raw: str | None) -> dt.datetime | None:
-    if not raw:
-        return None
-    try:
-        ts = dt.datetime.fromisoformat(raw)
-    except (ValueError, TypeError):
-        return None
-    # A timestamp may arrive tz-aware, but the rest of the code uses naive
-    # local time (now_iso / datetime.now()). Normalize aware → naive local so
-    # subtractions against datetime.now() don't raise TypeError.
-    if ts.tzinfo is not None:
-        ts = ts.astimezone().replace(tzinfo=None)
-    return ts
-
-
 def cmd_maintenance() -> int:
     """Vault upkeep that used to ride along inside scan_queue().
 
@@ -1986,7 +1853,7 @@ def scan_queue() -> int:
 
 
 # ---------------------------------------------------------------------------
-# list / status
+# list
 # ---------------------------------------------------------------------------
 
 
@@ -2010,41 +1877,6 @@ def cmd_list() -> int:
             f"branch={r.get('branch') or '-'}"
         )
     return 0
-
-
-def cmd_status(run_id: str) -> int:
-    status_path = RUNS_DIR / run_id / "status.json"
-    if not status_path.exists():
-        print(f"status not found: {status_path}")
-        return 1
-    print(status_path.read_text(encoding="utf-8"))
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Safety: vault dirty-check
-# ---------------------------------------------------------------------------
-
-
-# Files the daemon regenerates constantly; safe to ignore in the dirty check.
-ALLOWED_DIRTY_PREFIXES = (
-    "Worker/",
-    "Memory/episodes/",
-    "Memory/sessions/",      # manual session_log checkpoints (written by a
-                             # separate agent while worker keeps running)
-    "Todo/Briefings/",       # daily brief output
-    "Todo/Inbox/",           # cross-link review queue
-    "Todo/items/",           # task md: git-tracked since 2026-09-10, auto-committed by
-                             # sync_vault_state — an edit must not stall the queue
-)
-ALLOWED_DIRTY_EXACT = {
-    "Todo/Dashboard.md",
-    "Todo/NOW.md",
-    "Todo/FOCUS.md",
-    "Todo/Unified.md",
-    "Todo/Calendar.md",
-    "Memory/index.md",
-}
 
 
 # Vault state that is git-tracked ON PURPOSE and has to reach the remote: the
@@ -2635,9 +2467,9 @@ RESTART_COOLDOWN_S = 15 * 60
 #
 # Measured in TIME, not in ticks. The 169 figure is meaningless without knowing
 # the launchd interval, and pinning a count here would silently change meaning
-# the day that interval is retuned. Thresholds follow record_dirty_stall's
-# precedent — notify once past the threshold, then re-nag on a period, because a
-# one-shot alert that is missed leaves the system quietly broken for days.
+# the day that interval is retuned. Notify once past the threshold, then re-nag
+# on a period, because a one-shot alert that is missed leaves the system quietly
+# broken for days.
 DEFER_NOTIFY_AFTER_S = 6 * 3600
 DEFER_RENOTIFY_EVERY_S = 24 * 3600
 
@@ -2775,7 +2607,7 @@ def _note_restart_deferral(label: str, entry: dict, now: float) -> None:
     The alert is keyed on elapsed time rather than a count of deferrals — the
     launchd interval is a tunable, so a count would quietly change meaning the
     day it moves. Notify once past DEFER_NOTIFY_AFTER_S, then re-nag every
-    DEFER_RENOTIFY_EVERY_S, following record_dirty_stall: one alert that gets
+    DEFER_RENOTIFY_EVERY_S: one alert that gets
     missed is how 169 deferrals went unseen for four days.
     """
     try:
@@ -3071,662 +2903,6 @@ def rotate_logs(log_dir: Path | None = None,
     return rotated
 
 
-def vault_is_dirty_outside_worker() -> tuple[bool, list[str]]:
-    """Return (dirty, file_list). file_list contains paths outside the
-    allowed prefixes.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # No git or no HEAD; treat as clean (best-effort).
-        return False, []
-
-    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    # Also include untracked files via --others (so a half-written file blocks us).
-    try:
-        result_untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        files.extend(
-            line.strip()
-            for line in result_untracked.stdout.splitlines()
-            if line.strip()
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    bad = [
-        f
-        for f in files
-        if not f.startswith(ALLOWED_DIRTY_PREFIXES) and f not in ALLOWED_DIRTY_EXACT
-    ]
-    return bool(bad), bad
-
-
-# Stall marker: the dirty-check is a safety guard (stages may `git add -A`, so
-# the tree must be clean to avoid sweeping user WIP into worker commits). But a
-# single stray uncommitted file in a vault the user edits daily would otherwise
-# stall the whole pipeline silently and indefinitely. We persist a marker so the
-# stall is observable, and alert after STALL_NOTIFY_THRESHOLD consecutive aborts
-# (~ threshold × launchd interval) so the user finds out the same hour. A
-# one-shot alert is not enough: if it is missed, the pipeline stays silently
-# down for days (observed 2026-06-17: 358 consecutive aborts, 1 alert). So we
-# RE-NAG every STALL_RENOTIFY_EVERY aborts until the tree is cleaned.
-STALL_MARKER = WORKER_DIR / "stall.json"
-STALL_NOTIFY_THRESHOLD = 3
-STALL_RENOTIFY_EVERY = 144  # ~12h at the 300s launchd interval
-
-
-def record_dirty_stall(bad_files: list[str]) -> None:
-    """Persist/refresh the dirty-stall marker and re-nag periodically until clean."""
-    try:
-        prev = json.loads(STALL_MARKER.read_text()) if STALL_MARKER.exists() else {}
-    except (OSError, ValueError):
-        prev = {}
-
-    count = int(prev.get("consecutive_count", 0)) + 1
-    last_notified = int(prev.get("last_notified_count", 0))
-    marker = {
-        "first_seen": prev.get("first_seen") or now_iso(),
-        "last_seen": now_iso(),
-        "consecutive_count": count,
-        "files": bad_files,
-        "notified": bool(prev.get("notified", False)),
-        "last_notified_count": last_notified,
-    }
-
-    # Notify at the threshold, then re-nag every STALL_RENOTIFY_EVERY aborts so a
-    # missed first alert can never leave the pipeline silently stalled for days.
-    should_notify = count >= STALL_NOTIFY_THRESHOLD and (
-        last_notified == 0 or count - last_notified >= STALL_RENOTIFY_EVERY
-    )
-    if should_notify:
-        kakao_notify(_compose_worker_stall(count, bad_files))
-        marker["notified"] = True
-        marker["last_notified_count"] = count
-
-    try:
-        STALL_MARKER.write_text(json.dumps(marker, ensure_ascii=False, indent=2))
-    except OSError:
-        pass
-
-
-def clear_dirty_stall() -> None:
-    """Remove the stall marker once the vault is clean again (self-recovery)."""
-    if not STALL_MARKER.exists():
-        return
-    try:
-        prev = json.loads(STALL_MARKER.read_text())
-    except (OSError, ValueError):
-        prev = {}
-    if prev.get("notified"):
-        # Digest tier: the recovery already happened — nothing to do.
-        kakao_notify("✅ Worker 재개: vault 정리됨, 파이프라인 정상 가동.",
-                     level=LEVEL_DIGEST, event_key="worker-stall-resume")
-    try:
-        STALL_MARKER.unlink()
-    except OSError:
-        pass
-
-
-def ensure_vault_branch_fresh(branch: str) -> tuple[bool, str]:
-    """Ensure vault is on a fresh worker branch based on main.
-
-    If the worker branch already exists (stale from a previous run), delete it
-    and recreate from main HEAD. This prevents stale branches from being reused.
-
-    Returns (ok, message).
-
-    Every git call goes through `_prepare_git`, so the whole function is bounded
-    at `300 (pull) + 180 x 5 (local) = 1200s` instead of being able to occupy a
-    runner slot indefinitely on a wedged remote or a stuck index. The
-    `GIT_TIMEOUT_*_S` constants live further down this file, next to
-    `ensure_external_repo_ready`, which is fine because Python resolves globals
-    at *call* time — that also keeps the tests' `monkeypatch.setattr(worker,
-    "GIT_TIMEOUT_*", 1)` working.
-
-    Timeout (`rc == GIT_TIMEOUT_RC`) is a fatal return on every call here, and
-    each one says so in a string distinct from its ordinary-failure sibling, so
-    the runner log tells "wedged" apart from "genuinely failed" after the fact.
-    """
-    # Check current branch
-    current_branch_result = _prepare_git(
-        ["git", "branch", "--show-current"],
-        cwd=ROOT,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    # A wedged ref read stops us here rather than reporting an empty stdout as
-    # "not on main": if a trivial ref read is stuck, the five calls behind it are
-    # very likely stuck too, and failing now saves ~20 minutes of ceilings.
-    if current_branch_result.returncode == GIT_TIMEOUT_RC:
-        return (False,
-                f"branch --show-current timed out after {GIT_TIMEOUT_LOCAL_S}s "
-                f"(wedged index/hook?)")
-    # Any other non-zero rc keeps the old behaviour: read stdout and carry on.
-    current_branch = current_branch_result.stdout.strip()
-
-    # If not on main, checkout main first
-    if current_branch != "main":
-        checkout_main = _prepare_git(
-            ["git", "checkout", "main"],
-            cwd=ROOT,
-            timeout=GIT_TIMEOUT_LOCAL_S,
-        )
-        if checkout_main.returncode == GIT_TIMEOUT_RC:
-            return (False,
-                    f"checkout main timed out after {GIT_TIMEOUT_LOCAL_S}s "
-                    f"(wedged index/hook?): {checkout_main.stderr[:200]}")
-        if checkout_main.returncode != 0:
-            return False, f"checkout main failed: {checkout_main.stderr[:300]}"
-
-    # Pull latest main (non-fatal if offline)
-    pull_result = _prepare_git(
-        ["git", "pull", "--ff-only", "origin", "main"],
-        cwd=ROOT,
-        timeout=GIT_TIMEOUT_PULL_S,
-    )
-    if pull_result.returncode == GIT_TIMEOUT_RC:
-        # Asymmetric with `ensure_external_repo_ready`, where a pull timeout is
-        # only a warning, and deliberately so: the vault is the tick's OWN live
-        # checkout, so cutting a worker branch off a stale main contaminates the
-        # work itself. An external checkout is a throwaway cache, which is why it
-        # can afford to carry on with a stale tree.
-        return (False,
-                f"pull main timed out after {GIT_TIMEOUT_PULL_S}s (hung remote?): "
-                f"{pull_result.stderr[:200]}")
-    elif pull_result.returncode != 0:
-        # Unchanged contract: an ordinary offline failure warns and carries on.
-        # Making this fatal would kill every vault task on a host that cannot
-        # reach origin.
-        print(f"  [warn] pull main failed (offline?): {pull_result.stderr[:100]}")
-
-    # Check if worker branch already exists
-    branch_exists = _prepare_git(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=ROOT,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    # Only the timeout is an error here. `rev-parse --verify --quiet` answers
-    # rc=1 for a missing branch, which is the normal first-run case, so a
-    # `rc != 0` test would fail every task. Reading a wedged rev-parse as
-    # "absent" instead skips the delete below and resurfaces as a confusing
-    # `branch create failed: ... already exists`.
-    if branch_exists.returncode == GIT_TIMEOUT_RC:
-        return (False,
-                f"branch existence check timed out after {GIT_TIMEOUT_LOCAL_S}s "
-                f"(wedged index/hook?)")
-
-    # Delete stale worker branch if it exists
-    if branch_exists.returncode == 0:
-        del_result = _prepare_git(
-            ["git", "branch", "-D", branch],
-            cwd=ROOT,
-            timeout=GIT_TIMEOUT_LOCAL_S,
-        )
-        if del_result.returncode == GIT_TIMEOUT_RC:
-            return (False,
-                    f"branch delete timed out after {GIT_TIMEOUT_LOCAL_S}s "
-                    f"(wedged index/hook?): {del_result.stderr[:200]}")
-        if del_result.returncode != 0:
-            return False, f"branch delete failed: {del_result.stderr[:300]}"
-
-    # Create fresh worker branch from main HEAD
-    create_result = _prepare_git(
-        ["git", "checkout", "-b", branch],
-        cwd=ROOT,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    if create_result.returncode == GIT_TIMEOUT_RC:
-        return (False,
-                f"branch create timed out after {GIT_TIMEOUT_LOCAL_S}s "
-                f"(wedged index/hook?): {create_result.stderr[:200]}")
-    if create_result.returncode != 0:
-        return False, f"branch create failed: {create_result.stderr[:300]}"
-
-    return True, f"fresh branch {branch} created from main"
-
-
-# ---------------------------------------------------------------------------
-# External repo support (M4-c)
-# ---------------------------------------------------------------------------
-
-
-def resolve_working_dir(task: WorkerTask) -> Path:
-    """Compute the absolute working_dir for an external repo task.
-
-    Order:
-    1. ``working_dir`` field if set (expand ~).
-    2. Default: ``<paths.worker_root()>/<repo-name>`` (derived from ``repo``
-       URL) — ``MACP_WORKER_ROOT`` / the ``worker_root`` config key, defaulting
-       to ``~/Worker``. Resolved at call time, not as a module constant, so the
-       knob is honoured by a process that imported this module first.
-    """
-    if task.working_dir:
-        return Path(task.working_dir).expanduser().resolve()
-    if task.repo is None:
-        raise ValueError(f"task {task.slug} has no repo")
-    # Derive repo name from URL: git@host:user/name.git or https://host/user/name.git
-    repo = task.repo.rstrip("/")
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-    name = repo.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-    return (paths.worker_root() / name).resolve()
-
-
-# Wall-clock ceilings for the git calls in `ensure_external_repo_ready` (the
-# "prepare_branch" step). On 2026-09-25 the runner's cgroup went over
-# `memory.high` and `git-remote-https` sat for 18~72 minutes on calls that
-# normally take under a second; nothing here bounded a subprocess, so runner
-# slots stayed occupied by threads that would never return while the dashboard
-# showed idle. `stages.py` got the same treatment (PR #206) for its own git
-# calls; this function is the other unbounded network path.
-#
-# Values are graded per call, not uniform: the task body asks for "clone/pull
-# generous, set-head short".
-#
-# WORST-CASE ELAPSED for this function, with every call wedged:
-#   existing checkout: 300 (fetch) + 60 (set-head) + 300 (pull) = 660s
-#   fresh clone too:   660 + 600 (clone)                        = 1260s
-# plus the local ceilings below in the pathological case. Compare with the
-# 18~72 minutes actually observed on 2026-09-25 — that is the point of these
-# numbers. There is deliberately no whole-function deadline: a legitimately
-# slow large clone must not be killed by one.
-GIT_TIMEOUT_CLONE_S = 600       # generous — a fresh Android clone (DripCoffee,
-                                # Pairent) takes minutes over https, and it is
-                                # the heaviest network call in this function
-GIT_TIMEOUT_FETCH_S = 300       # a day's delta fetch; same grade as
-                                # stages.GIT_TIMEOUT_NETWORK_S
-GIT_TIMEOUT_SETHEAD_S = 60      # short — one ref lookup, normally ~0.6s
-                                # (stages.py:556-561's measured comment), so
-                                # this is 100x headroom
-GIT_TIMEOUT_PULL_S = 300        # generous, same grade as fetch
-GIT_TIMEOUT_LOCAL_S = 180       # symbolic-ref / rev-parse / checkout / branch -D;
-                                # same value as stages.GIT_TIMEOUT_LOCAL_S
-GIT_TIMEOUT_RC = _stages.GIT_TIMEOUT_RC   # 124, coreutils timeout(1)'s
-                                          # convention — one definition, not two
-
-
-def _prepare_git(args: list[str], *, cwd: Path | None = None,
-                 timeout: float) -> subprocess.CompletedProcess:
-    """`subprocess.run(args)` where exceeding `timeout` is a return value.
-
-    A `TimeoutExpired` must NOT escape to the caller: `ensure_external_repo_ready`
-    is called from the worker tick, so a hung remote would become a tick crash
-    instead of the ordinary non-zero-rc failure every call site here already
-    handles. Each call site keeps judging git by `returncode`, and `GIT_TIMEOUT_RC`
-    flows into its existing non-zero branch.
-
-    `FileNotFoundError` (git itself missing) is deliberately *not* caught — the
-    clone call site already turns that into its own failure string.
-    """
-    try:
-        return subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        partial = _stages._git_stream(exc.stderr)
-        if partial and not partial.endswith("\n"):
-            partial += "\n"
-        return subprocess.CompletedProcess(
-            args=args, returncode=GIT_TIMEOUT_RC,
-            stdout=_stages._git_stream(exc.stdout),
-            stderr=partial + f"git timeout after {timeout}s: {' '.join(args)}\n")
-
-
-def ensure_external_repo_ready(task: WorkerTask) -> tuple[bool, str, Path | None]:
-    """Clone if needed, then check out worker_branch (creating if absent).
-
-    Returns (ok, message, working_dir). On failure, working_dir may be None.
-
-    Every git call below goes through `_prepare_git`, so the whole function is
-    bounded by the sum of the `GIT_TIMEOUT_*_S` ceilings above (660s for an
-    existing checkout, 1260s if the clone hangs too) rather than being able to
-    occupy a runner slot indefinitely on a wedged remote.
-    """
-    if not task.is_external_repo:
-        return True, "not external", None
-
-    try:
-        wd = resolve_working_dir(task)
-    except ValueError as exc:
-        return False, str(exc), None
-
-    wd.parent.mkdir(parents=True, exist_ok=True)
-
-    # Step 1: clone if working_dir is missing or not a git checkout.
-    git_dir = wd / ".git"
-    if not git_dir.exists():
-        try:
-            clone = _prepare_git(
-                ["git", "clone", str(task.repo), str(wd)],
-                timeout=GIT_TIMEOUT_CLONE_S,
-            )
-        except FileNotFoundError as exc:
-            return False, f"clone failed: {str(exc)[:300]}", wd
-        if clone.returncode == GIT_TIMEOUT_RC:
-            # Deliberately a DIFFERENT string from "clone failed": a wedged
-            # remote and a bad URL / auth error need to be told apart in the
-            # runner log after the fact (2026-09-25).
-            return (False,
-                    f"clone timeout after {GIT_TIMEOUT_CLONE_S}s (hung remote?): "
-                    f"{clone.stderr[:200]}", wd)
-        if clone.returncode != 0:
-            return False, f"clone failed: {clone.stderr[:300]}", wd
-
-    # Step 2: fetch latest from origin (non-fatal if offline).
-    fetch_result = _prepare_git(
-        ["git", "fetch", "--quiet", "origin"],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_FETCH_S,
-    )
-    if fetch_result.returncode == GIT_TIMEOUT_RC:
-        print(f"  [warn] fetch timeout after {GIT_TIMEOUT_FETCH_S}s (hung remote?)")
-    # Refresh the local origin/HEAD pointer so a changed remote default branch
-    # propagates (plain fetch does not update it). Non-fatal if offline.
-    sethead_result = _prepare_git(
-        ["git", "remote", "set-head", "origin", "-a"],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_SETHEAD_S,
-    )
-    if sethead_result.returncode == GIT_TIMEOUT_RC:
-        print(f"  [warn] remote set-head timeout after {GIT_TIMEOUT_SETHEAD_S}s (hung remote?)")
-
-    # Step 3: determine default branch (main or master).
-    branch = task.worker_branch
-    default_branch = "main"
-    # The remaining calls are local-only, but a cgroup under memory pressure or a
-    # stalled filesystem can wedge those too, so they get the local ceiling. None
-    # of the judgements below change: rc=124 simply flows into each call's
-    # existing non-zero branch (symbolic-ref -> main/master fallback,
-    # checkout/branch -> the fatal returns).
-    sym_result = _prepare_git(
-        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    if sym_result.returncode == 0:
-        # e.g. "refs/remotes/origin/main" → "main".
-        # Strip the full "refs/remotes/origin/" prefix rather than rsplit on
-        # the last "/", so slashed default branches like
-        # "claude/coffee-recipe-timer-app-Uoevu" survive intact.
-        ref = sym_result.stdout.strip()
-        prefix = "refs/remotes/origin/"
-        default_branch = ref[len(prefix):] if ref.startswith(prefix) else ref.rsplit("/", 1)[-1]
-    else:
-        # Fallback: check if "main" exists, otherwise "master"
-        main_check = _prepare_git(
-            ["git", "rev-parse", "--verify", "--quiet", "refs/heads/main"],
-            cwd=wd,
-            timeout=GIT_TIMEOUT_LOCAL_S,
-        )
-        if main_check.returncode != 0:
-            default_branch = "master"
-
-    # Step 4: always create fresh worker branch from default branch HEAD.
-    # If worker branch already exists (stale from a previous run), delete it first.
-    branch_exists = _prepare_git(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-
-    # Checkout default branch and pull latest.
-    checkout_default = _prepare_git(
-        ["git", "checkout", default_branch],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    if checkout_default.returncode != 0:
-        return False, f"checkout {default_branch} failed: {checkout_default.stderr[:300]}", wd
-
-    pull_result = _prepare_git(
-        ["git", "pull", "--ff-only", "origin", default_branch],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_PULL_S,
-    )
-    # pull failure is non-fatal (offline scenario), but log it
-    if pull_result.returncode == GIT_TIMEOUT_RC:
-        print(f"  [warn] pull {default_branch} timeout after {GIT_TIMEOUT_PULL_S}s "
-              f"(hung remote?): {pull_result.stderr[:100]}")
-    elif pull_result.returncode != 0:
-        print(f"  [warn] pull {default_branch} failed (offline?): {pull_result.stderr[:100]}")
-
-    # Delete stale worker branch if it exists.
-    if branch_exists.returncode == 0:
-        del_result = _prepare_git(
-            ["git", "branch", "-D", branch],
-            cwd=wd,
-            timeout=GIT_TIMEOUT_LOCAL_S,
-        )
-        if del_result.returncode != 0:
-            return False, f"branch delete failed: {del_result.stderr[:300]}", wd
-
-    # Create fresh worker branch from default branch HEAD.
-    cb = _prepare_git(
-        ["git", "checkout", "-b", branch],
-        cwd=wd,
-        timeout=GIT_TIMEOUT_LOCAL_S,
-    )
-    if cb.returncode != 0:
-        return False, f"branch create failed: {cb.stderr[:300]}", wd
-
-    return True, f"ready at {wd} on {branch} (fresh from {default_branch})", wd
-
-
-# ---------------------------------------------------------------------------
-# Stage invocation
-# ---------------------------------------------------------------------------
-
-
-def strip_frontmatter(text: str) -> str:
-    """Strip a leading YAML frontmatter block from a slash-command file."""
-    if not text.startswith("---\n"):
-        return text
-    parts = text.split("\n---\n", 1)
-    if len(parts) != 2:
-        return text
-    return parts[1].lstrip("\n")
-
-
-# Substrings Claude Code / the Anthropic API use for capacity conditions
-# (account usage-limit reached, API rate limiting, model overloaded) — these
-# are transient/time-based, not a bug in the task, so callers should retry
-# rather than give up. Checked case-insensitively against stdout/stderr tail.
-_CAPACITY_ERROR_MARKERS = (
-    "usage limit",
-    "rate_limit_error",
-    "rate limit",
-    "overloaded_error",
-    "429 ",
-    "out of extra usage",
-    "out of usage",
-    # Claude Code subscription message: "You've hit your session limit ·
-    # resets 4:10am" — time-bound like the others (observed 2026-07-17).
-    "session limit",
-)
-
-
-def detect_capacity_error(text: str) -> str | None:
-    """Return a short reason if `text` looks like a Claude usage/rate-limit hit.
-
-    None if no known marker is present.
-    """
-    lowered = text.lower()
-    for marker in _CAPACITY_ERROR_MARKERS:
-        if marker in lowered:
-            return marker.strip()
-    return None
-
-
-def parse_verify_status(verify_md: Path) -> str | None:
-    """Return the `overall_status` (pass/fail/skip) from a verify.md frontmatter.
-
-    Returns the lowercased status, or None if it can't be found. Scans only the
-    leading `---` frontmatter block to avoid matching prose in the body.
-    """
-    try:
-        text = verify_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    for line in lines[1:]:
-        if line.strip() == "---":
-            break
-        m = re.match(r"\s*overall_status\s*:\s*([A-Za-z]+)", line)
-        if m:
-            return m.group(1).strip().lower()
-    return None
-
-
-def check_forbidden_tools(tools: str) -> str | None:
-    """Return error string if tools whitelist contains forbidden substrings."""
-    for pattern in FORBIDDEN_TOOL_SUBSTRINGS:
-        if pattern in tools:
-            return f"forbidden tool pattern '{pattern}' in allowed_tools='{tools}'"
-    return None
-
-
-def _sweep_due(key: str, min_interval_s: int) -> bool:
-    """Throttle expensive maintenance sweeps run from scan_queue.
-
-    The todo-sync daemon (KeepAlive=true) calls scan_queue in a tight loop, so
-    heavy sweeps (parent-id backfill, decision gates) must not run every pass.
-    Records the last run time per key in SWEEP_STATE_PATH. Returns True (and
-    stamps now) only if at least `min_interval_s` have elapsed.
-    """
-    now = dt.datetime.now().timestamp()
-    try:
-        state = json.loads(SWEEP_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        state = {}
-    if now - state.get(key, 0) < min_interval_s:
-        return False
-    state[key] = now
-    try:
-        SWEEP_STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
-    except Exception:
-        pass
-    return True
-
-
-def _area_from_tags(tags: Any) -> str:
-    """Legacy NOT NULL `area` column: derive from tags ('work' else 'private')."""
-    if isinstance(tags, list) and any(str(t) == "work" for t in tags):
-        return "work"
-    return "private"
-
-
-def _markdown_parent_links() -> dict[str, str]:
-    """Map leaf_slug -> parent_slug from `parent: "[[...]]"` frontmatter on disk.
-
-    This is the human-authored, authoritative source of the parent/leaf tree.
-    """
-    links: dict[str, str] = {}
-    if not ITEMS_DIR.exists():
-        return links
-    for path in ITEMS_DIR.glob("*.md"):
-        try:
-            fm, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        praw = fm.get("parent")
-        if isinstance(praw, str):
-            m = re.search(r"\[\[([^\]|]+)", praw)
-            if m:
-                links[path.stem] = m.group(1).strip()
-    return links
-
-
-def _build_parent_tree(tasks: list) -> tuple[list, dict[str, list]]:
-    """Group leaf tasks under their parent. Returns (parents, {parent_slug: [leaves]}).
-
-    Parent linkage is resolved in priority order:
-      1. markdown `parent:` frontmatter (authoritative, human-authored)
-      2. slug-prefix against the parent slug OR its stem (parent slug with a
-         trailing `-word` removed, e.g. `worldgraph-project` -> `worldgraph`),
-         since some parents carry a suffix their leaves don't share.
-    The DB `parent_id` column is too sparsely populated to rely on. Excludes
-    review-/decision- helper todos.
-    """
-    parents = [t for t in tasks if getattr(t, "is_parent", False)]
-    parent_slugs = {p.slug for p in parents}
-    md_links = _markdown_parent_links()
-
-    # Prefix candidates: full slug and stem, mapped to the parent slug. Longest
-    # prefix wins so nested names resolve to the most specific parent.
-    prefix_map: dict[str, str] = {}
-    for p in parents:
-        prefix_map[p.slug] = p.slug
-        stem = p.slug.rsplit("-", 1)[0]
-        if stem and stem != p.slug:
-            prefix_map.setdefault(stem, p.slug)
-    prefixes = sorted(prefix_map, key=len, reverse=True)
-
-    tree: dict[str, list] = {p.slug: [] for p in parents}
-    for t in tasks:
-        if getattr(t, "is_parent", False):
-            continue
-        if t.slug.startswith(("review-", "decision-")):
-            continue
-        # 1) markdown link
-        linked = md_links.get(t.slug)
-        if linked in parent_slugs:
-            tree[linked].append(t)
-            continue
-        # 2) slug-prefix / stem fallback
-        for pref in prefixes:
-            if t.slug.startswith(pref + "-"):
-                tree[prefix_map[pref]].append(t)
-                break
-    return parents, tree
-
-
-def _latest_run_per_slug() -> dict[str, dict]:
-    """Map slug -> its latest run's status.json (by run_id timestamp)."""
-    latest: dict[str, dict] = {}
-    if not RUNS_DIR.exists():
-        return latest
-    for sp in RUNS_DIR.glob("*/status.json"):
-        try:
-            s = json.loads(sp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        slug = s.get("slug")
-        if not slug:
-            continue
-        rid = s.get("run_id") or sp.parent.name
-        cur = latest.get(slug)
-        if cur is None or rid > (cur.get("run_id") or ""):
-            s["_run_dir"] = sp.parent
-            s["run_id"] = rid
-            latest[slug] = s
-    return latest
-
-
-def _run_is_ci_failed(status: dict) -> bool:
-    """True if the run's last stage was verify and it failed because CI was red
-    (overall_status=fail), as opposed to a transient claude/API error."""
-    sr = status.get("stage_results") or []
-    if not sr:
-        return False
-    last = sr[-1]
-    if last.get("stage") != "verify" or last.get("status") != "failed":
-        return False
-    blob = f"{last.get('message') or ''} {status.get('failure_reason') or ''}"
-    return "overall_status=fail" in blob
-
-
 # ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
@@ -3745,9 +2921,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Vault upkeep only (vault sync and the other upkeep steps) — no dispatch.",
     )
 
-    p_status = sub.add_parser("status", help="Print status.json of a given run-id")
-    p_status.add_argument("run_id")
-
     sub.add_parser("list", help="List all entries in Worker/queue.json")
 
     return parser
@@ -3763,8 +2936,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_maintenance()
     if args.command == "list":
         return cmd_list()
-    if args.command == "status":
-        return cmd_status(args.run_id)
     parser.error(f"unknown command: {args.command}")
     return 2  # unreachable
 

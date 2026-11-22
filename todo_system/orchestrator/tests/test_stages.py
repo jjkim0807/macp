@@ -120,40 +120,16 @@ class ConstantsTest(unittest.TestCase):
         legitimately, so a sweep over every stage would be red on arrival."""
         self.assertNotIn("Edit", stages.STAGE_TOOLS["verify"].split())
 
-    def test_legacy_verify_carries_every_fallback_runner(self):
-        """The legacy worker's verify whitelist is not overridable — worker.py
-        reads DEFAULT_VERIFY_TOOLS directly (no frontmatter path), so a runner
-        missing there means the Step 5b local fallback simply cannot run on that
-        path. Every runner added since 2026-08-18 (pnpm/node/npx) and 2026-08-24
-        (flutter/dart) landed in stages.py alone, leaving the legacy verify ten
-        runners short. Asserted against FALLBACK_RUNNER_TOOLS rather than a
-        literal list so a future addition is covered the moment it is written."""
-        from todo_system import worker
-        granted = worker.DEFAULT_VERIFY_TOOLS.split()
-        for tool in stages.FALLBACK_RUNNER_TOOLS.split():
-            self.assertIn(tool, granted, f"legacy verify cannot run {tool}")
-
     def test_legacy_stage_tools_match_the_stage_source(self):
         """stages.STAGE_TOOLS is the single source; worker.DEFAULT_*_TOOLS alias
         it. Pinned so re-pasting a literal into worker.py is red on arrival —
-        that copy-paste is exactly how the two lists drifted apart.
-
-        'quick' is excluded deliberately: the legacy pipeline has no such stage
-        (worker.STAGES_BY_MODE covers auto + delegate only), so requiring a
-        DEFAULT_QUICK_TOOLS would invent a constant nothing consumes."""
+        that copy-paste is exactly how the two lists drifted apart."""
         from todo_system import worker
-        for stage in ("research", "plan", "implement",
-                      "verify", "report", "delegate"):
+        for stage in ("implement", "delegate"):
             self.assertEqual(
                 getattr(worker, f"DEFAULT_{stage.upper()}_TOOLS"),
                 stages.STAGE_TOOLS[stage],
                 f"legacy {stage} whitelist drifted from stages.STAGE_TOOLS")
-
-    def test_legacy_verify_stays_read_only(self):
-        """The read-only invariant has to hold on the legacy path too, since
-        that is the one whose whitelist a task cannot override."""
-        from todo_system import worker
-        self.assertNotIn("Edit", worker.DEFAULT_VERIFY_TOOLS.split())
 
 
 class RunnerVaultDataRootSplitTest(unittest.TestCase):

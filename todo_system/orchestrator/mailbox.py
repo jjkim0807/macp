@@ -15,9 +15,7 @@ Transports:
   - GitMailbox : the vault git repo is the transport (durable, offline-tolerant,
     reaches remote hosts and a future cloud orchestrator).
 
-Stdlib-only. `Worker/agents/_state/` is gitignored runtime; message files under
-Worker/ are inside the worker dirty-guard's allowed prefix, so they never stall
-the queue.
+Stdlib-only. `Worker/agents/_state/` is gitignored runtime.
 """
 
 from __future__ import annotations

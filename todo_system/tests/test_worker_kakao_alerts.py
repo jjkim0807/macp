@@ -3,9 +3,9 @@
 No subprocess / no real send — the composers return strings only
 ([[tests-reach-real-alert-sender]]). Each asserts the three invariants the task
 fixes: length <= budget, the action/identity survives in the headline, and the
-free-form tail (a stall file list, a planner reason) is
+free-form tail (a planner reason) is
 clipped rather than blind-cut. Covers the AC-named kinds:
-정체(silence), 유휴(starvation), plus the commit-stall page.
+정체(silence), 유휴(starvation).
 """
 
 from __future__ import annotations
@@ -28,13 +28,6 @@ def test_starvation_clips_the_discovery_reason():
     text = worker._compose_starvation("09-16 22:00", "discovery blocked: " + LONG, 2)
     assert len(text) <= KAKAO_TEXT_LIMIT
     assert "유휴" in text.splitlines()[0]
-
-
-def test_worker_stall_lists_files_within_budget():
-    files = [f"Notes/some-long-note-name-number-{i}.md" for i in range(30)]
-    text = worker._compose_worker_stall(7, files)
-    assert len(text) <= KAKAO_TEXT_LIMIT
-    assert "7회" in text.splitlines()[0]
 
 
 def test_daemon_restart_escalated_names_the_label_and_attempts():

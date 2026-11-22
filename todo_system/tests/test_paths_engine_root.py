@@ -193,7 +193,6 @@ def test_engine_modules_converge_on_engine_root_in_process():
     assert human._ENGINE_ROOT == root
     assert stages._ENGINE_ROOT == root
     assert beta_publish._ENGINE_ROOT == root
-    assert worker.COMMANDS_DIR == root / "todo_system" / "prompts"
     assert stages.COMMANDS_DIR == root / "todo_system" / "prompts"
     assert worker.HEALTH_REPORT_SCRIPT == root / "scripts" / "health_report.py"
     assert beta_publish.LOCK_DIR == root / "Worker" / "_state" / "beta_locks"
@@ -209,7 +208,6 @@ _MODULES_PROBE = (
     "    'human._ENGINE_ROOT': human._ENGINE_ROOT,\n"
     "    'stages._ENGINE_ROOT': stages._ENGINE_ROOT,\n"
     "    'beta_publish._ENGINE_ROOT': beta_publish._ENGINE_ROOT,\n"
-    "    'worker.COMMANDS_DIR': worker.COMMANDS_DIR,\n"
     "    'worker.KAKAO_SEND_SCRIPT': worker.KAKAO_SEND_SCRIPT,\n"
     "    'worker.HEALTH_REPORT_SCRIPT': worker.HEALTH_REPORT_SCRIPT,\n"
     "    'human.KAKAO_SCRIPT': human.KAKAO_SCRIPT,\n"
@@ -231,7 +229,6 @@ def test_engine_modules_converge_on_engine_root_in_a_fresh_interpreter(tmp_path)
         "human._ENGINE_ROOT": root,
         "stages._ENGINE_ROOT": root,
         "beta_publish._ENGINE_ROOT": root,
-        "worker.COMMANDS_DIR": root / "todo_system" / "prompts",
         "worker.KAKAO_SEND_SCRIPT": root / "scripts" / "kakao_send.sh",
         "worker.HEALTH_REPORT_SCRIPT": root / "scripts" / "health_report.py",
         "human.KAKAO_SCRIPT": root / "scripts" / "kakao_send.sh",
