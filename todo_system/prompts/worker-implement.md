@@ -24,8 +24,8 @@ and the checks stayed green, because the missing data was gitignored.
 - Never end your turn describing work that is still running.
 - The runner enforces this: stages run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`,
   so `run_in_background` executes in the foreground. Give slow commands the Bash
-  `timeout` parameter instead — the runner raises the cap to `3600000` ms (60 min;
-  a call with no `timeout` gets 20 min). Pass `timeout: 3600000` to every
+  `timeout` parameter instead — the runner raises the cap to `6000000` ms (100 min;
+  a call with no `timeout` gets 20 min). Pass `timeout: 6000000` to every
   `./gradlew` call: builds on a busy host can take 10–30 min under memory
   contention, and a slow complete run beats splitting or skipping. If a Gradle command times out anyway, run
   `./gradlew --stop` (this run's own daemon registry only) before retrying once.
