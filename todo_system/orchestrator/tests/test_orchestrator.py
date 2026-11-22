@@ -1677,10 +1677,8 @@ class ReconcileQueueTest(unittest.TestCase):
         self.assertEqual(self.queue["runs"][0]["status"], "completed")
         self.assertTrue(self.queue["runs"][0]["finished_at"])
 
-    def test_failed_stays_pending_so_doctor_can_retry(self):
-        # a failed attempt (esp. capacity-limited) is still outstanding work;
-        # mirroring it would also flip-flop against doctor_recover_queue, which
-        # resets failed entries back to pending for its own auto-retry.
+    def test_failed_stays_pending(self):
+        # a failed attempt (esp. capacity-limited) is still outstanding work
         self.assertEqual(self._reconcile(A.FAILED), [])
         self.assertEqual(self.queue["runs"][0]["status"], "pending")
 

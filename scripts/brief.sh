@@ -48,17 +48,17 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-# Worker queue self-heal (doctor) — cleans up stuck in_progress entries, failed entries
-# of cancelled tasks, and auto-retryable failed entries. Guarantees brief reads a clean
-# queue. Result messages go to stdout one per line (`doctor: ...`).
+# Queue-view upkeep — closes pending entries of closed tasks and sweeps merged
+# worktrees, so brief reads a clean queue. Those lines go to stdout one per line
+# (`scan-queue: skip ...`, `worktree-sweep: ...`).
 if [[ "$INSTALLED" -eq 1 ]]; then
   "$MACP_PYTHON" -P -m todo_system.worker scan-queue 2>&1 \
     | tee -a "$LOG_DIR/brief.out.log" \
-    | grep '^doctor:' || true
+    | grep -E '^(scan-queue: skip|worktree-sweep:)' || true
 elif command -v uv >/dev/null 2>&1; then
   uv run --directory "$ENGINE_DIR" python -m todo_system.worker scan-queue 2>&1 \
     | tee -a "$LOG_DIR/brief.out.log" \
-    | grep '^doctor:' || true
+    | grep -E '^(scan-queue: skip|worktree-sweep:)' || true
 fi
 
 # (The email_to_todo pipeline was retired on 2026-08-05 — Decisions/2026-08-05-email-to-todo-retire.md)

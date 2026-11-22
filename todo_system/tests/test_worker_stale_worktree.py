@@ -2,7 +2,7 @@
 
 Live runs execute in a linked worktree at `<worker root>/wt-<slug>`; nothing
 cleans them up when the PR merges, so they pile up (22 on the host that
-prompted this). doctor now names the ones that look safe to drop, and stops
+prompted this). The reporter names the ones that look safe to drop, and stops
 there — removal is a human call, because a worktree can hold the only copy of
 uncommitted work.
 
@@ -305,8 +305,8 @@ class StaleWorktreeReportTest(unittest.TestCase):
 
         50 records x 4 git subprocesses x the 10s per-call timeout is ~33
         minutes, and `except Exception` fails open on a git that *breaks*, never
-        on one that *crawls* — so without a deadline the 5-minute maintenance
-        tick that runs doctor can be swallowed whole.
+        on one that *crawls* — so without a deadline the pass that runs it
+        can be swallowed whole.
         """
         for slug in ("task-a", "task-b", "task-c"):
             self.fx.add_worktree(slug, self.fx.merged_branch(slug))
@@ -418,7 +418,7 @@ class ReadOnlyGuaranteeTest(unittest.TestCase):
 
 
 class FailOpenTest(unittest.TestCase):
-    """doctor runs every 5 minutes; queue self-heal must survive a broken git."""
+    """The caller must survive a broken git."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

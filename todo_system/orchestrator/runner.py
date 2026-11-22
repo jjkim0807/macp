@@ -2144,7 +2144,7 @@ class StagedExecutor(ClaudeCodeExecutor):
             # run_ok False and the worktree standing as evidence; the retry's
             # ensure_worktree reuses it idempotently. Its gradle-registry dir
             # (stages.gradle_registry_base) goes with it; if the worktree removal
-            # failed, both stay and worktree_sweep's doctor pass reclaims them
+            # failed, both stay and worktree_sweep reclaims them
             # after the retention window. Both helpers are best-effort and never
             # raise, so this is safe as the final statement of this `finally`.
             if repo_url and repo is not None and run_ok:

@@ -830,18 +830,6 @@ def make_run_id(slug: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# scan-queue
-# ---------------------------------------------------------------------------
-
-
-STUCK_IN_PROGRESS_THRESHOLD = dt.timedelta(hours=3)
-# Auto-retry a failed entry once before giving up — handles transient failures
-# (network/lint timing) without nagging the user. `auto_retry_count` is bumped
-# on each automatic retry; >0 means doctor already retried it.
-AUTO_RETRY_LIMIT = 1
-
-
-# ---------------------------------------------------------------------------
 # Stale worker worktree reporting (read-only)
 # ---------------------------------------------------------------------------
 def _default_worktree_parent() -> Path:
@@ -861,21 +849,21 @@ def _default_worktree_parent() -> Path:
 # running stage. Nothing removes them once the PR merges, so they accumulate —
 # 22 linked worktrees on this host when this was written.
 #
-# doctor only *reports* candidates. Removal stays a human decision: a worktree
+# The reporter only *reports* candidates. Removal stays a human decision: a worktree
 # can hold the only copy of work that never made it into a commit, and a
 # false positive that merely prints a line costs nothing.
 
 WORKTREE_PREFIX = "wt-"
-# Detail lines are capped so a 22-candidate host costs 6 log lines per 5-minute
-# maintenance tick instead of 22 (same reasoning as the reconcile skip tally).
+# Detail lines are capped so a 22-candidate host costs 6 log lines per
+# todo-sync pass instead of 22 (same reasoning as the reconcile skip tally).
 MAX_STALE_WORKTREE_ACTIONS = 5
 # Bounds how many records are looked at: each one costs up to 4 git subprocesses
 # (`status --porcelain`, `merge-base --is-ancestor`, `merge-tree --write-tree`,
 # `rev-parse ^{tree}`).
 MAX_SCANNED_WORKTREES = 50
 # A count cap is not a runtime bound. 50 records x 4 subprocesses x the 10s
-# per-call timeout is ~33 minutes, which swallows the 5-minute maintenance tick
-# that runs doctor whole — and the `except Exception` below fails open on
+# per-call timeout is ~33 minutes, which swallows the todo-sync pass
+# that runs it whole — and the `except Exception` below fails open on
 # *failure*, never on *slowness*, so nothing else caps the wall clock.
 #
 # Not a hard ceiling: the deadline is read on loop *entry*, so the record already
@@ -1619,8 +1607,7 @@ def stale_worktree_actions(repo_root: Path = ROOT,
     `git worktree list` cannot see — those are out of scope here.
 
     Fail-open: any git failure (missing binary, timeout, not a repo) returns
-    `[]`. doctor runs on the 5-minute maintenance tick and its queue self-heal
-    has to complete even when this reporting hook cannot.
+    `[]`.
 
     Bounded in *time* as well as in count: the scan stops once
     `STALE_WORKTREE_BUDGET_S` is spent, because fail-open catches a git that
@@ -1660,7 +1647,7 @@ def stale_worktree_actions(repo_root: Path = ROOT,
             actions.append(f"worktree {unscanned}개는 검사하지 않음 ({reason})")
         return actions
     except Exception:
-        # Never raise into doctor: the queue self-heal must still run.
+        # Never raise into the caller.
         return []
 
 
@@ -1699,9 +1686,9 @@ def reclaim_stale_worktrees(repo_root: Path = ROOT,
       3. no unpushed commits                  — `_branch_has_no_unpushed_work`
       4. no live process using the worktree   — `_worktree_process_free`
 
-    Fail-open and count/time-bounded exactly like the reporter — it runs on the
-    5-minute maintenance tick, so a git that breaks *or* merely crawls must never
-    stall the queue self-heal. `git worktree remove` is deliberately
+    Fail-open and count/time-bounded exactly like the reporter — it runs in the
+    todo-sync pass (`scan_queue`), so a git that breaks *or* merely crawls must
+    never stall that pass. `git worktree remove` is deliberately
     `--force`-free: if the tree turned dirty between the clean check and here
     (TOCTOU) git aborts the remove and we log a hold rather than destroy the
     change. At most `MAX_STALE_WORKTREE_ACTIONS` are reclaimed per tick (each is
@@ -1762,158 +1749,6 @@ def reclaim_stale_worktrees(repo_root: Path = ROOT,
         return []
 
 
-def doctor_recover_queue(queue: dict[str, Any]) -> list[str]:
-    """Self-heal common stuck-queue conditions before scan_queue runs.
-
-    - in_progress entries older than STUCK_IN_PROGRESS_THRESHOLD with no
-      live run-dir status.json → reset to pending (worker died mid-claim,
-      typically dirty-check abort path).
-    - failed entries that have not been auto-retried → reset to pending
-      with auto_retry_count incremented. Tasks whose source markdown is
-      cancelled / status != open get the failed entry marked `skipped`.
-    - pending entries whose source task has since gone done / cancelled →
-      marked `skipped`, so they stop inflating count_auto_pending() and the
-      auto_queue_depth_limit check measures the live queue.
-    - merged, clean `wt-*` worktrees whose branch has no unpushed work and no
-      live process → the worktree + its local branch are reclaimed
-      (`reclaim_stale_worktrees`); any that fail a safety gate are logged only.
-      This branch touches only the filesystem, never the queue, so it cannot
-      interact with the three above.
-    - per-run `<repo>.wt/<slug>` worktrees of failed / parked external runs
-      idle past the retention window, and no run, long_job or process holding
-      them → the worktree (never its branch ref) and its gradle-registry dir
-      are reclaimed, plus orphan registry dirs
-      (`orchestrator.worktree_sweep.reclaim_parked_worktrees`). Filesystem only.
-
-    Returns a list of human-readable action descriptions for logging.
-    """
-    actions: list[str] = []
-    now = dt.datetime.now()
-    # Map slug -> source task status (for cancellation detection)
-    slug_to_status: dict[str, str] = {}
-    for t in iter_worker_tasks():
-        slug_to_status[t.slug] = t.status
-
-    for entry in queue.get("runs", []):
-        slug = entry.get("slug", "?")
-        status = entry.get("status")
-
-        if status == "in_progress":
-            run_dir = RUNS_DIR / entry.get("run_id", "")
-            status_file = run_dir / "status.json"
-            # Orphaned-but-finished: the run actually completed (status.json has
-            # finished_at) but the terminal queue update was lost (process killed
-            # right after writing status.json, or a dropped queue write).
-            # Reconcile the entry to its real terminal status instead of leaving
-            # it stuck "running" forever.
-            if status_file.exists():
-                try:
-                    sj = json.loads(status_file.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    sj = {}
-                if sj.get("finished_at"):
-                    final = "failed" if sj.get("failure_reason") else "completed"
-                    entry["status"] = final
-                    entry["finished_at"] = sj["finished_at"]
-                    actions.append(
-                        f"reconcile orphaned {final}: {slug} "
-                        f"(status.json finished, DB stuck running)"
-                    )
-                    continue
-            started = _parse_iso_timestamp(entry.get("started_at"))
-            if started is None:
-                continue
-            age = now - started
-            if age <= STUCK_IN_PROGRESS_THRESHOLD:
-                continue
-            if status_file.exists():
-                # status.json present but not finished → live long-running
-                # stage; don't disturb it.
-                continue
-            entry["status"] = "pending"
-            entry["started_at"] = None
-            entry["branch"] = None
-            actions.append(
-                f"reset in_progress→pending: {slug} (idle {int(age.total_seconds()/3600)}h, no run-dir)"
-            )
-
-        elif status == "failed":
-            # If source task was cancelled or removed, mark entry skipped.
-            source_status = slug_to_status.get(slug)
-            # is_closed: done / cancelled / canceled — a one-l `canceled` task
-            # used to fall through to the auto-retry below.
-            if is_closed(source_status) or source_status is None:
-                entry["status"] = "skipped"
-                actions.append(f"skip cancelled/removed task: {slug}")
-                continue
-            # Otherwise auto-retry once.
-            retries = int(entry.get("auto_retry_count", 0))
-            if retries >= AUTO_RETRY_LIMIT:
-                continue
-            entry["status"] = "pending"
-            entry["auto_retry_count"] = retries + 1
-            entry["started_at"] = None
-            entry["finished_at"] = None
-            actions.append(
-                f"auto-retry failed entry: {slug} (attempt {retries + 2})"
-            )
-
-        elif status == "pending":
-            # Deliberately narrower than the `failed` branch above: that one also
-            # skips on `source_status is None`, this one must not. `Todo/items/`
-            # is gitignored, so on a fresh clone or another host slug_to_status
-            # comes back empty and "not found" would close every live row at once.
-            # Closed = both cancel spellings, via is_closed.
-            source_status = slug_to_status.get(slug)
-            if is_closed(source_status):
-                entry["status"] = "skipped"
-                actions.append(
-                    f"skip stale pending: {slug} (source {source_status})"
-                )
-
-    # Outside the loop and last on purpose: it touches only the filesystem
-    # (never the queue) and is fail-open internally, so it cannot change any
-    # verdict reached above.
-    actions.extend(reclaim_stale_worktrees())
-    # Same contract, the per-run `<repo>.wt/<slug>` layout the `wt-*` sweep above
-    # deliberately cannot see. Fail-open inside; the guard here is a second belt.
-    try:
-        actions.extend(_worktree_sweep.reclaim_parked_worktrees())
-    except Exception:
-        pass
-
-    return actions
-
-
-def _queue_fingerprint(queue: dict[str, Any]) -> str:
-    """A stable snapshot of the queue, used to detect real changes.
-
-    `default=str` so an unexpected non-JSON value degrades to "looks different"
-    rather than raising inside the maintenance tick.
-    """
-    return json.dumps(queue, sort_keys=True, default=str)
-
-
-def run_doctor_and_persist(queue: dict[str, Any]) -> list[str]:
-    """Run doctor, log every action, and save the queue only if it changed.
-
-    The save is gated on the queue *actually changing* rather than on "doctor
-    said something", which is what the old `if doctor_actions:` meant. doctor
-    now also emits stale-worktree reclaim actions, and a candidate that stays
-    *held* (in-use / unpushed) keeps that list non-empty on every 5-minute
-    tick — while touching no queue state; gating on "said something" would rewrite
-    queue.json each such tick, for state nothing modified, widening the window
-    in which a concurrent orchestrator write gets clobbered.
-    """
-    before = _queue_fingerprint(queue)
-    actions = doctor_recover_queue(queue)
-    for action in actions:
-        print(f"doctor: {action}")
-    if _queue_fingerprint(queue) != before:
-        save_queue(queue)
-    return actions
-
-
 def _parse_iso_timestamp(raw: str | None) -> dt.datetime | None:
     if not raw:
         return None
@@ -1950,9 +1785,6 @@ def cmd_maintenance() -> int:
         (content-hash diff — unchanged docs are skipped), so query_related's
         semantic half does not answer from a stale snapshot; silent when nothing
         changed, one throttled line when sqlite-vec is absent.
-
-    doctor_recover_queue is deliberately NOT here: it heals Worker/queue.json,
-    which is exactly the store the cutover retires.
     """
     rc = 0
     # The third piece of scan_queue()'s upkeep, missing since the cutover.
@@ -2067,9 +1899,25 @@ def cmd_maintenance() -> int:
 def scan_queue() -> int:
     queue = load_queue()
 
-    # Self-heal: reset stuck/auto-retryable entries before the dispatcher
-    # scans for new tasks. Each action is logged so users see what changed.
-    run_doctor_and_persist(queue)
+    # A pending row whose source task has closed is skipped: nothing else
+    # closes a row that has no ledger assignment while its task still names a
+    # dispatchable mode. Only an explicitly closed source counts — Todo/items
+    # can be absent (a fresh clone), and "not found" must not close live rows.
+    closed = {t.slug: t.status for t in iter_worker_tasks() if is_closed(t.status)}
+    for entry in queue.get("runs", []):
+        if entry.get("status") == "pending" and entry.get("slug") in closed:
+            entry["status"] = "skipped"
+            print(f"scan-queue: skip stale pending: {entry['slug']} "
+                  f"(source {closed[entry['slug']]})")
+    # Worktree sweeps: filesystem only, never the queue, and fail-open, so
+    # neither can change what is registered below.
+    swept = list(reclaim_stale_worktrees())
+    try:
+        swept.extend(_worktree_sweep.reclaim_parked_worktrees())
+    except Exception:
+        pass
+    for action in swept:
+        print(f"worktree-sweep: {action}")
     existing_slugs = {entry["slug"] for entry in queue["runs"]}
     # Slugs whose latest entry is still actionable; if completed/failed, allow re-queue only if user manually clears entry.
     actionable_status = {"pending", "in_progress"}
