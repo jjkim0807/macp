@@ -80,6 +80,8 @@ task. -->
 > alerts and carry follow-ups. Copy the headings exactly; write the prose under them in
 > the vault's language.
 
+If a next step is only a choice a person has to make, do not leave it as prose under `## 다음 단계`: raise it as a decision task — on the human-owned task that carries the choice, or a new `worker_mode: manual` task under `<vault_root>/Todo/items/` — with `needs_decision: true`, `decision_options:` (one option per line, at most 6), the question in `next_action` and no `scheduled:`, and name that task in the bullet.
+
 #### `merged: no` requires a reason, and there are two kinds
 
 A merge that did not happen is either something broke or you chose not to. The

@@ -82,6 +82,9 @@ Authorization: Bearer <dashboard token>        (the web page sends its cookie in
 - The server diagnoses the task **again at click time** and runs the action only
   if that fresh card still offers it. A stale screen therefore cannot act. For
   example, a second [재개] after the first one returns `409`.
+- A fifth id, `answer`, goes to the same route but is not a triage card button.
+  It is the reply to a decision card, with its own body (`option` or `text`)
+  and its own click-time check. See [Decision cards](#decision-cards).
 
 What each action runs (no new mechanism):
 
@@ -99,9 +102,9 @@ replies.
 | status | meaning | `ok` |
 |---|---|---|
 | 200 | The action ran. `ok` says whether it worked (a refused merge, a vault not on `main`, …). | true / false |
-| 400 | Bad JSON, an unknown slug format, an action id outside the set, or bad `text` | false |
-| 404 | No ledger row for the task | false |
-| 409 | The fresh card does not offer this action | false |
+| 400 | Bad JSON, an unknown slug format, an action id outside the set, or bad `text`. For `answer`: a malformed or out-of-range `option`, bad `text`, or not exactly one of the two | false |
+| 404 | No ledger row for the task. For `answer`: no task md | false |
+| 409 | The fresh card does not offer this action. For `answer`: the task is not a decision that can be answered now | false |
 | 413 / 415 | The body is too large, or the request is not JSON | false |
 | 500 | The diagnosis itself crashed (see the dashboard log) | false |
 
@@ -110,12 +113,16 @@ gh/git stderr or a path; those go to the server log only. Show it as it is.
 
 ### 3. Irreversible steps never get a button
 
-The action ids form a closed set: `merge`, `resume`, `cancel` and `instruct`.
-There is no id for deploying, submitting, publishing, deleting or acting in the
-user's name, and the server answers any other id with `400` before it looks at
-the task. A task md with `human_gate: true` (an irreversible step is still
-pending) keeps only `cancel`, and its advice tells the person to do the step by
-hand.
+The action ids form a closed set: `merge`, `resume`, `cancel`, `instruct` and
+`answer`. There is no id for deploying, submitting, publishing, deleting or
+acting in the user's name, and the server answers any other id with `400`
+before it looks at the task. A task md with `human_gate: true` (an irreversible
+step is still pending) keeps only `cancel`, and its advice tells the person to
+do the step by hand.
+
+`answer` is never one of a triage card's buttons. It is the reply to a decision
+card, and it only records what was chosen
+(see [An answer only records](#3-an-answer-only-records)).
 
 ### 4. Client rules (web and app alike)
 
@@ -145,6 +152,194 @@ hand.
 - Web client: `triBlock`, `triAct`, `triSend` and `triClick` in the page
   template, called from `attnRow` and `humanRow`.
 - Android app: `macp-dashboard-android` renders the same fields, tracked as a
+  follow-up task.
+
+## Decision cards
+
+Some tasks are finished except for one choice a person has to make. Such a task
+used to get a calendar block, and the block kept moving while the answer took
+ten seconds. Now the server attaches a **decision card** to the task's row: the
+question, one button per option, and a one-line box for any other answer. One
+click records the answer in the task file.
+
+The source of truth is the "Decision cards" part of the module docstring of
+`todo_system/orchestrator/triage.py`. This section restates what a client needs.
+
+### 1. The `decision` field in `/api/status`
+
+The field appears on a row of `human` when both hold:
+
+- the row's `why` is `"owned"` or `"parked"`, and
+- the task md raises a decision that can be answered now: it has
+  `needs_decision: true` or the `decision` tag, its status is not closed, its
+  `worker_mode` is not `blocked`, and its `not_before` is not still ahead.
+
+Rows with `why: "blocked"` and rows of `human_later` never have it (it is not
+that person's turn yet), and no other list carries it. The field is
+**additive**. When it is absent (an older server, an answered task, or a card
+that failed to build), render the row exactly as before. A `parked` row can
+carry both `decision` and `triage`; draw the decision card first.
+
+```json
+"decision": {
+  "question": "Pick a budget plan",
+  "options": ["(a) raise the cap to 30",
+              "(b) split a separate budget: API only",
+              "(c) hold"]
+}
+```
+
+| key | type | render as |
+|---|---|---|
+| `question` | string | One sentence in bold. It is the task's `next_action` as one line (at most 300 characters). It may be empty; then draw no question line. |
+| `options` | string[] (0–6) | One button per entry, in order, with the entry as its text, unchanged. Each is one line of at most 200 characters. The list may be empty; the text box is then the only way to answer. |
+
+Both are the task author's words. A client never translates, rewords,
+shortens, sorts or filters them.
+
+The server also decides where the row goes, so a client keeps drawing rows in
+the order and sections it already uses:
+
+- the row has `urgent: true`, whatever its due date or time block, so it is
+  counted in the first-screen decision number and drawn in the urgent section;
+- rows with a card come first in `human`;
+- the row has `group: ""`, so it is never folded under a project header.
+
+### 2. `POST /api/action` with `action: "answer"`
+
+The card answers through the same route as the triage buttons, with the same
+auth, content type and size limit:
+
+```http
+POST /api/action
+Content-Type: application/json
+Authorization: Bearer <dashboard token>
+
+{"task": "<slug>", "action": "answer", "option": 2}
+```
+
+or, for an answer that is not one of the options:
+
+```json
+{"task": "<slug>", "action": "answer", "text": "<one line>"}
+```
+
+- Send **exactly one** of `option` and `text`.
+- `option` is the position of the chosen entry in the `options` the server
+  sent, **counted from 1**. It must be a JSON integer.
+- `text` is one line (no control characters or newlines) of 1–500 characters
+  after trimming.
+- The server reads the task md **again at click time**. A card that was
+  answered a moment ago, or a task that was closed, returns `409`. The reply
+  `message` says which choice was recorded, so a client can show it as is.
+
+What the server writes, as one commit of the one task file in the vault on
+`main`:
+
+- a Progress Log line `- <date>: 결정(대시보드): <the option's text, or the
+  answer>` (`decision (dashboard):` when the server's UI language is English),
+  with the chosen words verbatim;
+- `needs_decision: false`, and the `decision` tag and `decision_options` are
+  removed, so the card is gone on the next poll;
+- `next_action` becomes a short sentence naming the choice, and `updated` moves.
+
+When the task is assigned to a human agent and that assignment is still
+waiting (ledger `kind: human`, state `awaiting_human`), the server also sends
+the orchestrator **one** reply of type `needs-input` carrying the answer. The
+orchestrator stores it as the row's note and leaves the row waiting. A client
+does nothing for this.
+
+The response is JSON `{"ok": bool, "message": string}` under the rules of
+[Triage cards §2](#2-post-apiaction):
+
+| status | meaning | `ok` |
+|---|---|---|
+| 200 | The answer was handled. `ok` is false when nothing was recorded (a vault not on `main`, a busy vault, …), and also when the record was committed but the reply to the orchestrator could not be sent; `message` says which. | true / false |
+| 400 | `option` is not an integer ≥ 1 or is past the end of the list, `text` is malformed, or the body does not carry exactly one of the two | false |
+| 404 | No task md for that slug | false |
+| 409 | The task is not a decision that can be answered now (already answered, closed, blocked, not yet due) | false |
+| 413 / 415 | The body is too large, or the request is not JSON | false |
+| 500 | The card could not be read (see the dashboard log) | false |
+
+### 3. An answer only records
+
+The button writes the choice down. It does nothing else, whatever the chosen
+words say.
+
+- The server does not merge, resume, cancel, dispatch or close anything on an
+  answer. The task's `status` stays as it was, because the server cannot tell a
+  choice that ends the task from one that leaves a step to do.
+- An option may name a step that cannot be undone: a payment, a commitment, a
+  deletion, a submission, a publication. Choosing it records that choice and
+  runs nothing. Carrying it out belongs to a follow-up task or to the person,
+  under the usual human gate.
+- Handing an answered task to a worker stays a separate click: a task that is
+  parked for a person offers [재개] on its triage card once the decision is
+  recorded.
+- An answer can be undone by editing the task md back (or reverting that one
+  commit).
+
+A client must not add behavior to an option, for example treating an option
+that says "cancel" as the `cancel` action.
+
+### 4. Client rules (web and app alike)
+
+1. Render only: the `question`, one button per `options[]` entry with the entry
+   as its text, and a one-line input (max 500 characters) with a send button.
+   Make no client-side judgment, and add, drop or reorder no option.
+2. Show no confirm dialog. The click is the answer.
+3. Disable the card's buttons while its request is in flight.
+4. An empty input shows a local hint and sends nothing.
+5. Show the response `message` as it is: on the card when `ok` is false, and
+   somewhere that survives the row's next redraw when `ok` is true (web: the
+   status card's toast for 15 s), because an answered row loses its card on the
+   next poll. On a network failure or a reply that is not JSON, show the fixed
+   local sentence of Triage cards §4. Never show the HTTP status.
+6. Tapping inside the card must not open the task detail.
+7. At a 390 px width there is no horizontal scroll: a long option wraps inside
+   its button.
+8. Refresh after an answer. The server invalidates its cached status, so the
+   next poll already shows the row without the card.
+
+### 5. Writing a decision task (frontmatter)
+
+An agent or a person raises a decision by writing the task file this way:
+
+```yaml
+needs_decision: true
+next_action: "Pick a budget plan"
+decision_options:
+  - "(a) raise the cap to 30"
+  - "(b) split a separate budget: API only"
+  - "(c) hold"
+```
+
+- `needs_decision: true` (a plain `true` / `yes` / `1` / `on`) or the
+  `decision` tag marks the task. Nothing else does: titles and prose are never
+  read.
+- `decision_options` is a list, one option per line. Quote each entry. At most
+  six are sent, each cut to 200 characters. A one-line list `[a, b]` also
+  works; quote an entry that contains a comma. Without the field the card has
+  only the text box.
+- The question is `next_action`.
+- Leave `scheduled:` out. The calendar sync never puts a decision task on the
+  calendar, deletes the event it already has, and never moves its block.
+- The stage prompts tell agents to raise a leftover choice this way instead of
+  burying the options in the Progress Log.
+
+### 6. Where each side lives
+
+- The card and the marker: `todo_system/orchestrator/triage.py`
+  (`decision_card`, `md_decision`).
+- The record and the reply: `todo_system/orchestrator/triage_actions.py`
+  (`_answer`, reached through `run_action("answer", …)`).
+- Server wiring: `scripts/macp_dashboard.py`, where `_attach_decisions` (called
+  by `collect_status`) adds the field and orders the rows, and
+  `Handler._post_answer` (called by `Handler._post_action`) serves the POST.
+- Web client: `decBlock`, `decSend` and `decClick` in the page template, called
+  from `humanRow`; they post through `triAct`.
+- Calendar: `todo_system/calendar_sync.py` (`_is_decision_task`).
+- Android app: `macp-dashboard-android` renders the same field, tracked as a
   follow-up task.
 
 ## Usage vs results
