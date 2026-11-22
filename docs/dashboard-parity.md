@@ -146,3 +146,130 @@ hand.
   template, called from `attnRow` and `humanRow`.
 - Android app: `macp-dashboard-android` renders the same fields, tracked as a
   follow-up task.
+
+## Usage vs results
+
+The usage guard says how much was spent. This card says on what, and what came
+back: one table of project × kind of task, with output tokens, runs, merged
+PRs, tasks done / cancelled / failed and tokens per merge, for the last 7 days
+and for this month. The server aggregates and words everything. A client only
+draws it. The same model is appended to one brief a week, so the brief and the
+dashboard show the same numbers.
+
+The source of truth is the module docstring of `todo_system/usage_value.py`.
+This section restates what a client needs.
+
+### 1. The `usage_value` field in `/api/status`
+
+A top-level key, **additive**. When it is absent (an older server, or the
+aggregation failed) draw no card and change nothing else.
+
+```json
+"usage_value": {
+  "title": "사용량 대비 결과",
+  "basis": "본부 run dir 기준 — 원격 러너 런과 정리된 run dir는 빠져 있어 출력 토큰은 하한이에요",
+  "periods": [
+    {"id": "week", "label": "지난 7일", "range": "11/25–12/1",
+     "start": "2026-11-25", "end": "2026-12-01",
+     "total": {"out_tokens": 548000, "out_tokens_text": "548k",
+               "runs": 3, "runs_unmetered": 1, "merged_prs": 2,
+               "done": 3, "cancelled": 0, "failed": 0,
+               "tokens_per_merge": 274000, "tokens_per_merge_text": "274k",
+               "text": "런 3 · 머지 PR 2 · 완료 3 · 취소 0 · 실패 0 · 머지당 274k · 미계측 런 1"},
+     "rows": [
+       {"project": "macp", "kind": "self", "kind_label": "macp 자기개선",
+        "out_tokens": 466000, "out_tokens_text": "466k",
+        "runs": 1, "runs_unmetered": 0, "merged_prs": 1,
+        "done": 1, "cancelled": 0, "failed": 0,
+        "tokens_per_merge": 466000, "tokens_per_merge_text": "466k",
+        "text": "런 1 · 머지 PR 1 · 완료 1 · 취소 0 · 실패 0 · 머지당 466k"},
+       {"project": "app", "kind": "bug", "kind_label": "버그",
+        "out_tokens": 70000, "out_tokens_text": "70.0k",
+        "runs": 1, "runs_unmetered": 1, "merged_prs": 0,
+        "done": 1, "cancelled": 0, "failed": 0,
+        "tokens_per_merge": null, "tokens_per_merge_text": "—",
+        "text": "런 1 · 머지 PR 0 · 완료 1 · 취소 0 · 실패 0 · 머지당 — · 미계측 런 1"}]},
+    {"id": "month", "label": "이번 달", "range": "12/1–12/1",
+     "start": "2026-12-01", "end": "2026-12-01",
+     "total": {"out_tokens": 0, "out_tokens_text": "0",
+               "runs": 0, "runs_unmetered": 0, "merged_prs": 0,
+               "done": 0, "cancelled": 0, "failed": 0,
+               "tokens_per_merge": null, "tokens_per_merge_text": "—",
+               "text": "런 0 · 머지 PR 0 · 완료 0 · 취소 0 · 실패 0 · 머지당 —"},
+     "rows": []}
+  ]
+}
+```
+
+(The example is the 1st of a month: the week reaches back into the month
+before, so the month can be empty while the week is not. The week's third row
+is left out for length.)
+
+| key | type | render as |
+|---|---|---|
+| `title` | string | The card's heading. |
+| `basis` | string | One muted line under the heading: what was counted and why the tokens are a lower bound. |
+| `periods` | object[] | Always two, `week` then `month`, in this order. |
+| `periods[].id` | `"week"` \| `"month"` | Do not render it. A stable id. |
+| `periods[].label`, `.range` | string | The period's heading, e.g. 「지난 7일 11/25–12/1」. |
+| `periods[].start`, `.end` | `YYYY-MM-DD` | Do not render them. The same range as data. |
+| `periods[].total` | cell | The period's summary: `out_tokens_text` and `text`. |
+| `periods[].rows` | row[] | One line per row, **in the order received** (output tokens, high first). May be empty. |
+| `rows[].project` | string | A project chip. A data value (a repo name, or `vault`), never translated. |
+| `rows[].kind` | string | Do not render it. One of `discovery`, `self`, `feature`, `bug`, `security`, `research`, `ops`, `other`; the list can grow. |
+| `rows[].kind_label` | string | The row's title, next to the chip. |
+| `out_tokens_text` | string | The row's (or total's) output tokens, already shortened (`4.1M`). |
+| `text` | string | The rest of the cell as one line: runs, merged PRs, done, cancelled, failed, tokens per merge, and the unmetered runs when there are any. |
+| `out_tokens`, `runs`, `runs_unmetered`, `merged_prs`, `done`, `cancelled`, `failed`, `tokens_per_merge`, `tokens_per_merge_text` | number / string | The same cell as numbers, for a client that wants a table. `tokens_per_merge` is `null` (text `—`) when nothing was merged. |
+
+Every string is already in the server's UI language, numbers included. A client
+never formats a number, sorts or filters the rows, sums anything or translates
+a label.
+
+### 2. What the numbers mean
+
+- A **run** is one run directory on the dashboard's host. A period is
+  `[start, now]` in that host's local time: the last 7 calendar days, and the
+  month so far.
+- **Output tokens** are summed from each run's recorded stage usage. A run with
+  no usable record adds 0 and is counted in `runs_unmetered`, so the sum is a
+  lower bound.
+- **Merged PRs** are distinct PR URLs a run reported as merged, plus the last
+  PR of a task that is done now. Nothing is checked against GitHub.
+- **Done / cancelled / failed** count distinct tasks that ran in the period, by
+  their state now.
+- **Kind** comes from the task itself, first match: born from a discovery
+  report or a discovery run → `discovery`; the engine's own repo, tag or slug
+  prefix → `self`; then a kind tag, a slug prefix, a hint tag; else `other`.
+
+Not counted, and said so in `basis`: runs of a remote runner and run
+directories already pruned (they stay on the machine that ran them). Also
+missing: the PR of a vault delegate run (its URL is in no run directory, so
+the task shows as done with no merge), and the usage of the planner, the brief
+and interactive sessions.
+
+### 3. Client rules (web and app alike)
+
+1. Render only what the server sends. No arithmetic, no sorting, no number
+   formatting, no translation.
+2. The card is collapsed by default and remembers whether it is open (web:
+   `localStorage` key `mdash.sec.usage-value`).
+3. Hide the whole card when the key is absent or every period has no rows.
+4. A period with no rows shows the client's usual empty line.
+5. The card is read-only: no buttons, no request of its own.
+6. At a 390 px width there is no horizontal scroll.
+
+### 4. Where each side lives
+
+- Aggregation, wording and the brief section: `todo_system/usage_value.py`
+  (`build`, `render_brief`; CLI `python -m todo_system.usage_value report`).
+- Server wiring: `scripts/macp_dashboard.py`, where `collect_usage_value`
+  (called by `collect_status`) adds the field. A failure there drops the key
+  and logs one line.
+- Web client: `setUsageValue`, `uvPeriod` and `uvRow` in the page template,
+  called at the end of `update`.
+- Brief: `scripts/brief.sh` calls `python -m todo_system.usage_value
+  brief-section` after the agent wrote the brief and appends the section it
+  prints. The section goes into one brief a week.
+- Android app: `macp-dashboard-android` renders the same field, tracked as a
+  follow-up task.

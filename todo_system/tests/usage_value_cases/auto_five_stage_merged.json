@@ -1,0 +1,92 @@
+{
+  "case": "auto_five_stage_merged",
+  "source": "Shape of a real five-stage auto run of 2026-11-21 against the engine repo that opened and merged a PR: the stages.json keys and usage record keys, the report.md frontmatter, the task-file fields and the ledger payload keys. Every value is synthetic.",
+  "runs": [
+    {
+      "name": "20261121T144046-engine-triage-cards",
+      "files": {
+        "stages.json": {
+          "account": "acct",
+          "model_tier": "heavy",
+          "model_tier_reason": "model_tier: heavy",
+          "usage": {
+            "research": {"input_tokens": 80, "output_tokens": 40000, "cache_creation_input_tokens": 300000, "cache_read_input_tokens": 9000000, "num_turns": 44, "duration_ms": 430000, "model": "model-a", "session_id": "00000000-0000-4000-8000-000000000001", "total_cost_usd": 5.5},
+            "plan": {"input_tokens": 140, "output_tokens": 160000, "cache_creation_input_tokens": 590000, "cache_read_input_tokens": 22000000, "num_turns": 74, "duration_ms": 1500000, "model": "model-a", "session_id": "00000000-0000-4000-8000-000000000002", "total_cost_usd": 12.7},
+            "implement": {"input_tokens": 290, "output_tokens": 230000, "cache_creation_input_tokens": 520000, "cache_read_input_tokens": 50000000, "num_turns": 145, "duration_ms": 2400000, "model": "model-a", "session_id": "00000000-0000-4000-8000-000000000003", "total_cost_usd": 19.0},
+            "verify": {"input_tokens": 66, "output_tokens": 27000, "cache_creation_input_tokens": 160000, "cache_read_input_tokens": 4300000, "num_turns": 33, "duration_ms": 880000, "model": "model-b", "session_id": "00000000-0000-4000-8000-000000000004", "total_cost_usd": 4.5},
+            "report": {"input_tokens": 30, "output_tokens": 9000, "cache_creation_input_tokens": 69000, "cache_read_input_tokens": 1000000, "num_turns": 15, "duration_ms": 90000, "model": "model-a", "session_id": "00000000-0000-4000-8000-000000000005", "total_cost_usd": 0.95}
+          },
+          "completed": ["research", "plan", "implement", "verify", "report"]
+        },
+        "report.md": [
+          "---",
+          "stage: report",
+          "run_id: 20261121T144046-engine-triage-cards",
+          "slug: engine-triage-cards",
+          "branch: worker/engine-triage-cards",
+          "generated: 2026-11-21T16:15:00+09:00",
+          "overall_status: pass",
+          "pr_url: https://github.com/example/macp/pull/12",
+          "merged: yes",
+          "no_op: false",
+          "---",
+          "",
+          "# Report",
+          "",
+          "- synthetic body"
+        ],
+        "run.log": ["", "=== research (rc=0) ==="]
+      }
+    }
+  ],
+  "tasks": {
+    "engine-triage-cards": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - private",
+        "  - macp",
+        "  - worker",
+        "  - feature",
+        "status: done",
+        "due: \"-\"",
+        "updated: 2026-11-21",
+        "priority: 60",
+        "repo: \"https://github.com/example/macp.git\"",
+        "outcome: \"synthetic outcome\"",
+        "worker_mode: auto",
+        "auto_merge: true",
+        "model_tier: heavy",
+        "acceptance_criteria:",
+        "  - \"synthetic criterion\"",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "engine-triage-cards",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "done",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {
+          "tags": ["todo", "private", "macp", "worker", "feature"],
+          "repo": "https://github.com/example/macp.git",
+          "worker_mode": "auto",
+          "auto_merge": true,
+          "model_tier": "heavy"
+        }
+      }
+    }
+  },
+  "expect": {
+    "rules": {"engine-triage-cards": "self_repo"},
+    "week": [
+      {"project": "macp", "kind": "self", "out_tokens": 466000, "runs": 1, "runs_unmetered": 0,
+       "merged_prs": 1, "done": 1, "cancelled": 0, "failed": 0, "tokens_per_merge": 466000}
+    ]
+  }
+}

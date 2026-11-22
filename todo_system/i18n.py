@@ -292,6 +292,33 @@ MESSAGES: dict[str, dict[str, str]] = {
         # Progress Log lines a click writes into the task md
         "triage.md.cancel": "- {today}: 대시보드에서 취소(사용자)",
         "triage.md.instruction": "- {today}: 사용자 지시(대시보드): {text}",
+        # usage vs results (usage_value.py): the dashboard card and the brief table
+        "usage_value.title": "사용량 대비 결과",
+        "usage_value.basis": (
+            "본부 run dir 기준 — 원격 러너 런과 정리된 run dir는 빠져 있어 출력 토큰은 하한이에요"),
+        "usage_value.period.week": "지난 7일",
+        "usage_value.period.month": "이번 달",
+        "usage_value.kind.discovery": "발굴",
+        "usage_value.kind.self": "macp 자기개선",
+        "usage_value.kind.feature": "기능",
+        "usage_value.kind.bug": "버그",
+        "usage_value.kind.security": "보안",
+        "usage_value.kind.research": "연구",
+        "usage_value.kind.ops": "운영",
+        "usage_value.kind.other": "기타",
+        "usage_value.cell": (
+            "런 {runs} · 머지 PR {merged} · 완료 {done} · 취소 {cancelled} · 실패 {failed}"
+            " · 머지당 {per_merge}"),
+        "usage_value.cell_unmetered": " · 미계측 런 {n}",
+        "usage_value.total": "합계",
+        "usage_value.col.row": "프로젝트 · 종류",
+        "usage_value.col.out": "출력 토큰",
+        "usage_value.col.runs": "런",
+        "usage_value.col.merged": "머지 PR",
+        "usage_value.col.status": "완료/취소/실패",
+        "usage_value.col.per_merge": "머지당 토큰",
+        "usage_value.more_rows": "외 {n}행은 대시보드에 있어요",
+        "usage_value.no_runs": "런 없음",
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -586,6 +613,33 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.result.internal": "Something went wrong — check the dashboard log",
         "triage.md.cancel": "- {today}: cancelled from the dashboard (user)",
         "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
+        "usage_value.title": "Usage vs results",
+        "usage_value.basis": (
+            "Counted from this host's run dirs — remote-runner runs and pruned run dirs are "
+            "missing, so output tokens are a lower bound"),
+        "usage_value.period.week": "Last 7 days",
+        "usage_value.period.month": "This month",
+        "usage_value.kind.discovery": "Discovery",
+        "usage_value.kind.self": "macp self-improvement",
+        "usage_value.kind.feature": "Feature",
+        "usage_value.kind.bug": "Bug",
+        "usage_value.kind.security": "Security",
+        "usage_value.kind.research": "Research",
+        "usage_value.kind.ops": "Ops",
+        "usage_value.kind.other": "Other",
+        "usage_value.cell": (
+            "runs {runs} · merged PRs {merged} · done {done} · cancelled {cancelled} · "
+            "failed {failed} · {per_merge} per merge"),
+        "usage_value.cell_unmetered": " · {n} unmetered run(s)",
+        "usage_value.total": "Total",
+        "usage_value.col.row": "Project · kind",
+        "usage_value.col.out": "Output tokens",
+        "usage_value.col.runs": "Runs",
+        "usage_value.col.merged": "Merged PRs",
+        "usage_value.col.status": "Done/cancelled/failed",
+        "usage_value.col.per_merge": "Tokens per merge",
+        "usage_value.more_rows": "{n} more row(s) on the dashboard",
+        "usage_value.no_runs": "no runs",
     },
 }
 

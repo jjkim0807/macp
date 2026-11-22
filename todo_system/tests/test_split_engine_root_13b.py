@@ -319,7 +319,7 @@ def test_installed_layout_brief_uses_macp_python(tmp_path):
     assert ["-P", "-m", "todo_system.worker", "scan-queue"] in argvs, argvs
     assert ["-P", f"{engine}/scripts/export_db_snapshot.py"] in argvs, argvs
     probe = [a for a in argvs if "todo_system.orchestrator.usage_probe" in a]
-    assert len(probe) == 1 and len(py) == 4, argvs
+    assert len(probe) == 1 and len(py) == 5, argvs
     assert probe[0][:5] == ["-P", "-m", "todo_system.orchestrator.usage_probe", "record",
                             "--source"], probe
     assert _opt(probe[0], "--dest") == f"{h.vault}/Worker/_state/brief_usage.jsonl", probe
@@ -330,6 +330,11 @@ def test_installed_layout_brief_uses_macp_python(tmp_path):
     assert related[0][:4] == ["-P", "-m", "todo_system.orchestrator.related_context",
                               "emit-context"], related
     assert _opt(related[0], "--vault-root") == str(h.vault), related
+    # The fifth call: the weekly usage-vs-results section. The engine renders it
+    # and brief.sh appends it after the agent wrote the brief.
+    table = [a for a in argvs if "todo_system.usage_value" in a]
+    assert table == [["-P", "-m", "todo_system.usage_value", "brief-section",
+                      "--vault-root", str(h.vault)]], argvs
     for call in py:
         assert call["cwd"] == str(h.vault), call
         assert call["MACP_VAULT_ROOT"] == str(h.vault), call
@@ -356,14 +361,18 @@ def test_installed_layout_brief_without_macp_python_falls_back_to_uv(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert h.calls("py") == []
     uv = h.calls("uv")
-    # Four: scan-queue, export_db_snapshot.py, related_context emit-context
-    # (memory v2 wiring) and usage_probe.
-    assert len(uv) == 4, uv
+    # Five: scan-queue, export_db_snapshot.py, related_context emit-context
+    # (memory v2 wiring), usage_probe and usage_value brief-section (the weekly
+    # usage-vs-results table).
+    assert len(uv) == 5, uv
     for call in uv:
         assert call["argv"][:3] == ["run", "--directory", str(engine)], call
         assert call["MACP_VAULT_ROOT"] == str(h.vault), call
     assert len([c for c in uv
                 if "todo_system.orchestrator.related_context" in c["argv"]]) == 1, uv
+    table = [c["argv"] for c in uv if "todo_system.usage_value" in c["argv"]]
+    assert table == [["run", "--directory", str(engine), "python", "-m", "todo_system.usage_value",
+                      "brief-section", "--vault-root", str(h.vault)]], uv
 
 
 # --- kakao_send.sh / notify_kakao.sh: the resolver runs under MACP_PYTHON --------

@@ -1,0 +1,145 @@
+{
+  "case": "unmetered_runs",
+  "source": "Third run: shape of a real 2026-11-20 run whose verify stage timed out — usage.verify is {\"unavailable\": \"timeout\"} next to timed_out_stage and checkpoint_sha; the counted research/plan/implement records are added here so the sum of the accepted records is observable. reconstructed: the first two runs. No November run dir on the host lacked stages.json or its usage key, so they follow what the runner leaves before it writes stages.json (run.log, related.md) and before the first stage has finished (stages.json without usage). Every value is synthetic.",
+  "runs": [
+    {
+      "name": "20261119T090000-app-no-stages",
+      "files": {
+        "run.log": ["", "=== research (rc=1) ==="],
+        "related.md": ["# related", ""]
+      }
+    },
+    {
+      "name": "20261119T100000-app-no-usage",
+      "files": {
+        "stages.json": {
+          "account": "acct",
+          "model_tier": "standard",
+          "model_tier_reason": "model_tier: standard",
+          "completed": []
+        },
+        "related.md": ["# related", ""]
+      }
+    },
+    {
+      "name": "20261120T154934-app-player-skip-wired",
+      "files": {
+        "stages.json": {
+          "account": "acct",
+          "model_tier": "light",
+          "model_tier_reason": "model_tier: light",
+          "completed": ["research", "plan", "implement"],
+          "usage": {
+            "research": {"input_tokens": 30, "output_tokens": 10000, "cache_creation_input_tokens": 80000, "cache_read_input_tokens": 2000000, "num_turns": 20, "duration_ms": 200000, "model": "model-b", "session_id": "00000000-0000-4000-8000-000000000041", "total_cost_usd": 1.1},
+            "plan": {"input_tokens": 40, "output_tokens": 20000, "cache_creation_input_tokens": 100000, "cache_read_input_tokens": 3000000, "num_turns": 25, "duration_ms": 400000, "model": "model-b", "session_id": "00000000-0000-4000-8000-000000000042", "total_cost_usd": 1.9},
+            "implement": {"input_tokens": 90, "output_tokens": 40000, "cache_creation_input_tokens": 180000, "cache_read_input_tokens": 9000000, "num_turns": 70, "duration_ms": 1500000, "model": "model-b", "session_id": "00000000-0000-4000-8000-000000000043", "total_cost_usd": 4.2},
+            "verify": {"unavailable": "timeout"}
+          },
+          "timed_out_stage": "verify",
+          "checkpoint_sha": null
+        },
+        "requirements.md": ["# requirements", ""],
+        "implementation_plan.md": ["# plan", ""],
+        "run.log": ["", "=== research (rc=0) ==="]
+      }
+    }
+  ],
+  "tasks": {
+    "app-no-stages": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - private",
+        "  - side-project",
+        "  - app",
+        "  - bug",
+        "status: open",
+        "repo: \"https://github.com/example/app.git\"",
+        "worker_mode: auto",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "app-no-stages",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "failed",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {"tags": ["todo", "private", "side-project", "app", "bug"],
+                    "repo": "https://github.com/example/app.git", "worker_mode": "auto"}
+      }
+    },
+    "app-no-usage": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - private",
+        "  - side-project",
+        "  - app",
+        "  - bug",
+        "status: open",
+        "repo: \"https://github.com/example/app.git\"",
+        "worker_mode: auto",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "app-no-usage",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "in_progress",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {"tags": ["todo", "private", "side-project", "app", "bug"],
+                    "repo": "https://github.com/example/app.git", "worker_mode": "auto"}
+      }
+    },
+    "app-player-skip-wired": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - private",
+        "  - side-project",
+        "  - android",
+        "  - app",
+        "  - bug",
+        "status: done",
+        "priority: 70",
+        "worker_mode: manual",
+        "auto_merge: true",
+        "model_tier: standard",
+        "repo: \"https://github.com/example/app.git\"",
+        "parent: \"[[app-project]]\"",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "app-player-skip-wired",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "done",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {"tags": ["todo", "private", "side-project", "android", "app", "bug"],
+                    "repo": "https://github.com/example/app.git", "worker_mode": "manual"}
+      }
+    }
+  },
+  "expect": {
+    "rules": {"app-no-stages": "tag:bug", "app-no-usage": "tag:bug", "app-player-skip-wired": "tag:bug"},
+    "week": [
+      {"project": "app", "kind": "bug", "out_tokens": 70000, "runs": 3, "runs_unmetered": 3,
+       "merged_prs": 0, "done": 1, "cancelled": 0, "failed": 1, "tokens_per_merge": null}
+    ]
+  }
+}

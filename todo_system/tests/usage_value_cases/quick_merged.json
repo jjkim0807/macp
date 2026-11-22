@@ -1,0 +1,92 @@
+{
+  "case": "quick_merged",
+  "source": "Shape of a real quick run of 2026-11-17 (a one-file docs fix in an app repo): stages.json with the single usage.quick record, and quick.md, whose frontmatter has no pr_url — the PR and the merge are body lines (`- PR:`, `- merged: yes — …`). Every value is synthetic.",
+  "runs": [
+    {
+      "name": "20261117T114215-app-doc-weekly-check",
+      "files": {
+        "stages.json": {
+          "account": "acct",
+          "model_tier": "light",
+          "model_tier_reason": "model_tier: light",
+          "usage": {
+            "quick": {"input_tokens": 40, "output_tokens": 12000, "cache_creation_input_tokens": 90000, "cache_read_input_tokens": 1500000, "num_turns": 21, "duration_ms": 300000, "model": "model-b", "session_id": "00000000-0000-4000-8000-000000000011", "total_cost_usd": 1.2}
+          },
+          "completed": ["quick"]
+        },
+        "quick.md": [
+          "---",
+          "stage: quick",
+          "run_id: 20261117T114215-app-doc-weekly-check",
+          "slug: app-doc-weekly-check",
+          "branch: worker/app-doc-weekly-check",
+          "generated: 2026-11-17T12:00:00Z",
+          "overall_status: pass",
+          "no_op: false",
+          "---",
+          "",
+          "# Quick — synthetic title",
+          "",
+          "- change: docs/design.md, one row corrected (synthetic).",
+          "- commit: 0000000 chore(worker): app-doc-weekly-check — synthetic",
+          "- PR: https://github.com/example/app/pull/39",
+          "- checks: `git diff --stat origin/main` -> one docs file (1+/1-).",
+          "- merged: yes — squash merged (synthetic).",
+          "- notes: none."
+        ],
+        "related.md": ["# related", ""]
+      }
+    }
+  ],
+  "tasks": {
+    "app-doc-weekly-check": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - private",
+        "  - worker",
+        "  - app",
+        "  - docs",
+        "status: done",
+        "due: \"-\"",
+        "updated: 2026-11-17",
+        "priority: 40",
+        "parent: \"[[app-project]]\"",
+        "worker_mode: quick",
+        "repo: \"https://github.com/example/app.git\"",
+        "auto_merge: true",
+        "model_tier: light",
+        "outcome: \"synthetic outcome\"",
+        "acceptance_criteria:",
+        "  - \"synthetic criterion\"",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "app-doc-weekly-check",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "done",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {
+          "tags": ["todo", "private", "worker", "app", "docs"],
+          "repo": "https://github.com/example/app.git",
+          "worker_mode": "quick",
+          "auto_merge": true,
+          "model_tier": "light"
+        }
+      }
+    }
+  },
+  "expect": {
+    "rules": {"app-doc-weekly-check": "hint:docs"},
+    "week": [
+      {"project": "app", "kind": "ops", "out_tokens": 12000, "runs": 1, "runs_unmetered": 0,
+       "merged_prs": 1, "done": 1, "cancelled": 0, "failed": 0, "tokens_per_merge": 12000}
+    ]
+  }
+}

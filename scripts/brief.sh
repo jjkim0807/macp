@@ -209,6 +209,28 @@ fi
 
 echo "[$NOW_TS] brief.sh: brief generated at Todo/Briefings/${TODAY}.md"
 
+# Weekly usage-vs-results table (todo_system/usage_value.py). The ENGINE renders
+# it: the brief agent cannot run a command, and the same model feeds /api/status
+# `usage_value`, so the brief and the dashboard show the same numbers. The CLI
+# prints the section only when no brief of the last 7 days carries it yet (one
+# table a week, no state file) and prints nothing on any error. `|| true` is
+# mandatory under `set -euo pipefail`. Appended AFTER the agent wrote the file, so
+# the prompt stays byte-identical and the three lines the notification parser
+# reads sit above it, untouched.
+UV_SECTION=""
+if [[ "$INSTALLED" -eq 1 ]]; then
+  UV_SECTION=$("$MACP_PYTHON" -P -m todo_system.usage_value \
+    brief-section --vault-root "$VAULT_DIR" 2>/dev/null || true)
+elif command -v uv >/dev/null 2>&1; then
+  UV_SECTION=$(uv run --directory "$ENGINE_DIR" python -m todo_system.usage_value \
+    brief-section --vault-root "$VAULT_DIR" 2>/dev/null || true)
+fi
+if [[ -n "$UV_SECTION" ]]; then
+  if printf '\n%s\n' "$UV_SECTION" >> "$BRIEF_DIR/${TODAY}.md"; then
+    echo "[$NOW_TS] brief.sh: appended the weekly usage-vs-results table"
+  fi
+fi
+
 # Push to KakaoTalk if configured. Non-fatal if token missing or push fails.
 if [[ -f "$VAULT_DIR/.secrets/kakao-token.json" ]]; then
   if bash "$ENGINE_DIR/scripts/notify_kakao.sh" 2>>"$LOG_DIR/brief.out.log"; then

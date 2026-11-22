@@ -2922,8 +2922,12 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # triBlock() call in attnRow and humanRow, the [data-act]/.tri click guard, the
 # keydown/input handlers and update()'s typing guard (five new i18n keys); the rest of
 # the page is byte-identical.
-_KO_HTML_SHA256 = "9e191ce52955d15dbf62d58b0e7b1f0e0b1192dbb578a461e0ea63befeab815e"
-_KO_HTML_LEN = 51392
+# 2026-11-22: +1542 bytes = the usage-vs-results card (macp-weekly-usage-value-report):
+# the #c-uv section, uvRow/uvPeriod/setUsageValue, the setUsageValue() call that ends
+# update() and the QSEC entry with its comment line; no new i18n key; the rest of the
+# page is byte-identical.
+_KO_HTML_SHA256 = "81f62346786c14cc04346c9a12798c305fa770e5b70c379596a49fd05a83b867"
+_KO_HTML_LEN = 52934
 _HANGUL = re.compile("[가-힣]")
 
 
