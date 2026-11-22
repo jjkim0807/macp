@@ -379,3 +379,414 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
   이미 있는 클론은 원격을 확인하지 않고 재사용된다
   (`todo_system/orchestrator/repos.py:353-354`). `macp add`가 그 디렉터리의 `origin`을
   읽어 다른 리포면 태스크를 만들지 않고 이유를 말한다.
+
+## ③ 로그인·CLAUDE.md 재사용
+
+### D6 — 로그인: 프로세스 환경을 그대로 물려준다
+
+1인 모드에는 키를 넣는 단계가 없다. 사용자가 평소 쓰는 Claude Code 로그인으로 스테이지가
+돈다. 이것은 엔진이 계정을 설정하지 않았을 때 이미 하는 동작이다.
+
+- 계정·프로필이 없으면 러너의 계정 해석은 `(None, None)`을 돌려주고
+  (`todo_system/orchestrator/runner.py:356-357`), 스테이지 환경은 프로세스 환경의 사본이
+  된다 (`todo_system/orchestrator/runner.py:1170-1183`).
+- `claude_auth.claude_env`도 계정과 토큰 파일이 없으면 환경을 건드리지 않는다
+  (`todo_system/claude_auth.py:129-142`).
+- `auth_source`는 지금 쓰이는 자격증명을 `api-key`·`automation-token`·`keychain-oauth`
+  가운데 하나로 알려 준다 (`todo_system/claude_auth.py:145-152`). `macp status`가 이 값을
+  그대로 보여 준다.
+- 그래서 1인 모드는 프로필·계정을 만들지 않는다(D3). 여러 계정을 쓰려는 사람은 본부와
+  같은 방법(`python -m todo_system.macp account …`)을 쓰면 되고, 그때도 1인 모드 명령은
+  그대로 돈다.
+
+사용량 페이싱은 ⑤의 D9에서 다룬다.
+
+### CLAUDE.md: 엔진이 보장하는 것과 그렇지 않은 것
+
+엔진이 **보장하는** 것은 둘이다.
+
+1. 리포의 `.macp/memory/*.md`가 모든 스테이지 프롬프트 끝에 "Project memory"로 붙는다.
+   러너가 체크아웃에서 읽어 (`todo_system/orchestrator/runner.py:1184-1189`,
+   `todo_system/macp/memory.py:170`) 프롬프트에 넣는다
+   (`todo_system/orchestrator/stages.py:841-843`). 워커는 클론에서 일하므로 **커밋된**
+   메모리만 본다. `macp init`이 "`.macp/`를 커밋하면 워커도 본다"고 안내하는 이유다.
+2. `macp init`이 사용자의 `CLAUDE.md`에 `@.macp/memory/index.md`를 건다
+   (`todo_system/macp/memory.py:19`, `:75-80`). 대화형 세션과 워커가 같은 메모리를 읽게
+   된다.
+
+**보장하지 않는** 것이 하나 있다. 리포 자신의 `CLAUDE.md`를 스테이지가 자동으로 읽는지는
+확인하지 못했다. 스테이지는 볼트를 작업 디렉터리로 삼고
+(`todo_system/orchestrator/runner.py:1590-1591`) 체크아웃에는 `--add-dir`로 닿는다
+(`todo_system/orchestrator/stages.py:867-869`). 그 경로의 `CLAUDE.md`를 Claude Code가
+스스로 읽는지는 Claude Code의 동작이라 이 리포에서 알 수 없다 — **미확인**.
+
+그래서 자동 로드에 기대지 않고 태스크 본문에 적는다. `macp add`는 리포 최상위에
+`CLAUDE.md`·`AGENTS.md`가 있으면 태스크 본문 `## Spec`의 참고 항목에 그 경로를 넣는다.
+5단계 파이프라인의 첫 스테이지는 태스크 파일을 가장 먼저 읽게 돼 있고, 실행 메타데이터에
+경로가 없으면 `Todo/items/<slug>.md`를 읽으라고 적혀 있다
+(`todo_system/prompts/worker-research.md:12-14`). 엔진은 바뀌지 않는다.
+
+**`quick` 레인의 틈.** `quick` 프롬프트는 실행 메타데이터에서 `outcome`·`next_action`을
+읽으라고 한다 (`todo_system/prompts/worker-quick.md:9-10`). 그런데 메타데이터에는 그 둘도,
+태스크 파일 경로도 없다 (`todo_system/orchestrator/stages.py:737-752`). 본부에서는
+스테이지의 작업 디렉터리인 볼트에 `CLAUDE.md`가 있어 볼트 구조를 알려 준다. 작업
+디렉터리의 `CLAUDE.md`가 `claude -p`에 실린다는 것은 엔진에 기록돼 있다
+(`todo_system/orchestrator/model_select.py:147-151`). 1인 모드 볼트에는 그 파일이 없다
+(`vault-template/`에 없다). 2단계가 `vault-template/`에 몇 줄짜리 `CLAUDE.md`를 둔다:
+태스크는 `Todo/items/<slug>.md`에 있고 런 산출물은 `Worker/runs/<run-id>/`에 쓴다는 것.
+데이터 파일 하나이고, 이미 만들어진 볼트에는 영향이 없다. `quick` 스테이지가 이 안내
+없이도 태스크 파일을 찾아 읽는지는 확인하지 않았다 — **미확인**.
+
+## ④ macp add
+
+### D7 — 모델에게는 JSON만 받고, 나머지는 CLI가 한다
+
+`macp add "<자연어>"`는 `claude -p`를 **한 번** 부른다. 모델은 파일을 쓰지 않고 JSON 객체
+하나만 돌려준다. 이유는 셋이다: 가짜 `claude`로 테스트할 수 있고, 도구 권한이 필요 없고,
+스키마로 검사할 수 있다.
+
+**호출 모양.** 엔진의 모델 확인 호출과 같은 꼴을 쓴다
+(`todo_system/orchestrator/model_select.py:161-164`).
+
+- 인자: `claude -p <프롬프트> --model <모델> --effort <effort> --max-turns 1`. 모델과
+  effort는 light 단계의 값이다: `stages.stage_model("quick", "light")`,
+  `stages.stage_effort("quick", "light")` (`todo_system/orchestrator/stages.py:86-102`).
+- 환경: `claude_auth.claude_env()` (`todo_system/claude_auth.py:111`).
+- 작업 디렉터리: 빈 임시 디렉터리. 지침 파일이 있는 디렉터리에서 1턴 호출을 하면 모델이
+  일을 시작해 턴 제한에 걸린다는 것이 확인 호출에서 이미 드러났다
+  (`todo_system/orchestrator/model_select.py:147-151`).
+- 제한 시간은 모듈 상수로 둔다. JSON이 깨졌으면 한 번만 다시 부른다.
+
+**프롬프트에 넣는 것.** 사용자의 문장, 리포 이름, 최상위에서 추적되는 항목 이름
+(`git ls-files`에서 앞부분만), `CLAUDE.md`·`AGENTS.md` 유무. 모델이 완료 조건에 그
+리포에서 실제로 돌릴 명령(`uv run pytest`, `npm test` …)을 적을 수 있게 하려는 것이다.
+판단 규칙은 기존 `/todo` 명령의 것을 옮긴다 (`.claude/commands/todo.md:12-29`): 슬러그,
+한 줄 `outcome`, 지금 할 `next_action`, 구체적인 `if_then`, 로컬 명령으로 쓴
+`acceptance_criteria`, 건드릴 파일 `touches`. 프롬프트 파일은
+`todo_system/prompts/` 아래에 둔다.
+
+**누가 어느 필드를 채우나.**
+
+| 모델이 채운다 | CLI가 채운다 |
+|---|---|
+| `slug`, 제목, `outcome`, `next_action`, `if_then`, `acceptance_criteria[]`, `worker_mode`(`quick` 또는 `auto`), `estimate_p50`·`estimate_p90`, `touches[]`, 분류 태그 | `status: open`, `due: "-"`, `updated`, `review_cycle: "-"`, `priority`, `repo`, `auto_merge: false`, `worker_branch`, 본문 |
+
+**CLI가 고정하는 값과 이유.**
+
+- `auto_merge: false`를 **명시한다.** 이 필드가 없으면 기본이 참이다
+  (`todo_system/cli.py:98`, `:1051`; `todo_system/orchestrator/tasks.py:176-179`;
+  `todo_system/orchestrator/runner.py:475-486`). 첫 실행이 사용자 저장소의 기본 브랜치를
+  바꾸지 않게 하려는 것이고, 문서의 기존 권고와 같다 (`docs/getting-started.md:171-172`,
+  `SECURITY.md:16-17`). 사용자가 태스크 파일에서 `true`로 바꾸면 본부와 같은 자동 머지가
+  된다. 새 스위치는 없다.
+- `allowed_tools`를 **넣지 않는다.** 태스크가 이 필드를 주면 implement 스테이지의 기본
+  목록이 통째로 바뀐다 (`todo_system/orchestrator/stages.py:510-517`). 기존 템플릿의 값
+  (`vault-template/Todo/templates/auto-worker-task-template.md:37`)에는
+  `npm`·`pnpm`·`node`·`npx`가 없어서, 그대로 쓰면 기본 목록
+  (`todo_system/orchestrator/stages.py:379-382`)보다 좁아진다. 넣지 않으면 검증기도 이
+  항목을 건너뛴다 (`todo_system/task_validate.py:294-295`).
+  이 필드는 implement에만 적용된다 (`todo_system/orchestrator/stages.py:458`). `quick`
+  레인은 언제나 자기 기본 목록을 쓴다 (`todo_system/orchestrator/stages.py:390-392`).
+- 그래서 기존 `auto-worker` 템플릿을 쓰지 않고 1인 모드용 템플릿 파일(데이터)을 따로
+  둔다. 템플릿의 자리표시를 값으로 바꾸는 방식은 `cmd_new`가 선례다
+  (`todo_system/cli.py:1364-1371`).
+- 새 태스크는 `blocked`가 아니라 바로 실행 가능한 모드로 만든다. 기존 템플릿이
+  `blocked`로 시작하는 이유는 반쯤 쓴 파일이 디스패치되는 것을 막으려는 것인데
+  (`vault-template/Todo/templates/auto-worker-task-template.md:23-26`), 아래처럼 임시
+  이름에 쓰고 이름을 바꾸면 그런 순간이 없다.
+
+**태스크 본문.** `# <제목>` 아래 `## Spec`에 다음을 적는다: 목표(`outcome`과 같은 말),
+사용자가 친 문장 그대로, 참고(`CLAUDE.md`·`AGENTS.md` 경로), 그리고 한 줄 —
+"`auto_merge: false`는 `macp add`의 기본값이다. 결과를 사람이 검토해 머지한다는 뜻이고,
+안전·금융 경로라는 표시가 아니다." 마지막 줄이 필요한 이유: `quick` 프롬프트는
+`auto_merge: false`가 안전·금융 사유로 붙은 태스크를 만나면 실패로 멈추라고 한다
+(`todo_system/prompts/worker-quick.md:55-61`). 사유를 적어 두지 않으면 모델이 그 규칙을
+잘못 적용할 수 있다.
+
+**순서.**
+
+1. 현재 디렉터리가 등록된 리포 안인지 확인한다. 아니면 "`macp init`을 먼저"라고 말하고
+   끝낸다.
+2. `claude -p` 호출 → 출력에서 JSON 객체를 꺼낸다.
+3. 스키마 검사: 타입, `worker_mode` 값, 슬러그 형식(소문자·숫자·하이픈), 목록의 각 항목이
+   빈 문자열이 아닌지, 값이 한 줄인지. 슬러그가 이미 있으면 뒤에 번호를 붙인다.
+4. 파일 렌더. 문자열 값은 큰따옴표로 감싸고 이스케이프한다. 이 파서는 값 뒤의 `#`를
+   주석으로 떼지 않는다 (`todo_system/task_validate.py:369-387`).
+5. `Todo/items/<slug>.md.part`에 쓰고 `os.replace`로 이름을 바꾼다.
+6. `task_validate.validate_file` (`todo_system/task_validate.py:497`). 오류가 있으면
+   파일을 지우고 실패한다. 경고는 개수만 알린다.
+7. `db_connect` → `init_db` → `import_markdown_to_db`로 `todo.db`에 넣는다
+   (`todo_system/cli.py:1253-1256`).
+8. 볼트에서 그 파일만 `git add`하고 커밋한다.
+9. 한 줄로 알린다: 슬러그, 레인, `outcome`, 그리고 다음에 칠 명령 `macp up --once`.
+
+**실패할 때.** 원시 예외를 보여 주지 않는다. 경우마다 한 줄이고 `i18n`의 기존 방식
+(`todo_system/i18n.py:23`, `:904`; 언어는 `todo_system/paths.py:690`)으로 영어·한국어를
+둔다: `claude`를 찾을 수 없음 / 로그인되지 않음 / 시간 초과 / 응답이 JSON이 아님 / 스키마
+위반(어느 필드인지) / 등록된 리포 밖 / 같은 이름의 다른 리포가 이미 워커 루트에 있음.
+
+**이번 범위 밖.** 리포 밖에서 만드는 볼트 태스크, `delegate`·`manual` 모드 태스크. 그런
+태스크는 지금처럼 `macp new`로 만들 수 있다.
+
+### 검증기가 보는 것
+
+`validate_file`은 frontmatter가 엄격한 YAML로 읽히는지 본 뒤
+(`todo_system/task_validate.py:499-501`) 워커가 읽는 필드를 검사한다
+(`todo_system/task_validate.py:290`). `repo`가 있고 실행 가능한 모드인데 `touches`가
+없으면 경고한다 (`todo_system/task_validate.py:408-425`) — 그래서 모델에게 `touches`를
+받는다. 확인 실행 3에서 위 모양의 파일은 지적 0건이었다.
+
+## ⑤ macp up
+
+### D8 — 단일 스레드 루프, 전부 기존 호출
+
+`macp up`은 시작하면서 세 가지를 한다.
+
+- 볼트로 `chdir`한다. 틱 스크립트와 유닛이 그렇게 돈다
+  (`scripts/orchestrator_tick.sh:50`; 유닛의 `WorkingDirectory`
+  `scripts/systemd/gen_units.py:119`, `:129`). 현재 디렉터리 기준 상대 경로를 쓰는 곳이
+  아직 있어서다 (`todo_system/orchestrator/runner.py:600`,
+  `todo_system/orchestrator/mailbox.py:39`).
+- `Worker/up.lock`을 기존 `Lease` 클래스로 잡는다
+  (`todo_system/orchestrator/lease.py:85-89`, `:217`). 살아 있는 다른 `macp up`이 잡고
+  있으면 "이미 도는 루프가 처리한다"고 말하고 0으로 끝난다. 서비스를 띄워 둔 사람이
+  습관대로 `macp up --once`를 쳐도 러너가 둘이 되지 않는다. 죽은 프로세스의 잠금은 같은
+  호스트에서 바로 회수된다 (`todo_system/orchestrator/lease.py:147-160`). 긴 런 동안
+  갱신하지 못하므로 만료 시간은 길게 준다(생성자 인자 `ttl`).
+- 메일박스 주소는 `file://<볼트>/Worker/agents`다. 본부의 유닛과 틱이 쓰는 것과 같다
+  (`scripts/systemd/gen_units.py:195`, `scripts/orchestrator_tick.sh:54-58`). 엔진 CLI의
+  기본값 `git://`는 메시지마다 볼트에 커밋한다
+  (`todo_system/orchestrator/orchestrator.py:3608`,
+  `todo_system/orchestrator/mailbox.py:358`).
+
+**`macp up --once`가 하는 일.**
+
+| 순서 | 하는 일 | 호출 |
+|---|---|---|
+| 1 | 태스크 파일이 바뀌었으면 DB에 반영 | `import_markdown_to_db` (`todo_system/cli.py:1212`). 본부에서는 todo-sync 유닛이 하는 일이다 (`todo_system/cli.py:1395`, `:1433-1447`) |
+| 2 | 틱: 라우팅·디스패치 | `orchestrator._main(["--uri", <주소>, "--lease", "<볼트>/Worker/orchestrator.lock", "auto", "--db", "<볼트>/Todo/todo.db"])` — 틱 스크립트의 인자 그대로 (`scripts/orchestrator_tick.sh:54-63`) |
+| 3 | 러너 한 번: 받은 태스크의 파이프라인을 끝까지 실행 | `runner._main(["--agent", "worker-default", "--mode", "live-staged", "--uri", <주소>, "--once"])` (`todo_system/orchestrator/runner.py:3283-3292`). 인자는 러너 유닛과 같고 `--daemon`만 `--once`다 (`scripts/systemd/gen_units.py:195`) |
+| 4 | 수거 | `orchestrator._main(["--uri", <주소>, "collect"])` (`todo_system/orchestrator/orchestrator.py:3726-3729`) |
+| 5 | 틱: 닫기·정리 | 2와 같은 호출 |
+| 6 | 태스크 파일 변경 커밋 | 볼트에서 `Todo/items/`에 변경이 있을 때만 커밋 한 번 |
+| 7 | 상태 | `macp status`와 같은 출력 |
+
+**4번이 따로 있는 이유.** 틱은 수거보다 **먼저** 오래 소식이 없는 진행 중 행을 실패로
+돌린다 (`todo_system/orchestrator/orchestrator.py:3190`, `:3218`). 한도는 그 태스크의
+스테이지 제한 시간에 900초를 더한 값이다
+(`todo_system/orchestrator/orchestrator.py:2024-2041`, `:2070-2077`). 본부에서는 런이 도는
+동안에도 5분마다 틱이 돌아 스테이지 사이의 진행 메시지를 수거하므로 행이 계속 갱신된다.
+단일 스레드에서는 런이 도는 동안 틱이 없다. 그래서 스테이지가 여럿인 런이 한도보다 오래
+걸리면, 끝난 런을 다음 틱이 죽은 것으로 보고 결과를 버린다. 러너가 돌아온 직후에
+`collect`를 먼저 부르면 응답이 먼저 적용되고, 그 뒤의 틱은 그 행을 진행 중으로 보지 않는다.
+이 순서는 코드를 읽어 정한 것이다. 2단계가 테스트로 고정한다.
+
+**6번이 있는 이유.** 오케스트레이터는 끝난 태스크의 파일을 닫는다(확인 실행에서
+`status: done`으로 바뀐 것을 봤다). 본부에서는 maintenance가 볼트 변경을 커밋한다
+(`todo_system/worker.py:2494`, `:2597`). 그 함수는 push까지 하므로 원격 없는 볼트에서는
+쓰지 않고, 태스크 디렉터리만 커밋하는 몇 줄을 둔다. 원장·메일박스 같은 런타임 파일은
+`.gitignore`로 뺀다(②의 D5).
+
+**`macp up`(루프).** 같은 호출을 반복한다. 러너는 한 번 만들어 계속 쓴다
+(`todo_system/orchestrator/runner.py:3220-3221`, `:3286-3287`).
+
+- 15초마다 메일박스를 본다(러너의 기본 간격 `todo_system/orchestrator/runner.py:3251`).
+  사용량 가드가 막고 있으면 `bypass_guard` 태스크만 처리한다 — 러너의 직렬 분기와 같은
+  분기다 (`todo_system/orchestrator/runner.py:3181-3194`).
+- 틱은 세 경우에 돈다: 태스크 파일이 바뀌었을 때(`snapshot_mtime` 비교
+  `todo_system/cli.py:1122`, `:1435-1443`), 러너가 무언가를 처리했을 때(수거 먼저), 마지막
+  틱에서 5분이 지났을 때(본부의 틱 간격 `scripts/systemd/gen_units.py:208`).
+- 간격은 모듈 상수다. 환경변수나 설정 키로 꺼내지 않는다.
+
+**띄우지 않는 것.**
+
+| 본부의 유닛 | 1인 모드 | 이유 |
+|---|---|---|
+| todo-sync (`scripts/systemd/gen_units.py:217-222`) | 루프 안의 1번 | 같은 함수 |
+| planner (`:209-212`) | 띄우지 않음 | 큐가 비면 스스로 태스크를 만든다. 새 사용자가 시키지 않은 일이다 |
+| maintenance (`:213-216`) | 띄우지 않음 | 엔진 자기 갱신과 볼트 push. 설치본에는 갱신할 체크아웃이 없고 볼트에는 원격이 없다 |
+| brief·health (`:232-238`) | 띄우지 않음 | 첫 PR에 필요 없다 |
+| dashboard (`:226-231`) | `macp dashboard`를 칠 때만 | |
+
+알림은 설정 파일이 없으면 침묵한다 (`README.md:131-134`). 호스트 가드는 표식 파일이 없으면
+통과한다 (`todo_system/orchestrator/hq_host.py:49-50`). 일일 실행 한도와 리포별 동시 실행
+수는 프로필이 없을 때의 기본값을 그대로 쓴다
+(`todo_system/orchestrator/orchestrator.py:3698`; 확인 실행에서 프로필 없이 디스패치됐다).
+
+**원격 없는 볼트와 `_pull_main`.** 틱의 `auto`는 볼트에서 `git fetch origin main`을 한다
+(`todo_system/orchestrator/orchestrator.py:3684-3689`). 볼트가 git 리포가 아니면 조용히
+끝나지만 (`:3405-3407`), git 리포이고 원격이 없으면 세 번 시도하고 그 사이 1초씩 쉰 뒤
+오류처럼 보이는 줄을 찍는다 (`:3409-3415`, `:3450`; 확인 실행 6). 2단계가 여기에 가장 작은
+변경을 넣는다: **첫 fetch가 실패했고 `origin` 원격이 없으면 재시도 없이 조용히 끝낸다.**
+이 확인을 fetch 실패 뒤에 두면 원격이 있는 볼트에서는 git 호출 순서가 지금과 한 줄도
+다르지 않다(이 함수의 테스트는 git 호출을 가짜로 바꿔 순서를 본다 —
+`todo_system/orchestrator/orchestrator.py:3361`). 바로 뒤의 `_check_divergence`는 실패해도
+아무것도 찍지 않으므로 그대로 둔다 (`:3476-3488`).
+
+버린 선택지: 러너를 스레드로 돌리고 틱을 타이머로 돌리기. 본부와 더 비슷하지만 스레드와
+종료 처리가 늘어난다. 1인 모드는 동시 실행이 1이고(`vault-template/Worker/agents/registry.yaml:24`),
+위의 수거 순서로 스레드 없이 같은 결과를 얻는다.
+
+### D9 — `--once`는 페이싱 없이 바로 돈다
+
+사용량 가드는 Claude 구독의 5시간·주간 사용률을 읽어 자동화가 페이스를 앞서면 디스패치를
+보류한다 (`docs/getting-started.md:50-52`). 1인 모드는 두 경우를 나눈다.
+
+| 실행 | 가드 | 방법 |
+|---|---|---|
+| `macp up --once` | 끈다 | 사용자가 `USAGE_GUARD_DISABLE`를 직접 주지 않았을 때만, 엔진 import 전에 프로세스 환경에 `1`을 넣는다 |
+| `macp up`, `--service` | 켠다 | 아무것도 하지 않는다. 본부와 같은 판정이다 |
+
+이유:
+
+- 가드는 쿼터가 남아 있어도 보류한다. 기준이 "창이 지난 비율보다 사용률이 얼마나
+  앞섰나"이기 때문이다 (`todo_system/usage_guard.py:126-137`). Claude Code를 평소 많이 쓰는
+  사람 — 1인 모드의 대상 — 일수록 첫 실행에서 `USAGE-HOLD`를 볼 가능성이 높고, 풀리는
+  시각은 며칠 뒤일 수 있다. 지금 README도 이 때문에 5분 체험에서 가드를 끄게 한다
+  (`README.md:88`, `README.md:107-109`).
+- 런이 이미 도는 중에도 5시간 창이 80%를 넘으면 다음 스테이지 앞에서 기다린다
+  (`todo_system/usage_guard.py:164`, `:178-205`). 이 대기는 최대 5시간 반이다
+  (`todo_system/orchestrator/runner.py:2257-2303`). 포그라운드 명령이 그동안 멈춰 있게
+  된다.
+- 가드가 지키는 것은 "사람이 없는 동안 자동화가 사람 몫의 쿼터를 다 쓰는 일"이다. `--once`는
+  사람이 방금 치고 지켜보는 한 번의 실행이다. 대화형 세션과 같은 처지이고, 막아서 지킬
+  되돌릴 수 없는 것이 없다.
+- 한도가 실제로 찼으면 `claude`가 그렇게 말하고, 러너는 그것을 결함이 아닌 보류로 처리한다
+  (`todo_system/orchestrator/runner.py:1720-1766`). `macp up --once`는 그 이유를 보여 준다.
+
+끄는 스위치는 기존 것이다 (`todo_system/usage_guard.py:1115-1120`). 이 값이 있으면 가드는
+조회도 상태 기록도 하지 않으므로, 같은 볼트를 쓰는 다른 프로세스의 판정을 흐리지 않는다.
+README 초안은 이 차이를 한 문장으로 알린다.
+
+버린 선택지: 항상 켜 두기(위 첫 두 항목 때문에 "5분 안에"를 지킬 수 없는 사용자가 생긴다),
+`macp add`가 태스크마다 `bypass_guard: true`를 넣기(루프와 서비스에서도 페이싱이 꺼진다).
+
+### D10 — 끝 상태: PR 또는 로컬 브랜치, 머지는 사람
+
+공통 경로는 이렇다. `auto_merge: false`이면 러너는 이 태스크를 "검토 필요"로 본다
+(`todo_system/orchestrator/runner.py:489-502`). 파이프라인이 성공하면 응답에
+`review_required: true`가 실리고 (`:1998-1999`), 수거가 그 행을 사람 대기로 둔다
+(`todo_system/orchestrator/orchestrator.py:1334-1337`). `macp status`는 이것을 실패가
+아니라 **검토 대기**로 보여 준다.
+
+| | URL 원격 + `gh` 로그인 | URL 원격, `gh` 없음 | 경로 원격(원격 없음) |
+|---|---|---|---|
+| 워커가 남기는 것 | 원격의 `worker/<slug>` + 열린 PR | 원격의 `worker/<slug>` | 사용자 리포의 로컬 브랜치 `worker/<slug>` |
+| 근거 | `todo_system/prompts/worker-quick.md:21-22`, `:42`; `todo_system/prompts/worker-report.md:183-225`, `:343-345` | `todo_system/prompts/worker-report.md:248` | 확인 실행 7 |
+| 사람이 하는 일 | PR을 검토해 머지 | 브랜치를 보고 PR을 열거나 머지 | `git diff main...worker/<slug>` → `git merge worker/<slug>` → `macp complete <slug>` |
+| 태스크가 닫히는 경로 | 다음 틱이 머지된 PR을 보고 닫는다 (`todo_system/orchestrator/orchestrator.py:2263-2269`, `:2330-2331`) | 태스크 파일을 닫으면 다음 틱이 행을 정리한다 (`:2279`, `:2306`) | 왼쪽과 같음 |
+
+- `macp complete`는 기존 동사다 (`todo_system/cli.py:861`, `:2048`). 리포 안에서 치면 D4의
+  `vault_root` 키로 볼트를 찾는다.
+- 두 닫힘 경로 모두 `reconcile_merged`이고 틱마다 돈다
+  (`todo_system/orchestrator/orchestrator.py:2210`, `:3226`).
+- 경로 원격에서 사용자가 `worker/<slug>`를 체크아웃해 둔 동안 워커가 같은 브랜치로 다시
+  push하면 git이 거부한다(확인 실행 8). 검토는 `git diff`나 별도 워크트리로 하라고
+  안내한다.
+
+**2단계가 메워야 할 틈 둘.**
+
+1. **경로 원격에서의 `gh`.** `quick` 프롬프트는 push 뒤 `gh pr create`를 전제한다
+   (`todo_system/prompts/worker-quick.md:21-22`). report 프롬프트는 `gh`가 없을 때만
+   다룬다 (`todo_system/prompts/worker-report.md:248`). 경로 원격에서는 `gh`가 있어도
+   리포를 찾지 못한다. → `stages.build_stage_argv`의 외부 리포 분기
+   (`todo_system/orchestrator/stages.py:825-831`)에 **`repo`가 URL이 아닐 때만** 붙는 줄을
+   하나 더한다: "origin은 로컬 경로다. 브랜치를 push하고 멈춘다. `gh`를 부르지 않는다. PR
+   주소는 없다고 적는다. push된 브랜치가 결과물이다." 메타데이터가 프롬프트 뒤에 붙어
+   프롬프트의 문구를 이기는 것은 선례가 있다 (`todo_system/orchestrator/stages.py:655-668`).
+   URL 판정은 러너의 것과 같은 식을 쓴다
+   (`todo_system/orchestrator/runner.py:700-704`). URL `repo`에서는 조건이 참이 될 수 없어
+   본부의 스테이지 인자는 한 글자도 달라지지 않는다.
+2. **`quick` 런의 끝점 보장과 PR 주소.**
+   - 5단계 파이프라인은 implement가 끝나는 즉시 러너가 브랜치를 origin으로 밀어 둔다
+     (`todo_system/orchestrator/runner.py:1774-1826`). `quick`에는 그 단계가 없어 push가
+     모델의 몫이다. 성공한 런의 워크트리는 지워지지만 (`:1451-1456`) 브랜치는 공유 클론에
+     남는다. `macp up`은 검토 대기로 끝난 **경로 원격** 태스크에 한해, 사용자 리포에
+     브랜치가 없으면 공유 클론에서 `stages.checkpoint_push`를 한 번 부른다
+     (`todo_system/orchestrator/stages.py:2091`; 빨리감기만 하고 예외를 내지 않는다). URL
+     원격에는 쓰지 않는다 — 머지된 브랜치를 다시 밀어 올리는 사고가 기록돼 있다
+     (`todo_system/orchestrator/runner.py:1635-1640`).
+   - `quick` 런의 응답에는 PR 주소가 실리지 않는다. 러너는 `report.md`에서만 주소를 읽고
+     (`todo_system/orchestrator/runner.py:1981-1997`), `quick`은 `quick.md`에 적는다
+     (`todo_system/prompts/worker-quick.md:82`). `macp status`는 검토 대기 행의 런
+     디렉터리에서 그 줄을 읽어 보여 준다. 태스크 하나의 현재 상태를 찍는 기존 명령 `trace`
+     (`todo_system/orchestrator/orchestrator.py:3630-3634`, `:3749-3753`)가 이것을 이미
+     보여 주는지는 읽지 못했다 — **미확인**.
+
+실패했을 때: 검증이 실패하면 오케스트레이터가 한도 안에서 다시 보낸다
+(`todo_system/orchestrator/orchestrator.py:1385-1387`). `--once`에서는 다음 `macp up` 때다.
+모델이 사람의 결정을 요청하면 사람 대기가 된다 (`:1332-1333`).
+
+### D11 — 첫 태스크의 파이프라인과 5분
+
+레인은 둘이고 둘 다 기존 것이다 (`todo_system/orchestrator/runner.py:292-309`).
+
+| | `quick` | `auto` |
+|---|---|---|
+| `claude -p` 호출 수 | 1 (`todo_system/orchestrator/stages.py:165`) | 5 (`todo_system/orchestrator/stages.py:163`) |
+| 모델 단계 | light (`todo_system/orchestrator/model_select.py:394-396`) | 태그·추정 시간으로 정해지고 기본은 standard (`:399-406`) |
+| 턴 한도 | 120 | 스테이지마다 40~200 (`todo_system/orchestrator/stages.py:405-409`) |
+| 스테이지 제한 시간 | 60분 | 단계에 따라 60~180분 (`todo_system/orchestrator/stages.py:126`) |
+| 문서가 말하는 소요 | — | "몇 분에서 한 시간 이상" (`docs/getting-started.md:183-185`) |
+
+`macp add`의 프롬프트는 작고 목적이 하나인 변경은 `quick`, 설계가 필요하거나 여러 파일에
+걸친 변경은 `auto`로 고르게 한다. `quick`으로 받은 일이 작지 않으면 그 스테이지가 실패로
+멈추고 5단계로 보내라고 적는다 (`todo_system/prompts/worker-quick.md:52-54`).
+
+`quick`의 도구 목록에는 `gh`와 몇 가지 빌드 실행기만 있다
+(`todo_system/orchestrator/stages.py:276-279`, `:390-392`). `cargo`·`go`·`make`는 없다.
+README 초안의 첫 태스크를 문서 한 줄 고치기로 잡은 이유다.
+
+5분은 **목표**다. 이 문서를 쓰며 잰 것은 엔진이 쓰는 시간뿐이다.
+
+| 구간 | 목표 | 잰 것 |
+|---|---|---|
+| `macp init` | 10초 이내 | 볼트 만들기 0.04초 + 엔진 import 약 2초. 로그인 확인의 실제 호출 1번은 재지 않았다 |
+| `macp add` | 60초 이내 | 검증·DB 반영 0.12초. 모델 호출 1번은 재지 않았다 |
+| `macp up --once` | 4분 이내 (`quick`, 문서 수정 크기) | 엔진 호출 4번 4.2초(그 가운데 약 4.1초는 위에서 없애기로 한 `_pull_main` 대기). 스테이지의 모델 시간은 재지 않았다 |
+
+실제 값을 재는 방법은 ⑩에 있다.
+
+## ⑥ --service
+
+### D12 — 유닛 하나, 기존 렌더러
+
+`macp up --service`는 `systemd --user` 유닛 `macp-up.service` 하나를 쓰고 켠다.
+
+1. D4대로 볼트를 환경에 넣은 뒤 `scripts/systemd/gen_units.py`를 경로로 import한다. 이
+   파일은 패키지 모듈이 아니다. 엔진 루트 아래 `scripts/systemd/`에 있고
+   (`todo_system/paths.py:191`), 볼트·로그·유닛 디렉터리를 import 시점에 환경에서 읽는다
+   (`scripts/systemd/gen_units.py:51-52`, `:59-63`).
+2. `write_env()`를 부른다 (`scripts/systemd/gen_units.py:262-276`). `service()`가 그리는
+   유닛은 `EnvironmentFile=~/.config/macp/env`를 항상 갖고 (`:129`), 그 파일이 없으면
+   유닛이 뜨지 않는다. `write_env()`는 없을 때만 만든다.
+3. `service("macp-up", …, kind="simple", restart="always")`로 유닛 본문을 그린다
+   (`scripts/systemd/gen_units.py:119-147`).
+   - `ExecStart`: 지금 도는 인터프리터의 절대 경로로 `-P -m todo_system._entry up`. 설치
+     모드 유닛과 같은 꼴이다 (`scripts/systemd/gen_units.py:179`, `:189`).
+   - `Environment=MACP_VAULT_ROOT=<볼트>` 한 줄을 붙인다. 설치 모드 유닛이 그렇게 한다
+     (`:178`, `:188`).
+   - 작업 디렉터리는 볼트, 로그는 `<볼트>/logs/macp-up.out.log`와 `.err.log`다
+     (`:129`, `:133-134`).
+4. 유닛 파일을 쓰고 `systemctl --user daemon-reload`, `enable --now macp-up.service`를
+   부른다 (같은 호출 `scripts/systemd/gen_units.py:314-325`).
+5. 안내 두 줄을 찍는다. 로그아웃 뒤에도 돌리려면 `loginctl enable-linger`가 필요하다
+   (`docs/running.md:42`) — 실행하지는 않는다. 끄는 법은 `systemctl --user disable --now
+   macp-up.service`다.
+
+`build()`에는 넣지 않는다 (`scripts/systemd/gen_units.py:163-239`). 본부용 유닛 집합은
+지금 그대로 13개 파일이고 출력도 그대로다.
+
+주의할 점 둘:
+
+- `write_env()`가 만드는 환경 파일의 `PATH`는 `~/.local/bin:/usr/local/bin:/usr/bin:/bin`
+  이다 (`scripts/systemd/gen_units.py:102`). `claude`·`gh`가 다른 곳에 설치돼 있으면
+  서비스는 찾지 못한다. `--service`는 `claude`의 위치가 그 `PATH`에 없으면 환경 파일을
+  고치라고 알려 준다(고쳐 주지는 않는다 — 그 파일에는 사람이 넣은 값이 있을 수 있어
+  `write_env()`도 덮어쓰지 않는다 `:245-246`).
+- 서비스는 루프이므로 사용량 가드가 켜져 있다(D9).
+
+macOS: launchd 설치 스크립트가 있지만 프로세스마다 하나씩이다
+(`scripts/install_runner_launchagent.sh` 등, `docs/running.md:53-59`). 단일 루프용으로 다시
+쓸 수 있는지는 본문을 읽지 못했다 — **미확인**, 후속 과제다. 그동안 macOS에서는
+포그라운드 `macp up`을 쓴다.
