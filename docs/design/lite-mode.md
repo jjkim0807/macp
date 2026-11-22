@@ -790,3 +790,373 @@ macOS: launchd 설치 스크립트가 있지만 프로세스마다 하나씩이�
 (`scripts/install_runner_launchagent.sh` 등, `docs/running.md:53-59`). 단일 루프용으로 다시
 쓸 수 있는지는 본문을 읽지 못했다 — **미확인**, 후속 과제다. 그동안 macOS에서는
 포그라운드 `macp up`을 쓴다.
+
+## ⑦ Claude Code 플러그인
+
+### 로컬에서 확인한 형식
+
+Claude Code가 설치해 둔 공식 마켓플레이스 체크아웃
+(`~/.claude/plugins/marketplaces/claude-plugins-official/`)에서 읽은 것만 적는다. 이
+런에서는 `claude` 실행도 웹 접근도 할 수 없었다.
+
+| 무엇 | 확인한 내용 | 읽은 곳 (그 체크아웃 기준) |
+|---|---|---|
+| 플러그인의 구조 | `.claude-plugin/plugin.json`(필수), `skills/`·`commands/`·`agents/`·`.mcp.json`(선택) | `README.md:30-43` |
+| `plugin.json`의 필드 | `name`, `description`, `author{name,…}` | `plugins/example-plugin/.claude-plugin/plugin.json` |
+| 사용자가 부르는 스킬 | `skills/<이름>/SKILL.md`, frontmatter `name`·`description`·`argument-hint`·`allowed-tools`. `/<이름>`으로 부른다 | `plugins/example-plugin/README.md:23-46` |
+| `commands/*.md` | 옛 형식. 스킬과 똑같이 읽히고 파일 배치만 다르다. 본문에서 `$ARGUMENTS`를 쓴다 | `plugins/example-plugin/README.md:48-50`, `plugins/example-plugin/commands/example-command.md:1-15` |
+| 마켓플레이스 | 리포 루트의 `.claude-plugin/marketplace.json`. 머리에 `$schema`·`name`·`description`·`owner`, 그리고 `plugins[]` | `.claude-plugin/marketplace.json:1-21` |
+| `plugins[]` 항목 | `name`·`description`·`author`·`category`·`source`·`homepage`. 같은 리포 안의 플러그인은 `"source": "./plugins/<이름>"` | `.claude-plugin/marketplace.json:54-64` |
+| 설치 | `/plugin install <플러그인>@<마켓플레이스>` | `README.md:16` |
+| 이름 | 플러그인 `name`은 바꿀 수 없는 식별자다 | `README.md:45-58` |
+| 스킬의 등록 이름 | `<플러그인>:<스킬>` | `README.md:87` |
+
+공식 문서 주소는 그 README가 가리키는 둘이다: `https://code.claude.com/docs/en/plugins`,
+`https://code.claude.com/docs/en/plugin-marketplaces`.
+
+### D13 — 배치와 스킬 하나
+
+```
+.claude-plugin/marketplace.json              마켓플레이스 "macp". plugins[0] = { "name": "macp", "source": "./plugins/macp", … }
+plugins/macp/.claude-plugin/plugin.json      name · description · author
+plugins/macp/skills/macp/SKILL.md            사용자가 부르는 스킬 하나
+plugins/macp/README.md
+```
+
+- 로컬에서 본 "같은 리포의 상대 경로" 꼴을 그대로 쓴다. 리포 루트 자체를 플러그인으로
+  쓰는 꼴은 보지 못해 고르지 않는다.
+- 스킬은 하나(`macp`)다. 본문은 "`macp $ARGUMENTS`를 실행하고 출력을 그대로 전한다"뿐이다.
+  여섯 동사를 그대로 넘기므로 플러그인에는 로직이 없다(3단계 완료 조건). `macp`가 PATH에
+  없으면 ②의 설치 줄을 안내한다. 플러그인은 Python을 싣지 않는다.
+- `up`은 오래 걸린다. 스킬은 그것을 백그라운드로 실행하고 `macp status`로 확인하라고
+  안내한다. 세션에서 긴 명령을 다루는 방법이지 CLI 로직의 복제가 아니다. 세션의 명령 제한
+  시간이 실제로 어떻게 걸리는지는 **미확인**이라 3단계가 정한다.
+- 이 리포에는 이미 `/macp` 프로젝트 명령이 있다 (`.claude/commands/macp.md`: 프로젝트
+  등록과 진행 기록). 그대로 둔다. 플러그인 쪽은 `/macp:macp …`로 항상 닿는다. 다른
+  프로젝트에서 맨이름 `/macp add …`가 플러그인 스킬로 풀리는지, 둘 다 있을 때 무엇이
+  이기는지는 **미확인**.
+- 3단계가 건드릴 곳: `.claude-plugin/**`, `plugins/macp/**`, `README.md`·`README.ko.md`,
+  스킬 본문에 CLI 호출만 있는지 보는 테스트 하나. 3단계 태스크의 `touches`는 지금
+  `.claude-plugin/`뿐이라 넓혀야 한다. `plugins/`는 격리 게이트의 아카이브 목록
+  (`scripts/check_engine_isolation.sh:81-83`) 밖이다.
+
+**미확인 — 3단계가 CLI와 공식 문서로 확정한다.**
+
+- `/plugin marketplace add <소유자>/<리포>` 문법. 3단계 태스크의 완료 조건이 이 꼴을
+  전제한다.
+- `claude plugin validate`가 있는지와 그 출력. 없으면 위 표의 필드로 매니페스트를 검사하는
+  테스트가 대신한다.
+- 스킬 frontmatter의 `allowed-tools`에 `Bash(macp:*)` 같은 패턴을 쓸 수 있는지. 예제는
+  도구 이름만 나열한다.
+
+## ⑧ 본부 모드와의 경계
+
+### 기본값만 다른 것
+
+| 항목 | 본부 모드 | 1인 모드 | 같은 코드 |
+|---|---|---|---|
+| 볼트 위치 | `MACP_VAULT_ROOT`. 없으면 오류 | 같은 변수. 없으면 진입점이 `~/.macp/vault`로 채운다 | `paths.vault_root` (`todo_system/paths.py:140`) |
+| 볼트를 만드는 주체 | 사람이 `cp -r` (`docs/getting-started.md:29-32`) | `macp init` | 같은 `vault-template/` |
+| 워커 루트 | `~/Worker` | 볼트 설정의 기존 키로 `~/.macp/work` | `paths.worker_root` (`todo_system/paths.py:380`) |
+| 프로세스 | 5개 이상, 유닛 파일 13개 | 1개, 유닛 파일 1개 | 같은 `_main`들 |
+| 메일박스 주소 | `file://Worker/agents` | 같음 | `open_mailbox` (`todo_system/orchestrator/mailbox.py:397`) |
+| 태스크 작성 | 손으로, 또는 `macp new` | `macp add` | 같은 스키마와 `validate_file` |
+| `auto_merge` | 생략하면 참 | 거짓을 명시 | 같은 판정 (`todo_system/orchestrator/runner.py:489-502`) |
+| 사용량 가드 | 켬 | 루프·서비스는 켬, `--once`만 끔 | `usage_guard.check` (`todo_system/usage_guard.py:1101`) |
+| 볼트 원격 | 있음. maintenance가 push | 없음. push하지 않는다 | — |
+| planner·maintenance·brief·health | 뜬다 | 뜨지 않는다 | — |
+| 계정·프로필 | 설정한다 | 만들지 않는다. 프로세스의 로그인을 쓴다 | `_account_env` (`todo_system/orchestrator/runner.py:323`) |
+
+### 그대로인 것
+
+태스크 스키마와 검증기 · `todo.db` 캐시 · 틱 전체(라우팅, 원장, 재시도, 오래된 행 정리,
+머지된 PR 닫기) · 러너와 `StagedExecutor` · 스테이지 프롬프트, 도구 허용 목록, 턴 한도,
+제한 시간 · 런별 워크트리 격리와 push 가드 · 모델 단계 선택과 확인 호출 · 사용자 권한으로
+도는 `claude -p`(`SECURITY.md:5-9`) · 기존 CLI 동사와 모듈 진입점 전부 · 모든 `MACP_*`
+변수의 뜻과 우선순위(밖에서 준 값이 이긴다).
+
+### D14 — 엔진에서 바뀌는 네 군데, 본부에서는 닿지 않는다
+
+2단계가 기존 엔진 코드를 고치는 곳은 넷이다. 나머지는 새 모듈과 데이터 파일이다.
+
+| 바뀌는 곳 | 바뀌는 내용 | 본부 경로가 닿지 않는 이유 |
+|---|---|---|
+| `todo_system/_entry.py` | 여섯 동사의 선행 분기, `VaultRootError` 때 기본 볼트로 다시 시도 | 여섯 이름은 지금 argparse가 거부한다. 다시 시도는 지금 exit 2로 끝나는 경우에만 일어난다 |
+| `todo_system/macp/config.py` | `ProjectConfig.vault_root`(맨 끝 필드). 값이 있을 때만 읽고 쓴다 | 그 키가 없는 프로젝트 파일은 한 바이트도 달라지지 않는다 |
+| `todo_system/orchestrator/stages.py` | 외부 리포 분기에 "origin이 로컬 경로" 메타데이터 한 줄 | `repo`가 URL이면 붙지 않는다 |
+| `todo_system/orchestrator/orchestrator.py` | `_pull_main`: 첫 fetch 실패 + `origin` 원격 없음 → 조용히 끝냄 | `origin`이 있는 볼트에서는 git 호출 순서가 그대로다 |
+
+- 새 환경변수 0개, 새 설정 키 0개. `vault_root`와 `worker_root`는 해석기가 이미 읽는
+  키다 (`todo_system/paths.py:155`, `:411`).
+- `gen_units.build()`는 건드리지 않는다. 13개 유닛의 출력이 그대로다.
+- 데이터 파일: `vault-template/.gitignore`, `vault-template/CLAUDE.md`,
+  `todo_system/prompts/`의 프롬프트·템플릿, `pyproject.toml`의 wheel 포함 목록. 이미
+  만들어진 볼트는 템플릿을 다시 복사하지 않는다.
+- 주의: 테스트에는 경로를 `repo`로 쓰는 것이 있다
+  (`todo_system/orchestrator/runner.py:691-692`가 그렇게 적는다). 셋째 줄의 변경이 그런
+  테스트의 기대 인자를 바꾸는지 2단계가 확인한다.
+
+## ⑨ 지울 것
+
+1인 모드에서 필요 없어지는 것의 목록이다. "지금"의 근거는 모두 이 리포의 문서와 코드다.
+
+### 필수 단계
+
+| # | 지금 해야 하는 일 | 근거 | 1인 모드 |
+|---|---|---|---|
+| 1 | 엔진을 클론하고 `uv sync` | `README.md:83-84` | 설치 한 줄(선행 조건) |
+| 2 | `vault-template`을 손으로 복사 | `README.md:86` | `macp init`이 만든다 |
+| 3 | 볼트를 따로 git 리포로 만들기 | `docs/getting-started.md:34-36` | `init`이 `git init`. 원격은 필요 없다 |
+| 4 | `cli new`로 틀을 만들고 frontmatter를 손으로 채우기 | `README.md:90-92`, `docs/getting-started.md:62-76` | `macp add "<문장>"` |
+| 5 | `worker_mode: blocked`를 `auto`로 손으로 바꾸기 | `README.md:92`, `docs/getting-started.md:78-80` | 파일을 한 번에 써서 필요 없다 |
+| 6 | `cli validate` | `README.md:93` | `add` 안에서 |
+| 7 | `cli import-md` | `README.md:94` | `add`와 `up` 안에서 |
+| 8 | `orchestrator auto` → `runner … --once` → `orchestrator auto` → `orchestrator status`, 매번 `uv run --project ~/macp …` | `README.md:96-102` | `macp up --once` |
+| 9 | 실제 실행용 태스크에 `repo:` 주소와 `auto_merge: false`를 손으로 적기 | `docs/getting-started.md:161-162` | `add`가 채운다 |
+| 10 | 실제 실행 전에 `gh`를 설치하고 인증하기 | `docs/getting-started.md:142-143` | PR이 끝점일 때만. 없으면 브랜치가 결과물이다 |
+| 11 | 실제 실행 전에 `unset USAGE_GUARD_DISABLE` | `docs/getting-started.md:145` | 필요 없다 |
+
+### 환경변수
+
+| 지금 필수 | 근거 | 1인 모드 |
+|---|---|---|
+| `MACP_VAULT_ROOT` | `README.md:87`, `docs/configuration.md:3-4` | 진입점이 프로세스 안에서 채운다 |
+| `USAGE_GUARD_DISABLE=1` | `README.md:88`, `docs/getting-started.md:54-58` | `--once`가 프로세스 안에서 채운다 |
+| 셸 프로필에 `export MACP_VAULT_ROOT=…` 넣기 | `docs/getting-started.md:34` | 필요 없다 |
+
+필수 환경변수는 2개에서 0개가 된다. 선택 변수(`MACP_WORKER_ROOT`, `MACP_LANGUAGE` …)는
+지금처럼 동작한다.
+
+### 유닛과 프로세스
+
+| 지금 | 근거 | 1인 모드 |
+|---|---|---|
+| 계속 살려 둘 프로세스 5개 | `docs/running.md:3-12` | 1개 (`macp up`) |
+| 터미널 네 개에 한 줄씩 | `docs/running.md:17-27` | 터미널 하나 |
+| 유닛 파일 13개 | `scripts/systemd/gen_units.py:196-238` | 1개 (`macp-up.service`) |
+| — runner 서비스 | `:196-204` | 루프 안의 러너 호출 |
+| — orchestrator 서비스 + 타이머 | `:205-208` | 루프 안의 틱 |
+| — todo-sync 서비스 | `:219-222` | 루프 안의 DB 반영 |
+| — dashboard 서비스 | `:227-231` | 볼 때만 `macp dashboard` |
+| — planner·maintenance·brief·health 서비스 4 + 타이머 4 | `:209-216`, `:232-238` | 띄우지 않는다 |
+| 유닛을 깔기 전에 `export MACP_VAULT_ROOT` | `docs/running.md:38-40` | `--service`가 처리한다 |
+
+### 지우지 않는 것
+
+- 본부의 유닛, `gen_units.build()`, `docs/running.md`. 여러 리포를 24시간 돌리는 사람은
+  지금 방식을 그대로 쓴다.
+- 수동 루프. `docs/getting-started.md`에 남긴다. 각 조각이 무엇을 하는지 설명하는 자리다.
+- 기존 CLI 동사와 그림자 실행기(`--mode shadow`).
+- README에서 빠지는 문장 하나: "No agent is called and nothing leaves your machine."
+  (`README.md:79`). 새 5분 체험에서는 사실이 아니다.
+
+## ⑩ 측정
+
+### 지표
+
+주간 온보딩 점검이 쓰는 다섯 가지를 그대로 쓴다.
+
+| 지표 | 기준 (2026-11-21 원장) | 이 문서가 센 지금 | 목표 |
+|---|---|---|---|
+| 첫 결과까지 친 명령 수 | 약 11 | 12줄 | 3 이하 |
+| 손으로 고친 파일 수 | 1 | 1 | 0 |
+| 필수 환경변수 수 | 2 | 2 | 0 |
+| 걸린 분 | 기록 없음 | 재지 않음 | 5 이하 |
+| 결과의 종류 | 그림자 실행 | 그림자 실행 | 워커가 만든 커밋이 있는 브랜치(또는 PR) |
+
+### 재는 방법
+
+1. **게이트가 매번 잰다.** 2단계의 경로 테스트와 `scripts/check_engine_isolation.sh`의
+   README 구간이 깨끗한 `HOME`에서 세 명령을 그대로 친다. 가짜 `claude`를 쓰므로 여기서
+   나오는 것은 명령 수·손수정·환경변수·결과의 종류, 그리고 **엔진이 쓰는 시간**이다. 지금
+   그 구간은 8단계에 기대 출력 5개다 (`scripts/check_engine_isolation.sh:214-215`,
+   `:277-292`). 명령이 하나라도 늘면 이 구간이 실패하게 한다.
+2. **주간 점검이 원장에 한 줄을 남긴다.** 깨끗한 `HOME`에서 README 첫 절을 글자 그대로
+   따라 하고 다섯 값을 적는다. 직전 회차보다 나빠지면 그 원인을 먼저 고친다.
+3. **모델이 쓰는 시간은 실제 실행에서만 나온다.** 스테이지마다 러너가
+   `Worker/runs/<run-id>/stages.json`의 `usage.<stage>`에 `duration_ms`를 남긴다
+   (`todo_system/orchestrator/stages.py:527-546`). `macp add`의 호출 시간은 `add`가 끝날 때
+   한 줄로 찍는다.
+
+"분"은 둘로 나눠 적는다: 엔진 시간과 모델 시간. 앞의 것은 게이트가 지키고, 뒤의 것은
+모델·계정·태스크 크기에 달려 있어 목표치로만 둔다(⑤의 D11 표).
+
+## README '5분 체험' 초안
+
+`README.md:77-112`를 대신할 초안이다. README 자체는 2단계가 바꾼다. 펜스 안의 명령은
+3개이고, 설치 줄은 펜스 밖의 선행 조건이다.
+
+````markdown
+## Try it in five minutes
+
+A real Claude Code worker finishes one small task in a repository of yours and leaves
+you a pull request — or a local branch, if the repository has no GitHub remote.
+Nothing is merged for you.
+
+You need Linux or macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`, and
+the [Claude Code](https://code.claude.com) CLI, logged in. Install macp once:
+
+    uv tool install git+https://github.com/jjkim0807/macp
+
+Then, inside a git repository you own:
+
+```bash
+macp init                                   # makes ~/.macp/vault, registers this repository
+macp add "Add an install section to the README"
+macp up --once                              # dispatch → worker → result, then exit
+```
+
+- `macp init` creates your vault (tasks, run records, memory) under `~/.macp/` and
+  marks this repository as managed. There are no environment variables to set and no
+  vault repository to create.
+- `macp add` turns the sentence into a validated task file. You never edit frontmatter.
+- `macp up --once` runs one pass of the same orchestrator and runner the 24/7 setup
+  uses. The worker works in its own clone under `~/.macp/work`, on the branch
+  `worker/<slug>`. Your checkout is not touched.
+
+When it finishes, `macp status` shows the task waiting for your review, with the pull
+request link. Without a GitHub remote the result is the branch `worker/<slug>` in your
+repository: look at it with `git diff main...worker/<slug>`, merge it, then run
+`macp complete <slug>`.
+
+`macp up` keeps the loop running in the foreground and paces itself against your
+Claude subscription usage; `macp up --once` runs what you queued right away.
+`macp up --service` installs the loop as one systemd user unit.
+
+The worker is a headless agent with your user account's permissions — read
+[SECURITY.md](SECURITY.md) first. [Getting started](docs/getting-started.md) explains
+each step and still documents the manual loop.
+````
+
+초안과 함께 넘기는 것:
+
+- 설치 줄의 문법은 확인하지 않았다(②). 각 명령의 출력 문구는 2단계가 실제로 돌려 정한다.
+  엔진에 이미 있는 문자열만 그대로 인용한다.
+- 지금 절의 마지막 문장은 격리 게이트가 이 루프를 돌린다고 말한다 (`README.md:111-112`).
+  게이트의 README 구간이 새 세 명령으로 바뀐 뒤에 2단계가 그 문장을 다시 넣는다.
+- 한국어판 `README.ko.md`는 2단계가 같은 내용으로 맞춘다. 이 런에서는 그 파일을 읽지
+  않았다.
+- 워커가 사용자 권한으로 돈다는 안내와 `SECURITY.md` 링크는 지금 README의 Status 절에
+  있다 (`README.md:129-130`). 새 5분 체험은 실제 에이전트를 띄우므로 그 안내를 이 절
+  안으로 올렸다.
+
+## 후속 태스크 지도
+
+### 2단계 — 콘솔 명령 (`macp-lite-2-cli`)
+
+**새로 생기는 것.** `todo_system/lite.py`(얇은 글루) · `todo_system/prompts/`의 `add`
+프롬프트와 태스크 템플릿 · `vault-template/.gitignore` · `vault-template/CLAUDE.md` ·
+테스트.
+
+**바뀌는 것.** ⑧의 네 군데 · `todo_system/i18n.py`(문구) · `pyproject.toml`(wheel과
+sdist에 `vault-template` 넣기) · `README.md` · `README.ko.md` · `docs/getting-started.md` ·
+`scripts/check_engine_isolation.sh`의 README 구간.
+
+2단계 태스크의 `touches`는 지금 `todo_system/`뿐이다. 위 목록은 그보다 넓으므로 2단계의
+계획 스테이지가 넓힌다.
+
+**한 스테이지에 들어가지 않으면 이렇게 나눈다.** 각 조각은 그 자체로 게이트가 green이다.
+
+1. 볼트 해석(D4) · `macp init` · `ProjectConfig.vault_root` · `_entry` 분기 · wheel에
+   `vault-template` 넣기.
+2. `macp add`(프롬프트, 템플릿, 검사, 문구).
+3. `macp up`·`status`·`dashboard`·`memory`·`--service` · 스테이지 메타데이터 한 줄 ·
+   `_pull_main` · 경로 테스트 · README · 격리 게이트의 README 구간.
+
+**경로 테스트의 계약** (2단계 완료 조건 1번).
+
+- 환경: 임시 `HOME`. `MACP_*`·`USAGE_GUARD_*`·`CLAUDE_*` 변수를 모두 지운다. `PATH` 앞에
+  가짜 `claude`를 둔다. 깨끗한 `HOME`에는 git 사용자 정보가 없으므로 가짜가 만드는 커밋은
+  이름·메일을 직접 준다.
+- 준비: 커밋 하나가 있고 원격이 없는 임시 git 리포. 그 안에서 `macp init` →
+  `macp add "README에 설치 한 줄 추가"` → `macp up --once`.
+- 단언:
+  - 세 명령 모두 rc 0. 테스트가 설정한 엔진 환경변수는 0개.
+  - 리포의 `.macp/config.toml`에 `vault_root` 키가 있다.
+  - `~/.macp/vault/Todo/items/<slug>.md`가 있고 `macp validate <slug>`가 통과한다.
+  - **사용자의 리포에** `worker/<slug>` 브랜치가 있고 가짜가 만든 커밋이 들어 있다.
+  - 사용자의 체크아웃 브랜치와 작업 트리는 그대로다.
+  - 원장의 그 행은 검토 대기다.
+  - 러너 뒤에 `collect`가 `auto`보다 먼저 불린다(⑤).
+- 가짜 `claude`가 답해야 하는 호출은 세 가지다. 프롬프트 내용으로 구분한다.
+
+  | 호출 | 모양 | 가짜가 할 일 |
+  |---|---|---|
+  | 모델 확인 | `claude -p "Reply with just: ok" --model … --effort … --max-turns 1` (`todo_system/orchestrator/model_select.py:161-162`) | 아무 글자나 찍고 rc 0 |
+  | `add` | `claude -p <add 프롬프트> …` | JSON 객체를 찍고 rc 0 |
+  | 스테이지 | 프롬프트 끝에 "Run metadata" 블록 (`todo_system/orchestrator/stages.py:737-752`, `:825-831`) | `run_dir`·`working_dir`·`branch`를 읽어 워크트리에 커밋하고 `git push origin <branch>`, `<run_dir>/quick.md`에 `overall_status: pass`를 쓴다 (`todo_system/orchestrator/stages.py:421-430`, 판정 `todo_system/orchestrator/runner.py:1890-1896`) |
+
+  가짜의 출력에는 사용량 한도를 뜻하는 문구가 없어야 한다. 러너가 그런 문구를 보면 런을
+  보류로 돌린다 (`todo_system/orchestrator/runner.py:1720-1721`).
+
+**격리 게이트의 README 구간.** 같은 세 명령으로 바꾼다. 지금은 `MACP_VAULT_ROOT`와
+`USAGE_GUARD_DISABLE=1`을 넣고 돈다 (`scripts/check_engine_isolation.sh:195-196`). 새
+구간은 둘 다 넣지 않는다. 기대 출력은 엔진에 이미 있는 문자열을 그대로 쓴다 — 예:
+`dispatched <slug> -> worker-default` (`todo_system/orchestrator/orchestrator.py:3804`).
+이 게이트는 `git archive`로 뽑은 트리에서 돈다 (`scripts/check_engine_isolation.sh:81-83`).
+가짜 `claude`는 그 목록에 드는 경로(`todo_system/`나 `scripts/` 아래)에 둬야 한다.
+
+**본부가 그대로라는 증명.** 기존 골든과 스모크를 그대로 통과한다: 유닛 생성기의 골든
+(`scripts/systemd/testdata/default_units.golden`), 스테이지 인자와 오케스트레이터 CLI
+출력을 고정한 기존 테스트. 여기에 하나를 더한다 — 여섯 동사가 아닌 인자로 들어오면
+`todo_system.lite`가 import되지 않는다.
+
+**가짜로는 잡을 수 없는 것.** 아래는 실제 `claude`로만 확인된다. 사람의 승인을 기다릴
+일은 아니다. 2단계는 가짜로 통과하면 머지하고, 아래는 '확인 못 함'으로 기록한다. 첫 실제
+사용이 채운다.
+
+1. 한 번도 열어 본 적 없는 볼트 디렉터리에서 `claude -p`가 도구 허용 목록을 지키며 묻지
+   않고 도는지. 러너는 볼트를 "신뢰된 작업 공간"으로 전제한다
+   (`todo_system/orchestrator/runner.py:1103-1109`).
+2. `quick` 스테이지가 태스크 파일을 찾아 읽는지(③).
+3. 태스크 본문의 사유 한 줄이 `quick`의 안전 규칙 오적용을 막는지(④).
+4. `add`의 응답이 스키마를 지키는 비율.
+5. 실제로 걸리는 분(⑩).
+
+### 3단계 — Claude Code 플러그인 (`macp-lite-3-claude-code-plugin`)
+
+⑦의 배치대로 매니페스트 둘과 스킬 하나를 만든다. 스킬 본문에는 CLI 호출만 둔다. 먼저
+⑦의 미확인 세 가지를 `claude` CLI와 공식 문서로 확정한다. README에는 "이미 Claude Code를
+쓰고 있다면" 두 줄을 더한다: 마켓플레이스 추가와 플러그인 설치. CLI 설치 줄은 선행
+조건으로 그 위에 둔다.
+
+## 부록
+
+### 미확인 목록
+
+이 런에서 확인하지 못했거나 코드를 읽기만 한 것이다. 앞의 숫자는 다루는 절이다.
+
+| 절 | 확인하지 못한 것 | 누가 확정하나 |
+|---|---|---|
+| ② | `uv tool install git+…` 문법, 설치 뒤 `macp`가 PATH에 놓이는지 | 2단계 (깨끗한 `HOME`) |
+| ② | wheel 설치본에서의 전체 흐름. 확인 실행은 체크아웃에서만 했다 | 2단계 |
+| ② | 볼트 환경을 넣기 전에 `todo_system.macp` 패키지를 import해도 되는지. 그래서 `lite`는 `paths`만 먼저 import한다 | 2단계 |
+| ② | 경로 원격에서 사용자가 브랜치를 옮긴 뒤의 기준 브랜치 | 2단계 |
+| ③ | 리포의 `CLAUDE.md`가 `--add-dir` 경로에서 자동으로 읽히는지 | 첫 실제 사용 |
+| ③ | `quick` 스테이지가 안내 없이 태스크 파일을 찾는지 | 첫 실제 사용 |
+| ④ | 실제 `claude -p` 호출 전부: `add`의 JSON, 사유 줄의 효과 | 첫 실제 사용 |
+| ⑤ | 수거를 먼저 부르는 순서. 코드로만 확인했다 | 2단계 (테스트) |
+| ⑤ | 로그인된 계정에서의 사용량 가드(조회가 되는 경우) | 첫 실제 사용 |
+| ⑤ | 경로 원격에서 `gh`가 실제로 보이는 반응, `gh_pr_merged`가 경로 `repo`에 돌려주는 값 (`todo_system/orchestrator/stages.py:1024`) | 2단계 |
+| ⑤ | `trace`가 `quick` 런의 PR 주소를 보여 주는지 | 2단계 |
+| ⑤ | 새 볼트 디렉터리에서 `claude -p`의 도구 허용과 신뢰 처리 | 첫 실제 사용 |
+| ⑤ | 실제로 걸리는 시간 | 주간 점검, 실제 사용 |
+| ⑥ | 유닛의 실제 기동, `uv tool install`로 깔린 인터프리터 경로가 `ExecStart`에 맞는지 | 2단계 |
+| ⑥ | macOS launchd | 후속 과제 |
+| ⑦ | 마켓플레이스 추가 문법, `claude plugin validate`, 스킬의 `allowed-tools` 패턴, 맨이름 `/macp`의 해석, 세션의 명령 제한 시간 | 3단계 |
+| README | `README.ko.md`·`docs/concepts.md` 본문. 이 런에서 읽지 않았다 | 2단계 |
+
+### 열린 질문과 답한 곳
+
+조사 단계가 남긴 여덟 가지다.
+
+| 질문 | 답 |
+|---|---|
+| 겹치는 동사를 어디에 둘까 | ① D1 — 콘솔 스크립트의 선행 분기 |
+| 기본 볼트 위치 | ② D3 — `~/.macp/vault` |
+| 환경변수 없이 볼트 찾기, 설치 형태, "3개"를 세는 법 | ② D2·D4 |
+| 로컬 리포의 `repo:` 값과 원격·`gh`가 없을 때의 끝점 | ② 끝 절, ⑤ D10 |
+| 첫 태스크의 파이프라인 | ⑤ D11 — `quick` 먼저, 5분은 목표 |
+| 기존 `/macp` 명령과 플러그인의 관계 | ⑦ — 기존 명령은 그대로, 플러그인은 `/macp:macp` |
+| 세 태스크 공용 문구 "앞 단계 산출물을 읽고" | 이 노트가 그 산출물이다. 1단계에는 앞 산출물이 없었다 |
+| README 초안의 언어 | 초안은 영어, 이 노트는 한국어. 한국어판 반영은 2단계 |
