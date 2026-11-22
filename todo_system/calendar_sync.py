@@ -509,7 +509,7 @@ def _opted_out(source_path: str) -> bool:
 def _is_decision_task(source_path: str) -> bool:
     """True when the task md carries a decision marker: the `decision` tag or
     `needs_decision: true` (:func:`task_deps._has_decision_marker`, the one
-    definition, read the way :func:`task_deps.scan_items` reads it).
+    definition of the marker).
 
     A decision is answered on the dashboard the moment it is asked (a card with
     buttons — the "Decision cards" contract in orchestrator/triage.py), so it
@@ -517,6 +517,11 @@ def _is_decision_task(source_path: str) -> bool:
     the event it already has, and the overdue mover never rewrites its
     `scheduled:`. Read from the md, not the DB row — `needs_decision` is not a
     DB column, and an answer takes effect on the next sync, not the next import.
+
+    `needs_decision` counts only as a plain true / yes / 1 / on, the reading
+    the dashboard uses for its decision rows, so a task never loses its block
+    here without also showing up there as a decision. Anything else (a typo, a
+    value with an inline comment) keeps the block.
 
     Imports are local: ``task_deps`` imports ``cli``, which imports this module.
     Any read or parse error answers False — the old behaviour (synced like any
@@ -526,10 +531,10 @@ def _is_decision_task(source_path: str) -> bool:
         from . import task_deps
         from .cli import parse_frontmatter
         fm, _ = parse_frontmatter(_md_path(source_path).read_text(encoding="utf-8"))
-        raw = task_deps._fm_str(fm, "needs_decision")
+        raw = str(fm.get("needs_decision") or "").strip().strip("'\"").lower()
         return task_deps._has_decision_marker({
             "tags": [t.strip().lower() for t in task_deps._as_list(fm.get("tags")) if t.strip()],
-            "needs_decision": task_deps._as_bool(raw, False) if raw else False,
+            "needs_decision": raw in ("true", "yes", "1", "on"),
         })
     except Exception:  # noqa: BLE001 - fail-open by contract
         return False

@@ -413,12 +413,16 @@ def test_is_decision_task_reads_the_markers_and_fails_open(tmp_path, monkeypatch
         return str(p)
 
     assert CS._is_decision_task(md("a", "needs_decision: true")) is True
-    assert CS._is_decision_task(md("b", "needs_decision: true  # pick one")) is True
+    assert CS._is_decision_task(md("b", 'needs_decision: "Yes"')) is True
     assert CS._is_decision_task(md("c", "tags:\n  - todo\n  - Decision")) is True
     assert CS._is_decision_task(md("d", "tags: [todo, decision]")) is True
     assert CS._is_decision_task(md("e", "needs_decision: false")) is False
     assert CS._is_decision_task(md("f", "tags:\n  - todo")) is False
     assert CS._is_decision_task(md("g", "title: needs_decision: true")) is False
+    # only a plain truthy value counts (the dashboard's reading): a typo or an
+    # inline comment keeps the block rather than dropping it unseen
+    assert CS._is_decision_task(md("h", "needs_decision: true  # pick one")) is False
+    assert CS._is_decision_task(md("i", "needs_decision: maybe")) is False
     # a relative path resolves against the vault root, like every other md read here
     monkeypatch.setattr(CS, "ROOT", tmp_path)
     assert CS._is_decision_task("a.md") is True
