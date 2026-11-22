@@ -2,8 +2,7 @@
 # CUTOVER tick — v2 owns execution. Dispatch open auto tasks to agents (the
 # worker-default runner executes the staged pipeline), collect replies,
 # regenerate the dashboard. Activate by copying this over
-# orchestrator_tick.sh (see scripts/CUTOVER.md). Rollback: git restore
-# scripts/orchestrator_tick.sh + re-bootstrap the legacy worker.
+# orchestrator_tick.sh (see scripts/CUTOVER.md).
 
 set -uo pipefail
 

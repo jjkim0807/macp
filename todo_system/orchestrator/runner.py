@@ -158,7 +158,7 @@ class ClaudeCodeExecutor:
         Overridden by the observable variant to stream instead of capture."""
         r = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=1800,
-                           # Inject the long-lived token for the same reason as worker.py (no-op if the file is absent).
+                           # Inject the long-lived automation token (no-op if the file is absent).
                            env=claude_env())
         return r.returncode, {"stdout_tail": r.stdout[-500:]}
 
@@ -574,8 +574,8 @@ class StagedExecutor(ClaudeCodeExecutor):
 
         `restore_main` forces past a dirty working tree (`checkout -f`). That is
         right when the leftovers belong to a *finished* run and destructive when
-        they do not: the vault is ONE checkout shared by the live daemon and any
-        manual `run-next`, so a second run starting here rips HEAD off
+        they do not: the vault is ONE checkout shared by the live daemon,
+        so a second run starting here rips HEAD off
         `worker/<other-slug>` and deletes that run's uncommitted edits mid-stage.
 
         Returns `(reason, held_by_slug)` to defer, or None to proceed.

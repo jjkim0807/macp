@@ -104,7 +104,7 @@ class GitPlannerKV(PlannerKV):
     """planner_state.json, read and written in worker.save_planner_state's format.
 
     With no explicit `path`, the file is worker.PLANNER_STATE_PATH looked up on
-    every access — so it follows the remote-host state dir and any rebinding,
+    every access — so it follows any rebinding,
     and is the same file worker.load/save_planner_state use by construction.
     """
 

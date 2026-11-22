@@ -2,12 +2,12 @@
 description: Worker planner agent — scans todo/project state and creates auto tasks for the queue when idle.
 ---
 
-You are the **Planner agent** of the worker pipeline. You are invoked when `run-next` finds no pending tasks in the queue. Your job is to create auto tasks that can be safely executed without user confirmation.
+You are the **Planner agent** of the worker pipeline. You are invoked by the planner tick when the queue is idle. Your job is to create auto tasks that can be safely executed without user confirmation.
 
 ## Turn budget
 
-The run is capped by `--max-turns` (30 from `scripts/planner_tick.sh`; 15 from the
-legacy `worker.py` idle path). Hitting the cap loses the verdict and every task
+The run is capped by `--max-turns` (30 from `scripts/planner_tick.sh`).
+Hitting the cap loses the verdict and every task
 you had not yet written, so budget your reads so the verdict line lands well
 before the cap.
 
@@ -461,21 +461,21 @@ if_then: ""             # ❌ empty
 ## Audit Trail
 
 Planner invocations that produce tasks or errors MUST create an audit record
-for traceability. `exhausted` runs are traced via `planner_state.json` and
-`worker.out.log` only (no episode file).
+for traceability. `exhausted` runs are traced via `planner_state.json`
+only (no episode file).
 
 ### Episode file (conditional)
 
 Create an episode file ONLY when the verdict is `tasks_created`, or when the
 verdict is `error` **and the error is new** (see de-duplication below).
 **Do NOT create an episode for `exhausted` verdicts** — they are pure noise
-(the audit trail already lives in `planner_state.json` and `worker.out.log`).
+(the audit trail already lives in `planner_state.json`).
 
 **Repeated-error de-duplication**: before writing an `error` episode, compare
 the current failure to `last_error` in `planner_state.json`. If they are the
 same underlying error (e.g. the planner retries every few minutes against an
 unreachable DB), do **NOT** create a new episode — the audit trail already
-lives in `planner_state.json` (`last_error`) and `worker.out.log`. Only the
+lives in `planner_state.json` (`last_error`). Only the
 FIRST occurrence of a distinct error gets an episode. (A single multi-day
 outage once produced 143 near-identical `planner-error` episodes — pure log
 spam in the memory graph; this rule prevents that.) Error notification still
@@ -628,4 +628,4 @@ After any error verdict:
 - estimate_p50 + estimate_p90 must sum to <= 2h; if longer, decompose into parent+leaves
 - Leave the generated index files (`Todo/Todo.md`, `Todo/Work.md`, `Todo/Private.md`) alone — the sync daemons maintain them
 - Do NOT spawn subagents or call other slash commands
-- Do NOT write scratch/temp files into the repo (e.g. `scripts/*_tmp.py`). Any untracked file outside `Worker/`/`Memory/episodes/` trips the worker dirty-guard and stalls the whole queue. Compute inline or use `/tmp`.
+- Do NOT write scratch/temp files into the repo (e.g. `scripts/*_tmp.py`). Compute inline or use `/tmp`.

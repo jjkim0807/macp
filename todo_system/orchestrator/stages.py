@@ -1,7 +1,7 @@
 """v2 staged execution — port of the legacy worker's 5-stage pipeline
 (research → plan → implement → verify → report) into the orchestrator.
 
-The intelligence lives in the SAME stage prompts the legacy worker uses
+The intelligence lives in the SAME stage prompts the legacy worker used
 (todo_system/prompts/worker-<stage>.md): implement edits code, verify runs the
 project's own checks locally (GitHub Actions is not used) and writes
 overall_status, report opens the PR via gh and merges on that verdict. This
@@ -10,7 +10,7 @@ per-stage `claude -p` command, run stages in order, require each stage's
 artifact, and gate success on the verify verdict — so the v2 runner can own
 execution with the same quality gates (not the single-shot BackgroundExecutor).
 
-Constants mirror worker.py; kept in sync deliberately. Stdlib-only.
+Stdlib-only.
 """
 
 from __future__ import annotations
@@ -725,7 +725,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      allowed_tools: str | None = None,
                      tier: str | None = None,
                      max_turns: int | None = None) -> list[str]:
-    """Reproduce worker.build_stage_command: stage prompt + run metadata, with
+    """Build one stage's argv: stage prompt + run metadata, with
     the stage's tool whitelist and turn budget. `tier` is the task's model tier
     (model_select.classify_tier); None means the heavy ladder. The plan stage's
     metadata always ends with `plan_split_hint`. A vault task (no `repo`) whose
