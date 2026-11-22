@@ -25,9 +25,13 @@ import datetime as dt
 import http.client
 import importlib.util
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -40,6 +44,13 @@ _SRC = _REPO / "scripts" / "macp_dashboard.py"
 _CASES = Path(__file__).resolve().parent / "usage_value_cases"
 TOKEN = "usage-value-test-token"
 _HANGUL = re.compile("[가-힣]")
+_UV_MODULE = "todo_system.usage_value"
+
+no_zsh = pytest.mark.skipif(shutil.which("zsh") is None, reason="brief.sh is a zsh script")
+no_homebrew_cli = pytest.mark.skipif(
+    any(Path("/opt/homebrew/bin", n).exists() for n in ("claude", "uv")),
+    reason="brief.sh puts /opt/homebrew/bin ahead of $HOME/.local/bin; "
+           "the fakes would be shadowed by the real CLIs")
 
 
 def _load():
@@ -328,3 +339,219 @@ class TestUsageValueCardShell:
             assert '<section class="card" id="c-uv" hidden>' in page
             assert "function setUsageValue(u){" in page
         assert not _HANGUL.search(M.render_html("en"))
+
+
+# --- the brief: the real brief.sh, a fake claude, the real engine call ---------------------
+
+# Stands in for MACP_PYTHON. It records every call; the usage_value call alone is
+# handed to the real interpreter (with this checkout on PYTHONPATH), so the
+# section in the brief is what the engine really printed. SEAM_UV_CRASH makes
+# that one call die instead.
+_FAKE_PY = f'''#!{sys.executable}
+import json, os, sys
+argv = sys.argv[1:]
+with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({{"tool": "py", "argv": argv, "cwd": os.getcwd()}}) + "\\n")
+if "{_UV_MODULE}" in argv:
+    if os.environ.get("SEAM_UV_CRASH"):
+        sys.stderr.write("boom\\n")
+        sys.exit(1)
+    os.execve(sys.executable, [sys.executable, *argv],
+              {{**os.environ, "PYTHONPATH": {str(_REPO)!r}}})
+'''
+
+# The brief agent: writes the brief for yesterday, today and tomorrow, so the
+# file brief.sh looks for exists whichever side of midnight either clock is on.
+_FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import datetime as dt, json, os, sys
+from pathlib import Path
+with open(os.environ["SEAM_TEST_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"tool": "claude", "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
+out = Path.cwd() / "Todo" / "Briefings"
+out.mkdir(parents=True, exist_ok=True)
+today = dt.datetime.now().date()
+for day in (today - dt.timedelta(days=1), today, today + dt.timedelta(days=1)):
+    (out / f"{day.isoformat()}.md").write_text("# Brief\n", encoding="utf-8")
+'''
+
+# Records that the notification ran, and how many briefs carried the table then.
+_NOTIFY = r'''#!/bin/sh
+n=$(grep -l 'macp:usage-value' "$PWD"/Todo/Briefings/*.md 2>/dev/null | wc -l | tr -d ' ')
+printf '{"tool":"notify","marked":%s}\n' "$n" >> "$SEAM_TEST_LOG"
+'''
+
+_AGENT_BRIEF = "# Brief\n"
+
+
+def _write_exec(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+class _BriefHarness:
+    """An installed-shape engine tree (no pyproject, MACP_PYTHON set) holding a copy
+    of the real brief.sh, run against an existing vault."""
+
+    def __init__(self, tmp: Path, vault: Path):
+        self.tmp = tmp
+        self.vault = vault
+        self.log = tmp / "calls.jsonl"
+        self.bin = tmp / "bin"
+        self.home = tmp / "home"
+        self.home.mkdir(parents=True)
+        self.fakepy = _write_exec(self.bin / "fakepy", _FAKE_PY)
+        _write_exec(self.bin / "sqlite3", "#!/bin/sh\nexit 0\n")
+        for d in (self.bin, self.home / ".local" / "bin"):
+            _write_exec(d / "claude", _FAKE_CLAUDE)
+        self.engine = tmp / "site" / "todo_system" / "_engine"
+        scripts = self.engine / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(_REPO / "scripts" / "brief.sh", scripts / "brief.sh")
+        (scripts / "export_db_snapshot.py").write_text("# marker, never executed\n", encoding="utf-8")
+        _write_exec(scripts / "notify_kakao.sh", _NOTIFY)
+        commands = self.engine / ".claude" / "commands"
+        commands.mkdir(parents=True)
+        (commands / "brief.md").write_text("---\ndescription: x\n---\nPROMPT-BODY\n", encoding="utf-8")
+        self.briefings = vault / "Todo" / "Briefings"
+
+    def run(self, **env: str) -> subprocess.CompletedProcess:
+        # From scratch, and TZ is NOT pinned: brief.sh, the engine call and this
+        # test process must agree on what day and month it is.
+        full = {
+            "PATH": f"{self.bin}{os.pathsep}/usr/bin:/bin",
+            "HOME": str(self.home),
+            "SEAM_TEST_LOG": str(self.log),
+            "GIT_CEILING_DIRECTORIES": str(self.tmp),
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "MACP_VAULT_ROOT": str(self.vault),
+            "MACP_PYTHON": str(self.fakepy),
+            "MACP_LANGUAGE": "ko",
+            "MAILROOM_DIR": str(self.tmp / "no-mailroom"),
+            **({"TZ": os.environ["TZ"]} if "TZ" in os.environ else {}),
+            **env,
+        }
+        return subprocess.run(["zsh", str(self.engine / "scripts" / "brief.sh")], env=full,
+                              capture_output=True, text=True, errors="replace", timeout=180)
+
+    def calls(self) -> list[dict]:
+        if not self.log.exists():
+            return []
+        return [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()
+                if ln.strip()]
+
+    def uv_calls(self) -> list[dict]:
+        return [c for c in self.calls() if c["tool"] == "py" and _UV_MODULE in c["argv"]]
+
+    def briefs(self) -> dict[str, str]:
+        return {p.name: p.read_text(encoding="utf-8") for p in sorted(self.briefings.glob("*.md"))}
+
+    def with_table(self) -> list[str]:
+        return [text for text in self.briefs().values() if usage_value.BRIEF_MARKER in text]
+
+
+@no_zsh
+@no_homebrew_cli
+def test_brief_and_status_show_the_same_table(pv, served, tmp_path):
+    """AC: the real brief path and the dashboard's /api/status carry the same
+    numbers. The brief's section is, character for character, the engine's
+    rendering of the model the dashboard served."""
+    for attempt in (1, 2):
+        day = dt.date.today()
+        model = served()["usage_value"]                       # (a) the real /api/status
+        h = _BriefHarness(tmp_path / f"run{attempt}", pv.root)
+        r = h.run()                                           # (b) the real brief.sh
+        if dt.date.today() == day:
+            break
+        # Midnight fell between the two: both sides moved on. Once more, from a
+        # clean briefings dir and past the status cache's TTL.
+        shutil.rmtree(h.briefings)
+        time.sleep(M.STATUS_TTL_S + 0.5)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+
+    marked = h.with_table()
+    assert len(marked) == 1, h.briefs()
+    assert marked[0] == _AGENT_BRIEF + "\n" + usage_value.render_brief(model) + "\n"
+    assert "brief.sh: appended the weekly usage-vs-results table" in r.stdout
+
+    # the same numbers, cell by cell, as the dashboard rows
+    week = model["periods"][0]
+    assert week["total"]["runs"] > 0
+    lines = marked[0].split("\n")
+    table = lines[lines.index(f"**{week['label']}** ({week['range']})"):]
+    for row in week["rows"]:
+        line = next(ln for ln in table if ln.startswith(f"| {row['project']} · {row['kind_label']} |"))
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        assert cells[1] == row["out_tokens_text"], line
+        assert cells[2].split(" ")[0] == str(row["runs"]), line
+        assert cells[3] == str(row["merged_prs"]), line
+        assert cells[5] == row["tokens_per_merge_text"], line
+    total = next(ln for ln in table if ln.startswith("| **합계** |"))
+    assert f"| {week['total']['out_tokens_text']} | {week['total']['runs']}" in total
+
+    # the engine call: once, in the vault, pinned to it — and nothing of it reached the agent
+    (call,) = h.uv_calls()
+    assert call["argv"] == ["-P", "-m", _UV_MODULE, "brief-section", "--vault-root", str(pv.root)]
+    assert call["cwd"] == str(pv.root)
+    (claude,) = [c for c in h.calls() if c["tool"] == "claude"]
+    prompt = claude["argv"][claude["argv"].index("-p") + 1]
+    assert "PROMPT-BODY" in prompt
+    assert "macp:usage-value" not in prompt and "usage_value" not in prompt
+
+
+@no_zsh
+@no_homebrew_cli
+def test_brief_is_untouched_when_a_recent_brief_has_the_table(pv, tmp_path):
+    h = _BriefHarness(tmp_path / "run", pv.root)
+    h.briefings.mkdir(parents=True)
+    earlier = dt.date.today() - dt.timedelta(days=3)
+    seeded = "# Brief\n\n" + usage_value.BRIEF_MARKER + "\n## earlier table\n"
+    (h.briefings / f"{earlier.isoformat()}.md").write_text(seeded, encoding="utf-8")
+
+    r = h.run()
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    briefs = h.briefs()
+    assert briefs.pop(f"{earlier.isoformat()}.md") == seeded
+    assert briefs and set(briefs.values()) == {_AGENT_BRIEF}     # the agent's bytes, as written
+    assert "appended the weekly" not in r.stdout
+    assert len(h.uv_calls()) == 1                                # asked, and told "not due"
+
+
+@no_zsh
+@no_homebrew_cli
+def test_brief_survives_a_crashing_usage_value_cli(pv, tmp_path):
+    """`|| true` is load-bearing: under `set -euo pipefail` a non-zero rc in the
+    command substitution would end the script before the notification."""
+    h = _BriefHarness(tmp_path / "run", pv.root)
+    (pv.root / ".secrets").mkdir()
+    (pv.root / ".secrets" / "kakao-token.json").write_text("{}", encoding="utf-8")
+
+    r = h.run(SEAM_UV_CRASH="1")
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert len(h.uv_calls()) == 1
+    assert set(h.briefs().values()) == {_AGENT_BRIEF}
+    assert "appended the weekly" not in r.stdout
+    assert "brief.sh: kakao push OK" in r.stdout               # the rest of the script still ran
+    assert [c for c in h.calls() if c["tool"] == "notify"] == [{"tool": "notify", "marked": 0}]
+
+
+@no_zsh
+@no_homebrew_cli
+def test_table_is_appended_after_the_agent_and_before_the_notification(pv, tmp_path):
+    h = _BriefHarness(tmp_path / "run", pv.root)
+    (pv.root / ".secrets").mkdir()
+    (pv.root / ".secrets" / "kakao-token.json").write_text("{}", encoding="utf-8")
+
+    r = h.run()
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    order = ["claude" if c["tool"] == "claude" else "notify" if c["tool"] == "notify"
+             else "usage_value" if _UV_MODULE in c["argv"] else "py" for c in h.calls()]
+    assert [o for o in order if o != "py"] == ["claude", "usage_value", "notify"], order
+    # the notification read a brief that already had the table
+    assert [c for c in h.calls() if c["tool"] == "notify"] == [{"tool": "notify", "marked": 1}]
+    assert len(h.with_table()) == 1
