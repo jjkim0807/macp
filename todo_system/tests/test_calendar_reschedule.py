@@ -90,6 +90,62 @@ def test_reschedule_writes_md_and_log(tmp_path, monkeypatch):
     assert 'scheduled: "2026-11-16 09:00~09:30"' in Path(stays).read_text(encoding="utf-8")
 
 
+def test_reschedule_leaves_decision_tasks_alone(tmp_path, monkeypatch):
+    """A decision task is answered on the dashboard, not sat down to: its overdue
+    block is never moved, while a plain task in the same call still is."""
+    monkeypatch.setattr(CS, "_event_tzinfo", lambda: None)
+    monkeypatch.setattr(CS, "_event_timezone", lambda: None)
+    decision = _md(tmp_path, "pick", "2026-11-16 10:00~10:30", "needs_decision: true\n")
+    plain = _md(tmp_path, "late", "2026-11-16 10:00~10:30")
+    before = Path(decision).read_bytes()
+    rows = [{"slug": "pick", "path": decision}, {"slug": "late", "path": plain}]
+    moves = CS.reschedule_overdue_blocks(_Svc(), rows, ["cal"], now=D(2026, 11, 16, 13, 20))
+    assert moves == [("late", "2026-11-16 10:00~10:30", "2026-11-16 13:30~14:00")]
+    assert Path(decision).read_bytes() == before
+    assert "자동 재배치" in Path(plain).read_text(encoding="utf-8")
+
+
+def test_reschedule_leaves_decision_tagged_tasks_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(CS, "_event_tzinfo", lambda: None)
+    monkeypatch.setattr(CS, "_event_timezone", lambda: None)
+    tagged = _md(tmp_path, "pick", "2026-11-16 10:00~10:30", "tags:\n  - todo\n  - decision\n")
+    before = Path(tagged).read_bytes()
+    # A decision's block is not on the calendar either, so a future one holds no slot.
+    future = _md(tmp_path, "pick-later", "2026-11-16 13:30~14:00", "needs_decision: true\n")
+    plain = _md(tmp_path, "late", "2026-11-16 10:00~10:30")
+    rows = [{"slug": "pick", "path": tagged}, {"slug": "pick-later", "path": future},
+            {"slug": "late", "path": plain}]
+    moves = CS.reschedule_overdue_blocks(_Svc(), rows, ["cal"], now=D(2026, 11, 16, 13, 20))
+    assert moves == [("late", "2026-11-16 10:00~10:30", "2026-11-16 13:30~14:00")]
+    assert Path(tagged).read_bytes() == before
+    # with nothing but decision tasks there is nothing to move at all
+    assert CS.reschedule_overdue_blocks(_Svc(), rows[:2], ["cal"],
+                                        now=D(2026, 11, 16, 13, 20)) == []
+    assert Path(tagged).read_bytes() == before
+
+
+def test_sync_path_does_not_move_a_decision_block(tmp_path, monkeypatch):
+    """Wiring: the rows sync_due_tasks_to_calendar hands the mover exclude decision
+    tasks, so a long-past decision block stays as written while a plain one moves."""
+    from todo_system.tests.test_calendar_sync import _FakeEvents, _FakeService, _db
+
+    monkeypatch.setattr(CS, "_event_tzinfo", lambda: None)
+    monkeypatch.setattr(CS, "_event_timezone", lambda: None)
+    decision = _md(tmp_path, "pick", "2020-01-06 10:00~10:30", "needs_decision: true\n")
+    plain = _md(tmp_path, "late", "2020-01-06 10:00~10:30")
+    before = Path(decision).read_bytes()
+    con = _db([("pick", "pick a plan", "2020-01-06", "", decision, "open", "manual"),
+               ("late", "late task", "2020-01-06", "", plain, "open", "manual")])
+    events = _FakeEvents()
+    monkeypatch.setattr(CS, "load_credentials", lambda *a, **k: object())
+    monkeypatch.setattr(CS, "build", lambda *a, **k: _FakeService(events))
+    CS.sync_due_tasks_to_calendar(con=con, calendar_id="cal",
+                                  client_secret_path=Path("/nope"), token_path=Path("/nope"))
+    assert [b["summary"] for b in events.inserted] == ["late task"]
+    assert Path(decision).read_bytes() == before
+    assert "자동 재배치" in Path(plain).read_text(encoding="utf-8")
+
+
 def test_host_switch_disables(monkeypatch, tmp_path):
     monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "0")
     p = _md(tmp_path, "late", "2026-11-10 10:00~10:30")

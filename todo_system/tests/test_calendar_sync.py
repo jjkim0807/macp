@@ -5,6 +5,7 @@ import datetime as dt
 import sqlite3
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -290,6 +291,142 @@ class CalendarTimedOnlyTest(unittest.TestCase):
         (created, _), events = self._run(seed_old_event=False, timed_only=False)
         self.assertEqual(created, 4)
         self.assertEqual(events.deleted, [])
+
+
+class CalendarDecisionTasksTest(unittest.TestCase):
+    """A decision task (`decision` tag or `needs_decision: true`) is answered on
+    the dashboard, so it gets no calendar block even with a `scheduled:` time
+    block, and the event it already has is removed by the stale cleanup."""
+
+    BLOCK = 'scheduled: "2026-12-01 10:00~10:30"'
+
+    def setUp(self):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+
+    def _write(self, name: str, fm: str) -> str:
+        path = self.d / f"{name}.md"
+        path.write_text(f"---\n{fm}\n---\n# {name}\n", encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _event(eid: str, slug: str) -> dict:
+        return {"id": eid, "_slug": slug,
+                "extendedProperties": {"private": {"todo_slug": slug}}}
+
+    def test_decision_task_with_a_time_block_is_not_synced_and_its_event_is_removed(self):
+        pick = self._write("pick", f"needs_decision: true\n{self.BLOCK}")
+        work = self._write("work", 'scheduled: "2026-12-01 11:00~12:00"')
+        con = _db([
+            ("pick", "pick a plan", "-", "", pick, "open", "manual"),
+            ("work", "work block", "-", "", work, "open", "manual"),
+        ])
+        events = _FakeEvents(existing=[self._event("ev-pick", "pick")])
+        created, skipped = _sync(con, events, timed_only=True)
+
+        self.assertEqual([b["summary"] for b in events.inserted], ["work block"])
+        self.assertEqual(events.deleted, ["ev-pick"])
+        self.assertEqual((created, skipped), (1, 0))
+
+    def test_decision_tag_in_block_and_inline_form_is_left_off(self):
+        block = self._write("tag-block", f"tags:\n  - todo\n  - decision\n{self.BLOCK}")
+        inline = self._write("tag-inline", f"tags: [todo, decision]\n{self.BLOCK}")
+        con = _db([
+            ("tag-block", "block form", "-", "", block, "open", "manual"),
+            ("tag-inline", "inline form", "-", "", inline, "open", None),
+        ])
+        events = _FakeEvents(existing=[self._event("ev-block", "tag-block"),
+                                       self._event("ev-inline", "tag-inline")])
+        created, _ = _sync(con, events, timed_only=True)
+
+        self.assertEqual(events.inserted, [])
+        self.assertEqual(sorted(events.deleted), ["ev-block", "ev-inline"])
+        self.assertEqual(created, 0)
+
+    def test_all_dated_rule_leaves_a_decision_task_off_too(self):
+        pick = self._write("pick", "needs_decision: true\ndue: 2026-12-01")
+        con = _db([("pick", "pick a plan", "2026-12-01", "", pick, "open", "manual")])
+        events = _FakeEvents(existing=[self._event("ev-pick", "pick")])
+        created, _ = _sync(con, events)                      # timed_only=False
+
+        self.assertEqual(events.inserted, [])
+        self.assertEqual(events.deleted, ["ev-pick"])
+        self.assertEqual(created, 0)
+
+    def test_an_answered_or_plain_task_keeps_its_block(self):
+        answered = self._write("answered", f"needs_decision: false\n{self.BLOCK}")
+        plain = self._write("plain", f"tags:\n  - todo\n  - decisions-log\n{self.BLOCK}")
+        con = _db([
+            ("answered", "answered task", "-", "", answered, "open", "manual"),
+            ("plain", "plain task", "-", "", plain, "open", "manual"),
+        ])
+        events = _FakeEvents()
+        created, _ = _sync(con, events, timed_only=True)
+
+        self.assertEqual(sorted(b["summary"] for b in events.inserted),
+                         ["answered task", "plain task"])
+        self.assertEqual(events.deleted, [])
+        self.assertEqual(created, 2)
+
+    def test_a_decision_child_does_not_cover_its_parent(self):
+        # A timed child normally makes its parent a container (left off the
+        # calendar). A decision child has no block of its own any more, so the
+        # parent keeps its event.
+        parent = self._write("prep", 'scheduled: "2026-12-01 09:00~09:30"')
+        child = self._write("prep-1", f'parent: "[[prep]]"\nneeds_decision: true\n{self.BLOCK}')
+        con = _db([
+            ("prep", "prep parent", "-", "", parent, "open", "manual"),
+            ("prep-1", "pick one", "-", "", child, "open", "manual"),
+        ])
+        events = _FakeEvents()
+        created, _ = _sync(con, events, timed_only=True)
+
+        self.assertEqual([b["summary"] for b in events.inserted], ["prep parent"])
+        self.assertEqual(created, 1)
+
+    def test_a_done_decision_task_gets_no_done_event(self):
+        done = 'scheduled: "2026-12-01 10:00~10:30"\ncompleted: "2026-12-01 10:20"'
+        picked = self._write("picked", f"needs_decision: true\n{done}")
+        worked = self._write("worked", done)
+        con = _db([
+            ("picked", "picked a plan", "-", "", picked, "done", "manual"),
+            ("worked", "did the work", "-", "", worked, "done", "manual"),
+        ])
+        events = _FakeEvents(existing=[self._event("ev-picked", "picked")])
+        with mock.patch.object(CS, "_now_local", lambda: dt.datetime(2026, 12, 1, 12, 0)):
+            created, _ = _sync(con, events, timed_only=True)
+
+        # the plain done block keeps its record; the decision gets none and loses
+        # the live event it had
+        self.assertEqual([b["summary"] for b in events.inserted], ["✅ did the work"])
+        self.assertEqual(events.deleted, ["ev-picked"])
+        self.assertEqual(created, 1)
+
+
+def test_is_decision_task_reads_the_markers_and_fails_open(tmp_path, monkeypatch):
+    def md(name: str, fm: str) -> str:
+        p = tmp_path / f"{name}.md"
+        p.write_text(f"---\n{fm}\n---\n# {name}\n", encoding="utf-8")
+        return str(p)
+
+    assert CS._is_decision_task(md("a", "needs_decision: true")) is True
+    assert CS._is_decision_task(md("b", "needs_decision: true  # pick one")) is True
+    assert CS._is_decision_task(md("c", "tags:\n  - todo\n  - Decision")) is True
+    assert CS._is_decision_task(md("d", "tags: [todo, decision]")) is True
+    assert CS._is_decision_task(md("e", "needs_decision: false")) is False
+    assert CS._is_decision_task(md("f", "tags:\n  - todo")) is False
+    assert CS._is_decision_task(md("g", "title: needs_decision: true")) is False
+    # a relative path resolves against the vault root, like every other md read here
+    monkeypatch.setattr(CS, "ROOT", tmp_path)
+    assert CS._is_decision_task("a.md") is True
+    # fail-open: an unreadable md is the old behaviour (synced like any task)
+    assert CS._is_decision_task("missing.md") is False
+    assert CS._is_decision_task(str(tmp_path)) is False
+    (tmp_path / "plain.md").write_text("no frontmatter\n", encoding="utf-8")
+    assert CS._is_decision_task("plain.md") is False
 
 
 def test_parent_slug_forms(tmp_path):

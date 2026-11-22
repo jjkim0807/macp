@@ -506,6 +506,35 @@ def _opted_out(source_path: str) -> bool:
     return raw in ("false", "no", "off", "0")
 
 
+def _is_decision_task(source_path: str) -> bool:
+    """True when the task md carries a decision marker: the `decision` tag or
+    `needs_decision: true` (:func:`task_deps._has_decision_marker`, the one
+    definition, read the way :func:`task_deps.scan_items` reads it).
+
+    A decision is answered on the dashboard the moment it is asked (a card with
+    buttons — the "Decision cards" contract in orchestrator/triage.py), so it
+    gets no calendar block: the sync leaves it out, the stale cleanup deletes
+    the event it already has, and the overdue mover never rewrites its
+    `scheduled:`. Read from the md, not the DB row — `needs_decision` is not a
+    DB column, and an answer takes effect on the next sync, not the next import.
+
+    Imports are local: ``task_deps`` imports ``cli``, which imports this module.
+    Any read or parse error answers False — the old behaviour (synced like any
+    other task) beats a dead sync tick.
+    """
+    try:
+        from . import task_deps
+        from .cli import parse_frontmatter
+        fm, _ = parse_frontmatter(_md_path(source_path).read_text(encoding="utf-8"))
+        raw = task_deps._fm_str(fm, "needs_decision")
+        return task_deps._has_decision_marker({
+            "tags": [t.strip().lower() for t in task_deps._as_list(fm.get("tags")) if t.strip()],
+            "needs_decision": task_deps._as_bool(raw, False) if raw else False,
+        })
+    except Exception:  # noqa: BLE001 - fail-open by contract
+        return False
+
+
 def plan_overdue_moves(blocks: list[dict], busy: list[tuple[dt.datetime, dt.datetime]],
                        now: dt.datetime, *, hours: tuple[int, int] = (10, 18),
                        weekdays: set[int] | None = None) -> list[tuple[str, str, str]]:
@@ -558,7 +587,10 @@ def _freebusy(service, calendars: Sequence[str], start: dt.datetime,
 def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
                               now: dt.datetime | None = None) -> list[tuple[str, str, str]]:
     """Move open human tasks' overdue timed blocks to the next free slot and
-    write them to the md. Returns the moves. Never raises."""
+    write them to the md. Returns the moves. Never raises.
+
+    A decision task (:func:`_is_decision_task`) is skipped whole: its block is
+    neither moved nor counted as busy, because it is not on the calendar."""
     if os.environ.get("MACP_RESCHEDULE_OVERDUE", "1") in ("0", "false", "no", "off"):
         return []
     try:
@@ -567,6 +599,8 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
         blocks, busy, paths_by_slug = [], [], {}
         for r in rows:
             src = str(r["path"])
+            if _is_decision_task(src):
+                continue
             d, s, e = _parse_scheduled(src)
             if not (d and s and e):
                 continue
@@ -912,6 +946,13 @@ def sync_due_tasks_to_calendar(
     are deleted ``MACP_CALENDAR_DONE_KEEP_DAYS`` (default 30) after completion.
     A done task without `completed:` (done before 2026-11-19) loses its event
     as before. A reopened task's ✅ event stays as history until it ages out.
+
+    A decision task (the `decision` tag or `needs_decision: true`, see
+    :func:`_is_decision_task`) never gets an event, whatever its `scheduled:`
+    says: it is answered on the dashboard, not sat down to at a set time. It is
+    dropped before anything else is computed, so the cleanup deletes the event
+    it already has, a decision child does not turn its parent into a container,
+    a done decision keeps no ✅ record, and the overdue mover never sees it.
     """
     creds = load_credentials(client_secret_path, token_path)
     service = build("calendar", "v3", credentials=creds)
@@ -933,6 +974,13 @@ def sync_due_tasks_to_calendar(
         """,
         human_params,
     ).fetchall()
+
+    # A decision is answered on the dashboard, so it has no place on the
+    # calendar. Dropped FIRST: before covered_parents (a decision child carries
+    # no block that could stand in for its parent's), before target_by_slug
+    # (so the cleanup below deletes an event it already has) and before the
+    # overdue mover, which is handed these same `rows`.
+    rows = [r for r in rows if not _is_decision_task(str(r["path"]))]
 
     # A task whose open children carry timed blocks (`scheduled: DATE HH:MM~HH:MM`)
     # is a container: the children are the calendar entries, and the parent's
@@ -994,6 +1042,8 @@ def sync_due_tasks_to_calendar(
         ).fetchall()
         for r in done_rows:
             src = str(r["path"])
+            if _is_decision_task(src):
+                continue                 # never had a block worth a ✅ record
             d, s, e = _parse_scheduled(src)
             if not (d and s and e):
                 continue
