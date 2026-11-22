@@ -184,16 +184,3 @@ def test_real_execv_script_argv_is_untouched(installed_pkg, tmp_path):
     proc = _child(["-c", _EXEC_SNIPPET, str(installed_pkg), "hello.sh", "a", "b"], cwd=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip().splitlines()[-1] == "hello a b"
-
-
-def test_dry_run_from_dash_m_on_this_checkout_is_unchanged(tmp_path):
-    # Resolution only (worker_run_next.sh ignores argv and would run a real
-    # maintenance); pairs with 13a's orchestrator_tick.sh dry-run case.
-    proc = _child(["-m", "todo_system.engine_script", "--dry-run", "worker_run_next.sh"],
-                  cwd=ENGINE)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    assert len(lines) == 3, proc.stdout
-    got = dict(ln.split("=", 1) for ln in lines)
-    assert Path(got["script"]) == ENGINE / "scripts" / "worker_run_next.sh"
-    assert got["executable"] == "true"

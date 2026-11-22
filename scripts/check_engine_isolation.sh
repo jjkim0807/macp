@@ -13,9 +13,9 @@
 #      (ENGINE_TMP) with `git archive HEAD`.
 #   2. Makes two throwaway vaults, each a copy of the archived vault-template/ (the
 #      same skeleton a newcomer copies):
-#        VAULT_TMP — for the prime step and legs A/B/C.
-#        TRY_VAULT — for leg T only, so its hello-world task never reaches leg C.
-#   3. With MACP_VAULT_ROOT pointed at VAULT_TMP, runs 3 read-only CLIs from
+#        VAULT_TMP — for the prime step and legs A/B.
+#        TRY_VAULT — for leg T only.
+#   3. With MACP_VAULT_ROOT pointed at VAULT_TMP, runs 2 read-only CLIs from
 #      cwd=ENGINE_TMP (the engine archive) and judges each rc/observation.
 #   4. Leg T runs the README "Try it in five minutes" commands in the same order
 #      (cli new → set worker_mode: auto + outcome → cli validate → cli import-md →
@@ -44,9 +44,7 @@
 #
 # Verdict: RESULT: PASS (exit 0) only when the 2 migrated legs (cli list ·
 #       session_log list) are rc=0 AND leg T (the README five-minute loop) passes every
-#       step and every expected output. The worker leg C (run-next --dry-run) is
-#       expected to be rc=0 too, since all three modules respect paths.vault_root(),
-#       but a rc≠0 there is recorded only and does not fail the script.
+#       step and every expected output.
 #
 # Re-run:  bash scripts/check_engine_isolation.sh
 #
@@ -93,7 +91,7 @@ cp -R "$ENGINE_TMP/vault-template/." "$TRY_VAULT/"
 echo "[phase2] vault fixture ready ($(find "$VAULT_TMP" -type f | wc -l) file(s))"
 echo
 
-# --- Phase 3: run the 3 isolation legs + rc/observation table + exit policy ---
+# --- Phase 3: run the isolation legs + rc/observation table + exit policy ---
 # Each leg runs with cwd=ENGINE_TMP (the engine archive) + MACP_VAULT_ROOT=VAULT_TMP.
 # `uv run --directory` with the engine's own pyproject.toml/uv.lock → the project deps
 # (google-*·pyyaml) are resolved from the engine manifest (offline and a few seconds
@@ -155,23 +153,6 @@ capture uv run --directory "$ENGINE_TMP" python -m todo_system.session_log list
 B_RC=$CAP_RC; B_OBS="$(last_line "$CAP_OUT")"
 echo "$CAP_OUT" | sed 's/^/    B| /'
 echo "[phase3] leg B rc=$B_RC"
-echo
-
-# Leg C (migration done, recorded only): worker run-next --dry-run.
-# worker.py's own ROOT (PR #167), and the _VAULT_DATA_ROOT of
-# orchestrator/human.py · orchestrator/stages.py that run-next references
-# ([[macp-vault-root-human-stages-modules]]), were all migrated to
-# paths.vault_root() and respect MACP_VAULT_ROOT. rc≠0 is a regression, but this leg
-# only records it and does not fail the script (the exit policy looks only at legs
-# A/B/T).
-# This leg does not go through worker's engine-file paths (COMMANDS_DIR·
-# KAKAO_SEND_SCRIPT·HEALTH_REPORT_SCRIPT), so that coupling is caught by
-# todo_system/tests/test_worker_engine_root.py (inventory §11.9).
-echo "[phase3] leg C: worker run-next --dry-run"
-capture uv run --directory "$ENGINE_TMP" python -m todo_system.worker run-next --dry-run
-C_RC=$CAP_RC; C_OUT="$CAP_OUT"; C_OBS="$(last_line "$CAP_OUT")"
-echo "$CAP_OUT" | sed 's/^/    C| /'
-echo "[phase3] leg C rc=$C_RC"
 echo
 
 # --- Leg T (required): the README "Try it in five minutes" loop ----------------
@@ -310,36 +291,10 @@ printf '| %s | %s | %s | %s |\n' \
 printf '| %s | %s | %s | %s |\n' \
   "python -m todo_system.session_log list"          "$B_RC" "예 (paths.vault_root→env, stdlib)"                 "$B_OBS"
 printf '| %s | %s | %s | %s |\n' \
-  "python -m todo_system.worker run-next --dry-run" "$C_RC" "예 (worker.py·human.py·stages.py 모두 paths.vault_root→env)"  "$C_OBS"
-printf '| %s | %s | %s | %s |\n' \
   "README five-minute try (clean HOME)"             "$T_RC" "예 (MACP_VAULT_ROOT=TRY_VAULT, HOME=mktemp)"      "$T_OBS"
 printf '%s\n' "(prime: cli import-md rc=$PRIME_RC)"
 echo "======================================================="
 echo
-
-# --- coupling-gap findings (worker leg) ------------------------------------
-if [ "$C_RC" -ne 0 ]; then
-  echo "REGRESSION: worker run-next --dry-run rc=$C_RC — worker.py · orchestrator/human.py ·"
-  echo "  orchestrator/stages.py 는 모두 paths.vault_root() 로 마이그레이션되어"
-  echo "  MACP_VAULT_ROOT 를 존중해야 정상이다(PR #167,"
-  echo "  [[macp-vault-root-human-stages-modules]]). rc≠0 은 회귀일 가능성이 높다 —"
-  echo "  스크립트 exit 자체는 영향 없음(레그 A/B/T 만 판정에 반영)."
-  echo
-else
-  case "$C_OUT" in
-    *"no pending runs"*|*"entering planner path"*|*"[planner]"*)
-      echo "NOTE: worker 레그 rc=0 — worker.py · orchestrator/human.py ·"
-      echo "  orchestrator/stages.py 모두 paths.vault_root() 마이그레이션되어"
-      echo "  MACP_VAULT_ROOT(VAULT_TMP)를 존중한다(PR #167,"
-      echo "  [[macp-vault-root-human-stages-modules]]). 'no pending runs' 는 VAULT_TMP"
-      echo "  픽스처에 Worker/queue.json 이 없어 나오는 정상 결과다(레그 A/B처럼"
-      echo "  VAULT_TMP 를 읽었다는 뜻). 세 모듈 모두 엔진 파일(scripts/, 스테이지 프롬프트는"
-      echo "  패키지의 todo_system/prompts)만 __file__ 기준으로 앵커하며(worker.py 포함),"
-      echo "  이는 의도된 것이라 MACP_VAULT_ROOT 를 무시하는 게 맞다."
-      echo
-      ;;
-  esac
-fi
 
 # --- exit policy: PASS if legs A/B are rc=0 and leg T passed -----------------
 if [ "$A_RC" -eq 0 ] && [ "$B_RC" -eq 0 ] && [ "$T_RC" -eq 0 ]; then

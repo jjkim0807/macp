@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-# Two anchors, as in install_worker_launchagent.sh (11i) and
+# Two anchors, as in
 # install_orchestrator_launchagent.sh (11k). ENGINE_DIR is this script's own
 # checkout (where brief.sh lives). VAULT_DIR is where the data lives (logs/,
 # Todo/Briefings/, and the plist WorkingDirectory): MACP_VAULT_ROOT (split

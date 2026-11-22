@@ -2,7 +2,7 @@
 # Remote v2 runner loop (P4) — runs on a secondary host (WSL/Linux; a Windows
 # equivalent mirrors claude-remote-control-windows). Runs the orchestrator
 # Runner as a daemon; the git:// mailbox syncs messages with the Mac
-# orchestrator through the vault repo, exactly like worker_remote_loop.sh.
+# orchestrator through the vault repo.
 #
 # Identity is passed inline (--agent-id), so NO registry/PyYAML is needed here —
 # only the stdlib transport + git (+ claude for live modes). Runs under a bare

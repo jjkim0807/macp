@@ -463,8 +463,8 @@ class InstalledModeTest(unittest.TestCase):
                       out.getvalue())
 
     def test_macp_worker_unit_not_invented(self):
-        # The AC names a macp-worker unit, but systemd replaced worker_run_next.sh
-        # with the runner + maintenance units; inventing one would break the
+        # The AC names a macp-worker unit, but systemd runs the runner +
+        # maintenance units instead; inventing one would break the
         # default-mode golden.
         self.assertNotIn("macp-worker.service", self.inst)
         self.assertNotIn("macp-worker.service", self.default)

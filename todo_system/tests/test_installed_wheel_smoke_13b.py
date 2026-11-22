@@ -11,14 +11,6 @@ What it pins, from site-packages, with ``python -P`` and ``PYTHONPATH`` /
 
 * ``todo_system/_engine`` ships no ``pyproject.toml`` — the premise of the
   scripts' layout test — and the installed scripts carry the 13b branch.
-* ``python -m todo_system.engine_script worker_run_next.sh`` **really runs** to
-  rc 0 (AC2). The script ignores its arguments and runs ``maintenance`` against
-  the throwaway vault (primed with ``cli import-md`` so the queue readers find
-  a ``todo.db``). ``HOME`` is tmp because the script prepends
-  ``$HOME/.local/bin`` to ``PATH``, where a
-  ``uv`` tripwire sits — if the installed branch were not taken the old
-  ``uv run --project .../_engine`` line would hit the tripwire (rc 97) instead
-  of the real uv, so "no tripwire log" proves the branch, not just the rc.
 * ``engine_script kakao_send.sh`` resolves the card link through the
   site-packages ``paths.repo_slug`` under ``MACP_PYTHON`` (the positive
   control): before 13b the ``/usr/bin/python3`` call could not import
@@ -63,7 +55,7 @@ _SCRUB = (
 )
 _REPO_SLUG = "acme/smoke-13b"
 _BRANCH = '[[ ! -f "$ENGINE_DIR/pyproject.toml" && -n "${MACP_PYTHON:-}" ]]'
-_DAEMON_SCRIPTS = ("orchestrator_tick.sh", "worker_run_next.sh", "brief.sh",
+_DAEMON_SCRIPTS = ("orchestrator_tick.sh", "brief.sh",
                    "kakao_send.sh", "notify_kakao.sh")
 _UNTOUCHED_SCRIPTS = ("kakao_token_refresh.sh", "kakao_oauth_helper.sh")
 _SAMPLE_TASK = """---
@@ -195,7 +187,7 @@ def empty_cwd(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def home(tmp_path_factory) -> Path:
-    """Tmp HOME with the uv tripwire where worker_run_next.sh looks first."""
+    """Tmp HOME with the uv tripwire in ``.local/bin``."""
     root = tmp_path_factory.mktemp("smoke-home-13b")
     _write_exec(root / ".local" / "bin" / "uv", _UV_TRIPWIRE)
     return root
@@ -221,15 +213,6 @@ def site_engine(installed, vault, empty_cwd) -> Path:
     return root
 
 
-@pytest.fixture(scope="module")
-def primed_vault(installed, vault, empty_cwd) -> Path:
-    # maintenance's queue readers go straight to the DB, so import-md builds
-    # Todo/todo.db first (the isolation script's prime step, as in leaf 12).
-    _ok(_py(installed, vault, empty_cwd, "-m", "todo_system.cli", "import-md"), "cli import-md")
-    assert (vault / "Todo" / "todo.db").is_file()
-    return vault
-
-
 # --- the layout premise and the wheel's script bodies ----------------------------
 
 
@@ -248,49 +231,6 @@ def test_wheel_scripts_carry_the_installed_branch(site_engine):
     for name in _UNTOUCHED_SCRIPTS:
         text = (site_engine / "scripts" / name).read_text(encoding="utf-8")
         assert "MACP_PYTHON" not in text, name
-
-
-def _dry_run(proc: subprocess.CompletedProcess) -> dict[str, str]:
-    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    assert len(lines) == 3, proc.stdout
-    return dict(ln.split("=", 1) for ln in lines)
-
-
-def test_engine_script_dry_run_worker_run_next_is_unchanged(installed, vault, empty_cwd):
-    proc = _ok(_py(installed, vault, empty_cwd, "-m", "todo_system.engine_script",
-                   "--dry-run", "worker_run_next.sh"),
-               "engine_script --dry-run worker_run_next.sh")
-    got = _dry_run(proc)
-    path = Path(got["script"])
-    assert path.parts[-4:] == ("todo_system", "_engine", "scripts", "worker_run_next.sh"), path
-    assert path.is_relative_to(installed.venv.resolve()), (path, installed.venv)
-    assert json.loads(got["argv"]) == [str(path)]
-    assert got["executable"] == "true", got
-
-
-# --- AC2: engine_script worker_run_next.sh really runs from site-packages --------
-
-
-@needs_zsh
-def test_engine_script_runs_worker_run_next_from_site_packages(installed, primed_vault,
-                                                               empty_cwd, home, site_engine):
-    env = _script_env(primed_vault, home)
-    proc = _engine_script(installed, empty_cwd, env, "worker_run_next.sh")
-    out = proc.stdout + proc.stderr
-    print(f"--- engine_script worker_run_next.sh rc={proc.returncode} ---\n{out}")  # -rA shows it
-    assert proc.returncode == 0, f"rc={proc.returncode}\n{out}"
-
-    # The script's own log line, written from the vault's logs/.
-    log = (primed_vault / "logs" / "worker.out.log").read_text(encoding="utf-8", errors="replace")
-    assert "worker_run_next: maintenance" in log, log
-    # The installed branch was taken: the tripwire never fired, uv never named.
-    assert not Path(env["SMOKE_UV_LOG"]).exists(), Path(env["SMOKE_UV_LOG"]).read_text()
-    assert "uv run" not in out, out
-    assert "ERROR uv not on PATH" not in out, out
-    # No side effects outside the vault: no venv in the vault, no logs in the engine.
-    assert not (primed_vault / ".venv").exists()
-    assert not (site_engine / "logs").exists()
-    assert not (home / "Projects").exists()
 
 
 # --- positive control: the kakao script imports todo_system from site-packages ----
