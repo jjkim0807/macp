@@ -167,7 +167,7 @@ related:
 |---|---|---|---|
 | `macp init` | 볼트 보장, 현재 리포 등록, 로그인 확인 | `paths.engine_root` (`todo_system/paths.py:191`) · `config.write_project` (`todo_system/macp/config.py:330`) · `memory.ensure_memory` (`todo_system/macp/memory.py:31`) · `memory.link_agent_context` (`todo_system/macp/memory.py:61`) · `model_select.resolve_model` (`todo_system/orchestrator/model_select.py:304`) · `claude_auth.auth_source` (`todo_system/claude_auth.py:145`) | 템플릿 복사, `git init -b main`·첫 커밋, 마커에 `vault_root` 키 |
 | `macp add "<문장>"` | 문장 → 태스크 파일 → 검증 → DB → 커밋 | `stages.stage_model`·`stage_effort` (`todo_system/orchestrator/stages.py:86`, `:96`) · `claude_auth.claude_env` (`todo_system/claude_auth.py:111`) · `task_validate.validate_file` (`todo_system/task_validate.py:497`) · `cli.db_connect`·`init_db`·`import_markdown_to_db` (`todo_system/cli.py:115`, `:132`, `:1212`; `cmd_import`가 부르는 세 줄 `:1253-1256`) | 프롬프트, JSON 검사, 파일 렌더와 원자적 쓰기, 볼트 커밋 |
-| `macp up --once` | 동기화 → 틱 → 러너 한 번 → 틱 → 상태 | `cli.snapshot_mtime` (`todo_system/cli.py:1122`) · `orchestrator._main`의 `auto` (`todo_system/orchestrator/orchestrator.py:3603`, `:3756-3805`) · `runner._main`의 `--once` (`todo_system/orchestrator/runner.py:3231`, `:3292`) | 순서, 볼트로 chdir, 요약 출력 |
+| `macp up --once` | 동기화 → 틱 → 러너 한 번 → 수거 → 틱 → 상태 | `cli.snapshot_mtime` (`todo_system/cli.py:1122`) · `orchestrator._main`의 `auto`와 `collect` (`todo_system/orchestrator/orchestrator.py:3603`, `:3756-3805`, `:3726-3729`) · `runner._main`의 `--once` (`todo_system/orchestrator/runner.py:3231`, `:3292`) · `Lease` (`todo_system/orchestrator/lease.py:217`) · `stages.checkpoint_push` (`todo_system/orchestrator/stages.py:2091`) | 순서, 볼트로 chdir, 태스크 파일 커밋, 요약 출력 |
 | `macp up` | 위를 반복 | 위 + `Runner.poll_once` (`todo_system/orchestrator/runner.py:2705`) · `Runner._usage_blocked` (`:3033`) · `make_executor` (`:2165`) | 루프와 간격 |
 | `macp up --service` | 유닛 1개 설치 | `gen_units.service` (`scripts/systemd/gen_units.py:119`) · `write_env` (`:262`) · `systemctl` 호출 선례 (`:321-325`) | 유닛 이름과 `ExecStart` |
 | `macp status` | 볼트·등록·인증·원장을 한 화면에 | `config.resolve` (`todo_system/macp/config.py:194`) · `claude_auth.auth_source` · `orchestrator._main`의 `status` (`todo_system/orchestrator/orchestrator.py:3731-3734`) · `trace` (`:3749-3753`) | 묶어 찍기, 검토 대기 문구 |
@@ -317,9 +317,11 @@ related:
    - `vault-template`에는 `.gitignore`가 없다. 한 바퀴 돌고 나면 `Todo/todo.db`,
      `Todo/NOW.md`, `Todo/FOCUS.md`, `Todo/Dashboard.md`, `Worker/_state/`,
      `Worker/agents/<agent>/`, `Worker/assignments/`, `Worker/orchestrator.lock`,
-     `Worker/queue.lock`이 추적되지 않은 채 남는다(확인 실행에서 본 목록). 2단계가 이
-     목록과 `Worker/runs/`, `logs/`를 템플릿의 `.gitignore`에 넣는다. 본부 볼트는 템플릿을
-     다시 복사하지 않으므로 영향이 없다.
+     `Worker/queue.lock`이 추적되지 않은 채 남는다(확인 실행에서 본 목록). `macp init`이
+     **새 볼트에** `.gitignore`를 써서 이 목록과 `Worker/runs/`, `logs/`를 뺀다. 템플릿에는
+     넣지 않는다: 원장과 메일박스는 본부에서 git으로 호스트 사이를 오가는 상태라
+     (`README.md:68-70`), 템플릿에서 빼 버리면 템플릿으로 만든 본부식 새 볼트의 동작이
+     달라진다. 1인 모드는 호스트가 하나이므로 그 볼트에서만 뺀다.
 2. **리포 등록.** 현재 디렉터리가 git 리포 안이면 그 최상위에 대해 프로젝트 CLI의
    `init`과 같은 세 함수를 같은 순서로 부른다 (`todo_system/macp/__main__.py:52-55`):
    `write_project`(프로필 `default`, `vault_root` 키 포함) → `ensure_memory` →
@@ -577,9 +579,11 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
 (`todo_system/orchestrator/orchestrator.py:2024-2041`, `:2070-2077`). 본부에서는 런이 도는
 동안에도 5분마다 틱이 돌아 스테이지 사이의 진행 메시지를 수거하므로 행이 계속 갱신된다.
 단일 스레드에서는 런이 도는 동안 틱이 없다. 그래서 스테이지가 여럿인 런이 한도보다 오래
-걸리면, 끝난 런을 다음 틱이 죽은 것으로 보고 결과를 버린다. 러너가 돌아온 직후에
-`collect`를 먼저 부르면 응답이 먼저 적용되고, 그 뒤의 틱은 그 행을 진행 중으로 보지 않는다.
-이 순서는 코드를 읽어 정한 것이다. 2단계가 테스트로 고정한다.
+걸리면, 끝난 런의 행을 다음 틱이 죽은 것으로 보고 실패로 돌린다. 짝이 되는 진행 중 행이
+없는 응답은 버려진다고 수거 코드가 적고 있다
+(`todo_system/orchestrator/orchestrator.py:1390-1395`). 러너가 돌아온 직후에 `collect`를
+먼저 부르면 응답이 먼저 적용되고, 그 뒤의 틱은 그 행을 진행 중으로 보지 않는다. 이 순서는
+코드를 읽어 정한 것이다. 2단계가 테스트로 고정한다.
 
 **6번이 있는 이유.** 오케스트레이터는 끝난 태스크의 파일을 닫는다(확인 실행에서
 `status: done`으로 바뀐 것을 봤다). 본부에서는 maintenance가 볼트 변경을 커밋한다
@@ -648,9 +652,9 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
   (`todo_system/usage_guard.py:164`, `:178-205`). 이 대기는 최대 5시간 반이다
   (`todo_system/orchestrator/runner.py:2257-2303`). 포그라운드 명령이 그동안 멈춰 있게
   된다.
-- 가드가 지키는 것은 "사람이 없는 동안 자동화가 사람 몫의 쿼터를 다 쓰는 일"이다. `--once`는
-  사람이 방금 치고 지켜보는 한 번의 실행이다. 대화형 세션과 같은 처지이고, 막아서 지킬
-  되돌릴 수 없는 것이 없다.
+- 가드가 막으려는 것은 사람이 없는 동안 자동화가 사람 몫의 쿼터까지 다 쓰는 일이다.
+  `--once`는 사람이 방금 치고 지켜보는 한 번의 실행이다. 대화형 세션과 같은 처지이고,
+  막아서 지킬 되돌릴 수 없는 것이 없다.
 - 한도가 실제로 찼으면 `claude`가 그렇게 말하고, 러너는 그것을 결함이 아닌 보류로 처리한다
   (`todo_system/orchestrator/runner.py:1720-1766`). `macp up --once`는 그 이유를 보여 준다.
 
@@ -889,9 +893,9 @@ plugins/macp/README.md
 - 새 환경변수 0개, 새 설정 키 0개. `vault_root`와 `worker_root`는 해석기가 이미 읽는
   키다 (`todo_system/paths.py:155`, `:411`).
 - `gen_units.build()`는 건드리지 않는다. 13개 유닛의 출력이 그대로다.
-- 데이터 파일: `vault-template/.gitignore`, `vault-template/CLAUDE.md`,
-  `todo_system/prompts/`의 프롬프트·템플릿, `pyproject.toml`의 wheel 포함 목록. 이미
-  만들어진 볼트는 템플릿을 다시 복사하지 않는다.
+- 데이터 파일: `vault-template/CLAUDE.md`, `todo_system/prompts/`의 프롬프트·템플릿,
+  `pyproject.toml`의 wheel 포함 목록. 이미 만들어진 볼트는 템플릿을 다시 복사하지 않는다.
+  `.gitignore`는 템플릿이 아니라 `macp init`이 새 볼트에 쓴다(②의 D5).
 - 주의: 테스트에는 경로를 `repo`로 쓰는 것이 있다
   (`todo_system/orchestrator/runner.py:691-692`가 그렇게 적는다). 셋째 줄의 변경이 그런
   테스트의 기대 인자를 바꾸는지 2단계가 확인한다.
@@ -1045,8 +1049,7 @@ each step and still documents the manual loop.
 ### 2단계 — 콘솔 명령 (`macp-lite-2-cli`)
 
 **새로 생기는 것.** `todo_system/lite.py`(얇은 글루) · `todo_system/prompts/`의 `add`
-프롬프트와 태스크 템플릿 · `vault-template/.gitignore` · `vault-template/CLAUDE.md` ·
-테스트.
+프롬프트와 태스크 템플릿 · `vault-template/CLAUDE.md` · 테스트.
 
 **바뀌는 것.** ⑧의 네 군데 · `todo_system/i18n.py`(문구) · `pyproject.toml`(wheel과
 sdist에 `vault-template` 넣기) · `README.md` · `README.ko.md` · `docs/getting-started.md` ·
