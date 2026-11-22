@@ -1,0 +1,90 @@
+{
+  "case": "delegate_vault_done",
+  "source": "Shape of a real vault delegate run of 2026-11-22 (a recurring cost review; the task has no repo): stages.json with the single usage.delegate record, and delegate.md, whose frontmatter carries `status: pass` and no PR field — the runner opens the vault PR after the stage, so no run-dir file names it. The slug ends in a date but is not a discovery slug. Every value is synthetic.",
+  "runs": [
+    {
+      "name": "20261122T140107-cost-review-20261121",
+      "files": {
+        "stages.json": {
+          "account": "acct",
+          "model_tier": "standard",
+          "model_tier_reason": "model_tier: standard",
+          "usage": {
+            "delegate": {"input_tokens": 120, "output_tokens": 30000, "cache_creation_input_tokens": 210000, "cache_read_input_tokens": 6000000, "num_turns": 88, "duration_ms": 2600000, "model": "model-a", "session_id": "00000000-0000-4000-8000-000000000021", "total_cost_usd": 7.4}
+          },
+          "completed": ["delegate"]
+        },
+        "delegate.md": [
+          "---",
+          "stage: delegate",
+          "run_id: 20261122T140107-cost-review-20261121",
+          "slug: cost-review-20261121",
+          "branch: worker/cost-review-20261121",
+          "generated: 2026-11-22T14:45:00+09:00",
+          "status: pass",
+          "---",
+          "",
+          "# Delegate Run — synthetic title",
+          "",
+          "## TL;DR",
+          "",
+          "Synthetic summary line.",
+          "",
+          "## Changed files",
+          "",
+          "- `Notes/cost/2026-11-21.md` — synthetic"
+        ],
+        "related.md": ["# related", ""]
+      }
+    }
+  ],
+  "tasks": {
+    "cost-review-20261121": {
+      "md": [
+        "---",
+        "tags:",
+        "  - todo",
+        "  - work",
+        "  - worker",
+        "  - cost",
+        "  - compute-cost",
+        "status: done",
+        "due: 2026-11-22",
+        "updated: 2026-11-22",
+        "priority: 50",
+        "outcome: \"synthetic outcome\"",
+        "worker_mode: delegate",
+        "auto_merge: true",
+        "model_tier: standard",
+        "max_turns: 200",
+        "acceptance_criteria:",
+        "  - \"synthetic criterion\"",
+        "---",
+        "",
+        "# t"
+      ],
+      "ledger": {
+        "task_id": "cost-review-20261121",
+        "agent_id": "worker-default",
+        "kind": "ai-local",
+        "state": "done",
+        "checkout_busy": false,
+        "job_running": false,
+        "history": [],
+        "payload": {
+          "tags": ["todo", "work", "worker", "cost", "compute-cost"],
+          "worker_mode": "delegate",
+          "auto_merge": true,
+          "model_tier": "standard"
+        }
+      }
+    }
+  },
+  "expect": {
+    "rules": {"cost-review-20261121": "none"},
+    "week": [
+      {"project": "vault", "kind": "other", "out_tokens": 30000, "runs": 1, "runs_unmetered": 0,
+       "merged_prs": 0, "done": 1, "cancelled": 0, "failed": 0, "tokens_per_merge": null}
+    ]
+  }
+}

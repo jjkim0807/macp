@@ -92,9 +92,12 @@ functions that need them, so `--vault-root` can set the root first.
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
 import re
+from pathlib import Path
 
-from . import i18n
+from . import i18n, paths
 
 KINDS = ("discovery", "self", "feature", "bug", "security", "research", "ops", "other")
 PERIODS = ("week", "month")
@@ -317,6 +320,212 @@ def aggregate(runs: list[dict], tasks: dict, now: dt.datetime) -> dict:
     result into the wire model."""
     bounds = period_bounds(now)
     return {"periods": [_aggregate_period(pid, *bounds[pid], runs, tasks) for pid in PERIODS]}
+
+
+# --- reading the files -------------------------------------------------------------------
+
+_RESULT_HEAD = 8_000      # chars of report.md / quick.md read: the frontmatter and the summary lines
+_TASK_HEAD = 65_536       # chars of a task file read: its frontmatter sits at the top
+_PR_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+")
+_BODY_PR_RE = re.compile(r"^- PR:[ \t]*(.+)$", re.M)
+
+# path -> (mtime_ns, size, parsed value). The dashboard rebuilds the table every
+# few seconds over files that almost never change, so each is parsed once per
+# change and a rebuild costs one stat per file. Bounded by a blunt clear.
+_CACHE: dict[str, tuple[int, int, object]] = {}
+_CACHE_MAX = 20_000
+
+
+def clear_cache() -> None:
+    _CACHE.clear()
+
+
+def _cached(path: str, load):
+    """`load(path)`, run again only when the file's mtime or size changed. None
+    for a missing file. A loader returns None for a file it cannot use."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        _CACHE.pop(path, None)
+        return None
+    hit = _CACHE.get(path)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
+    value = load(path)
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[path] = (st.st_mtime_ns, st.st_size, value)
+    return value
+
+
+def _read_head(path: str, limit: int) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(limit)
+    except OSError:
+        return None
+
+
+def _load_usage(path: str) -> tuple[int, int, int] | None:
+    from .orchestrator import metrics    # resolves a vault root at import: not at module top
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    out = counted = uncounted = 0
+    for rec in (usage.values() if isinstance(usage, dict) else ()):
+        if metrics._usage_counted(rec):   # the one definition of a metered record, shared
+            out += rec["output_tokens"]
+            counted += 1
+        else:
+            uncounted += 1
+    return out, counted, uncounted
+
+
+def _result_of(text: str | None, *, body_pr: bool) -> tuple[str | None, bool | None] | None:
+    from .orchestrator import stages     # resolves a vault root at import: not at module top
+    if text is None:
+        return None
+    url = stages.parse_report_pr_url(text)
+    if url is not None:
+        m = _PR_URL_RE.search(url)
+        url = m.group(0) if m else _pr_key(url) or None
+    elif body_pr:
+        line = _BODY_PR_RE.search(text)
+        m = _PR_URL_RE.search(line.group(1)) if line else None
+        url = m.group(0) if m else None
+    return url, stages.parse_report_merged(text)
+
+
+def _load_report(path: str):
+    return _result_of(_read_head(path, _RESULT_HEAD), body_pr=False)
+
+
+def _load_quick(path: str):
+    return _result_of(_read_head(path, _RESULT_HEAD), body_pr=True)
+
+
+def _load_task(path: str) -> dict | None:
+    from .session_log import parse_frontmatter   # resolves a vault root at import
+    text = _read_head(path, _TASK_HEAD)
+    if text is None:
+        return None
+    fm, _ = parse_frontmatter(text)
+    return {"status": _text(fm.get("status")).lower(), "tags": _tags(fm.get("tags")),
+            "repo": _text(fm.get("repo")), "worker_mode": _text(fm.get("worker_mode")).lower(),
+            "from_discovery": _text(fm.get("from_discovery")),
+            "discover_repo": _text(fm.get("discover_repo"))}
+
+
+def _load_ledger(path: str) -> dict | None:
+    from .orchestrator import assignment
+    try:
+        with open(path, encoding="utf-8") as fh:
+            row = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return {"state": str(row.get("state") or ""), "deferred": assignment.is_deferred(row),
+            "tags": _tags(payload.get("tags")), "repo": _text(payload.get("repo")),
+            "worker_mode": _text(payload.get("worker_mode")).lower()}
+
+
+def run_usage(run_dir) -> tuple[int, int, int] | None:
+    """`(output tokens, accepted records, other records)` of a run's stages.json.
+
+    None when the file is missing or is not a JSON object; `(0, 0, 0)` when it
+    has no `usage`. A record counts when metrics._usage_counted accepts it."""
+    return _cached(os.path.join(run_dir, "stages.json"), _load_usage)
+
+
+def run_result(run_dir) -> tuple[str | None, bool | None]:
+    """`(PR url, merged)` a run reports: report.md if the run wrote one, else
+    quick.md. `(None, None)` when it wrote neither; delegate.md and discover.md
+    carry no PR and are not read."""
+    for name, load in (("report.md", _load_report), ("quick.md", _load_quick)):
+        found = _cached(os.path.join(run_dir, name), load)
+        if found is not None:
+            return found
+    return None, None
+
+
+def task_facts(slug: str, items_dir, assign_dir) -> dict:
+    """What project_of(), classify() and task_outcome() read about one task.
+
+    `status`, `from_discovery` and `discover_repo` come from the task file only;
+    `tags`, `repo` and `worker_mode` fall back to the ledger payload when the
+    file has none (or is gone); `state` and `deferred` are the ledger row's.
+    Missing values are "" / [] / False."""
+    md = _cached(os.path.join(items_dir, f"{slug}.md"), _load_task) or {}
+    row = _cached(os.path.join(assign_dir, f"{slug}.json"), _load_ledger) or {}
+    return {"status": md.get("status") or "",
+            "tags": md.get("tags") or row.get("tags") or [],
+            "repo": md.get("repo") or row.get("repo") or "",
+            "worker_mode": md.get("worker_mode") or row.get("worker_mode") or "",
+            "from_discovery": md.get("from_discovery") or "",
+            "discover_repo": md.get("discover_repo") or "",
+            "state": row.get("state") or "", "deferred": bool(row.get("deferred"))}
+
+
+def scan(runs_dir, items_dir, assign_dir, start: dt.datetime,
+         end: dt.datetime) -> tuple[list[dict], dict[str, dict]]:
+    """`(run records, {slug: task facts})` for the runs named inside [start, end].
+
+    `runs_dir` is listed once. A name outside the window is dropped on the name
+    alone: nothing of that run is opened or stat-ed. ([], {}) when the
+    directory cannot be listed."""
+    lo, hi = start.strftime(_RUN_TS_FORMAT), end.strftime(_RUN_TS_FORMAT)
+    runs: list[dict] = []
+    try:
+        entries = os.scandir(runs_dir)
+    except OSError:
+        return runs, {}
+    with entries:
+        for entry in entries:
+            m = _RUN_NAME_RE.match(entry.name)
+            if m is None or not lo <= m.group(1) <= hi:
+                continue
+            parsed = parse_run_name(entry.name)
+            try:
+                if parsed is None or not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            usage = run_usage(entry.path)
+            pr_url, merged = run_result(entry.path)
+            runs.append({"name": entry.name, "slug": parsed[1], "at": parsed[0],
+                         "out_tokens": usage[0] if usage else 0,
+                         "unmetered": usage is None or usage[1] == 0 or usage[2] > 0,
+                         "pr_url": pr_url, "merged": merged})
+    runs.sort(key=lambda r: r["name"])
+    tasks = {slug: task_facts(slug, items_dir, assign_dir)
+             for slug in sorted({r["slug"] for r in runs})}
+    return runs, tasks
+
+
+def build(vault_root=None, *, runs_dir=None, items_dir=None, assign_dir=None,
+          now: dt.datetime | None = None) -> dict:
+    """The wire model (module docstring) for the vault's run dirs, as of `now`.
+
+    The three directories default to the standard places under `vault_root`
+    (itself defaulting to the resolved vault). Reads local files only, cached
+    per file; a missing directory gives two empty periods."""
+    if runs_dir is None or items_dir is None or assign_dir is None:
+        root = (Path(vault_root) if vault_root is not None
+                else paths.vault_root(start=paths.vault_search_start()))
+        runs_dir = runs_dir if runs_dir is not None else root / "Worker" / "runs"
+        items_dir = items_dir if items_dir is not None else root / "Todo" / "items"
+        assign_dir = assign_dir if assign_dir is not None else root / "Worker" / "assignments"
+    now = _local_naive(now if now is not None else dt.datetime.now())
+    start = min(b[0] for b in period_bounds(now).values())
+    runs, tasks = scan(runs_dir, items_dir, assign_dir, start, now)
+    return present(aggregate(runs, tasks, now))
 
 
 # --- presentation: the wire model ----------------------------------------------------------

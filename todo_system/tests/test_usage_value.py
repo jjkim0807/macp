@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +33,11 @@ NOW = dt.datetime(2026, 11, 22, 18, 0, 0)
 APP = "https://github.com/example/app.git"
 ENGINE = "https://github.com/example/macp.git"
 _HANGUL = re.compile("[가-힣]")
+_REPO = Path(__file__).resolve().parents[2]
+_CASES = Path(__file__).resolve().parent / "usage_value_cases"
+CASE_NAMES = ("auto_five_stage_merged", "quick_merged", "delegate_vault_done",
+              "discovery_run_and_child", "unmetered_runs")
+_LOADERS = ("_load_usage", "_load_report", "_load_quick", "_load_task", "_load_ledger")
 
 
 def _run(name: str, out: int = 0, *, unmetered: bool = False, pr: str | None = None,
@@ -442,3 +451,397 @@ def test_model_is_json_and_follows_language(monkeypatch):
         assert (a["id"], a["range"], a["start"], a["end"]) == (b["id"], b["range"], b["start"], b["end"])
         assert [(r["project"], r["kind"], r["out_tokens"]) for r in a["rows"]] == [
             (r["project"], r["kind"], r["out_tokens"]) for r in b["rows"]]
+
+
+# --- the scanner: real-shaped files in a tmp vault ---------------------------------------------
+
+
+def _case(name: str) -> dict:
+    return json.loads((_CASES / f"{name}.json").read_text(encoding="utf-8"))
+
+
+def _content(value) -> str:
+    """A fixture file: an object is JSON, a list is its lines, a string is itself."""
+    if isinstance(value, dict):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "\n".join(value) + "\n"
+    return value
+
+
+def _usage(out: int) -> dict:
+    return {"input_tokens": 1, "output_tokens": out, "cache_creation_input_tokens": 2,
+            "cache_read_input_tokens": 3, "num_turns": 4, "duration_ms": 5, "model": "model-a",
+            "session_id": "00000000-0000-4000-8000-0000000000aa", "total_cost_usd": 0.1}
+
+
+def _report(pr: str = "null", merged: str = "n/a") -> list[str]:
+    return ["---", "stage: report", "overall_status: pass", f"pr_url: {pr}", f"merged: {merged}",
+            "no_op: false", "---", "", "# Report"]
+
+
+def _task_md(**fields) -> list[str]:
+    lines = ["---"]
+    for key, value in fields.items():
+        if isinstance(value, list):
+            lines += [f"{key}:", *(f"  - {v}" for v in value)]
+        else:
+            lines.append(f"{key}: {value}")
+    return [*lines, "---", "", "# t"]
+
+
+class _Vault:
+    """A tmp vault holding the three directories usage_value reads."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.runs = root / "Worker" / "runs"
+        self.items = root / "Todo" / "items"
+        self.assign = root / "Worker" / "assignments"
+        for d in (self.runs, self.items, self.assign):
+            d.mkdir(parents=True)
+
+    def run(self, name: str, files: dict | None = None) -> Path:
+        rd = self.runs / name
+        rd.mkdir()
+        for fname, value in (files or {}).items():
+            (rd / fname).write_text(_content(value), encoding="utf-8")
+        return rd
+
+    def task(self, slug: str, md=None, ledger: dict | None = None) -> None:
+        if md is not None:
+            (self.items / f"{slug}.md").write_text(_content(md), encoding="utf-8")
+        if ledger is not None:
+            (self.assign / f"{slug}.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+    def install(self, *names: str) -> _Vault:
+        for name in names:
+            case = _case(name)
+            for run in case["runs"]:
+                self.run(run["name"], run["files"])
+            for slug, task in case["tasks"].items():
+                self.task(slug, task.get("md"), task.get("ledger"))
+        return self
+
+    def scan(self, now: dt.datetime = NOW):
+        start = min(b[0] for b in uv.period_bounds(now).values())
+        return uv.scan(self.runs, self.items, self.assign, start, now)
+
+    def raw(self, now: dt.datetime = NOW) -> dict:
+        runs, tasks = self.scan(now)
+        return uv.aggregate(runs, tasks, now)
+
+    def build(self, now: dt.datetime = NOW) -> dict:
+        return uv.build(runs_dir=self.runs, items_dir=self.items, assign_dir=self.assign, now=now)
+
+
+@pytest.fixture
+def vault(tmp_path):
+    uv.clear_cache()
+    yield _Vault(tmp_path / "vault")
+    uv.clear_cache()
+
+
+def _count_loaders(monkeypatch) -> dict[str, list[str]]:
+    """Wrap every file loader; the result maps loader name -> the paths it read."""
+    seen: dict[str, list[str]] = {name: [] for name in _LOADERS}
+
+    def wrap(name):
+        real = getattr(uv, name)
+
+        def counting(path):
+            seen[name].append(str(path))
+            return real(path)
+        return counting
+
+    for name in _LOADERS:
+        monkeypatch.setattr(uv, name, wrap(name))
+    return seen
+
+
+@pytest.mark.parametrize("name", CASE_NAMES)
+def test_each_real_shaped_case_gives_its_expected_rows(vault, name):
+    case = _case(name)
+    assert case["case"] == name
+    assert case["source"].strip()
+    vault.install(name)
+    runs, tasks = vault.scan()
+    assert len(runs) == len(case["runs"])
+    assert _period(uv.aggregate(runs, tasks, NOW), "week")["rows"] == case["expect"]["week"]
+    assert {slug: uv.classify(tasks[slug], slug)[1] for slug in tasks} == case["expect"]["rules"]
+
+
+def test_all_cases_together_are_one_table(vault):
+    vault.install(*CASE_NAMES)
+    week = _period(vault.raw(), "week")
+    assert [(r["project"], r["kind"], r["out_tokens"], r["runs"]) for r in week["rows"]] == [
+        ("macp", "self", 466_000, 1), ("app", "discovery", 225_000, 2), ("app", "bug", 70_000, 3),
+        ("vault", "other", 30_000, 1), ("app", "other", 12_000, 1)]
+    assert week["total"] == {"out_tokens": 803_000, "runs": 8, "runs_unmetered": 3,
+                             "merged_prs": 3, "done": 6, "cancelled": 0, "failed": 1,
+                             "tokens_per_merge": 803_000 // 3}
+
+
+def test_scan_sums_usage_of_a_real_shaped_five_stage_run(vault):
+    vault.install("auto_five_stage_merged")
+    name = "20261121T144046-engine-triage-cards"
+    assert uv.run_usage(vault.runs / name) == (466_000, 5, 0)
+    (run,), _ = vault.scan()
+    assert (run["name"], run["slug"], run["at"]) == (
+        name, "engine-triage-cards", dt.datetime(2026, 11, 21, 14, 40, 46))
+    assert (run["out_tokens"], run["unmetered"]) == (466_000, False)
+
+
+def test_scan_run_without_stages_json_is_unmetered(vault):
+    vault.install("unmetered_runs")
+    assert uv.run_usage(vault.runs / "20261119T090000-app-no-stages") is None
+    assert uv.run_usage(vault.runs / "20261119T100000-app-no-usage") == (0, 0, 0)
+    by_slug = {r["slug"]: r for r in vault.scan()[0]}
+    for slug in ("app-no-stages", "app-no-usage"):
+        assert (by_slug[slug]["out_tokens"], by_slug[slug]["unmetered"]) == (0, True), slug
+
+
+def test_scan_unavailable_and_damaged_records_add_zero(vault):
+    vault.install("unmetered_runs")
+    # the real shape: a timed-out stage leaves {"unavailable": "timeout"}
+    assert uv.run_usage(vault.runs / "20261120T154934-app-player-skip-wired") == (70_000, 3, 1)
+    damaged = vault.run("20261121T100000-app-damaged", {"stages.json": {"usage": {
+        "research": _usage(5_000),
+        "plan": {**_usage(7_000), "output_tokens": "7000"},          # a string, not a count
+        "implement": {k: v for k, v in _usage(9_000).items() if k != "input_tokens"},
+        "verify": {**_usage(11_000), "output_tokens": True},         # a bool is not a count
+        "report": "oops",
+    }}})
+    assert uv.run_usage(damaged) == (5_000, 1, 4)
+    run = next(r for r in vault.scan()[0] if r["slug"] == "app-damaged")
+    assert (run["out_tokens"], run["unmetered"]) == (5_000, True)
+
+
+def test_scan_corrupt_stages_json_is_unmetered(vault):
+    vault.run("20261120T100000-app-corrupt", {"stages.json": "{not json"})
+    vault.run("20261120T110000-app-list", {"stages.json": "[1, 2]"})
+    vault.run("20261120T120000-app-binary", {})
+    (vault.runs / "20261120T120000-app-binary" / "stages.json").write_bytes(b"\xff\xfe\x00{")
+    runs, _ = vault.scan()
+    assert len(runs) == 3                                    # every run is still counted
+    for run in runs:
+        assert (run["out_tokens"], run["unmetered"]) == (0, True), run["name"]
+    total = _period(vault.raw(), "week")["total"]
+    assert (total["runs"], total["runs_unmetered"], total["out_tokens"]) == (3, 3, 0)
+
+
+def test_scan_reads_pr_from_report_frontmatter_and_quick_body(vault):
+    vault.install("auto_five_stage_merged", "quick_merged")
+    assert uv.run_result(vault.runs / "20261121T144046-engine-triage-cards") == (
+        "https://github.com/example/macp/pull/12", True)
+    assert uv.run_result(vault.runs / "20261117T114215-app-doc-weekly-check") == (
+        "https://github.com/example/app/pull/39", True)
+    none = vault.run("20261120T100000-a", {"report.md": _report()})
+    assert uv.run_result(none) == (None, None)
+    open_pr = vault.run("20261120T100001-b", {"report.md": _report(
+        '"https://github.com/example/app/pull/7/"', "no")})
+    assert uv.run_result(open_pr) == ("https://github.com/example/app/pull/7", False)
+    # report.md wins over quick.md, and a report's body is not searched for a PR line
+    both = vault.run("20261120T100002-c", {
+        "report.md": [*_report(), "- PR: https://github.com/example/app/pull/8"],
+        "quick.md": ["- PR: https://github.com/example/app/pull/9", "- merged: yes"]})
+    assert uv.run_result(both) == (None, None)
+    no_pr = vault.run("20261120T100003-d", {"quick.md": ["---", "stage: quick", "---", "",
+                                                         "- PR: 없음", "- merged: no — 0 commits"]})
+    assert uv.run_result(no_pr) == (None, False)
+    assert uv.run_result(vault.run("20261120T100004-e", {})) == (None, None)
+
+
+def test_scan_delegate_run_has_no_pr(vault):
+    vault.install("delegate_vault_done")
+    assert uv.run_result(vault.runs / "20261122T140107-cost-review-20261121") == (None, None)
+    # delegate.md and discover.md are never read for a PR, whatever they say
+    rd = vault.run("20261120T100000-x", {
+        "delegate.md": ["---", "status: pass", "pr_url: https://github.com/example/app/pull/99",
+                        "merged: yes", "---"],
+        "discover.md": ["- PR: https://github.com/example/app/pull/98", "- merged: yes"]})
+    assert uv.run_result(rd) == (None, None)
+
+
+def test_scan_ignores_non_run_names_and_plain_files(vault):
+    vault.run("20261120T100000-app-real", {"stages.json": {"usage": {"quick": _usage(10)}}})
+    # `…T250000-…` sorts inside the window as text but is not a time of day
+    for name in ("notes", "2026-11-20-misc", "_state", "20261340T999999-bad-date",
+                 "20261120T250000-bad-hour", "x-20261120T100000-app-real", "20261120T100000"):
+        vault.run(name, {"stages.json": {"usage": {"quick": _usage(999)}}})
+    (vault.runs / "20261120T110000-a-plain-file").write_text("not a run dir", encoding="utf-8")
+    runs, tasks = vault.scan()
+    assert [r["name"] for r in runs] == ["20261120T100000-app-real"]
+    assert list(tasks) == ["app-real"]
+    assert _period(vault.raw(), "week")["total"]["out_tokens"] == 10
+
+
+def test_scan_slug_is_everything_after_the_timestamp(vault):
+    vault.run("20261120T100000-engine-api-poc", {"stages.json": {"usage": {"quick": _usage(10)}}})
+    for slug in ("poc", "api-poc", "engine-api-poc"):
+        vault.task(slug, _task_md(status="open", repo=f"https://github.com/example/{slug}.git"))
+    runs, tasks = vault.scan()
+    assert [r["slug"] for r in runs] == ["engine-api-poc"]
+    assert list(tasks) == ["engine-api-poc"]                 # `…-api-poc` is not a run of `poc`
+    assert tasks["engine-api-poc"]["repo"] == "https://github.com/example/engine-api-poc.git"
+
+
+def test_scan_lists_runs_dir_once_and_opens_nothing_outside_the_window(vault, monkeypatch):
+    files = {"stages.json": {"usage": {"quick": _usage(10)}},
+             "report.md": _report("https://github.com/example/app/pull/1", "yes")}
+    vault.run("20261120T100000-app-in", files)
+    vault.run("20261005T100000-app-october", files)          # before the month started
+    vault.run("20261123T100000-app-tomorrow", files)         # after `now`
+    for slug in ("app-in", "app-october", "app-tomorrow"):
+        vault.task(slug, _task_md(status="done", repo=APP))
+    seen = _count_loaders(monkeypatch)
+    listed, stats = [], []
+    real_scandir, real_stat = os.scandir, os.stat
+
+    def scandir(path="."):
+        listed.append(str(path))
+        return real_scandir(path)
+
+    def stat(path, *args, **kwargs):
+        stats.append(str(path))
+        return real_stat(path, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "scandir", scandir)
+        m.setattr(os, "stat", stat)
+        runs, tasks = vault.scan()
+
+    assert [r["slug"] for r in runs] == ["app-in"]
+    assert listed == [str(vault.runs)]
+    touched = stats + [p for paths in seen.values() for p in paths]
+    assert any("app-in" in p for p in touched)
+    for name in ("app-october", "app-tomorrow"):
+        assert not [p for p in touched if name in p], name
+    assert list(tasks) == ["app-in"]
+
+
+def test_second_build_loads_no_file(vault, monkeypatch):
+    vault.install(*CASE_NAMES)
+    seen = _count_loaders(monkeypatch)
+    first = vault.build()
+    assert all(seen[name] for name in _LOADERS), seen        # every kind of file was read once
+    for paths in seen.values():
+        assert len(paths) == len(set(paths))
+        paths.clear()
+    assert vault.build() == first
+    assert seen == {name: [] for name in _LOADERS}
+
+
+def test_changed_file_is_reloaded_once(vault, monkeypatch):
+    vault.install("auto_five_stage_merged", "quick_merged")
+    first = vault.build()
+    seen = _count_loaders(monkeypatch)
+    rd = vault.runs / "20261117T114215-app-doc-weekly-check"
+    (rd / "stages.json").write_text(json.dumps({"usage": {"quick": _usage(1_000_000)}}),
+                                    encoding="utf-8")
+    second = vault.build()
+    assert seen == {**{name: [] for name in _LOADERS},
+                    "_load_usage": [str(rd / "stages.json")]}
+    assert first["periods"][0]["total"]["out_tokens"] == 478_000
+    assert second["periods"][0]["total"]["out_tokens"] == 1_466_000
+    assert second["periods"][0]["total"]["merged_prs"] == 2
+    # a file that went away is forgotten: the run keeps counting, its PR does not
+    (rd / "quick.md").unlink()
+    total = vault.build()["periods"][0]["total"]
+    assert (total["runs"], total["merged_prs"], total["done"]) == (2, 1, 2)
+    (vault.items / "app-doc-weekly-check.md").unlink()       # no longer known to be done
+    (vault.assign / "app-doc-weekly-check.json").unlink()
+    total = vault.build()["periods"][0]["total"]
+    assert (total["runs"], total["merged_prs"], total["done"]) == (2, 1, 1)
+
+
+def test_task_facts_fall_back_to_ledger_payload_without_md(vault):
+    row = {"task_id": "t", "state": "failed", "history": [],
+           "payload": {"tags": ["todo", "feature"], "repo": APP, "worker_mode": "Auto"}}
+    vault.task("t", ledger=row)
+    facts = uv.task_facts("t", vault.items, vault.assign)
+    assert facts == {"status": "", "tags": ["todo", "feature"], "repo": APP, "worker_mode": "auto",
+                     "from_discovery": "", "discover_repo": "", "state": "failed", "deferred": False}
+    assert (uv.project_of(facts, "t"), uv.classify(facts, "t"), uv.task_outcome(facts)) == (
+        "app", ("feature", "tag:feature"), "failed")
+    # a waiting row (checkout busy) is not a failure
+    vault.task("busy", ledger={**row, "checkout_busy": True})
+    assert uv.task_outcome(uv.task_facts("busy", vault.items, vault.assign)) is None
+    # the task file wins where it speaks; the payload fills what it leaves out
+    vault.task("both", _task_md(status="done", tags=["todo", "bug"]), ledger=row)
+    facts = uv.task_facts("both", vault.items, vault.assign)
+    assert (facts["status"], facts["tags"], facts["repo"], facts["worker_mode"]) == (
+        "done", ["todo", "bug"], APP, "auto")
+    assert uv.task_outcome(facts) == "done"
+    # neither file: a task with no facts, which the slug rules still place
+    facts = uv.task_facts("macp-gone", vault.items, vault.assign)
+    assert (uv.project_of(facts, "macp-gone"), uv.classify(facts, "macp-gone")) == (
+        "vault", ("self", "self_slug"))
+    # a ledger file that is not a JSON object is read as no row
+    (vault.assign / "junk.json").write_text("[]", encoding="utf-8")
+    assert uv.task_facts("junk", vault.items, vault.assign)["state"] == ""
+
+
+def test_task_file_placeholders_and_quotes_are_cleaned(vault):
+    vault.task("t", ["---", "tags: [todo, Feature]", 'status: "Done"', "repo: '-'",
+                     "worker_mode: off", 'from_discovery: "-"',
+                     'discover_repo: "https://github.com/example/app.git"', "---", "", "# t"])
+    facts = uv.task_facts("t", vault.items, vault.assign)
+    assert facts == {"status": "done", "tags": ["todo", "feature"], "repo": "", "worker_mode": "off",
+                     "from_discovery": "", "discover_repo": APP, "state": "", "deferred": False}
+
+
+def test_missing_runs_dir_gives_empty_periods(tmp_path):
+    uv.clear_cache()
+    gone = tmp_path / "no-such-vault"
+    model = uv.build(vault_root=gone, now=NOW)
+    assert [p["id"] for p in model["periods"]] == ["week", "month"]
+    for p in model["periods"]:
+        assert p["rows"] == []
+        assert (p["total"]["runs"], p["total"]["out_tokens"], p["total"]["tokens_per_merge"]) == (
+            0, 0, None)
+    assert not gone.exists()                                 # reading creates nothing
+
+
+def test_build_resolves_the_three_dirs_under_vault_root(vault):
+    vault.install(*CASE_NAMES)
+    assert uv.build(vault_root=vault.root, now=NOW) == vault.build()
+    assert uv.build(vault_root=str(vault.root), now=NOW) == vault.build()
+
+
+def test_build_runs_no_subprocess(vault, monkeypatch):
+    vault.install(*CASE_NAMES)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"subprocess started: {args!r}")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    assert vault.build()["periods"][0]["total"]["runs"] == 8
+
+
+def test_build_writes_nothing(vault):
+    vault.install(*CASE_NAMES)
+
+    def snapshot() -> dict[str, tuple[int, int]]:
+        return {str(p.relative_to(vault.root)): (p.stat().st_mtime_ns, p.stat().st_size)
+                for p in sorted(vault.root.rglob("*"))}
+
+    before = snapshot()
+    vault.build()
+    vault.build()
+    assert snapshot() == before
+
+
+def test_import_is_light(tmp_path):
+    """Importing the module resolves no vault root and pulls in none of the
+    engine's heavy modules: a clean process with no vault anywhere imports it."""
+    code = ("import sys, todo_system.usage_value\n"
+            "heavy = ('orchestrator', 'tasks', 'runner', 'stages', 'metrics', 'repos')\n"
+            "print([m for m in heavy if 'todo_system.orchestrator.' + m in sys.modules])\n"
+            "print('todo_system.session_log' in sys.modules)\n")
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(_REPO), "HOME": str(tmp_path)}
+    r = subprocess.run([sys.executable, "-P", "-c", code], cwd=str(tmp_path), env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split("\n")[:2] == ["[]", "False"], r.stdout
