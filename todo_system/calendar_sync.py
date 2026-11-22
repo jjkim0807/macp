@@ -604,10 +604,10 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
         blocks, busy, paths_by_slug = [], [], {}
         for r in rows:
             src = str(r["path"])
-            if _is_decision_task(src):
-                continue
             d, s, e = _parse_scheduled(src)
             if not (d and s and e):
+                continue
+            if _is_decision_task(src):       # after the block test: one md parse, only when needed
                 continue
             start, end = _block_bounds(d, s, e)
             if end > now:
@@ -1047,13 +1047,15 @@ def sync_due_tasks_to_calendar(
         ).fetchall()
         for r in done_rows:
             src = str(r["path"])
-            if _is_decision_task(src):
-                continue                 # never had a block worth a ✅ record
             d, s, e = _parse_scheduled(src)
             if not (d and s and e):
                 continue
             completed = _parse_completed(_extract_field_from_markdown(src, "completed"))
             if completed is None or now_local - completed > dt.timedelta(days=keep_days):
+                continue
+            # Last, so the md is parsed only for the few done rows that would get an
+            # event: a decision never had a block worth a ✅ record.
+            if _is_decision_task(src):
                 continue
             cal = (route_calendar(_split_tags(r["tags"]), calendar_routes, calendar_id)
                    if calendar_routes else calendar_id)
