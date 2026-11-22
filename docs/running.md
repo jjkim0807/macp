@@ -11,7 +11,7 @@ continuously means keeping five processes alive:
 | **planner tick** (optional) | `scripts/planner_tick.sh` | periodic; refills an empty queue |
 | **dashboard** (optional) | `scripts/macp_dashboard.py` | long-lived; http://127.0.0.1:8787 |
 
-Other units cover housekeeping: maintenance (worktree sweep, engine self-update), the
+Other units cover housekeeping: maintenance (vault sync, engine self-update), the
 morning brief, and the health report.
 
 ## The quickest way: four terminals
@@ -56,7 +56,9 @@ old error line says nothing about now.
 (`install_runner_launchagent.sh`, `install_orchestrator_launchagent.sh`,
 `install_todo_sync_launchagent.sh`, …). Labels use `MACP_LABEL_PREFIX` (or
 `label_prefix` in `.macp/config.toml`). Check them with
-`launchctl list | grep <prefix>`.
+`launchctl list | grep <prefix>`. There is no installer for the maintenance tick:
+schedule `python -m todo_system.worker maintenance` yourself (every ~5 minutes) if
+this Mac should sync the vault and update the engine.
 
 ## Updating the engine
 
@@ -106,7 +108,7 @@ What follows from this:
   need, `git -C <vault> worktree remove --force <path>` removes it.
 - A run that was killed outright (power loss, `kill -9`) leaves its worktree behind as
   well. The next run of the same task commits what was in it, removes it and starts
-  from a fresh one. The maintenance worktree sweep does not look at `vault.wt/`.
+  from a fresh one. The worktree sweep (run by todo-sync) does not look at `vault.wt/`.
 - Vault runs still run one at a time.
 
 ## Disk space

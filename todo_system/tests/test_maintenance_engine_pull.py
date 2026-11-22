@@ -226,10 +226,8 @@ def test_no_change_noop(tmp_path):
 
 def test_cmd_maintenance_rc_on_failure(monkeypatch):
     """A non-empty reason list raises the tick rc to 1 without dying (criterion #2)."""
-    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
     monkeypatch.setattr(worker, "pull_engine_checkout", lambda: ["engine-pull: boom"])
     # Neutralise every other upkeep step so rc == 1 can only come from engine-pull.
-    monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
     monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     monkeypatch.setattr(worker, "rotate_logs", lambda: [])
     monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: [])

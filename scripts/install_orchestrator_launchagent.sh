@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-# Two anchors, as in install_worker_launchagent.sh (11i). ENGINE_DIR is this
+# Two anchors. ENGINE_DIR is this
 # script's own checkout (where orchestrator_tick.sh lives). VAULT_DIR is where
 # the data lives (logs/, and the plist WorkingDirectory): MAESTRO_VAULT_DIR
 # wins, then MACP_VAULT_ROOT (split install), then the engine checkout itself

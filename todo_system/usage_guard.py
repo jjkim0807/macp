@@ -14,7 +14,7 @@ STARTING new automated work when either
   - utilization is ahead of the pace line (`elapsed% + allowance`) — i.e. on
     track to exhaust before `resets_at`.
 
-Blocking is advisory and self-clearing: callers (worker run-next, orchestrator
+Blocking is advisory and self-clearing: callers (orchestrator
 dispatch, runner poll, planner tick) simply skip a cycle; nothing is failed or
 poisoned, and as the window's clock advances the pace line catches up and the
 guard opens again. In-flight work is never interrupted; collect/replies keep

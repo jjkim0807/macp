@@ -44,7 +44,6 @@ _SCRUB = (
     "PYTHONSAFEPATH",
     "VIRTUAL_ENV",
     "UV_PROJECT_ENVIRONMENT",
-    "WORKER_HOST",
     "MAESTRO_VAULT_DIR",
     "KAKAO_VAULT_DIR",
     "MACP_VAULT_ROOT",
@@ -187,7 +186,6 @@ assert worker._ENGINE_ROOT == root, worker._ENGINE_ROOT
 assert human._ENGINE_ROOT == root, human._ENGINE_ROOT
 assert stages._ENGINE_ROOT == root, stages._ENGINE_ROOT
 assert beta_publish._ENGINE_ROOT == root, beta_publish._ENGINE_ROOT
-assert worker.COMMANDS_DIR == stages.COMMANDS_DIR, worker.COMMANDS_DIR
 assert worker.KAKAO_SEND_SCRIPT.is_file(), worker.KAKAO_SEND_SCRIPT
 assert worker.HEALTH_REPORT_SCRIPT.is_file(), worker.HEALTH_REPORT_SCRIPT
 assert human.KAKAO_SCRIPT.is_file(), human.KAKAO_SCRIPT
@@ -218,16 +216,6 @@ def test_cli_audit(installed, primed_vault, empty_cwd):
 def test_session_log_list(installed, primed_vault, empty_cwd):
     _ok(_py(installed, primed_vault, empty_cwd, "-m", "todo_system.session_log", "list"),
         "session_log list")
-
-
-def test_worker_run_next_dry_run(installed, primed_vault, empty_cwd):
-    proc = _ok(_py(installed, primed_vault, empty_cwd,
-                   "-m", "todo_system.worker", "run-next", "--dry-run"),
-               "worker run-next --dry-run")
-    out = proc.stdout + proc.stderr
-    # The isolation script's leg C vocabulary: the fixture has no queue, so the
-    # worker reports no pending runs and takes the (dry) planner path.
-    assert any(s in out for s in ("no pending runs", "entering planner path", "[planner]")), out
 
 
 def test_console_script_help(installed, vault, empty_cwd):

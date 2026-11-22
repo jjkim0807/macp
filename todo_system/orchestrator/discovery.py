@@ -13,7 +13,7 @@ active project whose last discovery is oldest (never-explored first). The runner
 executes it as the single `discover` stage (worker-discover.md): clone the repo
 into /tmp, run its own tests/lint/build and a bounded smoke launch, sweep the
 whole tree, and write a candidate-task report to
-`Memory/episodes/<date>-discovery-<name>.md` (git-tracked, dirty-guard exempt,
+`Memory/episodes/<date>-discovery-<name>.md` (git-tracked,
 auto-committed by sync_vault_state — no PR needed). The planner tick then injects
 every unconsumed report into the next planner run (`emit-context`), and the
 planner creates real tasks stamped `from_discovery: <report-stem>` or rejects

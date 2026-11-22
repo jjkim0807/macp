@@ -395,8 +395,8 @@ def worktree_path(url: str, slug: str,
     sibling `*.wt` directory, basename == slug, no `wt-` prefix) is deliberate:
     the 5-minute maintenance sweep only reclaims `<worker_root>/wt-*`, so a path
     one directory deeper whose name does not start with `wt-` is out of its
-    reach. Its own reaper is worktree_sweep.reclaim_parked_worktrees (same doctor
-    tick), which removes a failed / parked run's worktree only after the
+    reach. Its own reaper is worktree_sweep.reclaim_parked_worktrees (same
+    pass), which removes a failed / parked run's worktree only after the
     retention window and never while a run, long_job or process holds it."""
     base = local_path(url, _worker_root(worker_root))
     return base.parent / f"{base.name}.wt" / slug

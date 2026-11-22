@@ -2889,9 +2889,6 @@ class Orchestrator:
         DONE only, deliberately. A FAILED ledger state means "the last attempt
         failed", not "this task is over" — a capacity/rate-limit failure is
         retried once quota returns, so `pending` is the honest queue rendering.
-        Mirroring FAILED here would also fight `worker.doctor_recover_queue`,
-        which resets a failed entry back to pending for its own auto-retry:
-        the two would flip the same entry on every tick.
 
         Best-effort and lock-guarded: wrapped so it can never raise into tick(),
         since an exception here would freeze all dispatch. Per-entry isolation

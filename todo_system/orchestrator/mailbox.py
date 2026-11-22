@@ -13,12 +13,9 @@ symmetric in both directions.
 Transports:
   - FileMailbox: shared filesystem (local, low-latency).
   - GitMailbox : the vault git repo is the transport (durable, offline-tolerant,
-    reaches remote hosts and a future cloud orchestrator). Mirrors the proven
-    sync_pull/sync_push (rebase-retry) dance in scripts/worker_remote_loop.sh.
+    reaches remote hosts and a future cloud orchestrator).
 
-Stdlib-only. `Worker/agents/_state/` is gitignored runtime; message files under
-Worker/ are inside the worker dirty-guard's allowed prefix, so they never stall
-the queue.
+Stdlib-only. `Worker/agents/_state/` is gitignored runtime.
 """
 
 from __future__ import annotations
@@ -339,7 +336,7 @@ class GitMailbox(Mailbox):
         if not self._has_origin():
             return
         # -c rebase.autoStash works on older gits (Ubuntu 18.04 / 2.17), unlike
-        # the --autostash flag. Same choice as worker_remote_loop.sh:sync_pull.
+        # the --autostash flag.
         r = self._git(
             "-c", "rebase.autoStash=true", "pull", "--rebase", "origin", self.branch
         )

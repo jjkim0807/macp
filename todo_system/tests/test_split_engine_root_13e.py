@@ -1,5 +1,5 @@
-"""Public split 13e: the three LaunchAgent installers 13d left out (macp_monitor,
-claude_model_autoswitch, worker) can render an installed-mode plist that runs
+"""Public split 13e: the two LaunchAgent installers 13d left out (macp_monitor,
+claude_model_autoswitch) can render an installed-mode plist that runs
 their engine script from the wheel.
 
 Notes/macp-public-split-inventory.md, leaf 13e (13d's pattern applied to the
@@ -43,8 +43,6 @@ _CASES = {
     "claude_model_autoswitch": ("install_claude_model_autoswitch_launchagent.sh",
                                 "com.macp.secondbrain.claude-model-autoswitch",
                                 "claude_model_autoswitch.py", ()),
-    "worker": ("install_worker_launchagent.sh", "com.macp.secondbrain.worker",
-               "worker_run_next.sh", ()),
 }
 # The installers that lint the plist and check the vault's scripts/ for their target.
 _VAULT_SCRIPT_CASES = ("macp_monitor", "claude_model_autoswitch")
@@ -147,50 +145,9 @@ _CLAUDE_MODEL_AUTOSWITCH = """\
 </plist>
 """
 
-_WORKER = """\
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.macp.secondbrain.worker</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string>
-    <string>@ENGINE@/scripts/worker_run_next.sh</string>
-  </array>
-
-  <key>WorkingDirectory</key>
-  <string>@VAULT@</string>
-
-  <key>StartInterval</key>
-  <integer>300</integer>
-
-  <key>RunAtLoad</key>
-  <false/>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/opt/homebrew/bin:@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>MACP_VAULT_ROOT</key>
-    <string>@VAULT@</string>
-  </dict>
-
-  <key>StandardOutPath</key>
-  <string>@VAULT@/logs/worker.out.log</string>
-
-  <key>StandardErrorPath</key>
-  <string>@VAULT@/logs/worker.err.log</string>
-</dict>
-</plist>
-"""
-
 _EXPECTED = {
     "macp_monitor": _MACP_MONITOR,
     "claude_model_autoswitch": _CLAUDE_MODEL_AUTOSWITCH,
-    "worker": _WORKER,
 }
 
 

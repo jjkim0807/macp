@@ -10,7 +10,8 @@ its Gradle daemons register under `stages.GRADLE_REGISTRY_DIR / <slug>`.
   the worktree. Nothing else ever removed them: worker.reclaim_stale_worktrees
   only sees `<worker root>/wt-*` worktrees of the vault repo, by design.
 
-`reclaim_parked_worktrees` closes that gap from the 5-minute doctor tick. A
+`reclaim_parked_worktrees` closes that gap from the todo-sync pass
+(`worker.scan_queue`). A
 worktree is removed only when ALL of these hold, and any rung that cannot be
 answered holds it:
 
@@ -45,7 +46,7 @@ inside the window and is never even evaluated for removal.
 The ONLY recursive delete in this module is `shutil.rmtree` inside
 `remove_registry`, confined to one plain-named, non-symlink child of the registry
 dir. Worktrees go only through `git worktree remove`. Fail-open: the sweep
-returns [] on any unexpected error and never raises into the doctor tick.
+returns [] on any unexpected error and never raises into that pass.
 Silent when nothing is past the window; otherwise one `정리 완료/보류/제외`
 (cleaned up / held / excluded) line per entry it judged.
 """
@@ -334,7 +335,7 @@ def _protected_registry_names(root: Path) -> set[str]:
 def reclaim_parked_worktrees(now: float | None = None) -> list[str]:
     """Remove past-window parked `.wt/<slug>` worktrees with their registry
     dirs, then past-window orphan registry dirs. Returns the log lines (no
-    `doctor:` prefix — run_doctor_and_persist adds it). Never raises."""
+    prefix — the caller adds it). Never raises."""
     try:
         root = Path(disk_guard.WORKER_ROOT)
         if not root.is_dir():

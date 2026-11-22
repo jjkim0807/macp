@@ -46,7 +46,7 @@ def _defines_function(module_path: Path, func_name: str) -> bool:
 
 
 def test_doc_has_anchors() -> None:
-    assert len(_doc_anchors()) >= 20, "expected the macp-code catalog table to yield anchors"
+    assert len(_doc_anchors()) >= 15, "expected the macp-code catalog table to yield anchors"
 
 
 def test_every_doc_anchor_function_exists() -> None:

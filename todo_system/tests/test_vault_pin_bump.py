@@ -376,11 +376,9 @@ def test_commit_failure_reports_and_restores(tmp_path):
 
 def test_cmd_maintenance_rc_on_bump_failure(monkeypatch, capsys):
     """A non-empty reason list raises the tick rc to 1 without dying."""
-    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
     monkeypatch.setattr(worker, "pull_engine_checkout", lambda: [])
     monkeypatch.setattr(worker, "bump_vault_engine_pin", lambda: ["vault-pin: boom"])
     # Neutralise every other upkeep step so rc == 1 can only come from vault-pin.
-    monkeypatch.setattr(worker, "sweep_remote_completed_runs", lambda: 0)
     monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     monkeypatch.setattr(worker, "rotate_logs", lambda: [])
     monkeypatch.setattr(worker, "sync_wrappers", lambda: [])

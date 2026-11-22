@@ -18,8 +18,7 @@ scrubbed so nothing can quietly import this checkout:
   13b's problem).
 * The install-time seams: ``paths.is_installed()`` / ``vault_search_start()``
   answer the wheel way, ``beta_publish``'s scratch sits under the vault's
-  ``Worker/_state`` and never under the venv, ``cmd_run_parallel`` hands the
-  child the vault only (no ``PYTHONPATH`` into site-packages), a module imported
+  ``Worker/_state`` and never under the venv, a module imported
   with no env from inside the vault resolves it by cwd (RED on leaf 12: the
   site-packages anchor ignored the cwd and raised), and from outside any vault
   it still fails loudly.
@@ -46,7 +45,6 @@ _SCRUB = (
     "PYTHONSAFEPATH",
     "VIRTUAL_ENV",
     "UV_PROJECT_ENVIRONMENT",
-    "WORKER_HOST",
     "MAESTRO_VAULT_DIR",
     "KAKAO_VAULT_DIR",
     "MACP_VAULT_ROOT",
@@ -274,48 +272,6 @@ def test_installed_layout_probe(installed, vault, empty_cwd):
         "SWEEP_LOG_PATH": str(state / "beta_sweep.log"),
     }
     assert got["scratch_in_venv"] == []
-
-
-_RUN_PARALLEL_PROBE = """
-import contextlib, json, os, subprocess
-from todo_system import worker
-class P:
-    pid = 1
-    def wait(self):
-        return 0
-calls = []
-def fake_popen(args, **kw):
-    calls.append((list(args), kw))
-    return P()
-subprocess.Popen = fake_popen
-worker.queue_lock = contextlib.nullcontext
-worker.load_queue = lambda *a, **k: {"runs": [{"status": "pending"}]}
-rc = worker.cmd_run_parallel(1, dry_run=True)
-args, kw = [c for c in calls if "run-next" in c[0]][0]
-env = kw.get("env")
-print(json.dumps({
-    "rc": rc,
-    "argv_tail": args[1:],
-    "cwd": str(kw["cwd"]),
-    "env_is_none": env is None,
-    "vault": None if env is None else env.get("MACP_VAULT_ROOT"),
-    "pythonpath": None if env is None else env.get("PYTHONPATH"),
-}))
-"""
-
-
-def test_installed_run_parallel_child_gets_vault_only(installed, vault, empty_cwd):
-    # The real paths.is_installed() in the wheel, no monkeypatching of the seam:
-    # the child gets the vault and no PYTHONPATH (its _ENGINE_ROOT is in
-    # site-packages, which is already importable there).
-    proc = _ok(_py(installed, vault, empty_cwd, "-c", _RUN_PARALLEL_PROBE), "run-parallel probe")
-    got = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert got["rc"] == 0
-    assert got["argv_tail"] == ["-m", "todo_system.worker", "run-next", "--dry-run"]
-    assert got["cwd"] == str(vault)
-    assert got["env_is_none"] is False
-    assert got["vault"] == str(vault)
-    assert got["pythonpath"] is None
 
 
 def test_installed_module_resolves_vault_from_cwd_without_env(installed, vault):

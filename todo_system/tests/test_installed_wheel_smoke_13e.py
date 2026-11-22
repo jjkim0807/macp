@@ -1,4 +1,4 @@
-"""Installed-wheel smoke for 13e: the monitor, autoswitch and worker LaunchAgent
+"""Installed-wheel smoke for 13e: the monitor and autoswitch LaunchAgent
 installers' installed-mode ProgramArguments resolve their scripts from
 site-packages and keep the script's own argv.
 
@@ -47,7 +47,6 @@ _SCRUB = (
     "PYTHONSAFEPATH",
     "VIRTUAL_ENV",
     "UV_PROJECT_ENVIRONMENT",
-    "WORKER_HOST",
     "MAESTRO_VAULT_DIR",
     "KAKAO_VAULT_DIR",
     "MACP_VAULT_ROOT",
@@ -60,7 +59,6 @@ CONVERTED = {
                                             "macp_monitor.py", ("scan", "--daemon")),
     "install_claude_model_autoswitch_launchagent.sh": (
         "com.macp.secondbrain.claude-model-autoswitch", "claude_model_autoswitch.py", ()),
-    "install_worker_launchagent.sh": ("com.macp.secondbrain.worker", "worker_run_next.sh", ()),
 }
 _DECOY_EXIT = 3
 _DECOY = f"""print("DECOY engine_script from the cwd checkout")

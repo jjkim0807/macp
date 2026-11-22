@@ -7,7 +7,7 @@ hands the caller's interpreter down as ``MACP_PYTHON`` and the scripts run
 ``"$MACP_PYTHON" -P -m todo_system...`` (or ``-c`` / a script path) only when
 BOTH hold — no pyproject beside the engine AND ``MACP_PYTHON`` set. Everything
 else (a checkout with pyproject, a bare path run with the variable unset) keeps
-the uv / ``/usr/bin/python3`` command lines of 11f–11h byte for byte.
+the uv / ``/usr/bin/python3`` command lines of 11f–11g byte for byte.
 
 Each case copies the real script into a fake ``<site>/todo_system/_engine`` tree
 (with or without a pyproject marker) and runs it under zsh with a fake
@@ -31,11 +31,10 @@ import pytest
 
 _REAL_ENGINE = Path(__file__).resolve().parents[2]
 _TICK = "orchestrator_tick.sh"
-_RUN_NEXT = "worker_run_next.sh"
 _BRIEF = "brief.sh"
 _SEND = "kakao_send.sh"
 _NOTIFY = "notify_kakao.sh"
-_DAEMON_SCRIPTS = (_TICK, _RUN_NEXT, _BRIEF, _SEND, _NOTIFY)
+_DAEMON_SCRIPTS = (_TICK, _BRIEF, _SEND, _NOTIFY)
 _UNTOUCHED_SCRIPTS = ("kakao_token_refresh.sh", "kakao_oauth_helper.sh")
 _BRANCH_LINE = 'if [[ ! -f "$ENGINE_DIR/pyproject.toml" && -n "${MACP_PYTHON:-}" ]]; then'
 _FAKE_SLUG = "acme/fake-engine"
@@ -112,7 +111,7 @@ class _Harness:
         self.bin = tmp / "bin"
         self.home = tmp / "home"
         # The fake uv sits both at the front of PATH and in $HOME/.local/bin
-        # (worker_run_next.sh / brief.sh prepend the latter themselves).
+        # (brief.sh prepends the latter itself).
         for d in (self.bin, self.home / ".local" / "bin"):
             _write_exec(d / "uv", _FAKE_UV)
         self.fakepy = _write_exec(self.bin / "fakepy", _FAKE_PY)
@@ -196,10 +195,10 @@ def _expected_uv_calls(name: str) -> int:
     return 2 if name == _TICK else 1
 
 
-# --- the two tick scripts: installed branch on, fallback, checkout ----------------
+# --- the tick script: installed branch on, fallback, checkout ---------------------
 
 
-@pytest.mark.parametrize("name", [_TICK, _RUN_NEXT])
+@pytest.mark.parametrize("name", [_TICK])
 def test_installed_layout_uses_macp_python_and_never_uv(tmp_path, name):
     h = _Harness(tmp_path)
     engine = h.engine([name], pyproject=False)
@@ -223,19 +222,14 @@ def test_installed_layout_uses_macp_python_and_never_uv(tmp_path, name):
         assert _opt(auto[0]["argv"], "--lease") == f"{h.vault}/Worker/orchestrator.lock"
         assert _after(auto[0]["argv"], "auto", "--db") == f"{h.vault}/Todo/todo.db"
         assert (h.vault / "logs" / "orchestrator.out.log").is_file()
-    else:
-        assert py[0]["argv"] == ["-P", "-m", "todo_system.worker", "maintenance"], py
-        log = (h.vault / "logs" / "worker.out.log").read_text(encoding="utf-8")
-        assert "worker_run_next: maintenance" in log
-        assert "ERROR uv not on PATH" not in log               # the uv guard is skipped
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert not (engine / "logs").exists()
 
 
-@pytest.mark.parametrize("name", [_TICK, _RUN_NEXT])
+@pytest.mark.parametrize("name", [_TICK])
 def test_installed_layout_without_macp_python_falls_back_to_uv(tmp_path, name):
     """No pyproject but no MACP_PYTHON either (a bare path run of the wheel, or
-    the 11g/11h fake engines): the pre-13b split command line, unchanged."""
+    the 11g fake engine): the pre-13b split command line, unchanged."""
     h = _Harness(tmp_path)
     engine = h.engine([name], pyproject=False)
 
@@ -254,7 +248,7 @@ def test_installed_layout_without_macp_python_falls_back_to_uv(tmp_path, name):
         assert call["MACP_PYTHON"] is None, call
 
 
-@pytest.mark.parametrize("name", [_TICK, _RUN_NEXT])
+@pytest.mark.parametrize("name", [_TICK])
 def test_checkout_layout_with_macp_python_still_uses_uv(tmp_path, name):
     """pyproject present: a checkout launched through engine_script inherits
     MACP_PYTHON but reads it nowhere — the split uv command line as before."""
@@ -274,7 +268,7 @@ def test_checkout_layout_with_macp_python_still_uses_uv(tmp_path, name):
         assert call["MACP_PYTHON"] == str(h.fakepy), call     # inherited, unread
 
 
-@pytest.mark.parametrize("name", [_TICK, _RUN_NEXT])
+@pytest.mark.parametrize("name", [_TICK])
 def test_combined_checkout_with_macp_python_leaves_env_alone(tmp_path, name):
     """Engine == vault with pyproject: nothing exported, no -P, uv as before —
     even with MACP_PYTHON in the environment."""

@@ -21,8 +21,7 @@ Daemons, installers, wrappers and integrations. The engine's Python code is in
 `install_runner_launchagent.sh`, `install_orchestrator_launchagent.sh`,
 `install_todo_sync_launchagent.sh`, `install_brief_launchagent.sh`,
 `install_health_launchagent.sh` and `install_macp_monitor_launchagent.sh` install the
-macOS equivalents of the systemd units. `install_worker_launchagent.sh` and
-`worker_run_next.sh` drive the vault-upkeep loop.
+macOS equivalents of the systemd units.
 
 ## Wrappers for worker stages
 
@@ -43,7 +42,6 @@ rule. These wrappers have names without spaces. Copy one to `~/.local/bin/` and 
 | Script | What it does |
 |---|---|
 | `orchestrator_runner_remote.sh` | runner loop on a secondary host (WSL/Linux) |
-| `worker_remote_loop.sh`, `setup_remote_host_wsl.sh` | the remote-host worker loop and its one-time setup |
 | `app-test-node/` | an on-demand Android emulator node for app screen checks |
 
 ## Account and auth upkeep

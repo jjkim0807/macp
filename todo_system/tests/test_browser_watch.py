@@ -244,8 +244,6 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
             return ret
         return _f
 
-    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
-    monkeypatch.setattr(worker, "sweep_remote_completed_runs", rec("sweep", 0))
     monkeypatch.setattr(worker, "sync_vault_state", rec("sync", 0))
     monkeypatch.setattr(worker, "rotate_logs", rec("rotate", []))
     monkeypatch.setattr(worker, "bump_vault_engine_pin", rec("vault-pin", []))
@@ -260,21 +258,19 @@ def test_cmd_maintenance_continues_when_watch_raises(monkeypatch):
     monkeypatch.setattr(worker.browser_watch, "check_login_watch", boom)
     monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", rec("disk-prune", None))
     assert worker.cmd_maintenance() == 1
-    assert called == ["sweep", "sync", "rotate",
+    assert called == ["sync", "rotate",
                       "vault-pin", "wrappers", "restart", "silence", "starvation",
                       "disk-prune"]
 
 
 def test_cmd_maintenance_pages_through_kakao_notify(probe, monkeypatch):
-    for name in ("sweep_remote_completed_runs", "sync_vault_state"):
-        monkeypatch.setattr(worker, name, lambda: 0)
+    monkeypatch.setattr(worker, "sync_vault_state", lambda: 0)
     for name in ("rotate_logs", "restart_stale_daemons",
                  "sync_wrappers", "bump_vault_engine_pin"):
         monkeypatch.setattr(worker, name, lambda: [])
     for name in ("check_dispatch_silence", "check_work_starvation"):
         monkeypatch.setattr(worker, name, lambda: None)
     monkeypatch.setattr(worker.maintenance_disk, "check_and_prune", lambda **k: None)
-    monkeypatch.setattr(worker, "IS_REMOTE_HOST", False)
     sent = []
     monkeypatch.setattr(worker, "kakao_notify", lambda msg, *a, **k: sent.append(msg))
     # check_login_watch's default `run` is bound at import; patch the probe call.

@@ -79,7 +79,7 @@ the guard's kill switch (``MACP_DISK_GUARD=0``) and points ``WORKER_ROOT``,
 tests lift the switch and inject a fake for every seam; the tmp paths stay behind
 them as a second belt, so a forgotten seam finds an empty worker root, not a clone.
 The parked-worktree sweep (``orchestrator/worktree_sweep.py``, reached by every
-doctor and runner test) reads those same three seams plus its own
+scan_queue and runner test) reads those same three seams plus its own
 ``REGISTRY_DIR``, which the fixture also points into the tmp dir, so it can
 never remove a real worktree or gradle-registry dir.
 
