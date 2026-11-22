@@ -52,7 +52,7 @@ def known_worker_modes() -> frozenset[str]:
 
     return frozenset(
         set(VALID_MODES)
-        | {"blocked", "review", "review_required", "auto-review-disabled"}
+        | {"blocked", "review", "review_required"}
         | set(HUMAN_OVERRIDE_WORKER_MODES)
     )
 

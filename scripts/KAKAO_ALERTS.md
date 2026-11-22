@@ -53,9 +53,6 @@
 | `todo_system/worker.py:_note_restart_deferral` | 🤖⚠️ 재기동 계속 연기 | 즉시 | 구코드로 도는 중 — 확인 필요. 일 1회 재나그(자체 쿨다운) |
 | `todo_system/worker.py:record_dirty_stall` | ⚠️ Worker 정지: 미커밋 파일 | 즉시 | 커밋/정리해야 재개. 임계+12h 재나그(자체 쿨다운) |
 | `todo_system/worker.py:clear_dirty_stall` | ✅ Worker 재개 | **요약** | 자가 회복 완료 FYI |
-| `todo_system/worker.py:_run_next_impl` (worker start) | 🤖 Worker 시작 | **요약** | "조치 불필요, 진행 알림" — 문구 자체가 FYI |
-| `todo_system/worker.py:_run_next_impl` (worker fail) | ❌ Worker 실패 | 즉시 | 런 로그 확인 필요. event_key `worker-fail:<slug>` |
-| `todo_system/worker.py:_run_next_impl` (worker done) | ✅ Worker 완료 | **요약** | 후속 판단은 검토요청·리뷰 태스크가 따로 알림 |
 | `todo_system/orchestrator/runner.py:_publish_beta` | ❌ 베타 발행 실패 | 즉시 | 릴리즈 파이프라인 고장 — 확인 필요 |
 | `todo_system/orchestrator/beta_publish.py:maybe_publish` | 🚫 [베타 중단] 테스터 0 | 즉시 | 콘솔에서 테스터 추가 필요 |
 | `scripts/health_report.py:main` | ⚠️ 이상 N건 | 즉시 | WARN일 때만 발송(정상 무음) — 판단 필요. 주 1회 |

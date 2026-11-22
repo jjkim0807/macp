@@ -101,13 +101,12 @@ echo
 #
 # Neutralize redirect env vars this repo/shell may already carry, to make the
 # isolation certain:
-#   WORKER_HOST        → switches worker to remote-host mode, changing _STATE_DIR
 #   MAESTRO_VAULT_DIR  → brief/tick-family alias
 #   KAKAO_VAULT_DIR    → kakao-family alias
 #   VIRTUAL_ENV        → keeps the activated real repo .venv from leaking in (uv makes
 #                        a fresh ENGINE_TMP/.venv anyway, but this removes the
 #                        warning and keeps it hermetic)
-ISO_ENV=(env -u WORKER_HOST -u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
+ISO_ENV=(env -u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
          MACP_VAULT_ROOT="$VAULT_TMP")
 
 # Safely capture rc + merged output (including stderr). Wrapped in set +e and then
@@ -173,7 +172,7 @@ while IFS= read -r name; do
     MACP_*|USAGE_GUARD_*) TRY_ENV+=(-u "$name") ;;
   esac
 done < <(compgen -e)
-TRY_ENV+=(-u WORKER_HOST -u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
+TRY_ENV+=(-u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
           HOME="$TRY_HOME" MACP_VAULT_ROOT="$TRY_VAULT" USAGE_GUARD_DISABLE=1)
 if [ -n "$REAL_UV_CACHE" ]; then TRY_ENV+=(UV_CACHE_DIR="$REAL_UV_CACHE"); fi
 if [ -n "$REAL_UV_PYTHON" ]; then TRY_ENV+=(UV_PYTHON_INSTALL_DIR="$REAL_UV_PYTHON"); fi

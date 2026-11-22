@@ -127,7 +127,7 @@ ENGINE_SCRIPTS = (
     "export_db_snapshot.py",
 )
 # Env that would redirect the child away from the layout under test.
-_SCRUB = ("WORKER_HOST", "MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
+_SCRUB = ("MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
 
 
 def _vault_skeleton(root: Path) -> Path:

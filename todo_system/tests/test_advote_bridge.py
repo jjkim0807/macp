@@ -909,7 +909,7 @@ def test_state_path_is_vault_data_not_engine_package():
 
 
 _ENGINE = Path(__file__).resolve().parents[2]
-_SCRUB = ("WORKER_HOST", "MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
+_SCRUB = ("MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
 # vault_search_start() returns None in an installed wheel; patch it before the
 # bridge's import-time constants are computed so the cwd-upward search runs.
 _PROBE_INSTALLED = (

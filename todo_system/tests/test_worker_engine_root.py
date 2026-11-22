@@ -46,7 +46,7 @@ def test_engine_paths_ignore_redirected_vault(tmp_path):
     engine = Path(worker.__file__).resolve().parents[1]
 
     env = dict(os.environ)
-    for key in ("WORKER_HOST", "MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR"):
+    for key in ("MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR"):
         env.pop(key, None)
     env["MACP_VAULT_ROOT"] = str(vault)
     prior = env.get("PYTHONPATH")

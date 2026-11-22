@@ -90,14 +90,6 @@ class SyncVaultStateTest(unittest.TestCase):
         self._write("Worker/agents/orchestrator/inbox/m.json")
         self.assertEqual(worker.sync_vault_state(), 2)
 
-    def test_syncs_the_remote_host_transport(self):
-        # Worker/remote is not a backup — it IS how a task reaches another
-        # machine. Omitting it makes remote dispatch silently one-way.
-        self._write("Worker/remote/windows/inbox/t.md", "# task")
-        self.assertEqual(worker.sync_vault_state(), 1)
-        self.assertIn("Worker/remote/windows/inbox/t.md",
-                      _git(self.remote, "ls-tree", "-r", "--name-only", "main").stdout)
-
     def test_syncs_worker_files_that_are_not_in_a_known_subdir(self):
         # planner_policy.yaml is live config sitting directly under Worker/. An
         # enumeration of subdirectories misses it, and the Worker/ prefix is
@@ -316,8 +308,7 @@ class SyncVaultStateTest(unittest.TestCase):
 
     def test_the_maintenance_entry_point_syncs_under_the_lock(self):
         # The production path, not the function alone: `worker maintenance` →
-        # cmd_maintenance() → sync_vault_state() → the lock. The two steps ahead
-        # of the sync are stubbed (they read the live vault's items), and the
+        # cmd_maintenance() → sync_vault_state() → the lock. The
         # step right after it raises a BaseException sentinel — cmd_maintenance
         # catches Exception per step, not BaseException — so the tick stops
         # before anything that touches this host.
@@ -329,9 +320,7 @@ class SyncVaultStateTest(unittest.TestCase):
 
         def maintenance_tick():
             buf = io.StringIO()
-            with mock.patch.object(worker, "IS_REMOTE_HOST", False), \
-                 mock.patch.object(worker, "sweep_remote_completed_runs", return_value=0), \
-                 mock.patch.object(worker, "rotate_logs", side_effect=_Stop), \
+            with mock.patch.object(worker, "rotate_logs", side_effect=_Stop), \
                  mock.patch.object(worker, "VAULT_SYNC_LOCK_TIMEOUT_S", 0.2), \
                  contextlib.redirect_stdout(buf), \
                  self.assertRaises(_Stop):

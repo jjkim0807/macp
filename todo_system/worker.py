@@ -1,16 +1,13 @@
-"""Autonomous Implementation Worker (M4-a MVP).
+"""Queue-view registration and vault upkeep.
 
-Single-task, vault-only worker. Scans `Todo/items/**` for tasks with
-`worker_mode: auto`, registers them in `Worker/queue.json`, and executes a
-5-stage pipeline (Research → Plan → Implement → Verify → Report) by
-invoking `claude -p` once per stage as a subprocess.
-
-Scope of M4-a:
-- vault-only (no external `repo` field handling)
-- serial execution (no git worktree parallelism)
-- `auto_merge` defaults to true; the Report stage opens the PR via the `gh`
-  CLI and, once required CI checks pass, squash-merges it. Opt out per task
-  with `auto_merge: false`.
+`scan-queue` registers open `worker_mode: auto` tasks in `Worker/queue.json`,
+the derived view the dashboard and the monitor read; the todo-sync daemon
+calls `scan_queue()` on every change it detects. `maintenance` is the upkeep
+tick: vault sync, log rotation, engine and browser checkout pulls, daemon
+restarts, the silence and starvation alerts, the disk prune and the embedding
+tick. Tasks are executed by the orchestrator and its runners
+(todo_system/orchestrator), which also use this module's frontmatter parser,
+queue I/O, heartbeats and notifier.
 
 Stdlib only. Does NOT modify `todo_system/cli.py` — frontmatter parsing
 is duplicated here intentionally so worker fields can evolve without
@@ -26,7 +23,6 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -37,7 +33,6 @@ from typing import Any, Callable, Iterable, Iterator
 
 import hashlib
 
-from .claude_auth import claude_env
 from . import browser_watch
 from . import kakao_format
 from . import maintenance_disk
@@ -73,49 +68,10 @@ WORKER_DIR = ROOT / "Worker"
 COMMANDS_DIR = _stages.COMMANDS_DIR
 LOGS_DIR = ROOT / "logs"
 
-# ---------------------------------------------------------------------------
-# Multi-host routing (M5)
-# ---------------------------------------------------------------------------
-# The primary machine (the MacBook) runs with no WORKER_HOST set and behaves
-# exactly as before. A secondary machine (e.g. the Windows/WSL desktop, for
-# projects that cannot run on macOS) sets WORKER_HOST=<name> and is rerouted:
-#   - task source  : Worker/remote/<name>/inbox/*.md   (git-tracked)
-#   - run queue    : Worker/remote/<name>/queue.json   (git-tracked)
-#   - run artifacts: Worker/remote/<name>/runs/        (git-tracked; *.log ignored)
-#   - idle planner : disabled (only the primary host may create tasks)
-# Todo/items/ is host-local (not synced by the orchestrator across hosts), so
-# tasks travel to remote hosts via the git-tracked inbox, and results travel back the same way
-# (queue.json + runs/ + Memory/episodes/). The primary host's scan-queue
-# sweeps remote queue files and surfaces finished runs as review todos.
-DEFAULT_HOST = "default"
-
-
-def _detect_worker_host() -> str:
-    raw = os.environ.get("WORKER_HOST", "").strip().lower()
-    if not raw or raw == DEFAULT_HOST:
-        return DEFAULT_HOST
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", raw):
-        raise SystemExit(
-            f"invalid WORKER_HOST '{raw}' — use lowercase letters, digits, hyphens"
-        )
-    return raw
-
-
-WORKER_HOST = _detect_worker_host()
-IS_REMOTE_HOST = WORKER_HOST != DEFAULT_HOST
-REMOTE_DIR = WORKER_DIR / "remote"
-HOST_DIR = REMOTE_DIR / WORKER_HOST  # only meaningful when IS_REMOTE_HOST
-REMOTE_INBOX_DIR = HOST_DIR / "inbox"
-# Primary-host-local ledger of remote run_ids already surfaced as review todos.
-REMOTE_ACK_PATH = WORKER_DIR / "remote_ack.json"
-
-# Host-scoped runtime state: a remote host must never write the primary
-# host's queue/planner files (they'd collide via git on Worker/ paths).
-_STATE_DIR = HOST_DIR if IS_REMOTE_HOST else WORKER_DIR
-RUNS_DIR = _STATE_DIR / "runs"
-QUEUE_PATH = _STATE_DIR / "queue.json"
-PLANNER_STATE_PATH = _STATE_DIR / "planner_state.json"
-SWEEP_STATE_PATH = _STATE_DIR / "sweep_state.json"
+RUNS_DIR = WORKER_DIR / "runs"
+QUEUE_PATH = WORKER_DIR / "queue.json"
+PLANNER_STATE_PATH = WORKER_DIR / "planner_state.json"
+SWEEP_STATE_PATH = WORKER_DIR / "sweep_state.json"
 
 # todo-sync tick heartbeat: written by cli.cmd_daemon around each tick's real
 # work, read by _todo_sync_idle. Present-and-fresh = a sync is mid-write;
@@ -123,7 +79,7 @@ SWEEP_STATE_PATH = _STATE_DIR / "sweep_state.json"
 # _todo_sync_idle's 2026-08-18 note prescribed — the process tree carries no
 # usable signal (the uv wrapper's python child is permanently resident), so the
 # tick itself has to say when it is working.
-TODO_SYNC_HEARTBEAT_PATH = _STATE_DIR / "todo_sync_heartbeat"
+TODO_SYNC_HEARTBEAT_PATH = WORKER_DIR / "todo_sync_heartbeat"
 # A tick is seconds of sqlite/file writes. A heartbeat older than this is a
 # corpse from a tick that died mid-write (daemon killed, exception), not work.
 # Without this cutoff a single crash would leave the gate reading "busy"
@@ -160,7 +116,7 @@ def todo_sync_heartbeat_clear() -> None:
 # same reason: the ledger cannot answer this question. While the usage guard
 # holds messages in the mailbox (run_forever's only_bypass path) a `dispatched`
 # row sits untouched for DAYS with nothing running (2026-08-21 moksori-2).
-RUNNER_HEARTBEAT_PATH = _STATE_DIR / "_state" / "runner_heartbeat"
+RUNNER_HEARTBEAT_PATH = WORKER_DIR / "_state" / "runner_heartbeat"
 # A todo-sync tick is seconds; a runner tick is a five-stage pipeline, so the
 # cutoff cannot be "how long a tick takes". It is instead the hard bound between
 # two consecutive touches: the runner re-touches this file per stage, and one
@@ -201,17 +157,13 @@ def runner_heartbeat_clear() -> None:
 # Default per-stage tool whitelists (used when the task does not override).
 #
 # The values live in orchestrator.stages.STAGE_TOOLS and are aliased here; this
-# module no longer spells them out. The names stay because build_stage_command
-# and Task.allowed_tools_* read them by these names.
+# module no longer spells them out. The names stay because
+# WorkerTask.allowed_tools_* reads them by these names.
 #
 # Two hand-maintained copies is what this replaces, and they had drifted: by
 # 2026-08-24 the verify whitelist here was missing all ten Step 5b fallback
 # runners and implement was missing pnpm/node/npx — every one of them added to
-# stages.py alone, because nothing tied the lists together. That was not
-# cosmetic. build_stage_command reads DEFAULT_VERIFY_TOOLS directly with no
-# frontmatter override, so on this path the local-CI fallback could not run at
-# all: the exact failure (`flutter analyze` answering "This command requires
-# approval") that the stages.py copy had already been fixed for, twice.
+# stages.py alone, because nothing tied the lists together.
 #
 # Importing stages keeps this module's stdlib-only contract — stages is
 # stdlib-only too — and adds no cycle: orchestrator/__init__ is a docstring with
@@ -673,16 +625,10 @@ class WorkerTask:
 
 
 def iter_worker_tasks_vault() -> Iterable[WorkerTask]:
-    """Walk this host's task source and yield WorkerTask objects (flat layout).
-
-    Primary host: Todo/items/*.md. Remote host: its git-tracked inbox
-    Worker/remote/<host>/inbox/*.md (Todo/items/ is host-local and not
-    synced to other machines by the orchestrator).
-    """
-    source_dir = REMOTE_INBOX_DIR if IS_REMOTE_HOST else ITEMS_DIR
-    if not source_dir.exists():
+    """Walk Todo/items/*.md and yield WorkerTask objects (flat layout)."""
+    if not ITEMS_DIR.exists():
         return
-    for path in sorted(source_dir.glob("*.md")):
+    for path in sorted(ITEMS_DIR.glob("*.md")):
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
@@ -706,15 +652,14 @@ def iter_worker_tasks() -> Iterable[WorkerTask]:
 # ---------------------------------------------------------------------------
 
 
-QUEUE_LOCK_PATH = _STATE_DIR / "queue.lock"
+QUEUE_LOCK_PATH = WORKER_DIR / "queue.lock"
 
 
 @contextlib.contextmanager
 def queue_lock() -> Iterator[None]:
     """Exclusive flock on Worker/queue.lock — guards queue.json mutations.
 
-    Multiple `run-next` processes (or run-parallel children) call this to
-    safely claim distinct pending entries without races.
+    The orchestrator's queue reconcile takes it around its load/modify/save.
     """
     QUEUE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(QUEUE_LOCK_PATH, "w") as f:
@@ -841,19 +786,6 @@ def kakao_notify(message: str, link: str | None = None, *,
 # English planner reason) rides as a word-clipped tail so nothing is blind-cut.
 # All go through compose_alert → length is <= KAKAO_TEXT_LIMIT by construction.
 
-def _compose_worker_start(slug: str, mode: str, n_stages: int) -> str:
-    return compose_alert(f"🤖 Worker 시작: {slug} (mode={mode}, {n_stages} stage) — 조치 불필요, 진행 알림")
-
-
-def _compose_worker_done(slug: str, mode: str, n_stages: int) -> str:
-    return compose_alert(f"✅ Worker 완료: {slug} (mode={mode}, {n_stages} stage) — 리뷰 태스크를 확인해주세요")
-
-
-def _compose_worker_fail(slug: str, stage: str, message: str) -> str:
-    return compose_alert(f"❌ Worker 실패: {slug} ({stage} 단계) — 런 로그 확인이 필요합니다",
-                         tail=message)
-
-
 def _compose_dispatch_silence(pending_n: int, idle_h: float, threshold_h: float) -> str:
     return compose_alert(
         f"🤖⚠️ macp 정체: 대기 {pending_n}건인데 {idle_h:.1f}시간째 디스패치 없음 "
@@ -887,25 +819,6 @@ def _compose_daemon_restart_deferred(label: str, stalled_s: float, deferrals: in
         f"🤖⚠️ macp 데몬 재기동 보류: {label} 이(가) {int(stalled_s // 3600)}시간 동안 "
         f"{deferrals}회 연속 '작업 중'으로 판정돼 재기동이 계속 연기됐습니다. "
         "구코드로 계속 도는 중이니 수동 확인 필요.")
-
-
-def claim_next_pending() -> dict[str, Any] | None:
-    """Atomically pop the first pending entry, set status=in_progress.
-
-    Returns the queue entry dict or None if no pending available.
-
-    queue_lock() flock + load/modify/save provides a disjoint-claim guarantee
-    for concurrent processes on one machine.
-    """
-    with queue_lock():
-        queue = load_queue()
-        for entry in queue.get("runs", []):
-            if entry.get("status") == "pending":
-                entry["status"] = "in_progress"
-                entry["started_at"] = now_iso()
-                save_queue(queue)
-                return entry
-        return None
 
 
 def now_iso() -> str:
@@ -2016,90 +1929,6 @@ def _parse_iso_timestamp(raw: str | None) -> dt.datetime | None:
     return ts
 
 
-def _load_remote_ack() -> set[str]:
-    if not REMOTE_ACK_PATH.exists():
-        return set()
-    try:
-        data = json.loads(REMOTE_ACK_PATH.read_text(encoding="utf-8"))
-        return set(data.get("acked", []))
-    except (OSError, ValueError):
-        return set()
-
-
-def _save_remote_ack(acked: set[str]) -> None:
-    try:
-        REMOTE_ACK_PATH.write_text(
-            json.dumps({"acked": sorted(acked)}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        print(f"remote-sweep: ack save failed — {exc}")
-
-
-def sweep_remote_completed_runs() -> int:
-    """Primary-host sweep: surface finished remote-host runs (M5).
-
-    Remote hosts push their Worker/remote/<host>/queue.json via git; here we
-    read every remote queue and, for each completed/failed run not yet
-    acknowledged, create a review todo + kakao notification. Ack state is
-    primary-host-local (Worker/remote_ack.json, gitignored) so we never write
-    to files a remote host owns — that keeps the git sync conflict-free.
-    """
-    if IS_REMOTE_HOST or not REMOTE_DIR.exists():
-        return 0
-
-    acked = _load_remote_ack()
-    surfaced = 0
-    for qpath in sorted(REMOTE_DIR.glob("*/queue.json")):
-        host = qpath.parent.name
-        try:
-            runs = json.loads(qpath.read_text(encoding="utf-8")).get("runs", [])
-        except (OSError, ValueError) as exc:
-            print(f"remote-sweep: cannot read {qpath.name} for host={host}: {exc}")
-            continue
-        for entry in runs:
-            run_id = entry.get("run_id")
-            status_v = entry.get("status")
-            if not run_id or status_v not in ("completed", "failed"):
-                continue
-            if run_id in acked:
-                continue
-            slug = entry.get("slug", "?")
-            task_path = qpath.parent / "inbox" / f"{slug}.md"
-            run_dir = qpath.parent / "runs" / run_id
-
-            if status_v == "completed" and task_path.exists():
-                try:
-                    fm, _ = parse_frontmatter(task_path.read_text(encoding="utf-8"))
-                    task = WorkerTask(
-                        slug=slug,
-                        path=task_path,
-                        rel_path=str(task_path.relative_to(ROOT)),
-                        frontmatter=fm,
-                    )
-                    review = create_review_todo(
-                        task, run_id, run_dir, entry.get("mode") or "auto"
-                    )
-                    if review:
-                        print(
-                            f"remote-sweep: review todo for {host}/{slug} → "
-                            f"{review.relative_to(ROOT)}"
-                        )
-                except Exception as exc:
-                    print(f"remote-sweep: review todo failed for {host}/{slug}: {exc}")
-
-            # No Kakao ping for remote-run completions — it's a low-signal FYI the
-            # user asked to stop (2026-07-23). Genuine review needs still surface:
-            # completed runs get a review todo above, and the v2 orchestrator sends
-            # its own [review-request]/[quarantine] pings for tasks that actually need a human.
-            acked.add(run_id)
-            surfaced += 1
-
-    if surfaced:
-        _save_remote_ack(acked)
-    return surfaced
-
-
 def cmd_maintenance() -> int:
     """Vault upkeep that used to ride along inside scan_queue().
 
@@ -2108,9 +1937,6 @@ def cmd_maintenance() -> int:
     running both is what produced the duplicate-dispatch loop), but the upkeep half
     still has to run somewhere:
 
-      - sweep_remote_completed_runs: surfaces finished remote-host (Windows/sc1)
-        runs as review todos + kakao — the only path by which remote work is
-        reported back at all.
       - sync_vault_state: commits + pushes the tracked ledger/episodes/mailbox.
         This one was NOT carried over at cutover time and went unnoticed for six
         days, because losing it changes nothing locally — it only means the
@@ -2129,136 +1955,117 @@ def cmd_maintenance() -> int:
     which is exactly the store the cutover retires.
     """
     rc = 0
-    if not IS_REMOTE_HOST:
-        try:
-            surfaced = sweep_remote_completed_runs()
-            if surfaced > 0:
-                print(f"remote-sweep: {surfaced} remote run(s) surfaced")
-        except Exception as exc:
-            print(f"remote-sweep: error — {exc}")
+    # The third piece of scan_queue()'s upkeep, missing since the cutover.
+    try:
+        synced = sync_vault_state()
+        if synced > 0:
+            print(f"vault-sync: {synced} file(s) committed")
+    except Exception as exc:
+        print(f"vault-sync: error — {exc}")
+        rc = 1
+    try:
+        for name in rotate_logs():
+            print(f"log-rotate: {name} truncated")
+    except Exception as exc:
+        print(f"log-rotate: error — {exc}")
+        rc = 1
+    # Pull macp's own merged PRs into the engine checkout *before* the
+    # restart below, so the daemons kickstart onto the new code in one tick.
+    try:
+        for reason in pull_engine_checkout():
+            print(reason)
             rc = 1
-        # The third piece of scan_queue()'s upkeep, missing since the cutover.
-        try:
-            synced = sync_vault_state()
-            if synced > 0:
-                print(f"vault-sync: {synced} file(s) committed")
-        except Exception as exc:
-            print(f"vault-sync: error — {exc}")
+    except Exception as exc:
+        print(f"engine-pull: error — {exc}")
+        rc = 1
+    # The engine checkout just moved; let the vault's own `uv run` follow it
+    # instead of executing whatever commit its uv.lock pinned days ago.
+    try:
+        for reason in bump_vault_engine_pin():
+            print(reason)
             rc = 1
-        try:
-            for name in rotate_logs():
-                print(f"log-rotate: {name} truncated")
-        except Exception as exc:
-            print(f"log-rotate: error — {exc}")
+    except Exception as exc:
+        print(f"vault-pin: error — {exc}")
+        rc = 1
+    # New engine code is on disk; refresh the ~/.local/bin PATH wrappers from
+    # it in the same tick so a stage's `Bash(macp-*:*)` rule never hits a
+    # missing/stale wrapper (the 2026-10-23 macp-remote-gate exit 127 block).
+    try:
+        for name in sync_wrappers():
+            print(f"wrapper-sync: {name} (re)installed")
+    except Exception as exc:
+        print(f"wrapper-sync: error — {exc}")
+        rc = 1
+    # The logged-in browser's MCP server lives in its own checkout; a merged
+    # macp-browser PR (server code / npm deps) must reach it without a human
+    # pull (2026-10-28: stuck checkout, then @modelcontextprotocol/sdk missing).
+    try:
+        for reason in pull_browser_checkout():
+            print(reason)
             rc = 1
-        # Pull macp's own merged PRs into the engine checkout *before* the
-        # restart below, so the daemons kickstart onto the new code in one tick.
-        try:
-            for reason in pull_engine_checkout():
-                print(reason)
-                rc = 1
-        except Exception as exc:
-            print(f"engine-pull: error — {exc}")
-            rc = 1
-        # The engine checkout just moved; let the vault's own `uv run` follow it
-        # instead of executing whatever commit its uv.lock pinned days ago.
-        try:
-            for reason in bump_vault_engine_pin():
-                print(reason)
-                rc = 1
-        except Exception as exc:
-            print(f"vault-pin: error — {exc}")
-            rc = 1
-        # New engine code is on disk; refresh the ~/.local/bin PATH wrappers from
-        # it in the same tick so a stage's `Bash(macp-*:*)` rule never hits a
-        # missing/stale wrapper (the 2026-10-23 macp-remote-gate exit 127 block).
-        try:
-            for name in sync_wrappers():
-                print(f"wrapper-sync: {name} (re)installed")
-        except Exception as exc:
-            print(f"wrapper-sync: error — {exc}")
-            rc = 1
-        # The logged-in browser's MCP server lives in its own checkout; a merged
-        # macp-browser PR (server code / npm deps) must reach it without a human
-        # pull (2026-10-28: stuck checkout, then @modelcontextprotocol/sdk missing).
-        try:
-            for reason in pull_browser_checkout():
-                print(reason)
-                rc = 1
-        except Exception as exc:
-            print(f"browser-pull: error — {exc}")
-            rc = 1
-        # macp edits its own source; the daemons executing those edits are
-        # resident and would otherwise never load them.
-        try:
-            for label in restart_stale_daemons():
-                print(f"daemon-restart: {label} was running stale code — kickstarted")
-        except Exception as exc:
-            print(f"daemon-restart: error — {exc}")
-            rc = 1
-        # Everything that broke this week broke quietly. This is the one detector
-        # for the task pipeline going silent with work still queued.
-        try:
-            msg = check_dispatch_silence()
-            if msg:
-                print(f"silence-check: paged — {msg}")
-        except Exception as exc:
-            print(f"silence-check: error — {exc}")
-            rc = 1
-        # ...and the mirror: the pipeline going silent with NOTHING queued and
-        # no way left to find work on its own. Only a human can end that.
-        try:
-            msg = check_work_starvation()
-            if msg:
-                print(f"starvation-check: paged — {msg}")
-        except Exception as exc:
-            print(f"starvation-check: error — {exc}")
-            rc = 1
-        # The logged-in browser profile drops its session silently; find out
-        # when it drops, not when a task next needs it.
-        try:
-            msg = browser_watch.check_login_watch(notify=kakao_notify)
-            if msg:
-                print(f"browser-watch: paged — {msg.splitlines()[0]}")
-        except Exception as exc:
-            print(f"browser-watch: error — {exc}")
-            rc = 1
-        # The root disk fills with caches Gradle and uv re-download on demand
-        # (2026-11-03: 6.4G free of 96G); prune them before a build hits ENOSPC.
-        try:
-            line = maintenance_disk.check_and_prune(notify=kakao_notify)
-            if line:
-                print(line)
-        except Exception as exc:
-            print(f"disk-prune: error — {exc}")
-            rc = 1
-        # graph_memory.embed_vault has been incremental since G2 but nothing ever
-        # ran it on a schedule, so query_related's semantic half answered from a
-        # single manual run (2026-11-09) and silently degraded to BFS-only for
-        # everything written since.
-        try:
-            line = maintenance_embed.embed_tick()
-            if line:
-                print(line)
-        except Exception as exc:
-            print(f"embed-tick: error — {exc}")
-            rc = 1
+    except Exception as exc:
+        print(f"browser-pull: error — {exc}")
+        rc = 1
+    # macp edits its own source; the daemons executing those edits are
+    # resident and would otherwise never load them.
+    try:
+        for label in restart_stale_daemons():
+            print(f"daemon-restart: {label} was running stale code — kickstarted")
+    except Exception as exc:
+        print(f"daemon-restart: error — {exc}")
+        rc = 1
+    # Everything that broke this week broke quietly. This is the one detector
+    # for the task pipeline going silent with work still queued.
+    try:
+        msg = check_dispatch_silence()
+        if msg:
+            print(f"silence-check: paged — {msg}")
+    except Exception as exc:
+        print(f"silence-check: error — {exc}")
+        rc = 1
+    # ...and the mirror: the pipeline going silent with NOTHING queued and
+    # no way left to find work on its own. Only a human can end that.
+    try:
+        msg = check_work_starvation()
+        if msg:
+            print(f"starvation-check: paged — {msg}")
+    except Exception as exc:
+        print(f"starvation-check: error — {exc}")
+        rc = 1
+    # The logged-in browser profile drops its session silently; find out
+    # when it drops, not when a task next needs it.
+    try:
+        msg = browser_watch.check_login_watch(notify=kakao_notify)
+        if msg:
+            print(f"browser-watch: paged — {msg.splitlines()[0]}")
+    except Exception as exc:
+        print(f"browser-watch: error — {exc}")
+        rc = 1
+    # The root disk fills with caches Gradle and uv re-download on demand
+    # (2026-11-03: 6.4G free of 96G); prune them before a build hits ENOSPC.
+    try:
+        line = maintenance_disk.check_and_prune(notify=kakao_notify)
+        if line:
+            print(line)
+    except Exception as exc:
+        print(f"disk-prune: error — {exc}")
+        rc = 1
+    # graph_memory.embed_vault has been incremental since G2 but nothing ever
+    # ran it on a schedule, so query_related's semantic half answered from a
+    # single manual run (2026-11-09) and silently degraded to BFS-only for
+    # everything written since.
+    try:
+        line = maintenance_embed.embed_tick()
+        if line:
+            print(line)
+    except Exception as exc:
+        print(f"embed-tick: error — {exc}")
+        rc = 1
     return rc
 
 
 def scan_queue() -> int:
     queue = load_queue()
-
-    # Primary host: surface finished remote-host runs (git-synced queue files)
-    # as review todos + kakao notifications. Remote hosts skip it — their data
-    # source is just their inbox.
-    if not IS_REMOTE_HOST:
-        try:
-            surfaced = sweep_remote_completed_runs()
-            if surfaced > 0:
-                print(f"remote-sweep: {surfaced} remote run(s) surfaced")
-        except Exception as exc:
-            print(f"remote-sweep: error — {exc}")
 
     # Self-heal: reset stuck/auto-retryable entries before the dispatcher
     # scans for new tasks. Each action is logged so users see what changed.
@@ -2316,7 +2123,7 @@ def scan_queue() -> int:
             "run_id": make_run_id(task.slug),
             "task_path": task.rel_path,
             "mode": mode,
-            "host": WORKER_HOST,
+            "host": "default",
             "status": "pending",
             "created_at": now_iso(),
             "started_at": None,
@@ -2366,87 +2173,6 @@ def cmd_status(run_id: str) -> int:
     return 0
 
 
-def cmd_run_parallel(max_concurrent: int, dry_run: bool) -> int:
-    """Fan out up to N parallel `run-next` subprocesses.
-
-    Each child claims its own pending entry via flock on queue.lock. Children
-    exit normally; parent waits for all and returns 0 if every child succeeded.
-
-    Vault tasks (no `repo` field) and external-repo tasks are both supported,
-    but only external-repo tasks benefit from true parallelism (independent
-    working_dirs). Concurrent vault tasks would race on vault source files;
-    run-parallel does NOT prevent this — keep vault `worker_mode:auto` rare or
-    set max_concurrent=1 if vault tasks dominate the queue.
-    """
-    if max_concurrent < 1:
-        print("run-parallel: --max must be >= 1")
-        return 2
-
-    with queue_lock():
-        queue = load_queue()
-        pending_count = sum(
-            1 for r in queue.get("runs", []) if r.get("status") == "pending"
-        )
-
-    if pending_count == 0:
-        print("run-parallel: no pending runs")
-        return 0
-
-    n = min(max_concurrent, pending_count)
-    print(
-        f"run-parallel: spawning {n} worker(s) (pending={pending_count}, "
-        f"max_concurrent={max_concurrent}, dry_run={dry_run})"
-    )
-
-    base_argv = [
-        sys.executable,
-        "-m",
-        "todo_system.worker",
-        "run-next",
-    ]
-    if dry_run:
-        base_argv.append("--dry-run")
-
-    # Two roots (see the top of this module). cwd stays on the vault: cli,
-    # session_log and friends resolve vault_root() from cwd. In a split install
-    # (_ENGINE_ROOT != ROOT) cwd alone cannot serve both jobs, so the vault the
-    # parent resolved is handed over explicitly. A split CHECKOUT additionally
-    # puts the engine at the front of the import path — the child then imports
-    # todo_system without site-packages and cannot re-resolve a different vault.
-    # An installed wheel is already in the child's site-packages, and its
-    # _ENGINE_ROOT is todo_system/_engine — a PYTHONPATH entry there would point
-    # at site-packages, so it gets the vault only. In the combined layout env
-    # stays None, so the child (and every stage it spawns) inherits exactly what
-    # it did before.
-    child_env = None
-    if ROOT.resolve() != _ENGINE_ROOT:
-        child_env = {**os.environ, "MACP_VAULT_ROOT": str(ROOT)}
-        if not paths.is_installed():
-            prior = os.environ.get("PYTHONPATH")
-            child_env["PYTHONPATH"] = os.pathsep.join(
-                p for p in (str(_ENGINE_ROOT), prior) if p)
-
-    procs: list[subprocess.Popen[bytes]] = []
-    for i in range(n):
-        log_path = WORKER_DIR / f"run-parallel-{i:02d}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_f = open(log_path, "wb")
-        p = subprocess.Popen(
-            base_argv,
-            cwd=ROOT,
-            env=child_env,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-        )
-        procs.append(p)
-        print(f"  child #{i:02d} pid={p.pid} log={log_path.relative_to(ROOT)}")
-
-    rcs = [p.wait() for p in procs]
-    failed = [(i, rc) for i, rc in enumerate(rcs) if rc != 0]
-    print(f"run-parallel: done — {len(rcs)} child(ren), {len(failed)} failed")
-    return 0 if not failed else 1
-
-
 # ---------------------------------------------------------------------------
 # Safety: vault dirty-check
 # ---------------------------------------------------------------------------
@@ -2475,11 +2201,8 @@ ALLOWED_DIRTY_EXACT = {
 
 # Vault state that is git-tracked ON PURPOSE and has to reach the remote: the
 # assignment ledger (.gitignore keeps it tracked so "a cloud takeover inherits"
-# it), the run episodes that are the durable record of what the worker did, the
-# mailbox, whose consumed messages are deletions that otherwise pile up, and
-# Worker/remote — where git is not a backup but the actual TRANSPORT: a task
-# written to Worker/remote/<host>/inbox/ reaches that machine only by being
-# pushed, and its results come back the same way.
+# it), the run episodes that are the durable record of what the worker did, and
+# the mailbox, whose consumed messages are deletions that otherwise pile up.
 #
 # Worker as a whole rather than an enumeration of its children, because naming
 # children is how this list goes wrong: remote/ was missed on the first cut
@@ -3551,7 +3274,7 @@ def vault_is_dirty_outside_worker() -> tuple[bool, list[str]]:
 # one-shot alert is not enough: if it is missed, the pipeline stays silently
 # down for days (observed 2026-06-17: 358 consecutive aborts, 1 alert). So we
 # RE-NAG every STALL_RENOTIFY_EVERY aborts until the tree is cleaned.
-STALL_MARKER = _STATE_DIR / "stall.json"
+STALL_MARKER = WORKER_DIR / "stall.json"
 STALL_NOTIFY_THRESHOLD = 3
 STALL_RENOTIFY_EVERY = 144  # ~12h at the 300s launchd interval
 
@@ -3966,85 +3689,6 @@ def strip_frontmatter(text: str) -> str:
     return parts[1].lstrip("\n")
 
 
-def load_stage_prompt(stage: str) -> str:
-    path = COMMANDS_DIR / f"worker-{stage}.md"
-    text = path.read_text(encoding="utf-8")
-    return strip_frontmatter(text)
-
-
-def build_stage_command(
-    stage: str,
-    task: WorkerTask,
-    run_id: str,
-    run_dir: Path,
-    dry_run: bool,
-) -> tuple[list[str], str]:
-    """Return (argv, full_prompt). argv begins with `claude`."""
-    base_prompt = load_stage_prompt(stage)
-    branch = task.worker_branch
-
-    metadata_lines = [
-        "\n\n---\n\n",
-        "# Run metadata (injected by orchestrator)\n\n",
-        f"- run_id: `{run_id}`\n",
-        f"- slug: `{task.slug}`\n",
-        f"- task_path: `{task.rel_path}`\n",
-        f"- run_dir: `{run_dir.relative_to(ROOT)}`\n",
-        f"- branch: `{branch}`\n",
-        f"- vault_root: `{ROOT}`\n",
-        f"- stage: `{stage}`\n",
-        f"- auto_merge: `{task.auto_merge}`\n",
-    ]
-    if task.is_external_repo:
-        wd = resolve_working_dir(task)
-        metadata_lines.append(f"- repo: `{task.repo}`\n")
-        metadata_lines.append(f"- working_dir: `{wd}`\n")
-        metadata_lines.append(
-            "- **External repo task**: Implement / Verify operate on files under "
-            "`working_dir`. Use absolute paths for any edits. Vault artifacts "
-            "(prior stage outputs at `run_dir`) are read-only references.\n"
-        )
-    metadata = "".join(metadata_lines)
-    full_prompt = base_prompt + metadata
-
-    # Per-stage tool whitelist.
-    if stage == "research":
-        tools = DEFAULT_RESEARCH_TOOLS
-    elif stage == "plan":
-        tools = DEFAULT_PLAN_TOOLS
-    elif stage == "implement":
-        tools = task.allowed_tools_implement
-    elif stage == "verify":
-        tools = DEFAULT_VERIFY_TOOLS
-    elif stage == "report":
-        tools = DEFAULT_REPORT_TOOLS
-    elif stage == "delegate":
-        tools = task.allowed_tools_delegate
-    else:
-        raise ValueError(f"unknown stage: {stage}")
-
-    max_turns = task.max_turns
-    if max_turns is None:
-        max_turns = STAGE_MAX_TURNS.get(stage, DEFAULT_STAGE_MAX_TURNS)
-
-    argv: list[str] = [
-        "claude",
-        "-p",
-        full_prompt,
-        "--max-turns",
-        str(max_turns),
-        "--allowed-tools",
-        *tools.split(),
-    ]
-    # Allow worker stages to operate on external side-project repos under the
-    # clone root (e.g. LucidCue, DripCoffee, Pairent). Vault root is the
-    # invocation cwd; this --add-dir extends accessible filesystem scope.
-    worker_extra_dir = paths.worker_root()
-    if worker_extra_dir.exists():
-        argv += ["--add-dir", str(worker_extra_dir)]
-    return argv, full_prompt
-
-
 # Substrings Claude Code / the Anthropic API use for capacity conditions
 # (account usage-limit reached, API rate limiting, model overloaded) — these
 # are transient/time-based, not a bug in the task, so callers should retry
@@ -4103,242 +3747,6 @@ def check_forbidden_tools(tools: str) -> str | None:
         if pattern in tools:
             return f"forbidden tool pattern '{pattern}' in allowed_tools='{tools}'"
     return None
-
-
-def check_task_guardrails(task: WorkerTask) -> str | None:
-    """Return error string if task frontmatter violates guardrails.
-
-    auto_merge is no longer outright forbidden — it's an opt-in flag handled
-    by the Report stage. The merge gate is the Verify stage's local-check verdict
-    (verify.md `overall_status: pass`), enforced inside the Report stage prompt.
-    """
-    return None
-
-
-def invoke_stage(
-    stage: str,
-    task: WorkerTask,
-    run_id: str,
-    run_dir: Path,
-    dry_run: bool,
-) -> tuple[bool, str]:
-    """Run one stage. Returns (success, message).
-
-    success = True iff the stage's expected artifact exists after the call.
-    """
-    argv, _prompt = build_stage_command(stage, task, run_id, run_dir, dry_run)
-    artifact = run_dir / STAGE_ARTIFACT[stage]
-
-    # Extract the tools whitelist from argv (positions after --allowed-tools).
-    try:
-        tools_idx = argv.index("--allowed-tools")
-        tools_used = " ".join(
-            a for a in argv[tools_idx + 1:] if not a.startswith("--")
-        )
-    except ValueError:
-        tools_used = ""
-    err = check_forbidden_tools(tools_used)
-    if err:
-        return False, f"guardrail: {err}"
-
-    if dry_run:
-        # Print a concise representation; don't dump the full prompt body.
-        preview = " ".join(argv[:1] + ["-p", "<prompt>"] + argv[3:])
-        print(f"  [dry-run] would invoke: {preview}")
-        print(f"  [dry-run] expected artifact: {artifact.relative_to(ROOT)}")
-        return True, "dry-run"
-
-    if not shutil.which("claude"):
-        return False, "claude CLI not found on PATH"
-
-    log_path = run_dir / f"{stage}.stdout.log"
-    err_path = run_dir / f"{stage}.stderr.log"
-    try:
-        with log_path.open("w", encoding="utf-8") as out_f, err_path.open(
-            "w", encoding="utf-8"
-        ) as err_f:
-            subprocess.run(
-                argv,
-                cwd=ROOT,
-                check=True,
-                stdin=subprocess.DEVNULL,
-                stdout=out_f,
-                stderr=err_f,
-                # Injects the long-lived automation token if present — keeps headless
-                # auth working independent of the Keychain refresh token's absolute
-                # expiry. With no file present, os.environ passes through unchanged,
-                # so behavior is unchanged. See todo_system/claude_auth.py.
-                env=claude_env(),
-            )
-    except subprocess.CalledProcessError as exc:
-        combined_tail = ""
-        for p in (err_path, log_path):
-            try:
-                combined_tail += p.read_text(encoding="utf-8")[-2000:]
-            except OSError:
-                pass
-        capacity = detect_capacity_error(combined_tail)
-        if capacity:
-            return False, (
-                f"claude-capacity: {capacity} (exit={exc.returncode}); "
-                f"see {err_path.relative_to(ROOT)}"
-            )
-        return False, f"claude exit={exc.returncode}; see {err_path.relative_to(ROOT)}"
-    except FileNotFoundError:
-        return False, "claude CLI not found on PATH"
-
-    if not artifact.exists():
-        # `claude -p` exits 0 even when it ran out of turns (it just prints
-        # "Error: Reached max turns (N)" to stdout), so the generic
-        # "artifact missing" message hid the real cause. Surface it explicitly
-        # so the failure is diagnosable without grepping the stdout log.
-        try:
-            tail = log_path.read_text(encoding="utf-8")[-2000:]
-        except OSError:
-            tail = ""
-        m = re.search(r"Reached max turns \((\d+)\)", tail)
-        if m:
-            return False, (
-                f"stage hit max turns ({m.group(1)}) before writing "
-                f"{artifact.relative_to(ROOT)} — raise max_turns for this stage/task"
-            )
-        capacity = detect_capacity_error(tail)
-        if capacity:
-            return False, (
-                f"claude-capacity: {capacity} before writing "
-                f"{artifact.relative_to(ROOT)}"
-            )
-        return False, f"artifact missing after stage: {artifact.relative_to(ROOT)}"
-
-    # The Verify stage writes verify.md regardless of the verdict, so artifact
-    # existence alone is NOT success — that let a `fail` (e.g. red CI, or a
-    # "fix" that didn't actually fix anything) sail through to a clean Report
-    # and a "completed" run. Gate on the verdict: only pass/skip continue.
-    if stage == "verify":
-        verdict = parse_verify_status(artifact)
-        if verdict == "fail":
-            return False, f"verify: overall_status=fail (see {artifact.relative_to(ROOT)})"
-
-    return True, str(artifact.relative_to(ROOT))
-
-
-# ---------------------------------------------------------------------------
-# Review todo auto-generation
-# ---------------------------------------------------------------------------
-
-
-def should_skip_review_todo(task: WorkerTask) -> bool:
-    """Determine if review todo should NOT be created for this task.
-
-    Skip conditions:
-    1. Task has 'review' tag (to prevent infinite generation loops)
-    2. Task has 'worker_mode: auto-review-disabled'
-    """
-    tags = task.frontmatter.get("tags", [])
-    if isinstance(tags, list) and "review" in tags:
-        return True
-
-    worker_mode = task.frontmatter.get("worker_mode", "")
-    if isinstance(worker_mode, str) and worker_mode.strip().lower() == "auto-review-disabled":
-        return True
-
-    return False
-
-
-def create_review_todo(
-    task: WorkerTask,
-    run_id: str,
-    run_dir: Path,
-    mode: str,
-) -> Path | None:
-    """Create a review todo file for a completed worker run.
-
-    Returns the path of the created file, or None if creation was skipped.
-    """
-    # Remote hosts don't own Todo/items/ (it's the primary host's local data).
-    # The primary host's remote-sweep creates the review todo instead, once the
-    # run's queue.json/artifacts arrive via git.
-    if IS_REMOTE_HOST:
-        return None
-    if should_skip_review_todo(task):
-        return None
-
-    # Carry over the parent task's classification tags (e.g. work/private/domain)
-    # so the review inherits its lane in the flat, tags-based layout.
-    parent_tags = task.frontmatter.get("tags", [])
-    if not isinstance(parent_tags, list):
-        parent_tags = []
-    inherited_tags = [str(t) for t in parent_tags if str(t) not in ("todo", "review")]
-
-    # Generate run_id short form (first 13 chars, e.g., "20260602T0640")
-    runid_short = run_id[:13] if len(run_id) >= 13 else run_id
-
-    # Build file path (flat items/ layout)
-    filename = f"review-{task.slug}-{runid_short}.md"
-    review_path = ITEMS_DIR / filename
-
-    # Compute dates
-    today = dt.date.today()
-    due_date = today + dt.timedelta(days=3)
-    today_str = today.isoformat()
-    due_str = due_date.isoformat()
-
-    # Build frontmatter
-    frontmatter_lines = [
-        "---",
-        "tags:",
-        "  - todo",
-        *[f"  - {t}" for t in inherited_tags],
-        "  - review",
-        "status: open",
-        f"due: {due_str}",
-        f"scheduled: {today_str}",
-        f"updated: {today_str}",
-        "priority: 45",
-        "delegate: false",
-        f"parent: '[[{task.slug}]]'",
-        f'outcome: "{task.slug} worker 결과 검토 완료"',
-        'next_action: "report.md/verify.md 읽고 acceptance criteria 확인"',
-        'if_then: "Worker 완료 알림 보면 → review todo 열어서 결과 확인"',
-        "estimate_p50: 15m",
-        "estimate_p90: 30m",
-        "review_cycle: '-'",
-        "---",
-    ]
-
-    # Build body
-    run_dir_rel = run_dir.relative_to(ROOT)
-    body_lines = [
-        "",
-        f"# Review: {task.title}",
-        "",
-        f"Worker run `{run_id}` completed in mode `{mode}`.",
-        "",
-        "## Links",
-        "",
-        f"- 원본 task: [[{task.rel_path}|{task.slug}]]",
-        f"- report: [[{run_dir_rel}/report.md|report.md]]",
-        f"- verify: [[{run_dir_rel}/verify.md|verify.md]]",
-        "",
-        "## Checklist",
-        "",
-        "- [ ] Acceptance criteria 충족 여부 확인",
-        "- [ ] 빌드/테스트 통과 여부 확인",
-        "- [ ] 변경 사항 review 완료",
-        "- [ ] 다음 액션 결정 (merge / 수정 요청 / close)",
-        "",
-        "## Progress Log",
-        "",
-        f"- {today_str}: Worker 완료로 자동 생성 (run_id={run_id})",
-    ]
-
-    content = "\n".join(frontmatter_lines + body_lines) + "\n"
-
-    # Write file
-    review_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.write_text(content, encoding="utf-8")
-
-    return review_path
 
 
 def _sweep_due(key: str, min_interval_s: int) -> bool:
@@ -4472,520 +3880,13 @@ def _run_is_ci_failed(status: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Planner invocation (idle path)
-# ---------------------------------------------------------------------------
-
-
-def invoke_planner(dry_run: bool = False) -> tuple[int, str]:
-    """Invoke the planner agent to create auto tasks.
-
-    Returns (tasks_created_count, verdict_string).
-    """
-    planner_prompt_path = COMMANDS_DIR / "worker-planner.md"
-    if not planner_prompt_path.exists():
-        log_planner("error: planner prompt not found")
-        return 0, "error: prompt missing"
-
-    prompt_text = strip_frontmatter(planner_prompt_path.read_text(encoding="utf-8"))
-
-    if dry_run:
-        print(f"  [dry-run] would invoke planner with --max-turns {PLANNER_MAX_TURNS}")
-        return 0, "dry-run"
-
-    if not shutil.which("claude"):
-        log_planner("error: claude CLI not found")
-        return 0, "error: claude not found"
-
-    # Prepare log file
-    timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-    planner_log_path = LOGS_DIR / f"planner.{timestamp}.log"
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    argv = [
-        "claude",
-        "-p",
-        prompt_text,
-        "--max-turns",
-        str(PLANNER_MAX_TURNS),
-        "--allowed-tools",
-        "Read", "Write",
-    ]
-
-    try:
-        result = subprocess.run(
-            argv,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=600,  # 10 min max
-        )
-        # Write combined output to log
-        planner_log_path.write_text(
-            f"=== STDOUT ===\n{result.stdout}\n\n=== STDERR ===\n{result.stderr}\n",
-            encoding="utf-8",
-        )
-    except subprocess.TimeoutExpired:
-        log_planner("error: planner timed out after 600s")
-        return 0, "error: timeout"
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        log_planner(f"error: {exc}")
-        return 0, f"error: {exc}"
-
-    # Parse verdict from stdout
-    stdout = result.stdout
-    verdict = "unknown"
-    tasks_created = 0
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("verdict:"):
-            verdict = line
-            # Parse tasks count: verdict: tasks_created tasks=2 reason="..."
-            if "tasks=" in line:
-                try:
-                    tasks_part = line.split("tasks=")[1].split()[0]
-                    tasks_created = int(tasks_part)
-                except (IndexError, ValueError):
-                    pass
-            break
-
-    if verdict == "unknown":
-        capacity = detect_capacity_error(stdout + result.stderr)
-        if capacity:
-            verdict = f"claude-capacity: {capacity}"
-
-    log_planner(f"{verdict} (log={planner_log_path.name})")
-    return tasks_created, verdict
-
-
-def _handle_idle_planner(dry_run: bool = False) -> int:
-    """Handle the idle path: check conditions and invoke planner if appropriate.
-
-    Returns 0 on success (whether planner ran or was skipped), non-zero on error.
-    """
-    # Remote hosts never create tasks autonomously — only the primary host
-    # runs the planner. An idle remote worker simply waits for inbox pushes.
-    if IS_REMOTE_HOST:
-        print(
-            f"[planner] disabled on remote host '{WORKER_HOST}' — "
-            "idle until new tasks arrive in the inbox"
-        )
-        return 0
-
-    # Fetch once and reuse below — count_auto_pending + is_planner_exhausted
-    # both need the run queue; without this they'd each re-read it on every
-    # idle tick.
-    queue = load_queue()
-
-    # Check 1: auto queue depth limit
-    pending_count = count_auto_pending(queue=queue)
-    if pending_count >= AUTO_QUEUE_DEPTH_LIMIT:
-        msg = f"skip: auto queue depth={pending_count} >= limit={AUTO_QUEUE_DEPTH_LIMIT}"
-        print(f"[planner] {msg}")
-        log_planner(msg)
-        return 0
-
-    # Check 2: exhausted backoff
-    exhausted, reason = is_planner_exhausted(queue=queue)
-    if exhausted:
-        msg = f"skip: planner exhausted ({reason})"
-        print(f"[planner] {msg}")
-        log_planner(msg)
-        return 0
-
-    # Invoke planner
-    current_hash = compute_todo_state_hash()
-    print(f"[planner] invoking planner agent (dry_run={dry_run}, hash={current_hash})...")
-    log_planner(f"invoke: hash={current_hash}")
-    tasks_created, verdict = invoke_planner(dry_run=dry_run)
-
-    if dry_run:
-        print("[planner] dry-run complete")
-        return 0
-
-    # Save state based on verdict
-    if "exhausted" in verdict:
-        save_planner_state("exhausted")
-        print(f"[planner] {verdict}")
-    elif tasks_created > 0:
-        save_planner_state("tasks_created")
-        print(f"[planner] {verdict}")
-        # Run scan_queue to register the newly created tasks
-        print("[planner] running scan-queue to register new tasks...")
-        scan_queue()
-    else:
-        # No tasks created but not explicitly exhausted — treat as exhausted
-        save_planner_state("exhausted")
-        print(f"[planner] {verdict} — treating as exhausted")
-
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# run-next
-# ---------------------------------------------------------------------------
-
-
-def find_task_by_slug(slug: str) -> WorkerTask | None:
-    for task in iter_worker_tasks():
-        if task.slug == slug:
-            return task
-    return None
-
-
-def write_status(run_dir: Path, status: dict[str, Any]) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "status.json").write_text(
-        json.dumps(status, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def update_queue_entry(run_id: str, **fields: Any) -> None:
-    """Patch a single run entry by run_id.
-
-    flock + load/modify/save.
-    """
-    with queue_lock():
-        queue = load_queue()
-        for entry in queue["runs"]:
-            if entry["run_id"] == run_id:
-                entry.update(fields)
-                break
-        save_queue(queue)
-
-
-def _return_vault_to_main(own_branch: str | None = None) -> None:
-    """Best-effort return vault working tree to main branch.
-
-    Called in finally block; failures are logged but never raise.
-    This ensures the user sees vault on main after worker completes,
-    regardless of success/failure/abort.
-
-    The vault is a single checkout shared by every run, so this only moves HEAD
-    when it is on main or on `own_branch` (this run's own worker branch). If
-    another run is working on its own worker/<slug>, leave it alone — pulling it
-    down to main would silently strand that run's edits and commits on main.
-    A detached or unreadable HEAD counts as "not ours" and is left alone too.
-    """
-    try:
-        current_result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        current = current_result.stdout.strip() if current_result.returncode == 0 else ""
-
-        if current != "main" and current != own_branch:
-            print(
-                f"  [warn] return-to-main skipped: HEAD is "
-                f"{current or '(detached)'} (another run's branch)"
-            )
-            return
-
-        result = subprocess.run(
-            ["git", "checkout", "main"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            print(f"  [warn] return-to-main failed: {result.stderr[:100]}")
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"  [warn] return-to-main exception: {exc}")
-
-
-def run_next(dry_run: bool = False) -> int:
-    """Execute the first pending run in the queue.
-
-    Wrapper that ensures vault returns to main branch on exit (finally block).
-    """
-    # Mutable holder: the impl records this run's own worker branch here so the
-    # finally block can tell "our branch" from a concurrent run's branch.
-    own: dict[str, str | None] = {"branch": None}
-    try:
-        return _run_next_impl(dry_run, own_branch_out=own)
-    finally:
-        if not dry_run:
-            _return_vault_to_main(own["branch"])
-
-
-def _run_next_impl(
-    dry_run: bool = False,
-    own_branch_out: dict[str, str | None] | None = None,
-) -> int:
-    # Safety: vault must not be dirty outside Worker/ and Memory/episodes/.
-    # Check BEFORE claiming to avoid phantom in_progress entries on dirty-abort.
-    dirty, bad_files = vault_is_dirty_outside_worker()
-    if dirty:
-        print(
-            "run-next: aborting — vault has uncommitted changes outside "
-            "Worker/ and Memory/episodes/:"
-        )
-        for f in bad_files[:20]:
-            print(f"  - {f}")
-        if len(bad_files) > 20:
-            print(f"  ... and {len(bad_files) - 20} more")
-        record_dirty_stall(bad_files)
-        return 2
-
-    # Vault is clean: clear any prior stall marker (self-recovery).
-    clear_dirty_stall()
-
-    # Proactive usage guard: don't START a new pipeline run (or a planner
-    # invocation via the idle path below) while the Claude subscription is on
-    # pace to exhaust before its refill. Entries stay pending and nothing is
-    # marked failed — the guard clears by itself as the quota window advances.
-    # A dry-run launches no Claude process (invoke_planner / invoke_stage
-    # return before spawning), so it is not subject to pacing — and must not
-    # read the live account's usage, or throwaway-vault smoke runs turn red
-    # whenever the host's account is ahead of pace.
-    if dry_run:
-        print("  [dry-run] usage guard not evaluated (dry-run launches no Claude process)")
-    else:
-        try:
-            from todo_system import usage_guard
-            guard = usage_guard.check()
-        except Exception as exc:  # a guard outage must never stall the worker
-            guard = None
-            print(f"run-next: usage guard unavailable (continuing): {exc}")
-        if guard is not None and not guard.get("allowed", True):
-            print(f"run-next: skipping tick — usage guard blocked: {guard.get('reason')}")
-            return 3
-
-    # Atomic claim: marks status=in_progress under flock so concurrent
-    # run_next processes pick disjoint entries.
-    if dry_run:
-        # For dry-run we DON'T mutate the queue, just peek at first pending.
-        queue = load_queue()
-        pending = [r for r in queue.get("runs", []) if r.get("status") == "pending"]
-        if not pending:
-            print("run-next: no pending runs — entering planner path")
-            return _handle_idle_planner(dry_run=True)
-        entry = pending[0]
-    else:
-        entry = claim_next_pending()
-        if entry is None:
-            print("run-next: no pending runs — entering planner path")
-            return _handle_idle_planner(dry_run=False)
-
-    slug = entry["slug"]
-    run_id = entry["run_id"]
-
-    task = find_task_by_slug(slug)
-    if task is None:
-        print(f"run-next: task file disappeared for slug={slug}; marking failed")
-        update_queue_entry(
-            run_id,
-            status="failed",
-            finished_at=now_iso(),
-        )
-        return 1
-
-    # Task-level guardrails (auto_merge etc.) — fail fast before claiming.
-    guard_err = check_task_guardrails(task)
-    if guard_err:
-        print(f"run-next: guardrail rejected task={slug}: {guard_err}")
-        update_queue_entry(
-            run_id,
-            status="failed",
-            finished_at=now_iso(),
-        )
-        return 1
-
-    # M4-c: external repo — clone & checkout worker branch before first stage.
-    if task.is_external_repo:
-        if dry_run:
-            try:
-                wd = resolve_working_dir(task)
-                print(
-                    f"  [dry-run] would prepare external repo: clone {task.repo} "
-                    f"-> {wd}, checkout {task.worker_branch}"
-                )
-            except ValueError as exc:
-                print(f"  [dry-run] working_dir resolution failed: {exc}")
-        else:
-            ok, msg, wd = ensure_external_repo_ready(task)
-            print(f"run-next: external repo prep: {msg}")
-            if not ok:
-                update_queue_entry(
-                    run_id,
-                    status="failed",
-                    finished_at=now_iso(),
-                )
-                return 1
-    else:
-        # Vault-local task — ensure fresh worker branch from main.
-        if dry_run:
-            print(
-                f"  [dry-run] would prepare vault branch: fresh {task.worker_branch} from main"
-            )
-        else:
-            # Claim this branch as ours BEFORE prep: if prep fails partway and
-            # leaves HEAD on the worker branch, the finally block must still be
-            # allowed to bring our own vault checkout back to main.
-            if own_branch_out is not None:
-                own_branch_out["branch"] = task.worker_branch
-            ok, msg = ensure_vault_branch_fresh(task.worker_branch)
-            print(f"run-next: vault branch prep: {msg}")
-            if not ok:
-                update_queue_entry(
-                    run_id,
-                    status="failed",
-                    finished_at=now_iso(),
-                )
-                return 1
-
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    status: dict[str, Any] = {
-        "run_id": run_id,
-        "slug": slug,
-        "task_path": task.rel_path,
-        "started_at": now_iso(),
-        "finished_at": None,
-        "current_stage": None,
-        "branch": task.worker_branch,
-        "stage_results": [],
-        "failure_reason": None,
-    }
-    write_status(run_dir, status)
-
-    if not dry_run:
-        # claim_next_pending already set status=in_progress and started_at;
-        # just record the branch name here.
-        update_queue_entry(run_id, branch=task.worker_branch)
-
-    # Resolve which stage pipeline to run for this entry's mode.
-    # Default to 'auto' for legacy queue entries that lack `mode`.
-    entry_mode = entry.get("mode") or task.worker_mode or "auto"
-    if entry_mode not in STAGES_BY_MODE:
-        entry_mode = "auto"
-    stage_list = STAGES_BY_MODE[entry_mode]
-
-    print(f"run-next: starting run_id={run_id} slug={slug} mode={entry_mode} dry_run={dry_run}")
-    if not dry_run:
-        # Digest tier: "no action needed" is in the message itself (KAKAO_ALERTS.md).
-        kakao_notify(_compose_worker_start(slug, entry_mode, len(stage_list)),
-                     level=LEVEL_DIGEST, event_key=f"worker-start:{slug}")
-
-    for stage in stage_list:
-        stage_started = now_iso()
-        status["current_stage"] = stage
-        write_status(run_dir, status)
-        print(f"  stage={stage} started={stage_started}")
-
-        ok, message = invoke_stage(stage, task, run_id, run_dir, dry_run)
-        stage_finished = now_iso()
-
-        stage_record = {
-            "stage": stage,
-            "started_at": stage_started,
-            "finished_at": stage_finished,
-            "status": "ok" if ok else "failed",
-            "artifact_path": message if ok else None,
-            "message": message,
-        }
-        status["stage_results"].append(stage_record)
-        write_status(run_dir, status)
-
-        if not ok:
-            status["failure_reason"] = f"stage {stage} failed: {message}"
-            status["finished_at"] = stage_finished
-            write_status(run_dir, status)
-            if message.startswith("claude-capacity:"):
-                # Account usage/rate limit, not a task bug — it's time-bound and
-                # will clear on its own. Requeue as pending (unlimited retries,
-                # doesn't burn the AUTO_RETRY_LIMIT budget or land in the
-                # give-up-forever "failed" state) and skip the alarm
-                # notification so an hours-long limit window doesn't spam
-                # kakao every 5 minutes with the same transient condition.
-                if not dry_run:
-                    update_queue_entry(
-                        run_id,
-                        status="pending",
-                        started_at=None,
-                        finished_at=None,
-                    )
-                print(f"  stage={stage} capacity-limited: {message}")
-                print(f"run-next: requeued (pending) at stage={stage} — will retry next cycle")
-                return 1
-            if not dry_run:
-                update_queue_entry(
-                    run_id,
-                    status="failed",
-                    finished_at=stage_finished,
-                )
-                # Immediate — but the same slug re-failing inside the merge
-                # window (auto-retry churn) collapses into one "+N more" ping.
-                kakao_notify(_compose_worker_fail(slug, stage, message),
-                             event_key=f"worker-fail:{slug}")
-            print(f"  stage={stage} FAILED: {message}")
-            print(f"run-next: aborted at stage={stage}")
-            return 1
-
-        print(f"  stage={stage} ok artifact={message}")
-
-    status["current_stage"] = None
-    status["finished_at"] = now_iso()
-    write_status(run_dir, status)
-    if not dry_run:
-        # Note: Report stage is expected to itself update queue.json to
-        # status=completed/failed based on verify result. We treat absence
-        # of update as success here since all 5 stages produced artifacts.
-        update_queue_entry(
-            run_id,
-            status="completed",
-            finished_at=status["finished_at"],
-        )
-        # Digest tier: any follow-up judgement arrives as its own review alert.
-        kakao_notify(_compose_worker_done(slug, entry_mode, len(stage_list)),
-                     level=LEVEL_DIGEST, event_key=f"worker-done:{slug}")
-
-        # Create review todo for user to check the worker output.
-        review_path = create_review_todo(task, run_id, run_dir, entry_mode)
-        if review_path:
-            # Stage and commit the review todo so Report stage won't see dirty state.
-            subprocess.run(
-                ["git", "add", str(review_path)],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore(worker): add review todo for {slug}",
-                    "--",
-                    str(review_path),
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-            )
-            print(f"  review-todo created: {review_path.relative_to(ROOT)}")
-        elif IS_REMOTE_HOST:
-            print("  review-todo deferred to primary host (remote-sweep)")
-        else:
-            print("  review-todo skipped (task has review tag or auto-review-disabled)")
-
-    print(f"run-next: completed run_id={run_id}")
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Autonomous Implementation Worker (M4-a MVP)"
+        description="Queue view registration and vault upkeep"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -4993,24 +3894,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "maintenance",
-        help="Vault upkeep only (remote-run sweep, vault sync and the other upkeep steps) — no dispatch. "
-             "Used after the v2 cutover, when the legacy queue worker is no longer loaded.",
+        help="Vault upkeep only (vault sync and the other upkeep steps) — no dispatch.",
     )
-
-    p_run = sub.add_parser("run-next", help="Execute the first pending run in the queue")
-    p_run.add_argument("--dry-run", action="store_true", help="Print what would be invoked without calling claude")
 
     p_status = sub.add_parser("status", help="Print status.json of a given run-id")
     p_status.add_argument("run_id")
 
     sub.add_parser("list", help="List all entries in Worker/queue.json")
-
-    p_par = sub.add_parser(
-        "run-parallel",
-        help="Spawn N parallel run-next subprocesses; each claims a distinct pending entry (M4-b)",
-    )
-    p_par.add_argument("--max", type=int, default=3, help="max concurrent workers (default 3)")
-    p_par.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -5023,14 +3913,10 @@ def main(argv: list[str] | None = None) -> int:
         return scan_queue()
     if args.command == "maintenance":
         return cmd_maintenance()
-    if args.command == "run-next":
-        return run_next(dry_run=args.dry_run)
     if args.command == "list":
         return cmd_list()
     if args.command == "status":
         return cmd_status(args.run_id)
-    if args.command == "run-parallel":
-        return cmd_run_parallel(max_concurrent=args.max, dry_run=args.dry_run)
     parser.error(f"unknown command: {args.command}")
     return 2  # unreachable
 

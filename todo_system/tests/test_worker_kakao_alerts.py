@@ -3,8 +3,8 @@
 No subprocess / no real send — the composers return strings only
 ([[tests-reach-real-alert-sender]]). Each asserts the three invariants the task
 fixes: length <= budget, the action/identity survives in the headline, and the
-free-form tail (a failure message, a stall file list, a planner reason) is
-clipped rather than blind-cut. Covers the AC-named kinds: Worker 시작/실패/완료,
+free-form tail (a stall file list, a planner reason) is
+clipped rather than blind-cut. Covers the AC-named kinds:
 정체(silence), 유휴(starvation), plus the commit-stall page.
 """
 
@@ -15,22 +15,6 @@ from todo_system.kakao_format import KAKAO_TEXT_LIMIT
 
 LONG = "failure detail with several English words " * 120  # ~5000 chars, over the 4000 budget so the tail always clips
 LONG_SLUG = "play-store-9-ifthen-targetsdk-36"
-
-
-def test_worker_fail_clips_the_message_instead_of_the_old_blind_120_cut():
-    text = worker._compose_worker_fail(LONG_SLUG, "verify", LONG)
-    assert len(text) <= KAKAO_TEXT_LIMIT
-    head = text.splitlines()[0]
-    assert head.startswith(f"❌ Worker 실패: {LONG_SLUG}")
-    assert "확인" in head                       # the ask stays in the headline
-    assert not text.endswith("English words")   # tail is clipped + marked, not raw
-
-
-def test_worker_start_and_done_stay_within_budget_and_name_the_task():
-    for fn in (worker._compose_worker_start, worker._compose_worker_done):
-        text = fn(LONG_SLUG, "auto", 5)
-        assert len(text) <= KAKAO_TEXT_LIMIT
-        assert LONG_SLUG in text
 
 
 def test_dispatch_silence_keeps_the_pending_count():

@@ -229,7 +229,7 @@ def test_gitignore_blocks_a_stray_engine_marker_in_the_checkout():
 
 # --- fresh-interpreter: the helpers never depend on in-process state ----------
 
-_SCRUB = ("WORKER_HOST", "MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
+_SCRUB = ("MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT", "PYTHONPATH")
 
 _PROBE = (
     "import json\n"

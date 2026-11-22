@@ -31,7 +31,7 @@ import pytest
 from todo_system import engine_script
 
 ENGINE = Path(__file__).resolve().parents[2]
-_SCRUB = ("WORKER_HOST", "MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT",
+_SCRUB = ("MAESTRO_VAULT_DIR", "KAKAO_VAULT_DIR", "MACP_VAULT_ROOT",
           "PYTHONPATH", "PYTHONSAFEPATH", "MACP_PYTHON")
 _HELLO = "#!/bin/sh\nprintf 'hello %s\\n' \"$*\"\n"
 # Prints the variable the daemon scripts will read, or "unset".
