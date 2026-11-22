@@ -978,5 +978,100 @@ class TriageCardShell(unittest.TestCase):
             self.assertIn(s, ko)
 
 
+class DecisionCardShell(unittest.TestCase):
+    """The decision card renders what the server sends (question, options) plus a
+    one-line box, and posts `answer`. Like the triage card it judges nothing; the
+    live look (390 px, no horizontal scroll) is a run-log note, not a gate."""
+
+    T = M._HTML_TEMPLATE
+
+    def line(self, prefix: str) -> str:
+        return next(ln for ln in self.T.splitlines() if ln.startswith(prefix))
+
+    def render(self) -> str:
+        return self.T[self.T.index("function decBlock"):self.T.index("function decSend")]
+
+    def handlers(self) -> str:
+        return self.T[self.T.index("function decSend"):self.T.index("// @@dash.html.queue@@")]
+
+    def test_only_human_rows_render_the_card_above_the_triage_card(self):
+        row = self.line("const humanRow=")
+        self.assertIn("${decBlock(r.slug,r.decision)}${triBlock(r.slug,r.triage)}", row)
+        for other in ("const attnRow=", "const activeRow=", "const recentRow=", "const projRow="):
+            self.assertNotIn("decBlock(", self.line(other))
+
+    def test_the_card_renders_only_what_the_server_sent(self):
+        b = self.render()
+        for tok in ("if(!d)return ''", "esc(d.question)", "d.options", "${esc(o)}",
+                    'data-dec="opt"', 'data-n="${i+1}"', 'data-dec="send"',
+                    '<input class="tri-in" data-kind="answer"', 'maxlength="500"',
+                    "@@dash.js.dec_placeholder@@", "@@dash.js.tri_send@@"):
+            self.assertIn(tok, b)
+        # no verdict on the client: it never reads why/urgent/state, sorts or filters
+        for tok in ("r.why", "r.urgent", "r.state", "d.rule", ".sort(", ".filter("):
+            self.assertNotIn(tok, b)
+        # the buttons are the server's options, nothing the page invents
+        for word in ("deploy", "submit", "publish", "delete", "pay", "merge", "--admin"):
+            self.assertNotIn(word, b.lower())
+
+    def test_busy_disables_every_button(self):
+        b = self.render()
+        self.assertIn("dis=st.busy?' disabled':''", b)
+        self.assertEqual(b.count("${dis}>"), 2)                  # each option, and send
+        self.assertEqual(b.count("<button"), 2)
+
+    def test_answers_go_to_the_action_route_as_option_or_text(self):
+        h = self.handlers()
+        self.assertIn("triAct(slug,'answer',null,Number(btn.dataset.n))", h)      # an option: 1-based
+        self.assertIn("triAct(slug,'answer',v)", h)                               # a line of text
+        self.assertIn("btn.dataset.dec==='send'", h)
+        self.assertNotIn("fetch(", h)                                             # one sender only
+        act = self.T[self.T.index("async function triAct"):self.T.index("function triSend")]
+        for tok in ("fetch('/api/action'", "{task:slug,action,option}", "{task:slug,action}",
+                    "{task:slug,action,text}", "msg=j.message"):
+            self.assertIn(tok, act)
+        self.assertNotIn("status", act)                          # never an HTTP status
+
+    def test_an_empty_box_is_not_sent(self):
+        h = self.handlers()
+        send = h[:h.index("function decClick")]
+        self.assertIn("(st.adraft||'').trim()", send)
+        self.assertLess(send.index("@@dash.js.dec_need_text@@"), send.index("triAct("))
+        self.assertIn("return}", send[send.index("@@dash.js.dec_need_text@@"):send.index("triAct(")])
+
+    def test_card_clicks_never_open_the_detail_and_never_confirm(self):
+        m = self.T[self.T.index("function mount()"):]
+        self.assertLess(m.index("closest('[data-dec]')"), m.index("closest('[data-open]')"))
+        self.assertLess(m.index("closest('[data-dec]')"), m.index("closest('.tri')"))
+        self.assertIn('<div class="tri dec">', self.render())    # the .tri guard covers the box
+        self.assertNotIn("confirm(", self.T)
+        self.assertNotIn("http://", self.T)
+        self.assertNotIn("https://", self.T)
+
+    def test_enter_and_typing_use_the_answer_draft(self):
+        m = self.T[self.T.index("function mount()"):]
+        self.assertIn("ti.dataset.kind==='answer'", m)
+        self.assertIn("decSend(s)", m)
+        self.assertIn("triSend(s)", m)                           # the instruction box still works
+        self.assertIn("!e.isComposing", m)
+        self.assertIn("adraft", m)
+        # the instruction toggle focuses its own box, not the answer box of the same row
+        self.assertIn("x.dataset.kind!=='answer'", self.T)
+        # typing in the answer box holds the rows too: it is a .tri-in
+        self.assertIn("document.activeElement.classList.contains('tri-in')", self.T)
+
+    def test_long_options_wrap(self):
+        self.assertIn(".dec .tbtn{white-space:normal;text-align:left;overflow-wrap:anywhere}",
+                      self.T)
+
+    def test_both_languages_render_the_card_strings(self):
+        en, ko = M.render_html("en"), M.render_html("ko")
+        for s in ("One-line answer (max 500 chars)", "Write a one-line answer first"):
+            self.assertIn(s, en)
+        self.assertIsNone(_HANGUL_RE.search(en))
+        for s in ("직접 답 한 줄 (500자 이하)", "답을 한 줄 적어 주세요"):
+            self.assertIn(s, ko)
+
+
 if __name__ == "__main__":
     unittest.main()

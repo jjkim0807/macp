@@ -734,6 +734,9 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.tri_send": "보내기",
         "dash.js.tri_placeholder": "지시 한 줄 (500자 이하)",
         "dash.js.tri_need_text": "지시를 한 줄 적어 주세요",
+        # decision card (human rows): question and options come from the server
+        "dash.js.dec_placeholder": "직접 답 한 줄 (500자 이하)",
+        "dash.js.dec_need_text": "답을 한 줄 적어 주세요",
         "dash.js.done": " 완료",
         "dash.js.qw_next_tick": "다음 틱",
         "dash.js.qw_checkout_busy": "리포 사용중",
@@ -883,6 +886,8 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.tri_send": "Send",
         "dash.js.tri_placeholder": "One-line instruction (max 500 chars)",
         "dash.js.tri_need_text": "Write a one-line instruction first",
+        "dash.js.dec_placeholder": "One-line answer (max 500 chars)",
+        "dash.js.dec_need_text": "Write a one-line answer first",
         "dash.js.done": " done",
         "dash.js.qw_next_tick": "next tick",
         "dash.js.qw_checkout_busy": "repo busy",

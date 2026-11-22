@@ -2926,8 +2926,14 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # the #c-uv section, uvRow/uvPeriod/setUsageValue, the setUsageValue() call that ends
 # update() and the QSEC entry with its comment line; no new i18n key; the rest of the
 # page is byte-identical.
-_KO_HTML_SHA256 = "81f62346786c14cc04346c9a12798c305fa770e5b70c379596a49fd05a83b867"
-_KO_HTML_LEN = 52934
+# 2026-11-23: +2430 bytes = the decision card (macp-decision-tasks-answer-in-dashboard):
+# decBlock/decSend/decClick and their comment, the decBlock() call in humanRow, one
+# `.dec .tbtn` CSS rule, triAct's option argument and its separate answer reply line
+# (st.ans / st.amsg / st.adraft), the [data-dec] click line, the answer branch of the
+# keydown/input handlers and the instruction box's focus filter (two new i18n keys);
+# the rest of the page is byte-identical.
+_KO_HTML_SHA256 = "d4446fa82eca4ffaf392dc19c3b745d0df463809dd9f7b44e4e13ab3fab3182e"
+_KO_HTML_LEN = 55364
 _HANGUL = re.compile("[가-힣]")
 
 

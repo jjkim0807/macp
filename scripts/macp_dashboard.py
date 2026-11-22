@@ -2114,6 +2114,8 @@ border-radius:8px;cursor:pointer;font-size:12px;padding:3px 9px;white-space:nowr
 border-radius:6px;font:inherit;font-size:13px;padding:3px 8px}
 .tmsg{font-size:13px;margin-top:4px;overflow-wrap:anywhere}
 .tmsg.ok{color:var(--grn)}.tmsg.err{color:var(--red)}
+/* Decision card: the same box as a triage card; an option is a sentence, so its button wraps. */
+.dec .tbtn{white-space:normal;text-align:left;overflow-wrap:anywhere}
 .empty{color:var(--mut);font-size:13px;padding:5px 0}
 .mut{color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
@@ -2299,7 +2301,7 @@ const whyBadge=w=>{const m=WHY[w]||['?','b-gray'];return `<span class="badge ${m
 const md=s=>s?String(s).slice(5).replace('-','/').replace('T',' '):'';
 // `⛓ N` = N unfinished depends_on (title lists them). A symbol + a count, so no
 // new i18n key is needed and the ko/en DASHBOARD parity test is untouched.
-const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div>${triBlock(r.slug,r.triage)}</div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
+const humanRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div><div class="note">${esc(r.action)||'—'}</div>${decBlock(r.slug,r.decision)}${triBlock(r.slug,r.triage)}</div><div class="rmeta">${(r.waiting_on||[]).length?`<span class="age" title="${esca((r.waiting_on||[]).join(', '))}">⛓ ${(r.waiting_on||[]).length}</span> `:''}${r.later&&r.not_before?`<span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span> `:''}${r.due?`<span class="age">~${esc(md(r.due))}</span> `:''}${whyBadge(r.why)}</div></div>`;
 const attnRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div><div class="note">${esc(r.note)||'—'}</div>${triBlock(r.task,r.triage)}</div><div class="rmeta">${badge(r.state)}${r.capacity_limited?' <span class="badge b-gray">capacity</span>':''}${r.refail?` <span class="age">↻${r.refail}</span>`:''} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const activeRow=r=>`<div class="row clk" data-open="task:${esca(r.task)}"><div class="main"><div>${tlabel(r.task,r.title,r.project)}</div>${(r.agent&&!r.agent_is_default)?`<div class="note">agent ${esc(r.agent)}</div>`:''}</div><div class="rmeta">${badge(r.state)} <span class="age mono">${esc(r.age)}</span></div></div>`;
 const PST={waiting:['@@dash.js.waiting@@','b-wait'],blocked:['@@dash.js.why_blocked@@','b-fail']};
@@ -2335,26 +2337,30 @@ function triBlock(slug,t){
   const ev=(t.evidence||[]).map(e=>`<div class="note">${esc(e)}</div>`).join('');
   const btns=(t.actions||[]).map(a=>`<button class="tbtn" data-act="${esca(a.id)}" data-slug="${s}"${dis}>${esc(a.label)}</button>`).join('');
   const box=st.open?`<div class="tin"><input class="tri-in" data-slug="${s}" maxlength="500" placeholder="@@dash.js.tri_placeholder@@" value="${esca(st.draft)}"><button class="tbtn" data-act="instruct-send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>`:'';
-  const msg=st.busy?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.msg?`<div class="tmsg ${st.ok?'ok':'err'}">${esc(st.msg)}</div>`:'');
+  const msg=(st.busy&&!st.ans)?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.msg?`<div class="tmsg ${st.ok?'ok':'err'}">${esc(st.msg)}</div>`:'');
   return `<div class="tri"><div class="treason">${esc(t.reason)}</div>${ev}${t.advice?`<div class="tadv">${esc(t.advice)}</div>`:''}${btns?`<div class="tacts">${btns}</div>`:''}${box}${msg}</div>`;
 }
 // The result also lands on the status card for 15 s: a cancel or merge removes the row.
 let triToastTimer=null;
 function triToast(msg,ok){const el=$('tri-toast');if(!el)return;el.textContent=msg;el.className='tmsg '+(ok?'ok':'err');el.hidden=false;
   clearTimeout(triToastTimer);triToastTimer=setTimeout(()=>{el.hidden=true},15000)}
-async function triAct(slug,action,text){
+// A decision card answers through the same sender: option (1-based) or text, action 'answer'.
+// Its own reply line (st.amsg) and draft (st.adraft) keep it apart from a triage card on the same row.
+async function triAct(slug,action,text,option){
   const st=ts(slug);if(st.busy)return;
-  st.busy=true;st.msg='';if(last)update(last);
+  st.ans=action==='answer';
+  st.busy=true;st.msg='';st.amsg='';if(last)update(last);
   let ok=false,msg='@@dash.js.tri_net_fail@@';
   try{
     const r=await fetch('/api/action',{method:'POST',credentials:'same-origin',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(text==null?{task:slug,action}:{task:slug,action,text})});
+      body:JSON.stringify(option!=null?{task:slug,action,option}:(text==null?{task:slug,action}:{task:slug,action,text}))});
     const j=await r.json();
     if(j&&typeof j.message==='string'&&j.message){msg=j.message;ok=j.ok===true}
   }catch(_){}
-  st.busy=false;st.msg=msg;st.ok=ok;
-  if(ok){st.open=false;st.draft=''}
+  st.busy=false;
+  if(st.ans){st.amsg=ok?'':msg;if(ok)st.adraft=''}
+  else{st.msg=msg;st.ok=ok;if(ok){st.open=false;st.draft=''}}
   triToast(msg,ok);
   await tick();
 }
@@ -2364,12 +2370,32 @@ function triSend(slug){const st=ts(slug),v=(st.draft||'').trim();
 function triClick(btn){
   const slug=btn.dataset.slug||'',act=btn.dataset.act||'',st=ts(slug);
   if(act==='instruct'){st.open=!st.open;st.msg='';if(last)update(last);
-    if(st.open){const el=[...document.querySelectorAll('.tri-in')].find(x=>x.dataset.slug===slug);if(el)el.focus()}
+    if(st.open){const el=[...document.querySelectorAll('.tri-in')].find(x=>x.dataset.slug===slug&&x.dataset.kind!=='answer');if(el)el.focus()}
     return}
   if(act==='instruct-send'){triSend(slug);return}
   triAct(slug,act,null);
 }
 const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(r.name)}</div><div class="note">${r.provides?'provides: '+esc(r.provides):'—'}${(r.depends_on||[]).length?' · ← '+r.depends_on.map(esc).join(', '):''}${(r.consumers||[]).length?' · → '+r.consumers.map(esc).join(', '):''}</div></div></div>`;
+// Decision card (orchestrator/triage.py "Decision cards"; the server judges, this only renders):
+// the question, one button per option exactly as sent, and a one-line box for any other answer.
+// A click posts {task, action:'answer', option} (option = 1-based position) or {task, action:'answer',
+// text} to /api/action and shows the reply message as-is. No confirm dialog. An answer only records:
+// the server writes the choice down and runs nothing, whatever the option says.
+function decBlock(slug,d){
+  if(!d)return '';
+  const st=ts(slug),s=esca(slug),dis=st.busy?' disabled':'';
+  const opts=(d.options||[]).map((o,i)=>`<button class="tbtn" data-dec="opt" data-n="${i+1}" data-slug="${s}"${dis}>${esc(o)}</button>`).join('');
+  const msg=(st.busy&&st.ans)?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.amsg?`<div class="tmsg err">${esc(st.amsg)}</div>`:'');
+  return `<div class="tri dec">${d.question?`<div class="treason">${esc(d.question)}</div>`:''}${opts?`<div class="tacts">${opts}</div>`:''}<div class="tin"><input class="tri-in" data-kind="answer" data-slug="${s}" maxlength="500" placeholder="@@dash.js.dec_placeholder@@" value="${esca(st.adraft)}"><button class="tbtn" data-dec="send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>${msg}</div>`;
+}
+function decSend(slug){const st=ts(slug),v=(st.adraft||'').trim();
+  if(!v){st.amsg='@@dash.js.dec_need_text@@';if(last)update(last);return}
+  triAct(slug,'answer',v)}
+function decClick(btn){
+  const slug=btn.dataset.slug||'';
+  if(btn.dataset.dec==='send'){decSend(slug);return}
+  triAct(slug,'answer',null,Number(btn.dataset.n));
+}
 
 // @@dash.html.queue@@ (docs/dashboard-parity.md "@@dash.html.queue@@"): the server judges `wait`; rows render in the
 // order received (tick order). Existing badge classes only — no new colours.
@@ -2684,7 +2710,8 @@ function mount(){
     const tb=e.target.closest('#theme');if(tb){const i=THEMES.indexOf(themeGet());themeSet(THEMES[(i+1)%3]);return}
     const c=e.target.closest('.cp');if(c){e.stopPropagation();cp(c);return}
     const am=e.target.closest('[data-amode]');if(am){e.stopPropagation();setAgentMode(am);return}
-    // triage buttons first: they sit inside a row whose data-open would open the detail
+    // decision and triage buttons first: they sit inside a row whose data-open would open the detail
+    const da=e.target.closest('[data-dec]');if(da){e.stopPropagation();decClick(da);return}
     const ta=e.target.closest('[data-act]');if(ta){e.stopPropagation();triClick(ta);return}
     if(e.target.closest('.tri'))return;
     if(e.target.closest('#dv-back')){history.back();return}
@@ -2699,9 +2726,11 @@ function mount(){
   });
   document.addEventListener('keydown',e=>{
     const ti=e.target.closest&&e.target.closest('.tri-in');
-    if(ti&&e.key==='Enter'&&!e.isComposing){e.preventDefault();const s=ti.dataset.slug||'';ts(s).draft=ti.value;ti.blur();triSend(s);return}
+    if(ti&&e.key==='Enter'&&!e.isComposing){e.preventDefault();const s=ti.dataset.slug||'';
+      if(ti.dataset.kind==='answer'){ts(s).adraft=ti.value;ti.blur();decSend(s)}else{ts(s).draft=ti.value;ti.blur();triSend(s)}
+      return}
     if(e.key==='Escape'&&dstack.length)history.back()});
-  document.addEventListener('input',e=>{const ti=e.target.closest&&e.target.closest('.tri-in');if(ti)ts(ti.dataset.slug||'').draft=ti.value});
+  document.addEventListener('input',e=>{const ti=e.target.closest&&e.target.closest('.tri-in');if(ti)ts(ti.dataset.slug||'')[ti.dataset.kind==='answer'?'adraft':'draft']=ti.value});
   mounted=true;
 }
 
