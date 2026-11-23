@@ -180,7 +180,7 @@ uv run --project ~/macp python -m todo_system.orchestrator.runner \
     --agent worker-default --mode live-staged --once
 ```
 
-`live-staged` runs the five stages, each as its own `claude -p` call. The repository
+`live-staged` runs the three stages, each as its own `claude -p` call. The repository
 is cloned under `~/Worker/<repo>` (change the root with `MACP_WORKER_ROOT`), and the run works in a fresh git worktree on the
 branch `worker/add-version-flag`. A run can take from a few minutes to over an hour.
 
@@ -190,9 +190,7 @@ Every run leaves its artifacts in `~/my-vault/Worker/runs/<run_id>/`:
 
 | Stage | Artifact | What to look for |
 |---|---|---|
-| research | `requirements.md` | how the agent understood the task |
-| plan | `implementation_plan.md` | the steps it chose |
-| implement | `run.log` | the stage's captured output |
+| implement | `implementation_plan.md`, `run.log` | the steps it chose, and the stage's captured output |
 | verify | `verify.md` | the local checks it ran and their verdict (PASS / FAIL) |
 | report | `report.md` | the summary, the branch and the PR link |
 

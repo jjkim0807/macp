@@ -53,7 +53,7 @@ SPLIT_1118 = json.loads((FIX / "split.json").read_text(encoding="utf-8"))
 PARENT_TITLE = "macp — 가벼운 태스크는 묶어서 한 번에 검증 (통합 게이트)"
 REPO_URL = "https://github.com/example/macp.git"
 PLAN_REF = f"Worker/runs/{RUN_ID}/implementation_plan.md"
-REQ_REF = f"Worker/runs/{RUN_ID}/requirements.md"
+REQ_REF = f"Todo/items/{PARENT}.md"
 LABELS = ["1·2·3", "4·5·6", "7·8"]
 PHASES_MARKER = "\n## Phases\n"
 REQUIRED_KEYS = ("slug", "phases", "acceptance_criteria", "touches")
@@ -168,7 +168,7 @@ def test_phase_path_leaf_fields_are_unchanged():
     fm = phase_path._parent_fm()
     slug, rid = phase_path.PARENT, phase_path.RUN_ID
     plan_ref = f"Worker/runs/{rid}/implementation_plan.md"
-    req_ref = f"Worker/runs/{rid}/requirements.md"
+    req_ref = f"Todo/items/{slug}.md"
     plan = phase_path._build(phase_path.CHAT_SHAPE_PLAN, fm)
     subs = plan["subtasks"]
 
@@ -199,11 +199,12 @@ def test_phase_path_leaf_fields_are_unchanged():
     assert plan["reason"] == (
         "plan stage declared the task larger than one Implement stage — split at "
         "the plan's Phase boundaries (4 phases → 4 subtasks)")
-    # ... and everything else, key order included
+    # ... and everything else, key order included (digests retaken 2026-11-24:
+    # the requirements reference became the parent task md — the only change)
     assert _digest(plan) == (
-        "4272d85e3c369740a641006c222017e98f4fe6a06d28bc2dfde85c6554df9d22")
+        "745057a37cf716708243a109794ee0e5e044493b981890c67bc0c3156c18873d")
     assert _digest(phase_path._build(phase_path.SKILL_SHAPE_PLAN, fm)) == (
-        "85937dcd4b748b7d0d827bcaf58770cd677164dcfb0346c3a6eb116420c1d7a0")
+        "7ac9a889868e59c5673effb3439af0a4ce5dcb37c463d150fd1ac6be4e4d5ea6")
 
 
 # -- which fences are the plan's split block ------------------------------------------

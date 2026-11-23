@@ -35,14 +35,10 @@ class RemoteGateToolWiringTest(unittest.TestCase):
                 self.assertEqual(stages._safe_tools(stage).count(RULE), 1)
 
     def test_other_stages_do_not_get_it(self):
-        for stage in ("research", "plan", "report", "discover"):
+        for stage in ("report", "discover"):
             with self.subTest(stage=stage):
                 self.assertNotIn(RULE, stages._safe_tools(stage))
         self.assertNotIn(RULE, stages.FALLBACK_RUNNER_TOOLS)
-
-    def test_research_and_plan_stay_read_only(self):
-        self.assertEqual(stages.STAGE_TOOLS["research"], "Read Write")
-        self.assertEqual(stages.STAGE_TOOLS["plan"], "Read Write")
 
     def test_verify_stays_read_only_with_the_rule(self):
         """verify being test-only is what lets the pipeline trust its verdict; the
@@ -69,7 +65,7 @@ class RemoteGateToolWiringTest(unittest.TestCase):
             stage, task_id="demo-task", run_id="20260101T000000-demo-task",
             run_dir=Path("/vault/Worker/runs/x"), branch="worker/demo-task")
 
-    def test_metadata_line_present_for_write_stages_absent_for_research(self):
+    def test_metadata_line_present_for_write_stages_absent_for_report(self):
         for stage in ("implement", "verify", "quick", "delegate"):
             with self.subTest(stage=stage):
                 prompt = self._argv(stage)[2]
@@ -77,7 +73,7 @@ class RemoteGateToolWiringTest(unittest.TestCase):
                 self.assertIn("decide --repo", prompt)
                 self.assertIn("run --repo", prompt)
                 self.assertIn("demo-task", prompt)     # the --task-id is filled in
-        self.assertNotIn(stages.REMOTE_GATE_CLI, self._argv("research")[2])
+        self.assertNotIn(stages.REMOTE_GATE_CLI, self._argv("report")[2])
 
     @unittest.skipUnless(WRAPPER.is_file(), "scripts/macp-remote-gate not in this tree")
     def test_wrapper_runs_decide_from_any_cwd(self):

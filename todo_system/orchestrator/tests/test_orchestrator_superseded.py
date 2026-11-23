@@ -252,7 +252,7 @@ class RunnerReportedTest(_Fixture):
         self._row()
         self._reply(m.RESULT, **{sup.RESULT_KEY: reason}, review_required=False,
                     summary="superseded — stopped before stage verify, nothing pushed",
-                    branch=f"worker/{SLUG}", stages=["research", "plan", "implement"],
+                    branch=f"worker/{SLUG}", stages=["implement"],
                     **extra)
 
     def test_md_closed_report_closes_the_row_and_leaves_the_md_alone(self):
@@ -413,7 +413,7 @@ class UntouchedRepliesTest(_Fixture):
         self._write_md("done")
         self._row(state=A.DISPATCHED)
         self._reply(m.ACCEPT)
-        self._reply(m.PROGRESS, note="stage research …")
+        self._reply(m.PROGRESS, note="stage implement …")
         with self._spy() as spy:
             a = self._collect()
         spy.assert_not_called()

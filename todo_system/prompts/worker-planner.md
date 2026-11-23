@@ -252,7 +252,7 @@ default branch is healthy, you can still create safe, internal, reversible auto 
 sources across **active (non-cancelled) project repos** — so active projects keep
 improving between roadmap milestones instead of the queue going empty. All fit the
 guardrails (internal, zero external side-effect). For small mechanical ones, set
-`worker_mode: quick` so they run the cheap single-shot pipeline, not the full 5 stages.
+`worker_mode: quick` so they run the cheap single-shot pipeline, not the full pipeline.
 
 - **Code TODO/FIXME/HACK**: `grep -rn "TODO\|FIXME\|HACK" <repo>` — turn a concrete,
   self-contained one into a fix task (skip vague/ambiguous/decision-bound ones).

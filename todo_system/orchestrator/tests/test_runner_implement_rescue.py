@@ -172,10 +172,12 @@ class ImplementRescueWiringTest(unittest.TestCase):
             # write each stage's artifact so the stage counts as completed
             for st in pipeline:
                 art = self._run_dir() / stages.STAGE_ARTIFACT[st]
-                if st == "plan" and plan_body is not None:
-                    art.write_text(plan_body, encoding="utf-8")
-                elif not art.exists():
+                if not art.exists():
                     art.write_text("ok\n", encoding="utf-8")
+            if plan_body is not None:
+                # the plan implement writes before it edits
+                (self._run_dir() / stages.PLAN_ARTIFACT).write_text(
+                    plan_body, encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         vp = subprocess.CompletedProcess([], 0, "", "")
@@ -246,17 +248,21 @@ class ImplementRescueWiringTest(unittest.TestCase):
         self.assertNotIn("rescue", [o[0] for o in order])
         self.assertNotIn("checkpoint", [o[0] for o in order])
 
-    def test_plan_declares_oversize_short_circuits_implement(self):
+    def test_plan_declares_oversize_short_circuits_verify(self):
         plan = ("# Plan\nThis task exceeds a single Implement stage — it must be "
                 "re-scoped into 3 sub-tasks.\n")
         # an empty vault: the park finds no task md to build a split plan from
-        out, order = self._run(pipeline=("plan", "implement"), plan_body=plan,
+        out, order = self._run(pipeline=("implement", "verify"), plan_body=plan,
                                vault_root=self.tmp)
         self.assertFalse(out.ok)
         self.assertEqual(out.payload.get("verify"), "FAIL")
         self.assertIn("re-scop", out.payload.get("blocked_on", "").lower())
-        # implement never ran → no rescue, no checkpoint
-        self.assertEqual(order, [])
+        # the park comes after implement and verify never ran
+        self.assertEqual(out.payload["stages"], ["implement"])
+        self.assertTrue(any(p.startswith("plan declares oversize — skipping verify")
+                            for p in self.progress), self.progress)
+        self.assertFalse(any(p.startswith("verify verdict") for p in self.progress),
+                         self.progress)
         # the recognised oversize park keyword set sees it
         from todo_system.orchestrator import rescope
         self.assertTrue(rescope.is_oversize_rescope_park(out.payload["blocked_on"]))
@@ -270,12 +276,17 @@ class ImplementRescueWiringTest(unittest.TestCase):
 
     def test_template_plan_does_not_short_circuit(self):
         # Control: an ordinary plan (the `## Parallelizable subtasks` heading, no
-        # oversize declaration) must let Implement proceed — rescue + checkpoint run.
+        # oversize declaration) must let the pipeline proceed — rescue + checkpoint
+        # run and Verify is reached.
         plan = ("# Plan\n## Phases\n### Phase 1\n- edit a\n"
                 "## Parallelizable subtasks\nNone; run the subtasks serially.\n")
-        out, order = self._run(pipeline=("plan", "implement"), plan_body=plan)
+        out, order = self._run(pipeline=("implement", "verify"), plan_body=plan)
         self.assertIn("rescue", [o[0] for o in order])
         self.assertIn("checkpoint", [o[0] for o in order])
+        self.assertFalse(any(p.startswith("plan declares oversize")
+                             for p in self.progress), self.progress)
+        self.assertTrue(any(p.startswith("verify verdict") for p in self.progress),
+                        self.progress)
 
 
 if __name__ == "__main__":

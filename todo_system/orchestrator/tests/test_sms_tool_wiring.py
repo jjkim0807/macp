@@ -3,8 +3,8 @@ edit.
 
 The whitelist splits on spaces, so the CLI is granted through one space-free
 PATH wrapper rule, stages.SMS_TOOL_RULE == `Bash(macp-sms:*)`. These tests pin
-which stages get it, that delegate gets nothing broader, that research/plan
-stay read-only, that a task's own list keeps it, and that the wrapper runs.
+which stages get it, that delegate gets nothing broader, that a task's own
+list (added to the default) keeps it, and that the wrapper runs.
 """
 
 from __future__ import annotations
@@ -32,14 +32,10 @@ class SmsToolWiringTest(unittest.TestCase):
                 self.assertIn(stages.SMS_TOOL_RULE, stages._safe_tools(stage))
 
     def test_other_stages_do_not_get_it(self):
-        for stage in ("research", "plan", "report", "discover"):
+        for stage in ("report", "discover"):
             with self.subTest(stage=stage):
                 self.assertNotIn(stages.SMS_TOOL_RULE, stages._safe_tools(stage))
         self.assertNotIn(stages.SMS_TOOL_RULE, stages.FALLBACK_RUNNER_TOOLS)
-
-    def test_research_and_plan_stay_read_only(self):
-        self.assertEqual(stages.STAGE_TOOLS["research"], "Read Write")
-        self.assertEqual(stages.STAGE_TOOLS["plan"], "Read Write")
 
     def test_delegate_gets_no_broad_runner(self):
         granted = stages.STAGE_TOOLS["delegate"].split()
@@ -56,16 +52,15 @@ class SmsToolWiringTest(unittest.TestCase):
         self.assertEqual(task_validate._check_bash_patterns(stages.SMS_TOOL_RULE), [])
 
     def test_task_override_keeps_the_sms_rule(self):
+        # A task list adds to the implement default: the default (standing
+        # rules included) stays, in order, and the new rule goes after it.
+        default = stages.STAGE_TOOLS["implement"].split()
         self.assertEqual(stages._safe_tools("implement", "Read,Bash(gcloud:*)"),
-                         ["Read", "Bash(gcloud:*)", stages.SMS_TOOL_RULE,
-                          stages.BROWSER_TOOL_RULE, stages.REMOTE_GATE_TOOL_RULE,
-                          stages.EMULATOR_TOOL_RULE, stages.MAIL_TOOL_RULE])
+                         [*default, "Bash(gcloud:*)"])
+        self.assertEqual(default.count(stages.SMS_TOOL_RULE), 1)
         # Already listed by the task: exactly once.
         self.assertEqual(
-            stages._safe_tools("implement", f"Read,{stages.SMS_TOOL_RULE}"),
-            ["Read", stages.SMS_TOOL_RULE, stages.BROWSER_TOOL_RULE,
-             stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
-             stages.MAIL_TOOL_RULE])
+            stages._safe_tools("implement", f"Read,{stages.SMS_TOOL_RULE}"), default)
         # Stages a task cannot widen still return their own default untouched.
         self.assertEqual(stages._safe_tools("verify", "Read,Bash(gcloud:*)"),
                          stages.STAGE_TOOLS["verify"].split())

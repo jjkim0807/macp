@@ -1,5 +1,5 @@
-"""Route-level wiring: a Plan stage that declares the task too big for one
-Implement stage ends in an automatic split instead of a ⛔.
+"""Route-level wiring: an Implement stage whose plan declares the task too big
+for one stage ends in an automatic split instead of a ⛔ (Verify is skipped).
 
 Drives the real path end to end with only the stage subprocess (and the git /
 worktree plumbing around it) mocked:
@@ -50,7 +50,7 @@ from todo_system.orchestrator.tests.test_plan_split_block import (
 
 SLUG = "example-channel-design"
 PARK_SUMMARY = ("blocked on task exceeds a single Implement stage — needs "
-                "re-scoping (plan stage) — not a defect")
+                "re-scoping (plan) — not a defect")
 PARK_KEYS = {"branch", "run_dir", "verify", "stages", "blocked_on", "repo"}
 
 
@@ -99,8 +99,10 @@ def _agent() -> Agent:
 
 
 def _execute_plan_stage(vault_root: Path, clone: Path, slug: str, plan_body: str):
-    """Run StagedExecutor through the plan stage with the subprocess mocked: the
-    mocked plan stage writes `plan_body` as this run's implementation_plan.md."""
+    """Run StagedExecutor through the implement stage with the subprocess mocked:
+    the mocked implement stage writes `plan_body` as this run's
+    implementation_plan.md (the plan it writes before editing). Verify is in the
+    pipeline so the park is shown to skip it."""
     runs = vault_root / "Worker" / "runs"
     progress: list[str] = []
 
@@ -111,7 +113,7 @@ def _execute_plan_stage(vault_root: Path, clone: Path, slug: str, plan_body: str
     def fake_run(argv, **kw):
         rd = current_run_dir()
         if rd is not None:
-            (rd / stages.STAGE_ARTIFACT["plan"]).write_text(plan_body, encoding="utf-8")
+            (rd / stages.PLAN_ARTIFACT).write_text(plan_body, encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     vp = subprocess.CompletedProcess([], 0, "", "")
@@ -142,7 +144,7 @@ def _execute_plan_stage(vault_root: Path, clone: Path, slug: str, plan_body: str
             mock.patch.object(StagedExecutor, "_acquire_checkout_lease", return_value=None),
             mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
             mock.patch.object(StagedExecutor, "_pipeline_for",
-                              return_value=("plan", "implement")),
+                              return_value=("implement", "verify")),
             mock.patch("todo_system.worker.runner_heartbeat_start"),
             mock.patch.object(stages, "run_stage_subprocess", side_effect=fake_run),
             mock.patch("subprocess.run", side_effect=fake_run),

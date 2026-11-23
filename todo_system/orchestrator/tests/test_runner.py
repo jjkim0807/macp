@@ -953,7 +953,7 @@ class BrowserOwnerEnvRunnerTest(unittest.TestCase):
                 self.runs.mkdir()
 
     def test_other_stages_get_no_owner(self):
-        for stage in ("research", "plan"):
+        for stage in ("report",):
             with self.subTest(stage=stage):
                 env, _ = self._stage_env(stage)
                 self.assertNotIn(stages.BROWSER_OWNER_ENV, env)
@@ -1422,11 +1422,12 @@ class CleanupHookTest(unittest.TestCase):
             # which stage called it — write all three artifacts up front so every
             # stage clears its own artifact check and the loop reaches the end.
             d = self._run_dir()
-            for s in ("research", "plan", "implement"):
-                (d / stages.STAGE_ARTIFACT[s]).write_text("x\n", encoding="utf-8")
+            for s in stages.STAGES_AUTO:
+                (d / stages.STAGE_ARTIFACT[s]).write_text(
+                    "overall_status: pass\nmerged: no\n", encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        out, cleanup = self._run(("research", "plan", "implement"), fake_run)
+        out, cleanup = self._run(stages.STAGES_AUTO, fake_run)
         self.assertTrue(out.ok, out.summary)
         self.assertEqual(cleanup.call_count, 4)     # 3 stages + finally
         self._assert_all_targeted(cleanup, self.clone)
@@ -2149,14 +2150,14 @@ class StageUsageLoopTest(unittest.TestCase):
                          {"implement": {"unavailable": "no usage in transcript (rc=1)"}})
 
     def test_missing_artifact_is_judged_the_same(self):
-        # research's artifact is written by the stage itself; nobody writes it here
+        # verify's artifact is written by the stage itself; nobody writes it here
         legs = _claude_fixture("success")["legs"]
         self._plant(legs["text_sid"])
-        got = self._run(legs["text_sid"], stage="research")
-        ref = self._run(legs["text"], stage="research")
-        self.assertEqual(ref["out"].summary, "stage research: missing requirements.md")
+        got = self._run(legs["text_sid"], stage="verify")
+        ref = self._run(legs["text"], stage="verify")
+        self.assertEqual(ref["out"].summary, "stage verify: missing verify.md")
         self._assert_reads_unchanged("missing artifact", got, ref)
-        self.assertEqual(tuple(got["progress"]["usage"]["research"]), stages.USAGE_KEYS)
+        self.assertEqual(tuple(got["progress"]["usage"]["verify"]), stages.USAGE_KEYS)
 
     def test_success_adds_the_nine_keys_beside_the_existing_ones(self):
         leg = _claude_fixture("success")["legs"]["text_sid"]

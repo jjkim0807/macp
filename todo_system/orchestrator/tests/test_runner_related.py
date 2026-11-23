@@ -1,7 +1,7 @@
 """The runner writes `<run_dir>/related.md` before any stage runs (AC#1).
 
-The research stage's tools are `Read Write` — it cannot run a query, and
-`TASK_TOOLS_STAGES` is implement-only so a task cannot widen that. So the engine
+The stages are not handed a memory-query tool (and `TASK_TOOLS_STAGES` is
+implement-only, so a task cannot give verify/report one). So the engine
 has to do the query and leave the answer as a file. These pin the runner half:
 
 * the file really lands in the run dir the run just created, with the metadata;
@@ -196,13 +196,13 @@ class RunnerRelatedTest(unittest.TestCase):
 
 class RelatedIsAnInputNotAnArtifactTest(unittest.TestCase):
     """related.md must stay out of every required/inherited artifact list: the
-    research stage's required-artifact check would then fail whenever the engine
+    stage's required-artifact check would then fail whenever the engine
     legitimately wrote no file, which is exactly what AC#1 forbids."""
 
     def test_related_md_is_not_a_stage_artifact(self):
         self.assertNotIn(rc.RELATED_FILENAME, set(stages.STAGE_ARTIFACT.values()))
         self.assertNotIn(rc.RELATED_FILENAME, stages.APPENDED_ARTIFACTS)
-        self.assertEqual(stages.STAGE_ARTIFACT["research"], "requirements.md")
+        self.assertNotIn(rc.RELATED_FILENAME, stages.COMPANION_ARTIFACTS["implement"])
 
     def test_record_related_returns_none_rather_than_raising(self):
         with mock.patch.object(rc, "write_related", side_effect=RuntimeError("boom")):

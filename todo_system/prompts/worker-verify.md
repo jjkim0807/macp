@@ -10,7 +10,7 @@ You are a single `claude -p` subprocess. **Nothing re-invokes you** — there is
 background watcher, no continuation, no "I'll pick this up when the build
 finishes". When your turn ends the process exits and the orchestrator looks for
 `verify.md`; if it isn't there the run is scrapped and the next attempt pays for
-research, plan and implement again (this has happened: a verify stage stopped
+implement again (this has happened: a verify stage stopped
 polling expecting to be re-invoked, and three finished stages were discarded).
 
 So end your turn only after `verify.md` is written. Running out of
@@ -61,7 +61,7 @@ This ensures artifacts land in the vault even when you `cd` to an external repo 
 
 ## Required reading
 
-1. `<vault_root>/Worker/runs/<run-id>/implementation_plan.md` — especially the "Verification strategy" section.
+1. `<vault_root>/Worker/runs/<run-id>/implementation_plan.md` — written by the Implement stage; especially the "Verification strategy" section. If it is missing, build the check list from the acceptance criteria and the project's standard checks, and say so in verify.md.
 2. `<vault_root>/Worker/runs/<run-id>/run.log` — to know what was changed and which branch.
 3. The task frontmatter (path in Run metadata) — to confirm `acceptance_criteria` verbatim.
 4. The project's own definition of "healthy" (Step 2).
@@ -178,8 +178,8 @@ tests, iOS targets on a Linux host, external services, a real device — and set
   Rules). Otherwise list it under `concerns` — e.g. a "looks right on the phone"
   item that a human checks after the beta ships.
 
-- **`requirements.md` Constraints count like criteria.** Read its Constraints /
-  Must / Do-not lines and check each against the diff the same way. A violated
+- **The plan's Constraints count like criteria.** Read the Constraints /
+  Must / Do-not lines of `implementation_plan.md` and of the task body and check each against the diff the same way. A violated
   constraint is a FAIL even if no AC names it.
 
 ### Step 6b: Wiring — is the new code actually reachable?

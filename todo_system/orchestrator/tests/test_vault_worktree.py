@@ -322,15 +322,6 @@ def test_a_stage_that_changes_the_branch_is_pointed_at_the_worktree(stage):
     assert "External repo task" not in meta
 
 
-@pytest.mark.parametrize("stage", ["research", "plan"])
-def test_a_read_only_stage_is_told_where_the_branch_is_and_to_write_nothing_there(stage):
-    meta = _metadata(_prompt(stage, working_dir=WT))
-    assert f"- working_dir: `{WT}`\n" in meta
-    assert f"This stage writes nothing under `{WT}`" in meta
-    assert OVERRIDE not in meta
-    assert "git commit" not in meta
-
-
 def test_a_stage_with_no_branch_work_gets_only_the_working_dir_line():
     with_wt = _metadata(_prompt("discover", working_dir=WT))
     without = _metadata(_prompt("discover"))
@@ -503,7 +494,7 @@ def test_a_failed_run_keeps_its_uncommitted_work_on_the_branch(live, vault):
     wt = repos.vault_worktree_path("t")
 
     def act(ctx):
-        if ctx.stage == "plan":
+        if ctx.stage == "verify":
             (ctx.wd / "half.md").write_text("half-finished", encoding="utf-8")
             return False                # dies without its artifact
 
@@ -657,7 +648,7 @@ def test_a_rescue_that_fails_says_why_and_the_worktree_is_kept(live, vault):
     lock: dict = {}
 
     def act(ctx):
-        if ctx.stage == "plan":
+        if ctx.stage == "verify":
             (ctx.wd / "work.md").write_text("not committed", encoding="utf-8")
             gitdir = Path(ctx.g(ctx.wd, "rev-parse", "--absolute-git-dir").stdout.strip())
             lock["path"] = gitdir / "index.lock"
@@ -683,19 +674,19 @@ def test_a_rescue_that_fails_says_why_and_the_worktree_is_kept(live, vault):
 
 def test_a_stage_that_moves_the_live_head_is_caught_at_the_stage_boundary(live, vault):
     def act(ctx):
-        if ctx.stage == "research":
+        if ctx.stage == "implement":
             ctx.g(ctx.vault, "checkout", "-b", "stray")       # what the old prompt line did
 
     out = live.execute(act=act)
 
     assert out.ok, out.summary                                # the outcome is not changed
-    assert live.stage("research").live_head == MAIN_REF
-    assert live.stage("plan").live_head == MAIN_REF, "the next stage ran on a moved HEAD"
+    assert live.stage("implement").live_head == MAIN_REF
+    assert live.stage("verify").live_head == MAIN_REF, "the next stage ran on a moved HEAD"
     assert live.progress_json()["live_head_moved"] == {
-        "stage": "research", "from": MAIN_REF, "to": "refs/heads/stray", "restored": True}
-    assert "=== live vault HEAD moved (research) ===" in (
+        "stage": "implement", "from": MAIN_REF, "to": "refs/heads/stray", "restored": True}
+    assert "=== live vault HEAD moved (implement) ===" in (
         live.run_dir() / "run.log").read_text(encoding="utf-8")
-    assert any("live vault HEAD moved during stage research" in line for line in live.lines)
+    assert any("live vault HEAD moved during stage implement" in line for line in live.lines)
     assert _head_ref(vault) == MAIN_REF
 
 

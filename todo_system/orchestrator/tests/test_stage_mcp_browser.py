@@ -25,7 +25,7 @@ _INSTANCE_ENV = {"MACP_BROWSER_INSTANCE": "s-test",
                  "MACP_BROWSER_CDP": "http://127.0.0.1:9399"}
 _RUN_ID = "20260101T000000-t-slug"
 _MCP_STAGES = ("implement", "verify", "quick", "delegate")
-_NON_MCP_STAGES = ("research", "plan", "report", "discover")
+_NON_MCP_STAGES = ("report", "discover")
 _MCP_META_RE = re.compile(r"- \*\*Browser: MCP tools first[^\n]*\n")
 
 
@@ -152,10 +152,12 @@ class StageMcpWiringTest(unittest.TestCase):
                 self._assert_wired(argv)
 
     def test_task_allowed_tools_keep_mcp_rule(self):
-        argv = _argv("implement", self.server, allowed_tools="Read,Edit,Bash(git:*)")
+        argv = _argv("implement", self.server, allowed_tools="Read,Edit,Bash(gcloud:*)")
         a = argv.index("--allowed-tools")
         tools = argv[a + 1:argv.index("--add-dir")] if "--add-dir" in argv else argv[a + 1:]
-        self.assertEqual(tools[:3], ["Read", "Edit", "Bash(git:*)"])
+        # the task list adds to the default: default first, the new rule after it
+        default = stages.STAGE_TOOLS["implement"].split()
+        self.assertEqual(tools[:-1], [*default, "Bash(gcloud:*)"])
         for rule in (stages.SMS_TOOL_RULE, stages.BROWSER_TOOL_RULE,
                      stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
                      stages.MAIL_TOOL_RULE):
@@ -238,7 +240,7 @@ class StageMcpWiringTest(unittest.TestCase):
                                side_effect=RuntimeError("bad config")):
             self.assertIsNone(stages.browser_mcp_server("implement"))
 
-    # AC3: research / plan (and report / discover) never get it.
+    # AC3: report / discover never get it.
     def test_non_browser_stages_untouched_even_when_configured(self):
         for stage in _NON_MCP_STAGES:
             with self.subTest(stage=stage):
@@ -267,8 +269,8 @@ class StageMcpWiringTest(unittest.TestCase):
             tools = stages._safe_tools(stage, browser_mcp=True)
             self.assertEqual(tools[-1], stages.BROWSER_MCP_TOOL_RULE)
             self.assertEqual(tools[:-1], stages._safe_tools(stage))
-        self.assertEqual(stages._safe_tools("research", browser_mcp=True),
-                         stages._safe_tools("research"))
+        self.assertEqual(stages._safe_tools("report", browser_mcp=True),
+                         stages._safe_tools("report"))
 
 
 if __name__ == "__main__":

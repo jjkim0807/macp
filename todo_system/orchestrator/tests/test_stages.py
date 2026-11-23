@@ -59,8 +59,15 @@ def _pid_gone(pid: int) -> bool:
 
 class ConstantsTest(unittest.TestCase):
     def test_pipeline_shape(self):
-        self.assertEqual(stages.STAGES_AUTO,
-                         ("research", "plan", "implement", "verify", "report"))
+        self.assertEqual(stages.STAGES_AUTO, ("implement", "verify", "report"))
+        # research and plan are folded into implement: no stage, tools, budget
+        # or artifact of their own is left behind
+        for gone in ("research", "plan"):
+            for table in (stages.STAGE_TOOLS, stages.STAGE_MAX_TURNS, stages.STAGE_ARTIFACT):
+                self.assertNotIn(gone, table)
+        self.assertEqual(stages.RESUMABLE, ("implement",))
+        self.assertEqual(stages.PLAN_ARTIFACT, "implementation_plan.md")
+        self.assertEqual(stages.COMPANION_ARTIFACTS, {"implement": (stages.PLAN_ARTIFACT,)})
         # every stage has tools, a turn budget, and an artifact
         for s in stages.STAGES_AUTO:
             self.assertIn(s, stages.STAGE_TOOLS)
@@ -241,9 +248,13 @@ class BuildArgvTest(unittest.TestCase):
         self.assertIn("- slug: `worldgraph-4`", prompt)          # metadata injected
         self.assertIn("- stage: `implement`", prompt)
         self.assertIn("--max-turns", argv)
-        self.assertIn("200", argv)                               # implement budget
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "250")   # implement budget
         self.assertIn("Edit", argv)                              # implement can edit
         self.assertIn("Bash(git:*)", argv)
+        # it reads and plans for itself now: search and plain inspection tools,
+        # and the runners it needs to build and test what it writes
+        for tool in (*stages.INSPECT_TOOLS.split(), *stages.FALLBACK_RUNNER_TOOLS.split()):
+            self.assertIn(tool, argv, tool)
 
     def test_stage_prompts_load_from_the_package_prompts_dir(self):
         """The stage prompts ship inside the package (todo_system/prompts), where a
@@ -317,7 +328,7 @@ class BuildArgvTest(unittest.TestCase):
         self.assertEqual(stages.effective_tier("report", "heavy"), "standard")
         self.assertEqual(stages.effective_tier("report", "standard"), "light")
         self.assertEqual(stages.effective_tier("report", "light"), "light")
-        for st in ("research", "plan", "implement", "verify", "quick", "delegate"):
+        for st in ("implement", "verify", "quick", "delegate"):
             self.assertEqual(stages.effective_tier(st, "heavy"), "heavy", st)
             self.assertEqual(stages.effective_tier(st, "light"), "light", st)
         from unittest import mock
@@ -331,13 +342,13 @@ class BuildArgvTest(unittest.TestCase):
         import json
         import tempfile
         run_dir = Path(tempfile.mkdtemp())
-        stages.record_stage(run_dir, "research")
+        stages.record_stage(run_dir, "implement")
         stages.record_model_tier(run_dir, "light", "worker_mode: quick")
-        stages.record_stage(run_dir, "plan")
+        stages.record_stage(run_dir, "verify")
         data = json.loads((run_dir / stages.STAGE_PROGRESS).read_text())
         self.assertEqual(data["model_tier"], "light")
         self.assertEqual(data["model_tier_reason"], "worker_mode: quick")
-        self.assertEqual(data["completed"], ["research", "plan"])
+        self.assertEqual(data["completed"], ["implement", "verify"])
 
     def test_effort_falls_back_when_tier_module_breaks(self):
         from unittest import mock
@@ -387,10 +398,11 @@ class BuildArgvTest(unittest.TestCase):
 
     def test_injected_tool_list_reflects_a_task_override(self):
         """implement honours the task's own list, so the injected line has to
-        show that list — not the stage default it replaced."""
+        show it — added to the stage default, which stays."""
         prompt = self._argv("implement", allowed_tools="Read,Bash(gcloud:*)")[2]
         self.assertIn("Bash(gcloud:*)", prompt)
-        self.assertNotIn("Bash(pytest:*)", prompt)
+        self.assertIn("Bash(pytest:*)", prompt)
+        self.assertNotIn("Bash(gcloud:*)", self._argv("implement")[2])
 
 
 class VerifyVerdictTest(unittest.TestCase):
@@ -448,34 +460,36 @@ class ResumeTest(unittest.TestCase):
         return d
 
     def test_record_and_read_back(self):
-        d = self._run("20260101T000000-t", done=("research", "plan"))
-        self.assertEqual(stages.completed_stages(d), ["research", "plan"])
+        d = self._run("20260101T000000-t", done=("implement", "report"))
+        self.assertEqual(stages.completed_stages(d), ["implement", "report"])
 
-    def test_inherits_creative_prefix_from_crashed_run(self):
-        self._run("20260101T000000-t", done=("research", "plan", "implement"))
+    def test_inherits_implement_from_crashed_run(self):
+        self._run("20260101T000000-t", done=("implement",))
         got = stages.resumable_run("t", "20260102T000000-t")
         self.assertIsNotNone(got)
         _, resumable = got
-        self.assertEqual(resumable, ["research", "plan", "implement"])
+        self.assertEqual(resumable, ["implement"])
 
     def test_verify_and_report_never_inherited(self):
         # they read live state (CI conclusion, mergeability) — a stale artifact lies
-        self._run("20260101T000000-t", done=("research", "verify", "report"))
+        self._run("20260101T000000-t", done=("implement", "verify", "report"))
         _, resumable = stages.resumable_run("t", "20260102T000000-t")
-        self.assertEqual(resumable, ["research"])
+        self.assertEqual(resumable, ["implement"])
+        # nothing but implement is ever carried over
+        self._run("20260101T000000-u", done=("verify", "report"))
+        _, resumable = stages.resumable_run("u", "20260102T000000-u")
+        self.assertEqual(resumable, [])
 
     def test_real_verify_failure_starts_over(self):
         # FAIL = the code is broken; reusing that implement re-verifies the same red
-        self._run("20260101T000000-t", done=("research", "plan", "implement"),
-                  verify="fail")
+        self._run("20260101T000000-t", done=("implement",), verify="fail")
         self.assertIsNone(stages.resumable_run("t", "20260102T000000-t"))
 
     def test_verify_pass_still_resumable(self):
         # e.g. report crashed — no reason to re-implement
-        self._run("20260101T000000-t", done=("research", "plan", "implement"),
-                  verify="pass")
+        self._run("20260101T000000-t", done=("implement",), verify="pass")
         _, resumable = stages.resumable_run("t", "20260102T000000-t")
-        self.assertEqual(resumable, ["research", "plan", "implement"])
+        self.assertEqual(resumable, ["implement"])
 
     def test_no_prior_run_and_unrecorded_run(self):
         self.assertIsNone(stages.resumable_run("t", "20260102T000000-t"))
@@ -483,29 +497,65 @@ class ResumeTest(unittest.TestCase):
         self.assertIsNone(stages.resumable_run("t", "20260102T000000-t"))
 
     def test_other_tasks_runs_are_not_borrowed(self):
-        self._run("20260101T000000-other", done=("research", "plan"))
+        self._run("20260101T000000-other", done=("implement",))
         self.assertIsNone(stages.resumable_run("t", "20260102T000000-t"))
 
     def test_suffix_collision_run_is_not_borrowed(self):
         # 'other' above shares no substring, so it never caught the real failure:
         # a slug that merely ENDS with this one is still a DIFFERENT task, and
-        # inheriting its plan sends implement off building the wrong thing.
-        self._run("20260101T000000-api-poc", done=("research", "plan", "implement"))
+        # inheriting its implement hands verify the wrong task's work.
+        self._run("20260101T000000-api-poc", done=("implement",))
         self.assertIsNone(stages.resumable_run("poc", "20260103T000000-poc"))
         # positive control — matching NOTHING would satisfy the assertion above
-        self._run("20260102T000000-poc", done=("research",))
+        self._run("20260102T000000-poc", done=("implement",))
         rd, resumable = stages.resumable_run("poc", "20260103T000000-poc")
         self.assertEqual(rd.name, "20260102T000000-poc")
-        self.assertEqual(resumable, ["research"])
+        self.assertEqual(resumable, ["implement"])
 
     def test_inherit_copies_artifacts_and_skips_empty(self):
-        prior = self._run("20260101T000000-t", done=("research", "plan"))
-        (prior / stages.STAGE_ARTIFACT["plan"]).write_text("", encoding="utf-8")
+        prior = self._run("20260101T000000-t", done=("implement", "verify"))
+        (prior / stages.STAGE_ARTIFACT["verify"]).write_text("", encoding="utf-8")
         new = self.tmp / "20260102T000000-t"
         new.mkdir()
-        got = stages.inherit_artifacts(prior, new, ["research", "plan"])
-        self.assertEqual(got, ["research"])           # empty plan is not inherited
-        self.assertTrue((new / stages.STAGE_ARTIFACT["research"]).exists())
+        got = stages.inherit_artifacts(prior, new, ["implement", "verify"])
+        self.assertEqual(got, ["implement"])          # an empty artifact is not inherited
+        self.assertTrue((new / stages.STAGE_ARTIFACT["implement"]).exists())
+        self.assertFalse((new / stages.STAGE_ARTIFACT["verify"]).exists())
+
+    def test_the_plan_travels_with_an_inherited_implement(self):
+        # verify and report read implementation_plan.md, and the run that wrote
+        # it is the prior one: it is copied (and stamped) with run.log
+        prior = self._run("20260101T000000-t", done=("implement",))
+        (prior / stages.PLAN_ARTIFACT).write_text("# Plan\nstep\n", encoding="utf-8")
+        new = self.tmp / "20260102T000000-t"
+        new.mkdir()
+        self.assertEqual(stages.inherit_artifacts(prior, new, ["implement"]), ["implement"])
+        plan = new / stages.PLAN_ARTIFACT
+        self.assertTrue(plan.read_text(encoding="utf-8").startswith("# Plan\nstep\n"))
+        self.assertEqual(stages.read_provenance(plan), "20260101T000000-t")
+
+    def test_a_missing_or_empty_plan_does_not_block_the_inheritance(self):
+        for n, body in enumerate((None, "")):
+            with self.subTest(body=body):
+                prior = self._run(f"2026010{n + 1}T000000-t", done=("implement",))
+                if body is not None:
+                    (prior / stages.PLAN_ARTIFACT).write_text(body, encoding="utf-8")
+                new = self.tmp / f"new-{n}"
+                new.mkdir()
+                self.assertEqual(stages.inherit_artifacts(prior, new, ["implement"]),
+                                 ["implement"])
+                self.assertFalse((new / stages.PLAN_ARTIFACT).exists())
+
+    def test_the_plan_does_not_travel_without_its_implement(self):
+        # an implement with no run.log is not inherited, so it re-runs and
+        # writes its own plan: a copied one would be read as this run's
+        prior = self.tmp / "20260101T000000-t"
+        prior.mkdir()
+        (prior / stages.PLAN_ARTIFACT).write_text("# Plan\n", encoding="utf-8")
+        new = self.tmp / "20260102T000000-t"
+        new.mkdir()
+        self.assertEqual(stages.inherit_artifacts(prior, new, ["implement"]), [])
+        self.assertFalse((new / stages.PLAN_ARTIFACT).exists())
 
 
 class ProvenanceStampTest(unittest.TestCase):
@@ -519,11 +569,11 @@ class ProvenanceStampTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    FRONTMATTER = ("---\nstage: research\nrun_id: 20260101T000000-t\n---\n"
-                   "\n# Requirements\n본문 한 줄\n")
+    FRONTMATTER = ("---\nstage: implement\nrun_id: 20260101T000000-t\n---\n"
+                   "\n# Implementation Plan\n본문 한 줄\n")
 
     def test_stamp_frontmatter_preserves_body(self):
-        p = self.tmp / "requirements.md"
+        p = self.tmp / stages.PLAN_ARTIFACT
         p.write_text(self.FRONTMATTER, encoding="utf-8")
         before = stages.strip_frontmatter(self.FRONTMATTER)
 
@@ -541,7 +591,7 @@ class ProvenanceStampTest(unittest.TestCase):
         # run.log has no frontmatter; prepending a `---` block would leak past
         # strip_frontmatter() (it strips only the first) into the next prompt.
         p = self.tmp / "run.log"
-        p.write_text("\n=== research (rc=0) ===\nout\n", encoding="utf-8")
+        p.write_text("\n=== implement (rc=0) ===\nout\n", encoding="utf-8")
         self.assertTrue(stages.stamp_inherited(p, "20251231T235959-t"))
         text = p.read_text(encoding="utf-8")
         self.assertFalse(text.startswith("---"))
@@ -586,7 +636,7 @@ class ProvenanceStampTest(unittest.TestCase):
     def test_restamp_replaces_not_duplicates(self):
         # 3rd-generation inheritance: only the immediate hop is meaningful, and a
         # second `inherited_from:` key would make the frontmatter ambiguous
-        p = self.tmp / "requirements.md"
+        p = self.tmp / stages.PLAN_ARTIFACT
         p.write_text(self.FRONTMATTER, encoding="utf-8")
         stages.stamp_inherited(p, "20251231T235959-t")
         stages.stamp_inherited(p, "20260102T000000-t")
@@ -597,7 +647,7 @@ class ProvenanceStampTest(unittest.TestCase):
                          stages.strip_frontmatter(self.FRONTMATTER))
 
     def test_unstamped_artifact_reads_as_unknown_not_inherited(self):
-        p = self.tmp / "requirements.md"
+        p = self.tmp / stages.PLAN_ARTIFACT
         p.write_text(self.FRONTMATTER, encoding="utf-8")
         self.assertIsNone(stages.read_provenance(p))
         self.assertIsNone(stages.read_provenance(self.tmp / "missing.md"))
@@ -609,38 +659,37 @@ class ProvenanceStampTest(unittest.TestCase):
         prior.mkdir()
         new.mkdir()
         raw = b"\xff\xfe not utf-8 at all\n"
-        (prior / stages.STAGE_ARTIFACT["research"]).write_bytes(raw)
+        (prior / stages.STAGE_ARTIFACT["implement"]).write_bytes(raw)
+        (prior / stages.PLAN_ARTIFACT).write_bytes(raw)
 
-        got = stages.inherit_artifacts(prior, new, ["research"])
+        got = stages.inherit_artifacts(prior, new, ["implement"])
 
-        self.assertEqual(got, ["research"])           # still inherited
-        dst = new / stages.STAGE_ARTIFACT["research"]
-        self.assertEqual(dst.read_bytes(), raw)       # bytes untouched
-        self.assertIsNone(stages.read_provenance(dst))  # unknown, not a crash
+        self.assertEqual(got, ["implement"])          # still inherited
+        for dst in (new / stages.STAGE_ARTIFACT["implement"], new / stages.PLAN_ARTIFACT):
+            self.assertEqual(dst.read_bytes(), raw)       # bytes untouched
+            self.assertIsNone(stages.read_provenance(dst))  # unknown, not a crash
 
     def test_inherit_artifacts_stamps_every_copy(self):
         prior, new = self.tmp / "20260101T000000-t", self.tmp / "20260102T000000-t"
         prior.mkdir()
         new.mkdir()
-        (prior / stages.STAGE_ARTIFACT["research"]).write_text(
-            self.FRONTMATTER, encoding="utf-8")
+        (prior / stages.PLAN_ARTIFACT).write_text(self.FRONTMATTER, encoding="utf-8")
         # deliberately frontmatter'd, the shape that would tempt a header stamp
         (prior / stages.STAGE_ARTIFACT["implement"]).write_text(
             "---\nstage: implement\nrun_id: 20260101T000000-t\n---\n\nout\n",
             encoding="utf-8")
 
-        got = stages.inherit_artifacts(prior, new, ["research", "implement"])
+        got = stages.inherit_artifacts(prior, new, ["implement"])
 
-        self.assertEqual(got, ["research", "implement"])
-        for s in got:
-            self.assertEqual(
-                stages.read_provenance(new / stages.STAGE_ARTIFACT[s]),
-                "20260101T000000-t", f"{s} artifact lost its provenance")
-        # …and run.log got the append-safe marker, requirements.md the header key
+        self.assertEqual(got, ["implement"])
+        for name in (stages.STAGE_ARTIFACT["implement"], stages.PLAN_ARTIFACT):
+            self.assertEqual(stages.read_provenance(new / name),
+                             "20260101T000000-t", f"{name} lost its provenance")
+        # …and run.log got the append-safe marker, the plan the header key
         self.assertIn("(above this line)",
                       (new / stages.STAGE_ARTIFACT["implement"]).read_text(encoding="utf-8"))
         self.assertIn("inherited_from:",
-                      (new / stages.STAGE_ARTIFACT["research"]).read_text(encoding="utf-8"))
+                      (new / stages.PLAN_ARTIFACT).read_text(encoding="utf-8"))
 
 
 class ResumeInExecuteTest(unittest.TestCase):
@@ -664,7 +713,7 @@ class ResumeInExecuteTest(unittest.TestCase):
         from todo_system.orchestrator import repos
         if prior_done:
             d = self.tmp / "20260101T000000-t"
-            d.mkdir(parents=True)
+            d.mkdir(parents=True, exist_ok=True)
             for s in prior_done:
                 (d / stages.STAGE_ARTIFACT[s]).write_text(f"{s}\n", encoding="utf-8")
                 stages.record_stage(d, s)
@@ -710,16 +759,33 @@ class ResumeInExecuteTest(unittest.TestCase):
     def test_fresh_task_runs_every_stage(self):
         self.assertEqual(self._execute(), list(stages.STAGES_AUTO))
 
+    def test_an_oversize_declaring_implement_is_not_inherited(self):
+        # The prior implement only wrote a plan saying "too big" and parked. A
+        # re-dispatch must run implement again, not hand verify an empty branch.
+        prior = self.tmp / "20260101T000000-t"
+        prior.mkdir()
+        (prior / stages.PLAN_ARTIFACT).write_text(
+            "---\ndeclares_oversize: yes\n---\n# Plan\n", encoding="utf-8")
+        spawned = self._execute(prior_done=("implement",))
+        self.assertEqual(spawned, list(stages.STAGES_AUTO))
+
     def test_retry_skips_the_stages_already_bought(self):
-        spawned = self._execute(prior_done=("research", "plan", "implement"))
+        prior = self.tmp / "20260101T000000-t"
+        prior.mkdir()
+        (prior / stages.PLAN_ARTIFACT).write_text("# Plan\n", encoding="utf-8")
+        spawned = self._execute(prior_done=("implement",))
         # exactly the dancemirror case: only verify+report are re-run
         self.assertEqual(spawned, ["verify", "report"])
+        # …and they find the prior implement's plan in this run's dir
+        (new,) = [d for d in self.tmp.iterdir() if d.is_dir() and d.name.endswith("-t")
+                  and d.name != prior.name]
+        self.assertEqual(stages.read_provenance(new / stages.PLAN_ARTIFACT), prior.name)
 
     def test_inherited_stages_get_no_usage_row(self):
         # usage is per invocation: a stage carried over from a prior run spawned
         # nothing in this one, so this run has no tokens to report for it
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / "cfg")}):
-            self._execute(prior_done=("research", "plan", "implement"))
+            self._execute(prior_done=("implement",))
         new = [d for d in self.tmp.iterdir() if d.is_dir() and d.name.endswith("-t")
                and d.name != "20260101T000000-t"]
         self.assertEqual(len(new), 1, new)
@@ -796,8 +862,7 @@ class ResumeInExecuteTest(unittest.TestCase):
     def test_unpushed_branch_still_reimplements(self):
         # no remote branch = the code was never saved; skipping implement would
         # hand verify an empty diff
-        spawned = self._execute(prior_done=("research", "plan", "implement"),
-                                remote_branch=False)
+        spawned = self._execute(prior_done=("implement",), remote_branch=False)
         self.assertEqual(spawned, ["implement", "verify", "report"])
 
 
@@ -1064,7 +1129,7 @@ class CapacityLimitTest(unittest.TestCase):
             self.assertTrue(stages.is_capacity_limit(s), s)
 
     def test_ignores_normal_output(self):
-        for s in ("requirements.md written", "verify overall=fail: TS18046", ""):
+        for s in ("implementation_plan.md written", "verify overall=fail: TS18046", ""):
             self.assertFalse(stages.is_capacity_limit(s), s)
 
 
@@ -1207,7 +1272,7 @@ class ExecuteInvalidatesModelCacheTest(unittest.TestCase):
     def test_healthy_stage_output_is_still_offered_to_the_hook(self):
         # The runner does not pre-filter; the helper owns the decision, and the
         # tests above pin that a clean run changes nothing.
-        inv = self._execute(stdout="requirements.md written")
+        inv = self._execute(stdout="implementation_plan.md written")
         self.assertTrue(inv.called)
         self.assertNotIn("usage credits", inv.call_args_list[0].args[0])
 
@@ -3430,12 +3495,19 @@ class TaskAllowedToolsTest(unittest.TestCase):
             "implement", task_id="t", run_id="r", run_dir=Path("/x"),
             branch="b", allowed_tools="Read,Write,Bash(gcloud:*)")
         self.assertIn("Bash(gcloud:*)", argv)
-        self.assertNotIn("Bash(pytest:*)", argv)   # replaced, not merged
+        # added to the stage default, not a replacement for it: a task that lists
+        # one extra rule keeps git, the runners and every search tool
+        a = argv.index("--allowed-tools")
+        default = stages.STAGE_TOOLS["implement"].split()
+        self.assertEqual(argv[a + 1:a + 1 + len(default)], default)
+        self.assertEqual(argv[a + 1 + len(default)], "Bash(gcloud:*)")
+        for tool in ("Bash(pytest:*)", "Bash(git:*)", *stages.INSPECT_TOOLS.split()):
+            self.assertEqual(argv.count(tool), 1, tool)
 
     def test_read_only_stages_ignore_it(self):
-        # research/plan being read-only is what lets the pipeline trust their
-        # artifacts; a task must not be able to dissolve that
-        for stage in ("research", "plan", "verify"):
+        # verify being test-only (and discover reading a throwaway clone) is what
+        # lets the pipeline trust their artifacts; a task must not dissolve that
+        for stage in ("verify", "discover", "report"):
             argv = stages.build_stage_argv(
                 stage, task_id="t", run_id="r", run_dir=Path("/x"),
                 branch="b", allowed_tools="Bash(gcloud:*)")
@@ -3485,13 +3557,13 @@ class OrphanedCommitRecordTest(unittest.TestCase):
 
     def test_record_stage_preserves_sibling_keys(self):
         (self.run / stages.STAGE_PROGRESS).write_text(
-            json.dumps({"completed": ["research"], "orphaned_commits": _ORPHANED}),
+            json.dumps({"completed": ["implement"], "orphaned_commits": _ORPHANED}),
             encoding="utf-8")
 
-        stages.record_stage(self.run, "plan")
+        stages.record_stage(self.run, "verify")
 
         got = self._read()
-        self.assertEqual(got["completed"], ["research", "plan"])
+        self.assertEqual(got["completed"], ["implement", "verify"])
         self.assertEqual(got.get("orphaned_commits"), _ORPHANED,
                          "recording a stage erased the run's other structured state")
 
@@ -3504,26 +3576,26 @@ class OrphanedCommitRecordTest(unittest.TestCase):
 
     def test_the_report_outlives_the_rest_of_the_pipeline(self):
         """Detection happens before the first stage runs; the record has to still
-        be there when a human reads it after stage five."""
+        be there when a human reads it after the last stage."""
         stages.record_orphaned_commits(self.run, _ORPHANED)
-        for s in ("research", "plan", "implement", "verify", "report"):
+        for s in stages.STAGES_AUTO:
             stages.record_stage(self.run, s)
 
         self.assertEqual(self._read()["orphaned_commits"]["tip"], _ORPHANED["tip"])
         self.assertEqual(stages.completed_stages(self.run),
-                         ["research", "plan", "implement", "verify", "report"])
+                         list(stages.STAGES_AUTO))
 
     def test_recording_is_best_effort_on_a_corrupt_file(self):
         """Same contract record_stage already had: a damaged progress file costs a
         redundant re-run, never a dead run."""
         (self.run / stages.STAGE_PROGRESS).write_text("{not json", encoding="utf-8")
         stages.record_orphaned_commits(self.run, _ORPHANED)      # must not raise
-        stages.record_stage(self.run, "plan")                    # must not raise
+        stages.record_stage(self.run, "verify")                    # must not raise
         stages.record_orphaned_commits(self.tmp / "nope", _ORPHANED)   # nor a missing dir
 
     def test_no_report_writes_no_key(self):
         """A clean run stays clean — nothing to read, nothing to alarm about."""
-        stages.record_stage(self.run, "research")
+        stages.record_stage(self.run, "implement")
         self.assertNotIn("orphaned_commits", self._read())
 
 
@@ -4521,7 +4593,7 @@ class UsageKillSwitchArgvTest(unittest.TestCase):
             self.assertEqual(argv[3:], [
                 "--model", stages.stage_model("implement"),
                 "--effort", stages.stage_effort("implement"),
-                "--max-turns", "200",
+                "--max-turns", "250",
                 "--allowed-tools", *stages._safe_tools("implement"),
                 "--add-dir", str(self.worker_root)], repr(switch))
             self.assertIsNone(stages.argv_session_id(argv))
@@ -4529,7 +4601,7 @@ class UsageKillSwitchArgvTest(unittest.TestCase):
     def test_on_by_default_adds_one_fresh_uuid_right_before_allowed_tools(self):
         on = self._argv(None)
         i = on.index(stages.SESSION_ID_FLAG)
-        self.assertEqual(on[i - 2:i], ["--max-turns", "200"])
+        self.assertEqual(on[i - 2:i], ["--max-turns", "250"])
         self.assertEqual(on[i + 2], "--allowed-tools")
         self.assertEqual(str(uuid.UUID(on[i + 1])), on[i + 1])
         self.assertEqual(stages.argv_session_id(on), on[i + 1])
@@ -4568,15 +4640,15 @@ class RecordUsageTest(unittest.TestCase):
 
     def test_stages_accumulate_and_sibling_keys_survive(self):
         stages.record_model_tier(self.run, "standard", "model_tier: standard")
-        stages.record_stage(self.run, "research")
+        stages.record_stage(self.run, "implement")
         stages.record_orphaned_commits(self.run, {"count": 1, "shas": ["abc"]})
-        stages.record_usage(self.run, "research", {"unavailable": "timeout"})
-        stages.record_stage(self.run, "plan")
-        stages.record_usage(self.run, "plan", {"input_tokens": 1})
+        stages.record_usage(self.run, "implement", {"unavailable": "timeout"})
+        stages.record_stage(self.run, "verify")
+        stages.record_usage(self.run, "verify", {"input_tokens": 1})
         data = self._read()
-        self.assertEqual(data["usage"], {"research": {"unavailable": "timeout"},
-                                         "plan": {"input_tokens": 1}})
-        self.assertEqual(data["completed"], ["research", "plan"])
+        self.assertEqual(data["usage"], {"implement": {"unavailable": "timeout"},
+                                         "verify": {"input_tokens": 1}})
+        self.assertEqual(data["completed"], ["implement", "verify"])
         self.assertEqual((data["model_tier"], data["model_tier_reason"]),
                          ("standard", "model_tier: standard"))
         self.assertEqual(data["orphaned_commits"], {"count": 1, "shas": ["abc"]})
@@ -4584,14 +4656,14 @@ class RecordUsageTest(unittest.TestCase):
     def test_never_raises(self):
         p = self.run / stages.STAGE_PROGRESS
         p.write_text("{not json", encoding="utf-8")
-        stages.record_usage(self.run, "plan", {"x": 1})     # damaged → {} like _update_progress
-        self.assertEqual(self._read(), {"usage": {"plan": {"x": 1}}})
+        stages.record_usage(self.run, "verify", {"x": 1})     # damaged → {} like _update_progress
+        self.assertEqual(self._read(), {"usage": {"verify": {"x": 1}}})
         p.write_text('{"usage": [1]}', encoding="utf-8")
-        stages.record_usage(self.run, "plan", {"x": 2})     # wrong-typed usage → replaced
-        self.assertEqual(self._read(), {"usage": {"plan": {"x": 2}}})
-        stages.record_usage(self.run / "gone" / "deeper", "plan", {"x": 1})
+        stages.record_usage(self.run, "verify", {"x": 2})     # wrong-typed usage → replaced
+        self.assertEqual(self._read(), {"usage": {"verify": {"x": 2}}})
+        stages.record_usage(self.run / "gone" / "deeper", "verify", {"x": 1})
         with mock.patch.object(stages, "_update_progress", side_effect=RuntimeError("boom")):
-            stages.record_usage(self.run, "plan", {"x": 3})
+            stages.record_usage(self.run, "verify", {"x": 3})
 
 
 class RecordStageUsageTest(unittest.TestCase):
@@ -4619,7 +4691,7 @@ class RecordStageUsageTest(unittest.TestCase):
 
     def test_a_planted_transcript_becomes_the_nine_keys(self):
         self._plant(_asst("a", model="m-1", input_tokens=3, output_tokens=4), _cost(0.25))
-        rec = stages.record_stage_usage(self.run, "plan", self.argv, env=self.env,
+        rec = stages.record_stage_usage(self.run, "verify", self.argv, env=self.env,
                                         returncode=0, duration_ms=987)
         self.assertEqual(rec, {"input_tokens": 3, "output_tokens": 4,
                                "cache_creation_input_tokens": 0,
@@ -4627,7 +4699,7 @@ class RecordStageUsageTest(unittest.TestCase):
                                "duration_ms": 987, "model": "m-1",
                                "session_id": self.sid, "total_cost_usd": 0.25})
         self.assertEqual(tuple(rec), stages.USAGE_KEYS)
-        self.assertEqual(self._progress()["usage"]["plan"], rec)
+        self.assertEqual(self._progress()["usage"]["verify"], rec)
 
     def test_config_dir_comes_from_the_stage_env_else_the_process_env(self):
         self._plant(_asst("a"), slug="-some-other-cwd")      # any slug: globbed

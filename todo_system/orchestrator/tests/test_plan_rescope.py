@@ -289,7 +289,7 @@ def test_skill_shape_splits_into_four():
     ]
     subs = plan["subtasks"]
     plan_ref = f"Worker/runs/{RUN_ID}/implementation_plan.md"
-    req_ref = f"Worker/runs/{RUN_ID}/requirements.md"
+    req_ref = f"Todo/items/{PARENT}.md"
     # next_action matches the byte shape of the hand-made leaves
     assert subs[0]["next_action"] == (
         f"{plan_ref}의 부모 계획서 Phase 1과 {req_ref}를 읽고 그 단계만 수행한다"

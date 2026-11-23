@@ -17,7 +17,7 @@ usage-on/off shapes:
   ``--allowed-tools <tools…> [--add-dir <wr>]?`` — with the environment-dependent
   values (model/effort, the session-id uuid, the mcp-config json) normalised to
   placeholders so the test pins *structure*, not a machine's resolved model;
-* the full literal argv for two stages (``research`` read-only, ``implement``
+* the full literal argv for two stages (``report``, ``implement``
   with the richest tool set + mcp), so a change to the tool list or turn budget
   is a conscious golden update, not a silent drift;
 * the prompt body: the stage prompt passes through verbatim and the run-metadata
@@ -44,9 +44,9 @@ import pytest
 from todo_system.orchestrator import stages
 from todo_system.orchestrator import rescope
 
-# Representative stages: the read-only pair, the richest write stage, verify's
-# fallback-runner set, the two single-stage lanes.
-_STAGES = ("research", "plan", "implement", "verify", "quick", "delegate")
+# Representative stages: the richest write stage, verify's fallback-runner set,
+# report (no browser mcp), the two single-stage lanes.
+_STAGES = ("implement", "verify", "report", "quick", "delegate")
 
 _MODEL = "MODEL-SENTINEL"
 _EFFORT = "EFFORT-SENTINEL"
@@ -62,7 +62,7 @@ def _fix(monkeypatch, tmp_path, *, mcp: bool, usage: bool, wr_exists: bool) -> P
         server.parent.mkdir(parents=True, exist_ok=True)
         server.write_text("// stub\n", encoding="utf-8")
         # Mirror the real browser_mcp_server gating: a configured server is still
-        # only handed to BROWSER_MCP_STAGES, so research/plan stay mcp-off even
+        # only handed to BROWSER_MCP_STAGES, so report stays mcp-off even
         # with a server present.
         monkeypatch.setattr(
             stages, "browser_mcp_server",
@@ -124,9 +124,9 @@ def _expected(stage: str, wr: Path, *, mcp: bool, usage: bool, wr_exists: bool) 
 def test_argv_skeleton_is_pinned(monkeypatch, tmp_path, stage, mcp, usage):
     wr = _fix(monkeypatch, tmp_path, mcp=mcp, usage=usage, wr_exists=True)
     argv = _argv(stage, wr)
-    # research/plan are not browser-mcp stages, so mcp flags never appear there
+    # report is not a browser-mcp stage, so mcp flags never appear there
     # even when a server is "configured" — browser_mcp_server returns None for
-    # them regardless of the monkeypatch, so the skeleton must reflect that.
+    # it regardless of the monkeypatch, so the skeleton must reflect that.
     mcp_effective = mcp and stage in stages.BROWSER_MCP_STAGES
     assert _normalise(argv) == _expected(
         stage, wr, mcp=mcp_effective, usage=usage, wr_exists=True)
@@ -145,14 +145,14 @@ def test_add_dir_omitted_when_worker_root_absent(monkeypatch, tmp_path, stage):
 # Full literal snapshots — a tool-list / turn-budget change is a conscious update.
 # ---------------------------------------------------------------------------
 
-def test_literal_argv_research_mcp_off_usage_on(monkeypatch, tmp_path):
+def test_literal_argv_report_mcp_off_usage_on(monkeypatch, tmp_path):
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
-    argv = _argv("research", wr)
+    argv = _argv("report", wr)
     assert _normalise(argv) == [
         "claude", "-p", "<PROMPT>",
         "--model", _MODEL, "--effort", _EFFORT, "--max-turns", "40",
         stages.SESSION_ID_FLAG, "<SID>",
-        "--allowed-tools", "Read", "Write",
+        "--allowed-tools", "Read", "Write", "Edit", "Bash(git:*)", "Bash(gh:*)",
         "--add-dir", str(wr),
     ]
 
@@ -162,14 +162,18 @@ def test_literal_argv_implement_mcp_on_usage_on(monkeypatch, tmp_path):
     argv = _argv("implement", wr)
     assert _normalise(argv) == [
         "claude", "-p", "<PROMPT>",
-        "--model", _MODEL, "--effort", _EFFORT, "--max-turns", "200",
+        "--model", _MODEL, "--effort", _EFFORT, "--max-turns", "250",
         "--mcp-config", "<MCP_CONFIG>", "--strict-mcp-config",
         stages.SESSION_ID_FLAG, "<SID>",
         "--allowed-tools",
-        "Read", "Edit", "Write", "Bash(git:*)", "Bash(uv:*)", "Bash(npm:*)",
-        "Bash(pnpm:*)", "Bash(node:*)", "Bash(npx:*)", "Bash(pytest:*)",
-        "Bash(macp-sms:*)", "Bash(macp-browser:*)", "Bash(macp-remote-gate:*)",
-        "Bash(macp-emulator:*)", "Bash(macp-mail:*)", "mcp__macp-browser__*",
+        "Read", "Edit", "Write", "Grep", "Glob", "Bash(ls:*)", "Bash(grep:*)",
+        "Bash(rg:*)", "Bash(find:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+        "Bash(wc:*)", "Bash(pwd:*)", "Bash(git:*)", "Bash(gradlew:*)",
+        "Bash(./gradlew:*)", "Bash(uv:*)", "Bash(pytest:*)", "Bash(npm:*)",
+        "Bash(pnpm:*)", "Bash(node:*)", "Bash(npx:*)", "Bash(flutter:*)",
+        "Bash(dart:*)", "Bash(macp-sms:*)", "Bash(macp-browser:*)",
+        "Bash(macp-remote-gate:*)", "Bash(macp-emulator:*)", "Bash(macp-mail:*)",
+        "mcp__macp-browser__*",
         "--add-dir", str(wr),
     ]
 
@@ -243,7 +247,7 @@ def test_mcp_config_json_names_server_and_run_id_owner(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Plan stage: the machine-readable split block (rescope.rescope_from_split_block)
+# Implement stage (it writes the plan): the machine-readable split block (rescope.rescope_from_split_block)
 # is documented on the metadata.
 # ---------------------------------------------------------------------------
 
@@ -256,10 +260,10 @@ _THREE_PHASE_PLAN = (
 
 
 def test_plan_prompt_split_example_is_what_the_engine_parses(monkeypatch, tmp_path):
-    # The example a Plan agent is shown is fed to the engine's own reader and
+    # The example the implement agent is shown is fed to the engine's own reader and
     # builder, so the prompt and the parser cannot drift apart.
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
-    full = _argv("plan", wr)[2]
+    full = _argv("implement", wr)[2]
     assert _SPLIT_MARK in full
     blocks = rescope.find_plan_split_blocks(full)
     assert len(blocks) == 1                    # one example, and it reads as top-level
@@ -279,7 +283,7 @@ def test_plan_prompt_split_example_is_what_the_engine_parses(monkeypatch, tmp_pa
 
 def test_split_hint_names_every_key_the_builder_reads(monkeypatch, tmp_path):
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
-    full = _argv("plan", wr)[2]
+    full = _argv("implement", wr)[2]
     hint = full[full.index(_SPLIT_MARK):]
     for key in ("declares_oversize: yes", "`rescope`", "`slug`", "`phases`",
                 "`acceptance_criteria`", "`touches`", "`depends_on`", "`title`",
@@ -288,8 +292,8 @@ def test_split_hint_names_every_key_the_builder_reads(monkeypatch, tmp_path):
     assert hint.endswith("\n")
 
 
-@pytest.mark.parametrize("stage", [s for s in _STAGES + ("report",) if s != "plan"])
-def test_split_hint_is_plan_only(monkeypatch, tmp_path, stage):
+@pytest.mark.parametrize("stage", [s for s in _STAGES if s != "implement"])
+def test_split_hint_is_implement_only(monkeypatch, tmp_path, stage):
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
     full = _argv(stage, wr)[2]
     assert _SPLIT_MARK not in full
@@ -300,8 +304,8 @@ def test_split_hint_sits_in_the_metadata_block(monkeypatch, tmp_path):
     # Appended to the run metadata: the stage prompt passes through verbatim, the
     # hint comes after it (so it outranks it) and before the project memory.
     wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
-    prompt = stages.strip_frontmatter(stages.load_stage_prompt("plan"))
-    full = _argv("plan", wr, project_context="PROJECT-MEMORY-SENTINEL")[2]
+    prompt = stages.strip_frontmatter(stages.load_stage_prompt("implement"))
+    full = _argv("implement", wr, project_context="PROJECT-MEMORY-SENTINEL")[2]
     assert full.startswith(prompt)
     assert _SPLIT_MARK not in prompt
     head = "# Run metadata (injected by orchestrator)"

@@ -546,7 +546,7 @@ class _RecordingExecutor:
 
     def execute(self, msg, agent, progress, **_):
         self.calls.append(msg.task_id)
-        progress("stage research …")
+        progress("stage implement …")
         if self._during is not None:
             self._during(msg)
         # A staged run checks at every stage boundary before pushing anything.
@@ -724,13 +724,14 @@ class StagedCancelTest(unittest.TestCase):
                                            progress=lambda _: None)
         return out, ran, calls
 
-    def test_cancel_after_research_stops_before_report(self):
-        pipeline = ("research", "plan", "implement", "verify", "report")
-        out, ran, calls = self._run(pipeline, cancel_after="research")
-        self.assertEqual(ran, ["research"])                  # report never ran
+    def test_cancel_after_verify_stops_before_report(self):
+        pipeline = ("implement", "verify", "report")
+        out, ran, calls = self._run(pipeline, cancel_after="verify")
+        self.assertEqual(ran, ["implement", "verify"])       # report never ran
         self.assertTrue(out.payload.get("cancelled"))
         self.assertFalse(out.ok)
-        self.assertEqual(calls, {"checkpoint": 0, "publish": 0, "merge": 0})
+        # implement's own checkpoint ran before the cancel; nothing after it
+        self.assertEqual(calls, {"checkpoint": 1, "publish": 0, "merge": 0})
 
     def test_cancel_during_implement_skips_its_checkpoint(self):
         pipeline = ("implement", "verify", "report")
