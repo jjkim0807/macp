@@ -85,8 +85,8 @@ def classify(claim: dict, *, now: float | None = None,
     this envelope was an orphan" is worthless without the grounds.
 
     The ladder is deliberately biased toward *not* concluding death: a wrong
-    ORPHAN escalates a healthy run to a human, but a wrong LIVE only costs a
-    missing notification. Neither ever re-runs the pipeline.
+    ORPHAN re-dispatches a task whose run is still alive (two runs on one
+    branch), while a wrong LIVE only waits for the orchestrator's stale reaper.
     """
     now = time.time() if now is None else now
     alive = _alive_default if alive is None else alive

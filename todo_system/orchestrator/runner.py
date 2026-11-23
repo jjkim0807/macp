@@ -2685,18 +2685,18 @@ class Runner:
         did start — so re-entering `handle()` would redo a pipeline that may
         already have committed, pushed and merged.
 
-        `NEEDS_INPUT`, deliberately **not** `FAIL`: the orchestrator routes FAIL
-        into `_retry()` (orchestrator.py:354), which would re-dispatch the task and
-        cause exactly the re-run this exists to prevent. NEEDS_INPUT parks it as
-        AWAITING_HUMAN — non-terminal, so dispatch's dedup still refuses to re-send
-        it, and `reap_stale` ignores it (AWAITING_HUMAN ∉ _IN_FLIGHT).
+        ORPHAN (same host, claiming pid gone) answers `FAIL`: the run is dead, so
+        the orchestrator's ordinary failure path takes it — `_retry()` re-checks the
+        task is still open, then bounded retry, tiered cooldown, poison quarantine —
+        and the new run resumes from the pushed branch. UNKNOWN stays `NEEDS_INPUT`
+        (parked AWAITING_HUMAN): that run may still be alive, so nothing re-sends it.
         """
         verdict, evidence = claims_mod.classify(claim)
         self.log(f"redelivered {msg.type} task={msg.task_id} msg={msg.msg_id} "
                  f"-> {verdict}: {evidence}")
         self.claims.note_redelivery(msg.msg_id, verdict, evidence)
         if verdict != claims_mod.LIVE:
-            self._send(msg, m.NEEDS_INPUT,
+            self._send(msg, m.FAIL if verdict == claims_mod.ORPHAN else m.NEEDS_INPUT,
                        reason=f"redelivered envelope, execution already started ({verdict}): {evidence}",
                        redelivered=True, verdict=verdict, evidence=evidence,
                        claim=claim)

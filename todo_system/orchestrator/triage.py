@@ -178,7 +178,7 @@ _RESCOPE_PENDING = "rescope-pending"      # orchestrator.ALERT_RESCOPE_PENDING
 _REAPED = "reaped-stale"                  # orchestrator.reap_stale history type
 _RAN = ("ACCEPT", "PROGRESS")             # message.ACCEPT / message.PROGRESS
 
-# runner._classify_redelivery's NEEDS_INPUT reason (claims.ORPHAN / UNKNOWN).
+# runner._classify_redelivery's reply reason (FAIL for claims.ORPHAN, NEEDS_INPUT for UNKNOWN).
 _ORPHAN_RE = re.compile(
     r"redelivered envelope, execution already started \((orphan|unknown)\)")
 
