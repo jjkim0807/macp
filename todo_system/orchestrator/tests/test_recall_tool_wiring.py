@@ -201,6 +201,9 @@ class RecallStageArgvTest(unittest.TestCase):
                 self.assertIn("title, path and a one-line gist", line)
                 # where to name what it used: the stage's own artifact
                 self.assertIn(f"name its path in `{stages.STAGE_ARTIFACT[stage]}`", line)
+                # a host without an index must not cost the stage its turns
+                self.assertIn("A non-zero exit means this host has no index to search: "
+                              "carry on without it.", line)
                 # in the metadata block, not in the stage prompt file
                 self.assertNotIn(HINT_MARK, stages.load_stage_prompt(stage))
 

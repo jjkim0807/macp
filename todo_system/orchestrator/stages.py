@@ -686,7 +686,8 @@ def recall_hint(stage: str) -> str:
         "a one-line gist per result (at most 4 KB) from past tasks, run episodes, "
         "notes and decisions; the paths are relative to the vault root, so Read the "
         "ones that look useful. When a result helps, name its path in "
-        f"`{STAGE_ARTIFACT[stage]}` — the engine counts the results a run cited.\n")
+        f"`{STAGE_ARTIFACT[stage]}` — the engine counts the results a run cited. A "
+        "non-zero exit means this host has no index to search: carry on without it.\n")
 
 
 # The two report.md frontmatter keys the report stage copies from its metadata.
