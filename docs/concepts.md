@@ -135,6 +135,14 @@ it, for example to allow `Bash(./gradlew:*)`. The runner refuses to start a stag
 allowlist contains a few dangerous rules (`_safe_tools` raises `ValueError`; it does not
 strip them), and `validate` reports the same as an ERROR beforehand. Treat the allowlist as a guard rail, not a sandbox (see [SECURITY.md](../SECURITY.md)).
 
+**Memory.** Before the first stage the engine writes `related.md` into the run
+directory: the past tasks, run episodes, notes and decisions its index relates to the
+task. A stage that gets stuck later can ask for itself: `macp-recall "<question>"`
+searches the same index with free text and prints title, path and a one-line gist per
+result. implement, verify, quick and delegate hold that rule by default. Each call is
+recorded in the run's `recall.log`, and the report states how many calls a run made and
+how many of the results it went on to cite.
+
 **Isolation and concurrency.** Every run gets its own git worktree on
 `worker/<slug>` — a vault task too, so the vault you work in stays on its default
 branch while it runs ([where a run works](running.md#where-a-run-works)). Two tasks on the same repository run at the same time only when both
