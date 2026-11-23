@@ -372,12 +372,35 @@ EMULATOR_TOOL_STAGES = ("implement", "verify", "quick")
 # is attributable and the two can never co-drive the node.
 EMULATOR_OWNER_ENV = "MACP_EMULATOR_OWNER"
 
+# Free-text search of the vault's memory index (todo_system.recall) for a stage
+# that is stuck mid-run. Until this rule a run got its memory once — related.md,
+# queried by the engine before the first stage — so a problem it met later (a
+# build daemon that died, a migration trap) could not be looked up, even when a
+# past run had written the answer down. Same space-split problem as SMS, so one
+# PATH wrapper scripts/macp-recall gets one space-free rule. Read-only: it
+# prints title, path and a one-line gist per result (at most 4 KB) and writes
+# nothing but its own call log. The four stages that already run commands get
+# it; report and discover do not, and no task can hand it to them
+# (TASK_TOOLS_STAGES).
+RECALL_CLI = "macp-recall"
+RECALL_TOOL_RULE = f"Bash({RECALL_CLI}:*)"
+RECALL_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
+# Where a stage's calls are recorded, and whose task the stage is running (that
+# task's own document is left out of an answer): handed to the CLI through the
+# stage env (with_recall_env). The names are todo_system.recall's LOG_ENV /
+# TASK_ENV / LOG_FILENAME — spelled again here rather than imported (this module
+# imports no sibling at the top), and a test pins the two modules together.
+RECALL_LOG_ENV = "MACP_RECALL_LOG"
+RECALL_TASK_ENV = "MACP_RECALL_TASK"
+RECALL_LOG_FILENAME = "recall.log"
+
 # Rules every listed stage keeps even when a task supplies its own allowed_tools.
 _STANDING_RULES = ((SMS_TOOL_RULE, SMS_TOOL_STAGES),
                    (BROWSER_TOOL_RULE, BROWSER_TOOL_STAGES),
                    (REMOTE_GATE_TOOL_RULE, REMOTE_GATE_TOOL_STAGES),
                    (EMULATOR_TOOL_RULE, EMULATOR_TOOL_STAGES),
-                   (MAIL_TOOL_RULE, MAIL_TOOL_STAGES))
+                   (MAIL_TOOL_RULE, MAIL_TOOL_STAGES),
+                   (RECALL_TOOL_RULE, RECALL_TOOL_STAGES))
 
 # Read-only inspection: search tools plus the plain shell forms a model reaches
 # for first. Implement was denied `grep`/`ls`/`cat`/`find` about once a run, and
@@ -393,17 +416,17 @@ STAGE_TOOLS = {
     "implement": f"Read Edit Write {INSPECT_TOOLS} Bash(git:*) {FALLBACK_RUNNER_TOOLS} "
                  f"{SMS_TOOL_RULE} "
                  f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
-                 f"{MAIL_TOOL_RULE}",
+                 f"{MAIL_TOOL_RULE} {RECALL_TOOL_RULE}",
     "verify": (f"Read Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
                f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
-               f"{MAIL_TOOL_RULE}"),
+               f"{MAIL_TOOL_RULE} {RECALL_TOOL_RULE}"),
     "report": "Read Write Edit Bash(git:*) Bash(gh:*)",
     "delegate": ("Read Write Edit WebSearch WebFetch Bash(git:*) Bash(pwd:*) Bash(ls:*) "
                  f"{SMS_TOOL_RULE} {BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} "
-                 f"{MAIL_TOOL_RULE}"),
+                 f"{MAIL_TOOL_RULE} {RECALL_TOOL_RULE}"),
     "quick": (f"Read Edit Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
               f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
-              f"{MAIL_TOOL_RULE}"),
+              f"{MAIL_TOOL_RULE} {RECALL_TOOL_RULE}"),
     # No Edit: discover reads a throwaway clone and WRITES exactly two files (the
     # episode report + its artifact). The shell set is what "run the project"
     # needs — the CI runner set plus file inspection and a way to bound a
@@ -514,9 +537,9 @@ def _safe_tools(stage: str, task_tools: str | None = None, *,
 
     The forbidden check applies to the task-supplied list too — that is the
     property that makes honouring it safe at all. A task list still keeps the
-    _STANDING_RULES (SMS, BROWSER, REMOTE_GATE, EMULATOR, MAIL) on their
+    _STANDING_RULES (SMS, BROWSER, REMOTE_GATE, EMULATOR, MAIL, RECALL) on their
     stages, so a task needs no allowed_tools edit to read a 2FA code (SMS or
-    mail) or use the logged-in Chrome. `browser_mcp` (the MCP
+    mail), use the logged-in Chrome or search the vault's memory. `browser_mcp` (the MCP
     server is configured) appends BROWSER_MCP_TOOL_RULE last on either path.
     """
     tools = STAGE_TOOLS[stage]
@@ -644,6 +667,62 @@ def _build_tests_hint(working_dir: str) -> str:
         "as its own Bash call (no `&&`), then run `./gradlew …` / `npm …` "
         "etc. in later calls — the cwd persists. The absolute form "
         f"`{working_dir}/gradlew` is denied. Keep using `git -C` for git.\n")
+
+
+def recall_hint(stage: str) -> str:
+    """The run-metadata line that tells a RECALL_TOOL_STAGES stage to look a
+    problem up before retrying it, and where to name what it used.
+
+    On the metadata rather than in the four stage prompts: it comes after the
+    prompt, and one definition cannot drift between them. The file it names is
+    the stage's own artifact (STAGE_ARTIFACT) — one of the files
+    `todo_system.recall.usage` reads to count the results a run cited."""
+    return (
+        f"- **Past failures and decisions ({RECALL_CLI})**: when you are stuck — the "
+        "same error twice, a build or test failure you cannot explain, a repo "
+        "convention you have not met — search the vault's memory BEFORE trying "
+        f"again: `{RECALL_CLI} \"<the symptom or question>\" [--k 5]`. Use the words "
+        "of the error message and the project's own terms. It prints title, path and "
+        "a one-line gist per result (at most 4 KB) from past tasks, run episodes, "
+        "notes and decisions; the paths are relative to the vault root, so Read the "
+        "ones that look useful. When a result helps, name its path in "
+        f"`{STAGE_ARTIFACT[stage]}` — the engine counts the results a run cited. A "
+        "non-zero exit means this host has no index to search: carry on without it.\n")
+
+
+# The two report.md frontmatter keys the report stage copies from its metadata.
+RECALL_REPORT_KEYS = ("recall_calls", "recall_cited")
+
+
+def recall_report_line(run_dir: Path | str, task_id: str) -> str:
+    """The report stage's run-metadata line: what this run did with recall,
+    counted by the engine (`todo_system.recall.usage`) when the report's argv is
+    built — after implement and verify have finished, so their calls and what
+    they wrote are all in.
+
+    Counted here and not by the agent, for two reasons. The report stage has no
+    Bash rule to run a count with, and a number that decides whether the tool is
+    kept must not depend on how an agent reads a log. A run that never called
+    recall gets the same line with zeros: "0" has to be written down too, or a
+    missing line could mean either "unused" or "forgotten".
+
+    The count itself never raises. If it cannot be taken at all (a broken
+    install) the line says `unknown` rather than passing a made-up zero on."""
+    try:
+        from .. import recall
+        got = recall.usage(run_dir, task_id)
+        calls, cited, results = got["calls"], got["cited"], got["results"]
+    except Exception:       # noqa: BLE001 - the prompt builder must not fail
+        calls = cited = results = "unknown"
+    keys = " and ".join(f"`{key}: {value}`" for key, value
+                        in zip(RECALL_REPORT_KEYS, (calls, cited)))
+    return (
+        f"- **Recall usage (counted by the engine from `{RECALL_LOG_FILENAME}`)**: "
+        f"write {keys} into the report.md frontmatter exactly as given — zero "
+        "included, do not recount. The stages of this run called "
+        f"`{RECALL_CLI}` {calls} time(s) and were shown {results} distinct "
+        f"record(s); {cited} of them are named (by path or slug) in the plan, "
+        "run.log or verify.md.\n")
 
 
 # Stages of a vault task that change its branch: they get the full worktree rule.
@@ -827,6 +906,12 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             "this overrides the prompt's rule that parks such a criterion with "
             "`blocked_on:`. Aggregates only: never copy the seed DB, "
             "screenshots, or dumps into run.log / the commit / the PR.\n")
+    if stage in RECALL_TOOL_STAGES:
+        # Look it up before retrying it, on the metadata like the lines above.
+        meta.append(recall_hint(stage))
+    if stage == "report":
+        # What the run did with that tool, for report.md (zero included).
+        meta.append(recall_report_line(run_dir, task_id))
     if repo:
         meta.append(f"- repo: `{repo}`\n")
         if working_dir:
@@ -3331,4 +3416,23 @@ def with_emulator_owner(stage: str, env: dict, owner: str) -> dict:
         out[EMULATOR_OWNER_ENV] = owner
     else:
         out.pop(EMULATOR_OWNER_ENV, None)
+    return out
+
+
+def with_recall_env(stage: str, env: dict, run_dir: Path | str, task_id: str) -> dict:
+    """Copy of `env` for one stage: RECALL_TOOL_STAGES get the run's call log
+    (`<run_dir>/recall.log`, absolute — the stage's shell does not stay in one
+    directory) under RECALL_LOG_ENV and the task slug under RECALL_TASK_ENV, so
+    `macp-recall` records each call where the report stage counts them and
+    leaves the task's own document out of an answer. Every other stage has both
+    keys removed, so a value inherited from the runner's own env (a runner
+    started from inside a stage, a test) is never logged to. Never mutates
+    `env`."""
+    out = dict(env)
+    if stage in RECALL_TOOL_STAGES:
+        out[RECALL_LOG_ENV] = os.path.abspath(Path(run_dir) / RECALL_LOG_FILENAME)
+        out[RECALL_TASK_ENV] = task_id
+    else:
+        out.pop(RECALL_LOG_ENV, None)
+        out.pop(RECALL_TASK_ENV, None)
     return out

@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-WRAPPERS = ["macp", "macp-sms", "macp-remote-gate", "macp-emulator", "macp-anthropic-usage"]
+WRAPPERS = ["macp", "macp-sms", "macp-remote-gate", "macp-emulator", "macp-anthropic-usage",
+            "macp-recall"]
 
 
 def _fake_python(path: Path, tag: str) -> None:

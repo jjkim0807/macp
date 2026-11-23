@@ -31,6 +31,15 @@ body excerpt, nor ``outcome`` / ``next_action`` text: those are read as *query
 input* (``graph_memory._task_query_text``) and must not come back out. A reader
 who needs more opens the ``source`` path itself.
 
+One reader gets one field more. :func:`doc_card` is the record card behind
+free-text recall (``todo_system.recall``, which a worker stage runs mid-run as
+``macp-recall "<question>"``): title, path and the document's own one-line
+summary field, with the R5 document filter checked again at read time. It is a
+separate function, so ``related.md`` and both prompt sections stay metadata-only
+and byte-identical. The recall rule is granted by ``stages.STAGE_TOOLS`` to the
+four stages that already run commands; the planner's and the brief's whitelists
+are not touched.
+
 Fail-open by contract. Every public function swallows its own errors and
 degrades, in this order:
 
@@ -77,7 +86,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from .. import graph_memory as gm
 
@@ -144,6 +153,13 @@ def _connect_ro(path: Path | None = None) -> sqlite3.Connection | None:
         return None
 
 
+def open_index(root: Path | None = None) -> sqlite3.Connection | None:
+    """The read-only connection to ``root``'s edge DB (the resolved vault's when
+    ``root`` is ``None``), or ``None`` when there is none to read. The public
+    spelling of what :func:`emit_context` does, for the recall CLI."""
+    return _connect_ro(db_path(root))
+
+
 # -- titles (metadata, so R5-clean) -------------------------------------------
 
 def _own_doc(root: Path, slug: str, source_file: str | None) -> Path | None:
@@ -194,6 +210,12 @@ def title_for(root: Path, slug: str, source_file: str | None = None) -> str:
         fm, body = gm.parse_frontmatter(own.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return slug
+    return _title_from(fm, body, slug)
+
+
+def _title_from(fm: Mapping[str, Any], body: str, slug: str) -> str:
+    """:func:`title_for`'s rule over an already-parsed document: frontmatter
+    ``title``, else the first H1 within ``HEADING_SCAN_LINES``, else the slug."""
     raw = fm.get("title")
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
@@ -201,6 +223,89 @@ def title_for(root: Path, slug: str, source_file: str | None = None) -> str:
         if line.startswith("# "):
             return line[2:].strip() or slug
     return slug
+
+
+# -- one record's card, for free-text recall (todo_system.recall) --------------
+# The fourth consumer of this module does not get a file or a prompt section: a
+# worker stage asks a question mid-run (``macp-recall "<question>"``) and reads
+# the answer off stdout. It is here, and not in the CLI, for the reason in the
+# module docstring: the privacy boundary is enforced in one place.
+#
+# What a card may carry is wider than :func:`item_line` by exactly one field,
+# the gist, because the caller has nothing else to decide by — it has no run
+# directory to open first. The gist is the document's own one-line summary
+# field and nothing else. Body text never leaves, and neither does
+# ``next_action`` / ``if_then``.
+
+GIST_FIELDS = ("description", "summary", "outcome")   # first non-empty one wins
+GIST_FACT_FIELDS = ("event_date", "date")             # the date beside a `status`
+GIST_MAX_CHARS = 160
+
+
+class DocCard(NamedTuple):
+    """One record as recall may show it: metadata plus its own one-line summary."""
+
+    slug: str
+    path: str    # vault-relative path of the document itself, "/"-separated
+    title: str
+    gist: str    # "" when the document declares nothing usable
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Whitespace collapsed to single spaces, cut to ``limit`` characters."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:max(limit - 1, 0)].rstrip() + "…"
+
+
+def gist_for(fm: Mapping[str, Any]) -> str:
+    """The one-line gist of a document, from its frontmatter alone.
+
+    The first non-empty string among ``GIST_FIELDS``. A document with none of
+    them but a ``status`` (an episode, a decision) gets that status and its
+    date instead, which for a worker episode says whether the run passed and
+    when. ``""`` otherwise — a bare date says nothing, and the title and the
+    path are the answer then.
+    """
+    for key in GIST_FIELDS:
+        value = fm.get(key)
+        if isinstance(value, str) and value.strip():
+            return _one_line(value, GIST_MAX_CHARS)
+    status = fm.get("status")
+    if not (isinstance(status, str) and status.strip()):
+        return ""
+    facts = [f"status: {status.strip()}"]
+    for key in GIST_FACT_FIELDS:
+        value = fm.get(key)
+        if isinstance(value, str) and value.strip():
+            facts.append(value.strip())
+            break
+    return _one_line(" · ".join(facts), GIST_MAX_CHARS)
+
+
+def doc_card(root: Path, slug: str, source_file: str | None = None) -> DocCard | None:
+    """The card of ``slug``'s own document, or ``None`` when it must not be shown.
+
+    ``None`` for a record with no document on disk (a stale index row, a dangling
+    link: there is nothing to open), for a document that resolves outside the
+    vault, for one that cannot be read, and for one outside the R5 boundary
+    (``graph_memory.is_embeddable``: SMS / mail / health-raw / OTP by path
+    segment or tag). The boundary is checked HERE, at read time, on the file as
+    it is now — the index was filtered when it was built, and a document tagged
+    since then is still in it until the next embed tick. Unreadable means not
+    shown: the check cannot be made, so the answer is no.
+    """
+    base = Path(root)
+    own = _own_doc(base, slug, source_file)
+    if own is None:
+        return None
+    try:
+        rel = own.resolve().relative_to(base.resolve()).as_posix()
+        fm, body = gm.parse_frontmatter(own.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not gm.is_embeddable(rel, fm):
+        return None
+    return DocCard(slug=slug, path=rel, title=_title_from(fm, body, slug), gist=gist_for(fm))
 
 
 # -- the query ----------------------------------------------------------------

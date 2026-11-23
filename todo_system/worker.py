@@ -1092,7 +1092,8 @@ def bump_vault_engine_pin(
 # The space-free PATH wrappers a worker stage's allowed_tools can grant (one per
 # standing rule in stages._STANDING_RULES + SMS). Kept in sync below so a stage's
 # `Bash(macp-*:*)` rule always resolves to the CURRENT engine's script.
-_WRAPPER_NAMES = ("macp-sms", "macp-browser", "macp-remote-gate", "macp-emulator")
+_WRAPPER_NAMES = ("macp-sms", "macp-browser", "macp-remote-gate", "macp-emulator",
+                  "macp-recall")
 _WRAPPER_BINDIR = Path("~/.local/bin").expanduser()
 
 

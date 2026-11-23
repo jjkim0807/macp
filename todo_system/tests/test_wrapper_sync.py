@@ -14,11 +14,12 @@ import stat
 
 from todo_system import worker
 
-WRAPPERS = ("macp-sms", "macp-browser", "macp-remote-gate", "macp-emulator")
+WRAPPERS = ("macp-sms", "macp-browser", "macp-remote-gate", "macp-emulator",
+            "macp-recall")
 
 
 def _engine(tmp_path):
-    """A tmp engine checkout with a scripts/ dir holding all four fake wrappers."""
+    """A tmp engine checkout with a scripts/ dir holding every fake wrapper."""
     scripts = tmp_path / "engine" / "scripts"
     scripts.mkdir(parents=True)
     for name in WRAPPERS:
@@ -26,8 +27,17 @@ def _engine(tmp_path):
     return tmp_path / "engine"
 
 
-def test_all_four_wrapper_names_are_covered():
+def test_every_wrapper_name_is_covered():
     assert set(worker._WRAPPER_NAMES) == set(WRAPPERS)
+
+
+def test_every_synced_wrapper_ships_in_this_engine_tree():
+    """A name in the sync list with no script behind it installs nothing, and the
+    stage holding its rule then meets exit 127 — the gap this module exists for.
+    macp-browser is the one wrapper kept in a second tree as well, but its
+    engine copy ships here too."""
+    scripts = worker.paths.engine_root() / "scripts"
+    assert [n for n in worker._WRAPPER_NAMES if not (scripts / n).is_file()] == []
 
 
 def test_missing_dest_is_installed_0755(tmp_path):
@@ -48,7 +58,9 @@ def test_exit_127_repro_installs_the_one_missing_wrapper(tmp_path):
     engine = _engine(tmp_path)
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in ("macp-sms", "macp-browser", "macp-emulator"):   # three already present
+    for name in WRAPPERS:                        # every other one already present
+        if name == "macp-remote-gate":
+            continue
         dest = bindir / name
         dest.write_bytes((engine / "scripts" / name).read_bytes())
         dest.chmod(0o755)
@@ -87,5 +99,5 @@ def test_missing_source_is_skipped_not_raised(tmp_path):
     (engine / "scripts" / "macp-emulator").unlink()   # the engine lacks one wrapper
     bindir = tmp_path / "bin"
     synced = worker.sync_wrappers(engine=engine, bindir=bindir)  # must not raise
-    assert set(synced) == {"macp-sms", "macp-browser", "macp-remote-gate"}
+    assert set(synced) == set(WRAPPERS) - {"macp-emulator"}
     assert not (bindir / "macp-emulator").exists()

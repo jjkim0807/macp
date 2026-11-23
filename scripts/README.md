@@ -36,6 +36,11 @@ rule. These wrappers have names without spaces. Copy one to `~/.local/bin/` and 
 | `macp-sms` | the host's phone-SMS inbox (verification codes) |
 | `macp-browser` | a logged-in Chrome over CDP, with a lease so one user drives it at a time |
 | `macp-remote-gate` | a heavy verification command on a separate high-memory node |
+| `macp-recall` | a free-text search of the vault's memory index: `macp-recall "<question>" [--k 5]` prints title, path and a one-line gist per result (read-only, at most 4 KB) |
+
+`macp-sms`, `macp-browser`, `macp-remote-gate`, `macp-emulator` and `macp-recall` are
+granted to the worker stages by default (`todo_system/orchestrator/stages.py`), and the
+maintenance tick copies them to `~/.local/bin/` after it pulls the engine checkout.
 
 ## Several hosts
 

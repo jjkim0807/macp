@@ -36,6 +36,8 @@ overall_status: pass | fail
 pr_url: <url or null>
 merged: yes | no | n/a
 no_op: true | false
+recall_calls: <number>
+recall_cited: <number>
 ---
 
 <!-- `merged`: set truthfully after the merge step. `yes` = the PR was actually
@@ -44,6 +46,14 @@ merge did not happen — report `yes` only if `gh pr merge` succeeded; `n/a` =
 auto_merge was false (rare — ready PR left open for human review). The
 orchestrator surfaces `no` for human review instead of silently closing the
 task. -->
+
+<!-- `recall_calls` / `recall_cited`: how often this run's stages searched the
+vault's memory with `macp-recall`, and how many of the records they were shown
+they went on to name in the plan, run.log or verify.md. The engine counts both
+and gives them in the Run metadata below ("Recall usage"): copy the two values
+as given. Write both lines on every report, `0` included — these numbers decide
+whether the tool is kept, and a missing line cannot be told from an unused one.
+Keep them when you re-Write the file for `pr_url` / `merged`. -->
 
 # Worker Run Report — <task title>
 
