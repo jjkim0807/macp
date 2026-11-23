@@ -689,6 +689,41 @@ def recall_hint(stage: str) -> str:
         f"`{STAGE_ARTIFACT[stage]}` — the engine counts the results a run cited.\n")
 
 
+# The two report.md frontmatter keys the report stage copies from its metadata.
+RECALL_REPORT_KEYS = ("recall_calls", "recall_cited")
+
+
+def recall_report_line(run_dir: Path | str, task_id: str) -> str:
+    """The report stage's run-metadata line: what this run did with recall,
+    counted by the engine (`todo_system.recall.usage`) when the report's argv is
+    built — after implement and verify have finished, so their calls and what
+    they wrote are all in.
+
+    Counted here and not by the agent, for two reasons. The report stage has no
+    Bash rule to run a count with, and a number that decides whether the tool is
+    kept must not depend on how an agent reads a log. A run that never called
+    recall gets the same line with zeros: "0" has to be written down too, or a
+    missing line could mean either "unused" or "forgotten".
+
+    The count itself never raises. If it cannot be taken at all (a broken
+    install) the line says `unknown` rather than passing a made-up zero on."""
+    try:
+        from .. import recall
+        got = recall.usage(run_dir, task_id)
+        calls, cited, results = got["calls"], got["cited"], got["results"]
+    except Exception:       # noqa: BLE001 - the prompt builder must not fail
+        calls = cited = results = "unknown"
+    keys = " and ".join(f"`{key}: {value}`" for key, value
+                        in zip(RECALL_REPORT_KEYS, (calls, cited)))
+    return (
+        f"- **Recall usage (counted by the engine from `{RECALL_LOG_FILENAME}`)**: "
+        f"write {keys} into the report.md frontmatter exactly as given — zero "
+        "included, do not recount. The stages of this run called "
+        f"`{RECALL_CLI}` {calls} time(s) and were shown {results} distinct "
+        f"record(s); {cited} of them are named (by path or slug) in the plan, "
+        "run.log or verify.md.\n")
+
+
 # Stages of a vault task that change its branch: they get the full worktree rule.
 # research/plan only read; every other stage gets the bare `working_dir` line.
 VAULT_WORKTREE_WRITE_STAGES = ("implement", "verify", "report", "quick", "delegate")
@@ -873,6 +908,9 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     if stage in RECALL_TOOL_STAGES:
         # Look it up before retrying it, on the metadata like the lines above.
         meta.append(recall_hint(stage))
+    if stage == "report":
+        # What the run did with that tool, for report.md (zero included).
+        meta.append(recall_report_line(run_dir, task_id))
     if repo:
         meta.append(f"- repo: `{repo}`\n")
         if working_dir:

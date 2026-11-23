@@ -1,9 +1,9 @@
 """Worker stages may search the vault's memory mid-run (`macp-recall`) without a
-task `allowed_tools` edit.
+task `allowed_tools` edit, and what they looked up reaches the report.
 
 The whitelist splits on spaces, so the CLI is granted through one space-free
-PATH-wrapper rule, stages.RECALL_TOOL_RULE == `Bash(macp-recall:*)`. Pinned
-here, each on the path production takes:
+PATH-wrapper rule, stages.RECALL_TOOL_RULE == `Bash(macp-recall:*)`. Three
+things are pinned here, each on the path production takes:
 
 * **who holds the rule** — implement / verify / quick / delegate, in the argv
   `build_stage_argv` builds and the claude backend hands to the subprocess;
@@ -12,7 +12,11 @@ here, each on the path production takes:
 * **what the stage is told and given** — the usage line on the run metadata,
   and the env the runner's stage loop passes (`MACP_RECALL_LOG` =
   `<run_dir>/recall.log`, `MACP_RECALL_TASK` = the task slug), stripped from
-  every other stage.
+  every other stage;
+* **what the report stage is handed** — the engine's count of this run's calls
+  and cited results, in the report's own argv, zero included. The last test
+  joins the three: a lookup made with the env the runner gave a stage lands in
+  that run's log and comes out in that run's report argv.
 
 The CLI itself (format, privacy boundary, the 4 KB cap, the log) is pinned in
 todo_system/tests/test_recall.py.
@@ -21,6 +25,8 @@ todo_system/tests/test_recall.py.
 from __future__ import annotations
 
 import contextlib
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -29,6 +35,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from todo_system import graph_memory as gm
 from todo_system import recall, task_validate
 from todo_system.orchestrator import agent_backend, stages
 from todo_system.orchestrator import message as m
@@ -256,7 +263,7 @@ class RecallEnvRunnerTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _stage_env(self, stage: str) -> tuple[dict, Path]:
+    def _stage_env(self, stage: str, *, keep: bool = False) -> tuple[dict, Path]:
         seen: dict = {}
 
         def fake_run(argv, **kw):
@@ -290,9 +297,10 @@ class RecallEnvRunnerTest(unittest.TestCase):
             out = StagedExecutor().execute(msg, _agent(), progress=lambda _: None)
         self.assertTrue(out.payload.get("timed_out"), out.payload)
         (run_dir,) = list(self.runs.iterdir())
-        shutil.rmtree(self.runs)
-        self.runs.mkdir()
-        return seen["env"], self.runs / run_dir.name
+        if not keep:            # the next call must find one run directory again
+            shutil.rmtree(self.runs)
+            self.runs.mkdir()
+        return seen["env"], run_dir
 
     def test_granted_stages_get_this_runs_log_and_task(self):
         for stage in GRANTED:
@@ -311,6 +319,145 @@ class RecallEnvRunnerTest(unittest.TestCase):
                 env, _run_dir = self._stage_env(stage)
                 self.assertNotIn(stages.RECALL_LOG_ENV, env)
                 self.assertNotIn(stages.RECALL_TASK_ENV, env)
+
+    def test_a_lookup_made_with_the_stage_env_reaches_the_report_argv(self):
+        """The three parts joined: the env the runner's loop gave implement →
+        the real CLI → this run's recall.log → the count in the report's argv."""
+        env, run_dir = self._stage_env("implement", keep=True)
+        vault = self.tmp / "vault"
+        items = vault / "Todo" / "items"
+        items.mkdir(parents=True)
+        (items / "gradle-daemon-task.md").write_text(
+            "---\noutcome: the build survives a gradle stop\n---\n\n# Gradle daemon task\n\n"
+            "gradle daemon disappeared during the build\n", encoding="utf-8")
+        (items / f"{TASK}.md").write_text(        # the running task's own document
+            "---\noutcome: the demo\n---\n\n# Demo task\n\n"
+            "gradle daemon disappeared during the build\n", encoding="utf-8")
+        embed, dim, _name = gm.resolve_embedder(name="hash")
+        con = gm.init_relations_db(vault / "Memory" / "relations.sqlite")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                gm.embed_vault(con, vault_root=vault, embedder=embed, dim=dim)
+        finally:
+            con.close()
+
+        handed = {k: env[k] for k in (stages.RECALL_LOG_ENV, stages.RECALL_TASK_ENV)}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, handed), contextlib.redirect_stdout(out):
+            os.environ.pop("MACP_EMBEDDER", None)
+            rc = recall.main(["gradle daemon disappeared", "--vault-root", str(vault)])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("   path: Todo/items/gradle-daemon-task.md", out.getvalue())
+        self.assertNotIn(f"Todo/items/{TASK}.md", out.getvalue())   # its own doc is left out
+        (entry,) = recall.read_log(run_dir / "recall.log")          # in THIS run's directory
+        self.assertEqual(entry["results"], ["Todo/items/gradle-daemon-task.md"])
+        self.assertIn("`recall_calls: 1` and `recall_cited: 0`", _argv("report", run_dir)[2])
+        # The stage names what it used in its artifact; the next count sees it.
+        (run_dir / "run.log").write_text(
+            "fixed the way Todo/items/gradle-daemon-task.md did\n", encoding="utf-8")
+        self.assertIn("`recall_calls: 1` and `recall_cited: 1`", _argv("report", run_dir)[2])
+
+
+class RecallReportTest(unittest.TestCase):
+    """What the report stage is started with."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self._tmp.name) / RUN_ID
+        self.run_dir.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _log(self, *calls: dict) -> None:
+        (self.run_dir / "recall.log").write_text(
+            "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in calls), encoding="utf-8")
+
+    def _line(self, argv: list[str]) -> str:
+        (line,) = [ln for ln in argv[2].splitlines() if "**Recall usage" in ln]
+        return line
+
+    def test_a_run_that_never_called_recall_is_still_given_zeros(self):
+        self.assertFalse((self.run_dir / "recall.log").exists())
+
+        line = self._line(_argv("report", self.run_dir))
+
+        self.assertIn("`recall_calls: 0` and `recall_cited: 0`", line)
+        self.assertIn("zero included", line)
+        self.assertIn("into the report.md frontmatter", line)
+
+    def test_the_count_is_the_engines_over_this_runs_log_and_artifacts(self):
+        self._log(
+            {"ts": "t", "query": "gradle daemon", "k": 5,
+             "results": ["Todo/items/alpha-task.md", "Notes/beta-note.md"]},
+            {"ts": "t", "query": "room migration", "k": 5,
+             "results": ["Notes/beta-note.md", "Memory/episodes/2026-01-02-worker-gamma.md",
+                         f"Todo/items/{TASK}.md"]},
+            {"ts": "t", "query": "broken", "k": 5, "results": [], "error": "no memory index"})
+        (self.run_dir / "run.log").write_text(
+            f"branch worker/{TASK}\nused Todo/items/alpha-task.md\n", encoding="utf-8")
+        (self.run_dir / "verify.md").write_text(
+            "the earlier failure is [[2026-01-02-worker-gamma]]\n", encoding="utf-8")
+
+        line = self._line(_argv("report", self.run_dir))
+
+        # 3 calls (the failed one included), 4 distinct records, 2 cited — the
+        # task's own document is not one of them although run.log names its slug.
+        self.assertIn("`recall_calls: 3` and `recall_cited: 2`", line)
+        self.assertIn("called `macp-recall` 3 time(s) and were shown 4 distinct record(s)", line)
+        self.assertEqual(recall.usage(self.run_dir, TASK),
+                         {"calls": 3, "results": 4, "cited": 2})
+
+    def test_only_the_report_stage_is_handed_the_count(self):
+        self._log({"ts": "t", "query": "q", "k": 5, "results": ["Notes/beta-note.md"]})
+        for stage in stages.STAGE_TOOLS:
+            with self.subTest(stage=stage):
+                prompt = _argv(stage, self.run_dir)[2]
+                self.assertEqual("**Recall usage" in prompt, stage == "report")
+        # … and it sits in the metadata block, after the report prompt.
+        prompt = _argv("report", self.run_dir)[2]
+        self.assertLess(prompt.index("# Run metadata (injected by orchestrator)"),
+                        prompt.index("**Recall usage"))
+
+    def test_the_claude_backend_starts_report_with_the_count(self):
+        self._log({"ts": "t", "query": "q", "k": 5, "results": ["Notes/beta-note.md"]})
+        (self.run_dir / "run.log").write_text("see beta-note\n", encoding="utf-8")
+        started: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            started.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(stages, "run_stage_subprocess", side_effect=fake_run):
+            agent_backend.ClaudeAgentBackend().run_stage(
+                "report", task_id=TASK, run_id=RUN_ID, run_dir=self.run_dir,
+                branch=f"worker/{TASK}", worker_root=self.run_dir / "no-worker-root")
+
+        (argv,) = started
+        self.assertIn("`recall_calls: 1` and `recall_cited: 1`", self._line(argv))
+        self.assertNotIn(RULE, argv)                # counted for it, not granted to it
+
+    def test_a_count_that_cannot_be_taken_is_unknown_not_zero(self):
+        self._log({"ts": "t", "query": "q", "k": 5, "results": ["Notes/beta-note.md"]})
+        with mock.patch.object(recall, "usage", side_effect=RuntimeError("broken")):
+            line = self._line(_argv("report", self.run_dir))
+
+        self.assertIn("`recall_calls: unknown` and `recall_cited: unknown`", line)
+        self.assertNotIn("recall_calls: 0", line)
+
+    def test_the_report_template_has_both_keys_in_its_frontmatter(self):
+        prompt = stages.load_stage_prompt("report")
+        template = prompt[prompt.index("```markdown\n---\nstage: report"):]
+        frontmatter = template[:template.index("\n---\n", len("```markdown\n---\n"))]
+        for key in stages.RECALL_REPORT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(f"\n{key}: <number>", frontmatter)
+                # the same key the metadata line tells the agent to write
+                self.assertIn(f"`{key}: 0`", self._line(_argv("report", self.run_dir)))
+        self.assertEqual(stages.RECALL_REPORT_KEYS, ("recall_calls", "recall_cited"))
+        self.assertIn("`0` included", prompt)
 
 
 if __name__ == "__main__":
