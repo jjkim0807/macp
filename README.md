@@ -14,7 +14,7 @@ to step in. macp is that layer.
 
 You write tasks as small markdown files. macp then:
 
-- **Analyzes and splits.** Every task goes through research → plan → implement →
+- **Analyzes and splits.** Every task goes through implement (which plans first) →
   verify → report. A task that turns out too big for one implement stage is split
   into 2–5 dependent subtasks automatically.
 - **Allocates resources.** Each task gets a model tier (heavy / standard / light)
@@ -52,8 +52,8 @@ about 25 a day (counted from its assignment ledger).
                                      │  assignment ledger + mailbox
                        ┌─────────────┴───────────────┐
   data plane           │ runner                      │──► coding agent per stage
-                       │ research → plan → implement │     (own worktree, model tier,
-                       │ → verify → report (PR)      │      tool allowlist)
+                       │ implement → verify          │     (own worktree, model tier,
+                       │ → report (PR)               │      tool allowlist)
                        └─────────────┬───────────────┘
                                      │  questions it cannot answer
                                      ▼

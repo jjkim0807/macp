@@ -160,7 +160,14 @@ def stage_timeout_for(payload: dict) -> int:
     return STAGE_TIMEOUTS.get(tier, DEFAULT_STAGE_TIMEOUT)
 
 
-STAGES_AUTO = ("research", "plan", "implement", "verify", "report")
+# 2026-11-23 (user decision): research and plan are no longer separate stages.
+# Over 608 runs (10-24 → 11-23) they were 33% of the pipeline's cost, 67% of the
+# files implement read had already been read by them, and with `Read Write` only
+# they planned without searching or running anything. Implement now reads the
+# task, writes a short implementation_plan.md and builds, in one session; verify
+# stays a separate session because the session that wrote the code should not
+# grade it.
+STAGES_AUTO = ("implement", "verify", "report")
 STAGES_DELEGATE = ("delegate",)
 STAGES_QUICK = ("quick",)   # right-sizing: one combined call for trivial changes
 # Planner-fed exploration (discovery.py): clone a project into /tmp, run its own
@@ -226,15 +233,14 @@ def route_to_solar(agent: str | None, stage: str) -> bool:
 
 
 # Stages whose read-only / test-only guarantee the pipeline TRUSTS when it reads
-# their artifact: research and plan write only their report, verify is test-only
-# by design, discover reads a throwaway clone. That guarantee is enforced today
+# their artifact: verify is test-only by design, discover reads a throwaway clone. That guarantee is enforced today
 # by the stage's tool allowlist (STAGE_TOOLS has no Edit for them / TASK_TOOLS_STAGES
 # forbids widening them). A backend that cannot enforce an allowlist could let one
 # of these silently write, dissolving the guarantee — so it must declare the
 # `tool_allowlist` capability or the dispatcher refuses it (agent_backend
 # capability gate, AC #3). Write stages (implement/report/delegate/quick) already
 # touch the world, so they require only headless execution.
-_READONLY_GUARANTEE_STAGES = ("research", "plan", "verify", "discover")
+_READONLY_GUARANTEE_STAGES = ("verify", "discover")
 
 
 def required_capabilities(stage: str) -> frozenset[str]:
@@ -373,11 +379,19 @@ _STANDING_RULES = ((SMS_TOOL_RULE, SMS_TOOL_STAGES),
                    (EMULATOR_TOOL_RULE, EMULATOR_TOOL_STAGES),
                    (MAIL_TOOL_RULE, MAIL_TOOL_STAGES))
 
+# Read-only inspection: search tools plus the plain shell forms a model reaches
+# for first. Implement was denied `grep`/`ls`/`cat`/`find` about once a run, and
+# research/plan (now part of implement) had no search at all.
+INSPECT_TOOLS = ("Grep Glob Bash(ls:*) Bash(grep:*) Bash(rg:*) Bash(find:*) "
+                 "Bash(cat:*) Bash(head:*) Bash(tail:*) Bash(wc:*) Bash(pwd:*)")
+
 STAGE_TOOLS = {
-    "research": "Read Write",
-    "plan": "Read Write",
-    "implement": "Read Edit Write Bash(git:*) Bash(uv:*) Bash(npm:*) Bash(pnpm:*) "
-                 f"Bash(node:*) Bash(npx:*) Bash(pytest:*) {SMS_TOOL_RULE} "
+    # The runner set (FALLBACK_RUNNER_TOOLS) is here so implement compiles and
+    # tests what it writes: a branch implement could not build failed verify on a
+    # one-line compile error and re-bought the whole pipeline (7 of 31 verify
+    # FAILs, 10-24 → 11-23, were of this or the stage-boundary kind).
+    "implement": f"Read Edit Write {INSPECT_TOOLS} Bash(git:*) {FALLBACK_RUNNER_TOOLS} "
+                 f"{SMS_TOOL_RULE} "
                  f"{BROWSER_TOOL_RULE} {REMOTE_GATE_TOOL_RULE} {EMULATOR_TOOL_RULE} "
                  f"{MAIL_TOOL_RULE}",
     "verify": (f"Read Write Bash(git:*) Bash(gh:*) {FALLBACK_RUNNER_TOOLS} {SMS_TOOL_RULE} "
@@ -403,7 +417,7 @@ STAGE_TOOLS = {
                  f"Bash(ruff:*) Bash(make:*) {FALLBACK_RUNNER_TOOLS}"),
 }
 STAGE_MAX_TURNS = {
-    "research": 40, "plan": 40, "implement": 200,
+    "implement": 250,
     "verify": 50, "report": 40, "delegate": 200, "quick": 120,
     "discover": 120,
 }
@@ -419,8 +433,6 @@ def stage_max_turns(stage: str, task_max_turns: int | None = None) -> int:
 
 
 STAGE_ARTIFACT = {
-    "research": "requirements.md",
-    "plan": "implementation_plan.md",
     "implement": "run.log",          # orchestrator-written (captured stage output)
     "verify": "verify.md",
     "report": "report.md",
@@ -509,12 +521,14 @@ def _safe_tools(stage: str, task_tools: str | None = None, *,
     """
     tools = STAGE_TOOLS[stage]
     if task_tools and stage in TASK_TOOLS_STAGES:
-        tools = task_tools.replace(",", " ")
-        # The task list replaces the default wholesale; the standing rules are
-        # granted to every write stage regardless of task.
-        for rule, rule_stages in _STANDING_RULES:
-            if stage in rule_stages and rule not in tools.split():
-                tools = f"{tools} {rule}"
+        # The task list ADDS to the stage default (it replaced it until
+        # 2026-11-23, so a task that listed `./gradlew` lost git's neighbours and
+        # every search tool). The default already carries the standing rules.
+        have = tools.split()
+        for rule in task_tools.replace(",", " ").split():
+            if rule not in have:
+                have.append(rule)
+        tools = " ".join(have)
     if (browser_mcp and stage in BROWSER_MCP_STAGES
             and BROWSER_MCP_TOOL_RULE not in tools.split()):
         tools = f"{tools} {BROWSER_MCP_TOOL_RULE}"
@@ -668,15 +682,6 @@ def vault_worktree_meta(stage: str, working_dir: str, branch: str) -> list[str]:
     the runner checks the live HEAD after every stage."""
     wd = working_dir
     lines = [f"- working_dir: `{wd}`\n"]
-    if stage in ("research", "plan"):
-        lines.append(
-            f"- **Vault task — its branch lives in a separate worktree**: `{wd}` is "
-            f"a linked worktree of the vault with `{branch}` checked out; the vault "
-            "root (this stage's cwd) stays on its default branch. Tracked files as "
-            "the branch has them — including the commits of an earlier attempt — "
-            f"are under `{wd}`; gitignored files and changes not committed yet are "
-            f"only under the vault root. This stage writes nothing under `{wd}`.\n")
-        return lines
     if stage not in VAULT_WORKTREE_WRITE_STAGES:
         return lines
     lines.append(
@@ -834,7 +839,7 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         # vault. Only that shape opens this arm: with no `working_dir`, or one
         # that is the vault root itself, the prompt is what it always was.
         meta.extend(vault_worktree_meta(stage, working_dir, branch))
-    if stage == "plan":
+    if stage == "implement":
         # How an oversize plan states a split the engine can run without a person
         # (rescope.rescope_from_split_block).
         meta.append(plan_split_hint(task_id))
@@ -2301,12 +2306,15 @@ def invalidate_model_cache_if_unavailable(text: str) -> bool:
 
 
 STAGE_PROGRESS = "stages.json"
-# Stages worth carrying over from a crashed run. The creative prefix is where
-# nearly all the cost is (research 40 + plan 40 + implement 200 max_turns);
-# verify and report deliberately ALWAYS re-run, because their job is to read
-# live state (CI conclusion, PR mergeability) that a stale artifact would
+# Stages worth carrying over from a crashed run: implement, where nearly all the
+# cost is. verify and report deliberately ALWAYS re-run, because their job is to
+# read live state (PR mergeability, the merged tree) that a stale artifact would
 # misreport.
-RESUMABLE = ("research", "plan", "implement")
+RESUMABLE = ("implement",)
+# The plan implement writes before it edits. Not a stage artifact (run.log is),
+# but verify and report read it, so it travels with an inherited implement.
+PLAN_ARTIFACT = "implementation_plan.md"
+COMPANION_ARTIFACTS = {"implement": (PLAN_ARTIFACT,)}
 
 
 def _update_progress(run_dir: Path, **fields) -> None:
@@ -2776,6 +2784,11 @@ def inherit_artifacts(prior_run: Path, new_run: Path, stages_: list[str]) -> lis
                 # to gain a comment. Unstamped reads back as unknown, not fresh.
                 stamp_inherited(dst, Path(prior_run).name,
                                 appended=name in APPENDED_ARTIFACTS)
+                for extra in COMPANION_ARTIFACTS.get(s, ()):
+                    esrc = Path(prior_run) / extra
+                    if esrc.exists() and esrc.stat().st_size > 0:
+                        (Path(new_run) / extra).write_bytes(esrc.read_bytes())
+                        stamp_inherited(Path(new_run) / extra, Path(prior_run).name)
                 got.append(s)
         except OSError:
             continue

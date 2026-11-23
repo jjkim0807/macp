@@ -112,7 +112,7 @@ def test_capability_gate_passes_on_solar_lane_and_refuses_readonly():
     b = ab.SolarAgentBackend()
     for stage in stages.SOLAR_STAGES:      # the positive path — gate not vacuous
         assert ab.missing_capabilities(b, stage) == [], stage
-    assert ab.missing_capabilities(b, "research") == ["tool_allowlist"]
+    assert ab.missing_capabilities(b, "discover") == ["tool_allowlist"]
     assert ab.missing_capabilities(b, "verify") == ["tool_allowlist"]
 
 
@@ -151,7 +151,7 @@ S_ACCT, G_ACCT = object(), object()
     ("upstage", "quick", S_ACCT, None, (SOLAR, S_ACCT)),
     ("UPSTAGE", "delegate", S_ACCT, None, (SOLAR, S_ACCT)),   # case-insensitive
     ("upstage", "delegate", None, None, (CLAUDE, None)),       # no account → claude
-    ("upstage", "research", S_ACCT, None, (CLAUDE, None)),     # off-lane → claude
+    ("upstage", "verify", S_ACCT, None, (CLAUDE, None)),       # off-lane → claude
     ("upstage", "implement", S_ACCT, None, (CLAUDE, None)),
     ("gemini", "quick", None, G_ACCT, (GEMINI, G_ACCT)),
     ("gemini", "delegate", None, G_ACCT, (CLAUDE, None)),      # gemini lane = quick

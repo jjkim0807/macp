@@ -75,7 +75,7 @@ gets.
 
 | Mode | Dispatched? | Pipeline | Use it for |
 |---|---|---|---|
-| `auto` | yes | research → plan → implement → verify → report | normal code changes |
+| `auto` | yes | implement → verify → report | normal code changes |
 | `quick` | yes | one combined stage | a trivial, safe change (a typo, a config value) |
 | `delegate` | yes | one stage that researches and updates the task file or notes | investigation, drafting, "find out and write it down" |
 | `discover` | yes | clone, run tests/build/smoke launch, sweep, report candidates | finding work in a project |

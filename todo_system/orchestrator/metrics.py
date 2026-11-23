@@ -282,13 +282,13 @@ def _share_summary(report_vals: list, pipeline_vals: list) -> dict:
 
 
 def report_stage_share(runs: str | Path | None = None) -> dict:
-    """Report stage's share of the 5-stage pipeline's usage, over Worker/runs.
+    """Report stage's share of the pipeline's usage, over Worker/runs.
 
     Sample: a run counts only when stages.json carries `usage`, `completed` holds
-    all of STAGES_AUTO, and every one of those five records is counted
+    all of STAGES_AUTO, and every one of those records is counted
     (_usage_counted). Otherwise it is excluded as no_usage / not_full_pipeline /
     partial_usage — a missing stage would understate the pipeline total and
-    inflate the share. Cost sums only over runs whose five records all carry a
+    inflate the share. Cost sums only over runs whose records all carry a
     numeric total_cost_usd (cost_n of n).
 
     The verdict is the pooled cost share against REPORT_SHARE_THRESHOLD; with no
@@ -480,7 +480,7 @@ def _breakdown_lines(bd: dict) -> list[str]:
     Purely additive to render(): the four sections above it (and write()/__main__)
     are unchanged and pinned by tests, because the todo-sync daemon regenerates
     Metrics.md and must never be broken by this block."""
-    order = list(stages.STAGES_AUTO)   # research, plan, implement, verify, report
+    order = list(stages.STAGES_AUTO)
     lines = [
         "## 스테이지별 분해 (pipeline breakdown)",
         f"> 라우팅·rework 는 렛저 전수(**{bd['ledger_n']}건**), 스테이지 콜/바이트/판정은 "

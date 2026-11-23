@@ -32,7 +32,7 @@ from todo_system.orchestrator import stages
 from todo_system.orchestrator.registry import Agent
 from todo_system.orchestrator.runner import StagedExecutor
 
-_PIPELINE_STAGES = ("research", "plan", "implement", "verify", "report",
+_PIPELINE_STAGES = ("implement", "verify", "report",
                     "delegate", "quick", "discover")
 
 
@@ -51,7 +51,7 @@ class _Backend:
 # ---- the pure decision ------------------------------------------------------
 
 def test_required_capabilities_readonly_stages_need_allowlist():
-    for stage in ("research", "plan", "verify", "discover"):
+    for stage in ("verify", "discover"):
         assert stages.required_capabilities(stage) == frozenset({"headless", "tool_allowlist"})
     for stage in ("implement", "report", "delegate", "quick"):
         assert stages.required_capabilities(stage) == frozenset({"headless"})
@@ -62,7 +62,7 @@ def test_required_capabilities_readonly_stages_need_allowlist():
 def test_missing_capabilities_flags_allowlist_gap():
     allow_all_only = _Backend({"headless"})           # no tool_allowlist
     # read-only stages: refused, with the exact missing capability named
-    assert ab.missing_capabilities(allow_all_only, "research") == ["tool_allowlist"]
+    assert ab.missing_capabilities(allow_all_only, "discover") == ["tool_allowlist"]
     assert ab.missing_capabilities(allow_all_only, "verify") == ["tool_allowlist"]
     # write stages: allowed (headless is enough)
     assert ab.missing_capabilities(allow_all_only, "implement") == []
@@ -139,11 +139,11 @@ def _drive(monkeypatch, tmp_path, stage, *, missing):
 
 
 def test_runner_refuses_stage_when_backend_misses_capability(monkeypatch, tmp_path):
-    out, run_sub = _drive(monkeypatch, tmp_path, "research", missing=["tool_allowlist"])
+    out, run_sub = _drive(monkeypatch, tmp_path, "verify", missing=["tool_allowlist"])
     assert out.ok is False
     assert "capability" in out.summary and "tool_allowlist" in out.summary
     gate = out.payload.get("capability_gate")
-    assert gate == {"backend": "claude", "stage": "research", "missing": ["tool_allowlist"]}
+    assert gate == {"backend": "claude", "stage": "verify", "missing": ["tool_allowlist"]}
     # the gate fired BEFORE dispatch — the stage subprocess never ran.
     run_sub.assert_not_called()
 
@@ -152,6 +152,6 @@ def test_runner_dispatches_when_backend_supports_all(monkeypatch, tmp_path):
     # Empty missing list → the gate passes and the stage subprocess runs (the
     # positive path; the stage then fails later on the absent artifact, which is
     # not what we assert here).
-    out, run_sub = _drive(monkeypatch, tmp_path, "research", missing=[])
+    out, run_sub = _drive(monkeypatch, tmp_path, "verify", missing=[])
     run_sub.assert_called_once()
     assert out.payload.get("capability_gate") is None

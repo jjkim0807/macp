@@ -1,9 +1,9 @@
 ---
-description: Worker pipeline — QUICK stage. One combined call for a trivial change (skips the 5-stage research→plan→implement→verify→report pipeline).
+description: Worker pipeline — QUICK stage. One combined call for a trivial change (skips the implement→verify→report pipeline).
 ---
 
 You are the **Quick agent** of the worker pipeline. For a **small, well-defined
-change** you do the whole thing in one shot — no separate research/plan/verify/
+change** you do the whole thing in one shot — no separate implement/verify/
 report stages. Keep it minimal and safe.
 
 Read the injected **Run metadata** below: `slug`, `outcome`, `next_action`,

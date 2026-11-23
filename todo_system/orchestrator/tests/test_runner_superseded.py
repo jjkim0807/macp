@@ -2,7 +2,7 @@
 at the next stage boundary once its task is over.
 
 These drive the REAL stage loop: `StagedExecutor._pipeline_for` and
-`ClaudeAgentBackend.run_stage` are not patched, so the five stages of
+`ClaudeAgentBackend.run_stage` are not patched, so the three stages of
 `STAGES_AUTO` are walked by production code and only the stage subprocess
 itself is a fake (it records its name, writes that stage's artifact and can
 close the task md mid-run, the way a person does). Git plumbing around the loop
@@ -10,7 +10,7 @@ is mocked like the sibling runner suites; the squash-merge cases use a real
 bare origin + clones.
 
 Every "stops early" test has a control on the same harness in which the md
-stays open and all five stages run. Without it, a harness that could never get
+stays open and all three stages run. Without it, a harness that could never get
 past `implement` would make the early stop look like a pass.
 """
 
@@ -45,8 +45,6 @@ REPO_URL = "git@example.invalid:x/superseded-fixture.git"
 ALL_STAGES = list(stages.STAGES_AUTO)
 
 _ARTIFACTS = {
-    "research": ("requirements.md", "# requirements\n"),
-    "plan": ("implementation_plan.md", "---\ndeclares_oversize: no\n---\n# plan\n"),
     "verify": ("verify.md", "---\noverall_status: pass\n---\n"),
     "report": ("report.md", "---\noverall_status: pass\npr_url: null\n---\n"),
     "delegate": ("delegate.md", "# delegate\n"),
@@ -241,7 +239,7 @@ class _Harness(_HarnessMixin, unittest.TestCase):
 
 
 class MdClosedMidRunTest(_Harness):
-    def test_control_open_md_runs_all_five_stages(self):
+    def test_control_open_md_runs_all_stages(self):
         out, mk = self._run()
         self._assert_ran_to_the_end(out, mk)
         self.assertEqual(out.payload["stages"], ALL_STAGES)
@@ -251,23 +249,16 @@ class MdClosedMidRunTest(_Harness):
         self.on_stage["implement"] = self._close_md("done")
         out, mk = self._run()
         self._assert_stopped(out, mk, reason=sup.REASON_MD_CLOSED,
-                             ran=["research", "plan", "implement"],
+                             ran=["implement"],
                              where="after implement, before the checkpoint push")
         self.assertIn("task md status: done", out.summary)
         self.assertEqual(mk.order, ["rescue"])          # rescue ran, the push did not
         self.assertNotIn("stage verify …", self.progress)
 
-    def test_md_done_during_research_stops_before_plan(self):
-        self.on_stage["research"] = self._close_md("done")
-        out, mk = self._run()
-        self._assert_stopped(out, mk, reason=sup.REASON_MD_CLOSED,
-                             ran=["research"], where="before stage plan")
-        self.assertEqual(mk.order, [])
-
     def test_md_done_during_verify_stops_before_report(self):
         self.on_stage["verify"] = self._close_md("done")
         out, mk = self._run()
-        self.assertEqual(self.ran, ["research", "plan", "implement", "verify"])
+        self.assertEqual(self.ran, ["implement", "verify"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
         self.assertIn("before stage report", out.summary)
         # The implement checkpoint had already gone out; nothing after it did.
@@ -280,7 +271,7 @@ class MdClosedMidRunTest(_Harness):
         self.md.write_text(_md("done"), encoding="utf-8")
         out, mk = self._run()
         self._assert_stopped(out, mk, reason=sup.REASON_MD_CLOSED, ran=[],
-                             where="before stage research")
+                             where="before stage implement")
 
     def test_cancelled_spellings_and_case_stop_too(self):
         for status in ("cancelled", "canceled", "Done"):
@@ -290,17 +281,17 @@ class MdClosedMidRunTest(_Harness):
                 shutil.rmtree(self.runs)
                 self.runs.mkdir()
                 self.md.write_text(_md("open"), encoding="utf-8")
-                self.on_stage["plan"] = self._close_md(status)
+                self.on_stage["implement"] = self._close_md(status)
                 out, mk = self._run()
                 self._assert_stopped(out, mk, reason=sup.REASON_MD_CLOSED,
-                                     ran=["research", "plan"],
-                                     where="before stage implement")
+                                     ran=["implement"],
+                                     where="after implement, before the checkpoint push")
                 self.assertIn(f"task md status: {status.lower()}", out.summary)
 
     def test_absolute_task_path_is_read_too(self):
-        self.on_stage["plan"] = self._close_md("done")
+        self.on_stage["implement"] = self._close_md("done")
         out, mk = self._run(self._payload(task_path=str(self.md)))
-        self.assertEqual(self.ran, ["research", "plan"])
+        self.assertEqual(self.ran, ["implement"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
 
 
@@ -313,7 +304,7 @@ class FailOpenTest(_Harness):
 
     def test_control_this_fixture_stops_when_nothing_fails(self):
         out, _ = self._run()
-        self.assertEqual(self.ran, ["research", "plan", "implement"])
+        self.assertEqual(self.ran, ["implement"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
 
     def test_unreadable_frontmatter_runs_all_stages(self):
@@ -344,7 +335,7 @@ class FailOpenTest(_Harness):
         # test_stages.py hands _execute a Mock() agent; the check must not read it.
         agent = mock.Mock()
         out, _ = self._run(agent=agent)
-        self.assertEqual(self.ran, ["research", "plan", "implement"])
+        self.assertEqual(self.ran, ["implement"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
         self.assertEqual(
             [c for c in agent.mock_calls if "superseded" in str(c)], [])
@@ -368,7 +359,7 @@ class FailOpenTest(_Harness):
         with self._patched() as mk, \
                 mock.patch.object(stages, "_update_progress", side_effect=update):
             out = StagedExecutor().execute(msg, _agent(), progress=progress)
-        self.assertEqual(self.ran, ["research", "plan", "implement"])
+        self.assertEqual(self.ran, ["implement"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
         mk.checkpoint.assert_not_called()
 
@@ -386,8 +377,8 @@ class UsagePauseTest(_Harness):
         with mock.patch.object(runner_mod, "_wait_for_session_headroom",
                                side_effect=wait):
             out, mk = self._run()
-        self.assertEqual(seen, ["research", "plan", "implement", "verify"])
-        self.assertEqual(self.ran, ["research", "plan", "implement"])
+        self.assertEqual(seen, ["implement", "verify"])
+        self.assertEqual(self.ran, ["implement"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MD_CLOSED)
         self.assertIn("after the usage pause, before stage verify", out.summary)
         mk.kakao.assert_not_called()
@@ -455,7 +446,7 @@ class GitWiringTest(_HarnessMixin, _GitFixture):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_control_unmerged_branch_runs_all_five_stages(self):
+    def test_control_unmerged_branch_runs_all_stages(self):
         out, mk = self._run()
         self._assert_ran_to_the_end(out, mk)
 
@@ -472,11 +463,11 @@ class GitWiringTest(_HarnessMixin, _GitFixture):
         self.on_stage["implement"] = self._land_squash
         out, mk = self._run()
         self._assert_stopped(out, mk, reason=sup.REASON_MERGED,
-                             ran=["research", "plan", "implement"],
+                             ran=["implement"],
                              where="after implement, before the checkpoint push")
         self.assertIn("already in the default branch", out.summary)
         self.assertEqual(mk.order, ["rescue"])
-        self.assertEqual(self.probes, [(["research", "plan", "implement"], True)])
+        self.assertEqual(self.probes, [(["implement"], True)])
         # The md is still open: the orchestrator closes it, not the runner.
         self.assertEqual(self.md.read_text(encoding="utf-8"), _md("open"))
 
@@ -487,9 +478,9 @@ class GitWiringTest(_HarnessMixin, _GitFixture):
         self._land_squash()
         out, mk = self._run()
         self._assert_stopped(out, mk, reason=sup.REASON_MERGED,
-                             ran=["research", "plan", "implement"],
+                             ran=["implement"],
                              where="after implement, before the checkpoint push")
-        self.assertEqual(self.probes, [(["research", "plan", "implement"], True)])
+        self.assertEqual(self.probes, [(["implement"], True)])
 
     def test_implement_that_adds_work_on_a_merged_branch_carries_on(self):
         self._land_squash()
@@ -505,23 +496,23 @@ class GitWiringTest(_HarnessMixin, _GitFixture):
     def test_squash_merge_during_verify_stops_before_report(self):
         self.on_stage["verify"] = self._land_squash
         out, mk = self._run()
-        self.assertEqual(self.ran, ["research", "plan", "implement", "verify"])
+        self.assertEqual(self.ran, ["implement", "verify"])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MERGED)
         self.assertIn("before stage report", out.summary)
 
     def test_inherited_implement_on_a_merged_branch_stops_before_verify(self):
         # A resumed run skips implement; the first boundary it reaches still asks.
         self._land_squash()
-        out, mk = self._run(inherited=("research", "plan", "implement"))
+        out, mk = self._run(inherited=("implement",))
         self.assertEqual(self.ran, [])
         self.assertEqual(out.payload[sup.RESULT_KEY], sup.REASON_MERGED)
-        self.assertEqual(out.payload["stages"], ["research", "plan", "implement"])
+        self.assertEqual(out.payload["stages"], ["implement"])
         self.assertIn("before stage verify", out.summary)
         self.assertEqual(self.probes, [([], True)])
         mk.checkpoint.assert_not_called()
 
     def test_control_inherited_implement_on_an_unmerged_branch_verifies(self):
-        out, mk = self._run(inherited=("research", "plan", "implement"))
+        out, mk = self._run(inherited=("implement",))
         self.assertEqual(self.ran, ["verify", "report"])
         self.assertNotIn(sup.RESULT_KEY, out.payload)
 
@@ -571,7 +562,7 @@ class EndToEndTest(_Harness):
         self.on_stage["implement"] = self._close_md("done")
         closed = _md("done").encode("utf-8")
         replies, mk, row = self._dispatch_and_run()
-        self.assertEqual(self.ran, ["research", "plan", "implement"])
+        self.assertEqual(self.ran, ["implement"])
         types_ = [r.type for r in replies]
         self.assertNotIn(m.FAIL, types_)
         self.assertNotIn(m.NEEDS_INPUT, types_)
@@ -594,7 +585,7 @@ class EndToEndTest(_Harness):
         self.assertIsNone(self.orch.dispatch(Task(SLUG, self._payload())))
 
     def test_control_open_md_runs_to_the_review_park_and_alerts(self):
-        # Same wiring with the md left open: all five stages run, and (the task
+        # Same wiring with the md left open: all three stages run, and (the task
         # is auto_merge:false) the orchestrator parks it for review and pages.
         replies, mk, row = self._dispatch_and_run()
         self.assertEqual(self.ran, ALL_STAGES)

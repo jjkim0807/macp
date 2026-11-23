@@ -26,26 +26,23 @@ MERGED_PARK = [{"ts": "2026-01-02T00:00:00+00:00",
 
 
 def _runs(tmp_path: Path) -> Path:
-    """Two runs: run 1 wrote research and verified FAIL; run 2 inherited the
-    research, carries an unstamped foreign-author plan and an author-less
-    run.log, and verified PASS."""
+    """Two runs: run 1 ran implement and verified FAIL; run 2 inherited the
+    implement run.log, carries an unstamped foreign-author report and an
+    author-less quick.md, and verified PASS."""
     runs = tmp_path / "runs"
     for rid in (RUN1, RUN2):
         (runs / rid).mkdir(parents=True)
-    research = stages.STAGE_ARTIFACT["research"]
-    (runs / RUN1 / research).write_text(
-        f"---\nstage: research\nrun_id: {RUN1}\n---\n\n# R\n", encoding="utf-8")
-    stages.record_stage(runs / RUN1, "research")
-    (runs / RUN2 / research).write_text(
-        f"---\nstage: research\nrun_id: {RUN1}\n---\n\n# R\n", encoding="utf-8")
-    stages.stamp_inherited(runs / RUN2 / research, RUN1)
-    stages.record_stage(runs / RUN2, "research")
-    (runs / RUN2 / stages.STAGE_ARTIFACT["plan"]).write_text(
-        f"---\nstage: plan\nrun_id: {RUN1}\n---\n\n# P\n", encoding="utf-8")
-    stages.record_stage(runs / RUN2, "plan")
-    (runs / RUN2 / stages.STAGE_ARTIFACT["implement"]).write_text(
-        "\n=== implement (rc=0) ===\nout\n", encoding="utf-8")
+    log = stages.STAGE_ARTIFACT["implement"]
+    (runs / RUN1 / log).write_text("\n=== implement (rc=0) ===\nout\n", encoding="utf-8")
+    stages.record_stage(runs / RUN1, "implement")
+    (runs / RUN2 / log).write_text("\n=== implement (rc=0) ===\nout\n", encoding="utf-8")
+    stages.stamp_inherited(runs / RUN2 / log, RUN1, appended=True)
     stages.record_stage(runs / RUN2, "implement")
+    (runs / RUN2 / stages.STAGE_ARTIFACT["report"]).write_text(
+        f"---\nstage: report\nrun_id: {RUN1}\n---\n\n# P\n", encoding="utf-8")
+    stages.record_stage(runs / RUN2, "report")
+    (runs / RUN2 / stages.STAGE_ARTIFACT["quick"]).write_text("# Q\nout\n", encoding="utf-8")
+    stages.record_stage(runs / RUN2, "quick")
     for rid, verdict in ((RUN1, "fail"), (RUN2, "pass")):
         (runs / rid / stages.STAGE_ARTIFACT["verify"]).write_text(
             f"---\nstage: verify\nrun_id: {rid}\noverall_status: {verdict}\n---\n",
@@ -130,7 +127,7 @@ def test_en_render_has_no_hangul_in_any_branch(monkeypatch, tmp_path):
         "- PR: merged",
         "- PR: exists but not merged yet (open/closed)",
         "- PR: unknown (no gh / not authenticated / no PR — not a failure)",
-        f"- `requirements.md` (research) — **inherited** ← `{RUN1}`",
+        f"- `run.log` (implement) — **inherited** ← `{RUN1}`",
         "- `verify.md` (verify) — this run",
         "- no runs (no `*-never-ran` directory at all)",
         "- no run left a verify.md (all 0 run(s)) — this task has never been verified",

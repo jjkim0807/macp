@@ -4,7 +4,7 @@
 The whitelist splits on spaces, so the tools are granted through one
 space-free PATH wrapper rule, stages.BROWSER_TOOL_RULE == `Bash(macp-browser:*)`.
 These tests pin which stages get it, that delegate gets nothing broader, that
-research/plan stay read-only and that a task's own list keeps it. The wrapper —
+a task's own list adds to the default and keeps the rule. The wrapper —
 not the rule — is what narrows it to `browser.sh status|up` and the fixed node
 tools, so it is run against a stub folder to pin what it dispatches and what it
 refuses — including the advisory lease that keeps one owner on the one Chrome
@@ -42,14 +42,10 @@ class BrowserToolWiringTest(unittest.TestCase):
                 self.assertEqual(stages._safe_tools(stage).count(RULE), 1)
 
     def test_other_stages_do_not_get_it(self):
-        for stage in ("research", "plan", "report", "discover"):
+        for stage in ("report", "discover"):
             with self.subTest(stage=stage):
                 self.assertNotIn(RULE, stages._safe_tools(stage))
         self.assertNotIn(RULE, stages.FALLBACK_RUNNER_TOOLS)
-
-    def test_research_and_plan_stay_read_only(self):
-        self.assertEqual(stages.STAGE_TOOLS["research"], "Read Write")
-        self.assertEqual(stages.STAGE_TOOLS["plan"], "Read Write")
 
     def test_delegate_gets_no_broad_runner(self):
         granted = stages.STAGE_TOOLS["delegate"].split()
@@ -67,15 +63,14 @@ class BrowserToolWiringTest(unittest.TestCase):
         self.assertEqual(task_validate._check_bash_patterns(RULE), [])
 
     def test_task_override_keeps_the_rule(self):
+        # A task list adds to the implement default: the default (standing
+        # rules included) stays, in order, and the new rule goes after it.
+        default = stages.STAGE_TOOLS["implement"].split()
         self.assertEqual(stages._safe_tools("implement", "Read,Bash(gcloud:*)"),
-                         ["Read", "Bash(gcloud:*)", stages.SMS_TOOL_RULE, RULE,
-                          stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
-                          stages.MAIL_TOOL_RULE])
+                         [*default, "Bash(gcloud:*)"])
+        self.assertEqual(default.count(RULE), 1)
         # Already listed by the task: exactly once.
-        self.assertEqual(stages._safe_tools("implement", f"Read,{RULE}"),
-                         ["Read", RULE, stages.SMS_TOOL_RULE,
-                          stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
-                          stages.MAIL_TOOL_RULE])
+        self.assertEqual(stages._safe_tools("implement", f"Read,{RULE}"), default)
         # Stages a task cannot widen still return their own default untouched.
         self.assertEqual(stages._safe_tools("verify", "Read,Bash(gcloud:*)"),
                          stages.STAGE_TOOLS["verify"].split())
@@ -91,7 +86,7 @@ class BrowserToolWiringTest(unittest.TestCase):
                 env = stages.with_browser_owner(stage, base, "RUNID-x")
                 self.assertEqual(env[OWNER_ENV], "RUNID-x")
                 self.assertEqual(env["PATH"], "/bin")
-        for stage in ("research", "plan", "report", "discover"):
+        for stage in ("report", "discover"):
             with self.subTest(stage=stage):
                 env = stages.with_browser_owner(stage, base, "RUNID-x")
                 self.assertNotIn(OWNER_ENV, env)
@@ -112,7 +107,7 @@ class BrowserToolWiringTest(unittest.TestCase):
                                    f"{stages.BROWSER_CLI} scratch acquire",
                                    f"`{OWNER_ENV}` is already `RUNID-x`", "exit 75"):
                         self.assertIn(needle, text)
-            for stage in ("research", "plan", "report"):
+            for stage in ("report",):
                 with self.subTest(stage=stage):
                     self.assertNotIn("lease acquire", prompt(stage))
                     self.assertNotIn("scratch acquire", prompt(stage))

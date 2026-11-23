@@ -239,7 +239,7 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
     def test_max_turns_reaches_stage_argv(self):
         # End-to-end seam: a task's `max_turns:` must reach `claude --max-turns`
         # for the staged pipeline. Before 2026-11-17 the loader dropped it, so a
-        # task written with `max_turns: 150` still ran plan 40 / verify 50
+        # task written with `max_turns: 150` still ran verify 50 (and, then, plan 40)
         # (dripcoffee-dial-1 failed twice on those caps).
         from todo_system.orchestrator import stages
         big = self._md("big.md", "---\nmax_turns: 150\n---\n# b\n")
@@ -257,9 +257,9 @@ class LoadDispatchablePayloadTest(unittest.TestCase):
             return int(argv[argv.index("--max-turns") + 1])
 
         self.assertEqual(turns("verify", got["big"]), 150)
-        self.assertEqual(turns("plan", got["big"]), 150)
-        # raises, never lowers: implement keeps its 200
-        self.assertEqual(turns("implement", got["big"]), 200)
+        self.assertEqual(turns("report", got["big"]), 150)
+        # raises, never lowers: implement keeps its 250
+        self.assertEqual(turns("implement", got["big"]), 250)
         self.assertEqual(turns("verify", got["bad"]), stages.STAGE_MAX_TURNS["verify"])
 
     def test_reads_each_md_once(self):

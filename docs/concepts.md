@@ -43,7 +43,7 @@ routed to you are parked in your inbox, not executed.
                                                                   │
                          runner picks up TASK_ASSIGN ◄────────────┘
                                    │
-                    research → plan → implement → verify → report
+                    implement → verify → report
                                    │
                   RESULT ──► orchestrator collects ──► ledger: done ──► task md: done
                      │
@@ -95,9 +95,7 @@ derived cache of the task markdown and is **not** migrated either way.
 
 | Stage | Reads | Writes | Job |
 |---|---|---|---|
-| research | task file, vault notes | `requirements.md` | restate the task as checkable requirements |
-| plan | requirements | `implementation_plan.md` | choose the steps and files |
-| implement | plan | code on `worker/<slug>`, `run.log` | make the change, commit |
+| implement | task file, vault notes, the code | `implementation_plan.md`, code on `worker/<slug>`, `run.log` | understand the task, write a short plan, make the change, commit |
 | verify | the diff | `verify.md` | run the project's own checks **locally**, judge against `acceptance_criteria` |
 | report | everything | `report.md`, PR | summarize, push, open the PR, merge if allowed |
 

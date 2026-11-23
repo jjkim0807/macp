@@ -9,10 +9,10 @@ AC#2 has two halves and this file pins both:
   about a description of it.
 * **no agent's tool permissions change.** That is the half a reader cannot check
   by eye six months from now, and the half this wiring would be tempting to
-  "fix" by widening a whitelist instead. So the three permission surfaces are
-  asserted verbatim: ``STAGE_TOOLS["research"]``, ``TASK_TOOLS_STAGES``, and the
-  ``--allowed-tools`` lines of both scripts. If a later change adds Bash to the
-  research stage or a python module to brief's list, this fails.
+  "fix" by widening a whitelist instead. So the permission surfaces are
+  asserted verbatim: ``TASK_TOOLS_STAGES`` and the ``--allowed-tools`` lines of
+  both scripts. If a later change lets a task widen another stage or adds a
+  python module to brief's list, this fails.
 
 Harness shapes copied from ``test_planner_tick_keep_alive.py`` (planner, bash)
 and ``test_split_engine_root_13b.py`` (brief, zsh + a fake ``MACP_PYTHON``).
@@ -59,17 +59,9 @@ no_homebrew_cli = pytest.mark.skipif(
 
 # --- half 1: the permission surfaces, asserted verbatim -------------------------
 
-def test_the_research_stage_still_has_no_bash():
-    """The reason this whole module exists. If research ever gains Bash the
-    engine-side injection is no longer the only way to reach it — and that is a
-    decision for a human, not a side effect of a later refactor."""
-    assert stages.STAGE_TOOLS["research"] == "Read Write"
-    assert "Bash" not in stages.STAGE_TOOLS["research"]
-
-
-def test_a_task_cannot_widen_the_research_stage():
+def test_a_task_can_widen_only_the_implement_stage():
     """`allowed_tools` in a task's frontmatter reaches implement only, so no task
-    can grant research the Bash this wiring works around."""
+    can hand verify/report/discover a tool this wiring would then depend on."""
     assert stages.TASK_TOOLS_STAGES == ("implement",)
 
 

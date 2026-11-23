@@ -50,7 +50,7 @@ def _norm_sid(argv: list[str]) -> list[str]:
 _KW = dict(task_id="slug", run_id="RID", run_dir=Path("/rd"), branch="worker/slug")
 
 
-@pytest.mark.parametrize("stage", ["research", "implement", "verify", "quick", "delegate"])
+@pytest.mark.parametrize("stage", ["report", "implement", "verify", "quick", "delegate"])
 def test_run_stage_argv_is_byte_identical_to_build_stage_argv(fixed, monkeypatch, stage):
     captured = {}
 

@@ -3,8 +3,8 @@ a task `allowed_tools` edit.
 
 The whitelist splits on spaces, so the CLI is granted through one space-free
 PATH wrapper rule, stages.MAIL_TOOL_RULE == `Bash(macp-mail:*)`. These tests pin
-which stages get it, that delegate gets nothing broader, that research/plan
-stay read-only, and that a task's own list keeps it. The wrapper itself ships
+which stages get it, that delegate gets nothing broader, and that a
+task's own list (added to the default) keeps it. The wrapper itself ships
 from its own repo, so there is no wrapper-file test here.
 """
 
@@ -28,22 +28,13 @@ class MailToolWiringTest(unittest.TestCase):
                 self.assertEqual(stages._safe_tools(stage).count(RULE), 1)
 
     def test_other_stages_do_not_get_it(self):
-        for stage in ("research", "plan", "report", "discover"):
+        for stage in ("report", "discover"):
             with self.subTest(stage=stage):
                 self.assertNotIn(RULE, stages._safe_tools(stage))
         self.assertNotIn(RULE, stages.FALLBACK_RUNNER_TOOLS)
 
     def test_is_a_standing_rule(self):
         self.assertIn((RULE, stages.MAIL_TOOL_STAGES), stages._STANDING_RULES)
-
-    def test_research_and_plan_stay_read_only(self):
-        self.assertEqual(stages.STAGE_TOOLS["research"], "Read Write")
-        self.assertEqual(stages.STAGE_TOOLS["plan"], "Read Write")
-        # A task cannot widen them either.
-        for stage in ("research", "plan"):
-            with self.subTest(stage=stage):
-                self.assertEqual(stages._safe_tools(stage, f"Read,{RULE}"),
-                                 ["Read", "Write"])
 
     def test_delegate_gets_no_broad_runner(self):
         granted = stages.STAGE_TOOLS["delegate"].split()
@@ -64,7 +55,8 @@ class MailToolWiringTest(unittest.TestCase):
     def test_task_override_keeps_the_rule(self):
         tools = stages._safe_tools("implement", "Read,Bash(gcloud:*)")
         self.assertEqual(tools.count(RULE), 1)
-        self.assertEqual(tools[-1], RULE)
+        # the task list adds to the default; its new rule goes after it
+        self.assertEqual(tools, [*stages.STAGE_TOOLS["implement"].split(), "Bash(gcloud:*)"])
         # Already listed by the task: exactly once.
         self.assertEqual(stages._safe_tools("implement", f"Read,{RULE}").count(RULE), 1)
         # Stages a task cannot widen still return their own default untouched.

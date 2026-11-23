@@ -171,9 +171,9 @@ DEFAULT_IMPLEMENT_TOOLS = _stages.STAGE_TOOLS["implement"]
 DEFAULT_DELEGATE_TOOLS = _stages.STAGE_TOOLS["delegate"]
 
 # Pipeline shape per worker_mode.
-# - auto: full 5-stage R-P-I-V-Rep (for code-change tasks)
+# - auto: implement → verify → report (for code-change tasks)
 # - delegate: single-stage 'delegate' (for research/update-the-task-file tasks)
-STAGES_AUTO = ("research", "plan", "implement", "verify", "report")
+STAGES_AUTO = ("implement", "verify", "report")
 STAGES_DELEGATE = ("delegate",)
 STAGES_DISCOVER = _stages.STAGES_DISCOVER
 STAGES_BY_MODE = {

@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from todo_system.orchestrator import metrics
+from todo_system.orchestrator import metrics, stages
 
 
 def _write(path: Path, text: str) -> None:
@@ -55,11 +55,13 @@ class PipelineBreakdownTest(unittest.TestCase):
         _ledger(self.led, "ci-fix-delta", "auto", "rejected")
         _ledger(self.led, "gamma", "quick", "done")
 
-        # Runs: A is a full 5-stage run of slug "alpha"; B is a SECOND run of the
+        # The run dirs are the pre-2026-11-23 shape (research and plan were stages
+        # of their own): those dirs are still on disk and the breakdown still reads
+        # them. A is a full 5-stage run of slug "alpha"; B is a SECOND run of the
         # same slug (redispatch) whose stages.json completed only research+plan —
         # even though verify.md exists on disk, it must NOT be counted as a verify
         # CALL, while its bytes and verdict still are. C has no stages.json, so it
-        # falls back to artifact presence (research + implement).
+        # falls back to artifact presence — today's artifacts only (implement).
         _run(self.runs, "20260101T010101-alpha",
              completed=["research", "plan", "implement", "verify", "report"],
              arts={"requirements.md": "R" * 10, "implementation_plan.md": "P" * 20,
@@ -97,16 +99,18 @@ class PipelineBreakdownTest(unittest.TestCase):
 
     def test_stage_calls_prefer_completed_over_artifacts(self):
         # A: 5 from completed. B: only research+plan from completed (verify.md on
-        # disk is ignored for CALLS). C: research+implement from artifact fallback.
+        # disk is ignored for CALLS). C: implement from artifact fallback — its
+        # requirements.md is no stage's artifact any more.
         self.assertEqual(self.bd["stage_calls"],
-                         {"research": 3, "plan": 2, "implement": 2, "verify": 1, "report": 1})
+                         {"research": 2, "plan": 2, "implement": 2, "verify": 1, "report": 1})
 
     def test_stage_bytes_sum_every_artifact_on_disk(self):
         # Bytes count the artifact wherever it exists, independent of `completed`,
         # so verify sums BOTH verify.md files even though verify was 1 call.
+        # Only today's stage artifacts are measured: requirements.md and
+        # implementation_plan.md belong to no stage now.
         self.assertEqual(self.bd["stage_bytes"], {
-            "research": 10 + 7 + 4, "plan": 20 + 3, "implement": 30 + 6,
-            "verify": 21 + 21, "report": 5,
+            "implement": 30 + 6, "verify": 21 + 21, "report": 5,
         })
 
     def test_verify_verdict_tally(self):
@@ -209,7 +213,8 @@ def _usage(i, o, cc, cr, cost):
 class StageUsageBreakdownTest(unittest.TestCase):
     """stage_usage: per-stage token N / Σ / median from stages.json `usage`. A
     run_dir from before instrumentation has none, so it leaves the sample and
-    shows only in the 'k of N run_dirs' line."""
+    shows only in the 'k of N run_dirs' line. The fixture is run dirs written
+    while research and plan were stages: their rows are still read and shown."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -282,9 +287,12 @@ class StageUsageBreakdownTest(unittest.TestCase):
         self.assertIn("| implement | 0 | 1 | — | — | — | — | — | — |", text)
         self.assertIn("| quick | 1 | 0 | 15 (15) | 5 (5) | 5 (5) | 5 (5) | 5 (5) "
                       "| $0.0040 |", text)
-        # STAGES_AUTO order first, anything else after
-        self.assertLess(text.index("| report |"), text.index("| quick |"))
-        self.assertLess(text.index("| research |"), text.index("| plan |"))
+        # STAGES_AUTO order first, anything else after (by name) — the stages of
+        # older run dirs (research, plan) included
+        self.assertLess(text.index("| implement |"), text.index("| report |"))
+        self.assertLess(text.index("| report |"), text.index("| plan |"))
+        self.assertLess(text.index("| plan |"), text.index("| quick |"))
+        self.assertLess(text.index("| quick |"), text.index("| research |"))
 
     def test_a_breakdown_without_stage_usage_still_renders(self):
         text = "\n".join(metrics._breakdown_lines(_FIXTURE))
@@ -300,7 +308,10 @@ class StageUsageBreakdownTest(unittest.TestCase):
         self.assertIn("| research | 2 | 0 |", md)
 
 
-_FULL = ["research", "plan", "implement", "verify", "report"]
+_FULL = list(stages.STAGES_AUTO)
+# The pipeline as it was before research and plan were folded into implement:
+# what the run dirs verify_fail_retry_cost reads were written by.
+_LEGACY_FULL = ["research", "plan", "implement", "verify", "report"]
 
 
 def _run_usage_fixture(runs: Path, name: str, usage: dict, completed=None) -> None:
@@ -308,14 +319,19 @@ def _run_usage_fixture(runs: Path, name: str, usage: dict, completed=None) -> No
         "completed": _FULL if completed is None else completed, "usage": usage})})
 
 
+def _full(other, report) -> dict:
+    """implement and verify get `other`, report gets `report`."""
+    return {**{st: other for st in _FULL[:-1]}, "report": report}
+
+
 def _five(other, report) -> dict:
-    """research..verify all get `other`, report gets `report`."""
-    return {**{st: other for st in _FULL[:4]}, "report": report}
+    """A pre-merge run: research..verify all get `other`, report gets `report`."""
+    return {**{st: other for st in _LEGACY_FULL[:4]}, "report": report}
 
 
 class ReportStageShareTest(unittest.TestCase):
-    """report_stage_share: report's share of the 5-stage pipeline, over full
-    runs only. A: report is 1/3 of io/quota/cost. B: report is 10/810. Pooled and
+    """report_stage_share: report's share of the 3-stage pipeline, over full
+    runs only. A: report is 1/2 of io/quota/cost. B: report is 10/810. Pooled and
     per-run-median ratios therefore diverge; C–F are the four exclusion shapes."""
 
     def setUp(self):
@@ -327,17 +343,17 @@ class ReportStageShareTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _sample(self):
-        _run_usage_fixture(self.runs, "20261001T000001-a", _five(
+        _run_usage_fixture(self.runs, "20261001T000001-a", _full(
             _usage(10, 10, 5, 100, 0.1), _usage(20, 20, 10, 500, 0.2)))
-        _run_usage_fixture(self.runs, "20261001T000002-b", _five(
-            _usage(100, 100, 0, 0, 1.0), _usage(5, 5, 0, 0, 0.05)))
-        _run_usage_fixture(self.runs, "20261001T000003-c", _five(
+        _run_usage_fixture(self.runs, "20261001T000002-b", _full(
+            _usage(200, 200, 0, 0, 2.0), _usage(5, 5, 0, 0, 0.05)))
+        _run_usage_fixture(self.runs, "20261001T000003-c", _full(
             _usage(1, 1, 1, 1, 0.01), {"unavailable": "timeout"}))
         _run_usage_fixture(self.runs, "20261001T000004-d",
                            {"quick": _usage(1, 1, 1, 1, 0.01)}, completed=["quick"])
         _run(self.runs, "20261001T000005-e", completed=_FULL)
-        f = _five(_usage(1, 1, 1, 1, 0.01), _usage(1, 1, 1, 1, 0.01))
-        del f["research"]
+        f = _full(_usage(1, 1, 1, 1, 0.01), _usage(1, 1, 1, 1, 0.01))
+        del f["implement"]
         _run_usage_fixture(self.runs, "20261001T000006-f", f)
         return metrics.report_stage_share(self.runs)
 
@@ -346,57 +362,57 @@ class ReportStageShareTest(unittest.TestCase):
         self.assertEqual((s["run_dirs_n"], s["n"], s["cost_n"]), (6, 2, 2))
         self.assertEqual(s["excluded"],
                          {"no_usage": 1, "not_full_pipeline": 1, "partial_usage": 2})
-        self.assertEqual(s["partial_by_stage"], {"report": 1, "research": 1})
+        self.assertEqual(s["partial_by_stage"], {"report": 1, "implement": 1})
 
     def test_pooled_vs_median_ratios_per_basis(self):
         s = self._sample()
         io = s["bases"]["io"]
-        self.assertEqual((io["report_sum"], io["pipeline_sum"]), (50, 930))
+        self.assertEqual((io["report_sum"], io["pipeline_sum"]), (50, 890))
         self.assertEqual(io["report_median"], 25)
-        self.assertAlmostEqual(io["pooled_ratio"], 0.0538)
-        self.assertAlmostEqual(io["median_run_ratio"], 0.1728)   # (1/3 + 10/810) / 2
+        self.assertAlmostEqual(io["pooled_ratio"], 0.0562)
+        self.assertAlmostEqual(io["median_run_ratio"], 0.2562)   # (1/2 + 10/810) / 2
         q = s["bases"]["quota"]
-        self.assertEqual((q["report_sum"], q["pipeline_sum"]), (60, 960))
-        self.assertAlmostEqual(q["pooled_ratio"], 0.0625)
+        self.assertEqual((q["report_sum"], q["pipeline_sum"]), (60, 910))
+        self.assertAlmostEqual(q["pooled_ratio"], 0.0659)
         a = s["bases"]["all"]
-        self.assertEqual((a["report_sum"], a["pipeline_sum"]), (560, 1860))
-        self.assertAlmostEqual(a["pooled_ratio"], 0.3011)
+        self.assertEqual((a["report_sum"], a["pipeline_sum"]), (560, 1610))
+        self.assertAlmostEqual(a["pooled_ratio"], 0.3478)
         c = s["cost"]
         self.assertAlmostEqual(c["report_sum"], 0.25)
-        self.assertAlmostEqual(c["pipeline_sum"], 4.65)
+        self.assertAlmostEqual(c["pipeline_sum"], 4.45)
         self.assertAlmostEqual(c["report_median"], 0.125)
-        self.assertAlmostEqual(c["pooled_ratio"], 0.0538)
+        self.assertAlmostEqual(c["pooled_ratio"], 0.0562)
 
     def test_verdict_keep_below_threshold(self):
         s = self._sample()
         self.assertEqual((s["primary_basis"], s["verdict"]), ("cost_usd", "keep"))
-        self.assertAlmostEqual(s["primary_ratio"], 0.0538)
+        self.assertAlmostEqual(s["primary_ratio"], 0.0562)
         self.assertEqual(s["threshold"], 0.10)
 
     def test_verdict_de_model_at_or_above_threshold(self):
-        _run_usage_fixture(self.runs, "20261001T000001-a", _five(
+        _run_usage_fixture(self.runs, "20261001T000001-a", _full(
             _usage(10, 10, 5, 100, 0.1), _usage(20, 20, 10, 500, 0.2)))
         s = metrics.report_stage_share(self.runs)
         self.assertEqual((s["n"], s["verdict"]), (1, "de-model"))
-        self.assertAlmostEqual(s["primary_ratio"], 0.3333)
+        self.assertAlmostEqual(s["primary_ratio"], 0.5)
 
     def test_run_missing_one_cost_leaves_cost_but_stays_in_tokens(self):
-        _run_usage_fixture(self.runs, "20261001T000001-a", _five(
+        _run_usage_fixture(self.runs, "20261001T000001-a", _full(
             _usage(10, 10, 0, 0, 0.1), _usage(10, 10, 0, 0, None)))
-        _run_usage_fixture(self.runs, "20261001T000002-b", _five(
+        _run_usage_fixture(self.runs, "20261001T000002-b", _full(
             _usage(10, 10, 0, 0, 0.1), _usage(10, 10, 0, 0, 0.1)))
         s = metrics.report_stage_share(self.runs)
         self.assertEqual((s["n"], s["cost_n"]), (2, 1))
         self.assertEqual(s["bases"]["io"]["report_sum"], 40)
-        self.assertAlmostEqual(s["cost"]["pooled_ratio"], 0.2)
+        self.assertAlmostEqual(s["cost"]["pooled_ratio"], 0.3333)
 
     def test_no_cost_falls_back_to_quota(self):
-        _run_usage_fixture(self.runs, "20261001T000001-a", _five(
+        _run_usage_fixture(self.runs, "20261001T000001-a", _full(
             _usage(100, 100, 0, 0, None), _usage(5, 5, 0, 0, None)))
         s = metrics.report_stage_share(self.runs)
         self.assertEqual((s["cost_n"], s["primary_basis"], s["verdict"]),
                          (0, "quota", "keep"))
-        self.assertAlmostEqual(s["primary_ratio"], 0.0123)
+        self.assertAlmostEqual(s["primary_ratio"], 0.0244)
 
     def test_empty_runs_is_insufficient(self):
         s = metrics.report_stage_share(self.tmp / "nope")
@@ -411,9 +427,9 @@ _VPASS = "---\noverall_status: pass\n---\n"
 def _vrun(runs: Path, name: str, usage: dict | None, verify: str | None = None) -> None:
     """usage=None → stages.json without `usage` (a pre-instrumentation run)."""
     if usage is None:
-        _run(runs, name, completed=_FULL)
+        _run(runs, name, completed=_LEGACY_FULL)
     else:
-        _run_usage_fixture(runs, name, usage)
+        _run_usage_fixture(runs, name, usage, completed=_LEGACY_FULL)
     if verify is not None:
         _write(runs / name / "verify.md", verify)
 

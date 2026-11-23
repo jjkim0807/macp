@@ -899,7 +899,6 @@ def execute_rescope(ledger, vault_root, notify, *, items_dir=None, templates_dir
 # write.
 
 _PLAN_FILENAME = "implementation_plan.md"
-_REQUIREMENTS_FILENAME = "requirements.md"
 _PHASES_H2_RE = re.compile(r"^##\s+Phases\b", re.I)
 # Only the next H2 ends the section: a stray `# …` line in a Phase body (an
 # unfenced shell comment) must not cut it short and silently drop later Phases.
@@ -1047,9 +1046,11 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _plan_refs(run_id: str) -> tuple[str, str]:
-    """Vault-relative paths of a run's plan and requirements."""
-    return (f"Worker/runs/{run_id}/{_PLAN_FILENAME}",
-            f"Worker/runs/{run_id}/{_REQUIREMENTS_FILENAME}")
+    """Vault-relative paths of a run's plan and of the parent task md, which
+    states the requirements (there is no requirements.md since research and plan
+    were folded into implement; a run id is `<timestamp>-<slug>`)."""
+    slug = run_id.split("-", 1)[1] if "-" in run_id else run_id
+    return (f"Worker/runs/{run_id}/{_PLAN_FILENAME}", f"Todo/items/{slug}.md")
 
 
 def _phase_label(group) -> str:

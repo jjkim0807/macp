@@ -273,8 +273,8 @@ def _select_backend(agent: str | None, stage: str, vendors: dict, default):
 
 
 class StagedExecutor(ClaudeCodeExecutor):
-    """live-staged: run the legacy 5-stage pipeline (research → plan → implement
-    → verify → report) via the existing stage prompts, in an isolated worktree,
+    """live-staged: run the staged pipeline (implement → verify → report) via
+    the existing stage prompts, in an isolated worktree,
     and gate success on the verify stage's CI verdict. The faithful port of the
     worker's quality pipeline into v2 — the missing piece for retiring the
     legacy worker (vs. the single-shot Background/ClaudeCode executors). Stage
@@ -294,9 +294,9 @@ class StagedExecutor(ClaudeCodeExecutor):
         - delegate (research / update-the-task-file): one stage.
         - discover (planner-fed project exploration, discovery.py): one stage.
         - trivial/quick (small, well-defined change): one combined `quick` stage
-          instead of the full 5 — cuts cost ~5x for one-liners. Triggered by
+          instead of the full pipeline — cuts cost for one-liners. Triggered by
           worker_mode 'quick' or a 'trivial'/'quick' tag.
-        - otherwise: the full research→plan→implement→verify→report pipeline."""
+        - otherwise: the full implement→verify→report pipeline."""
         p = payload or {}
         wm = (p.get("worker_mode") or "").lower()
         tags = [str(t).lower() for t in (p.get("tags") or [])]
@@ -1397,6 +1397,16 @@ class StagedExecutor(ClaudeCodeExecutor):
             prior_dir, candidates = prior
             if not (repo_url and stages.remote_branch_exists(repo, branch)):
                 candidates = [s for s in candidates if s != "implement"]
+            # A prior implement that only declared the task oversize did no work:
+            # inheriting it would skip the park check below and hand verify a
+            # branch with nothing new on it.
+            try:
+                if rescope.plan_declares_oversize(
+                        (prior_dir / stages.PLAN_ARTIFACT).read_text(
+                            encoding="utf-8", errors="replace")):
+                    candidates = []
+            except OSError:
+                pass
             inherited = stages.inherit_artifacts(prior_dir, run_dir, candidates)
             if inherited:
                 progress(f"resume: inheriting {'+'.join(inherited)} from {prior_dir.name}")
@@ -1600,7 +1610,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                             auto_merge=auto_merge, project_context=project_ctx,
                             allowed_tools=payload.get("allowed_tools"), tier=tier,
                             max_turns=payload.get("max_turns"),
-                            retry_context=(retry_ctx if stage in ("research", "plan", "implement") else ""),
+                            retry_context=(retry_ctx if stage == "implement" else ""),
                             account=backend_acct, cwd=stage_cwd, env=stage_env_run,
                             timeout=stage_timeout, progress=progress)
                     except subprocess.TimeoutExpired as e:
@@ -1845,19 +1855,23 @@ class StagedExecutor(ClaudeCodeExecutor):
                             progress(f"implement rescue: {rescued['note']}")
                     except Exception as e:      # noqa: BLE001 — best-effort, fail open
                         progress(f"implement rescue skipped ({type(e).__name__})")
-                if stage == "plan" and rescope.plan_declares_oversize(
-                        artifact.read_text(encoding="utf-8")):
-                    # The plan DECLARES the task too big for one Implement stage
-                    # (rescope.plan_declares_oversize — the strong phrases only, not
-                    # the template's `## Parallelizable subtasks` heading). Don't run
-                    # Implement: return a benign FAIL+blocked_on in the verify-FAIL
+                plan_art = run_dir / stages.PLAN_ARTIFACT
+                if stage == "implement" and plan_art.exists() \
+                        and rescope.plan_declares_oversize(
+                            plan_art.read_text(encoding="utf-8", errors="replace")):
+                    # The plan implement wrote DECLARES the task too big for one
+                    # stage (rescope.plan_declares_oversize — the strong phrases
+                    # only, not the template's `## Parallelizable subtasks`
+                    # heading); the prompt tells it to stop there without editing.
+                    # Don't run Verify: return a benign FAIL+blocked_on in the
+                    # verify-FAIL
                     # shape (:1368) so collect() parks it as AWAITING_HUMAN without a
                     # refail, and — because the note carries "re-scop"/"exceeds a
                     # single implement stage" — is_oversize_rescope_park recognises
                     # it, so a later rescope.json auto-splits it (hand-split compat).
                     blocked = ("task exceeds a single Implement stage — needs "
-                               "re-scoping (plan stage)")
-                    progress(f"plan declares oversize — skipping implement: {blocked}")
+                               "re-scoping (plan)")
+                    progress(f"plan declares oversize — skipping verify: {blocked}")
                     # Leave the machine-readable split plan, built from this plan's
                     # `### Phase N:` headings, so collect() hands the park to the
                     # auto-split sweep instead of a ⛔ (rescope.write_plan_rescope).

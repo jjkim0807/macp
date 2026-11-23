@@ -171,7 +171,7 @@ def test_gemini_runs_the_read_only_stage_capability_check_cleanly():
     # where it actually runs, not a missing capability.
     g = ab.GeminiAgentBackend()
     assert ab.missing_capabilities(g, "quick") == []
-    assert ab.missing_capabilities(g, "research") == []   # has tool_allowlist
+    assert ab.missing_capabilities(g, "verify") == []   # has tool_allowlist
 
 
 # ---- end-to-end routing: an `agent: gemini` quick task completes (AC #2) ----

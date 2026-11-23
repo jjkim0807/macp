@@ -62,7 +62,7 @@ def test_no_hold_no_wait_no_note():
     c = _Clock()
     notes = []
     assert runner_mod._wait_for_session_headroom(
-        "research", {}, notes.append, gate=lambda: None, sleep=c.sleep, clock=c)
+        "implement", {}, notes.append, gate=lambda: None, sleep=c.sleep, clock=c)
     assert notes == [] and c.t == 1_000_000.0
 
 
@@ -82,12 +82,12 @@ def test_bounded_by_the_window_reset_and_the_cap():
     c = _Clock()
     gate = _gate_seq(*([("x", c.t + 120)] * 1000))
     notes = []
-    assert runner_mod._wait_for_session_headroom("plan", {}, notes.append, gate=gate,
+    assert runner_mod._wait_for_session_headroom("verify", {}, notes.append, gate=gate,
                                                  sleep=c.sleep, clock=c)
     assert "proceeding" in notes[-1] and c.t - 1_000_000.0 <= 5 * 60
     c2 = _Clock()
     gate2 = _gate_seq(*([("x", c2.t + 10 * 3600)] * 10_000))
-    assert runner_mod._wait_for_session_headroom("plan", {}, lambda _n: None, gate=gate2,
+    assert runner_mod._wait_for_session_headroom("verify", {}, lambda _n: None, gate=gate2,
                                                  sleep=c2.sleep, clock=c2)
     assert c2.t - 1_000_000.0 <= runner_mod.STAGE_GATE_MAX_S + 60
 
@@ -95,12 +95,12 @@ def test_bounded_by_the_window_reset_and_the_cap():
 def test_bypass_guard_and_switch_never_wait(monkeypatch):
     c = _Clock()
     gate = _gate_seq(("x", c.t + 3600))
-    assert runner_mod._wait_for_session_headroom("plan", {"bypass_guard": True},
+    assert runner_mod._wait_for_session_headroom("verify", {"bypass_guard": True},
                                                  lambda _n: None, gate=gate,
                                                  sleep=c.sleep, clock=c)
     assert gate.calls == []
     monkeypatch.setenv(runner_mod.STAGE_GATE_ENV, "0")
-    assert runner_mod._wait_for_session_headroom("plan", {}, lambda _n: None, gate=gate,
+    assert runner_mod._wait_for_session_headroom("verify", {}, lambda _n: None, gate=gate,
                                                  sleep=c.sleep, clock=c)
     assert gate.calls == []
 
@@ -110,13 +110,13 @@ def test_cancel_during_wait_stops():
     gate = _gate_seq(*([("x", c.t + 3600)] * 10))
     with mock.patch.object(runner_mod, "_cancel_requested_now", return_value=True):
         assert runner_mod._wait_for_session_headroom(
-            "plan", {}, lambda _n: None, gate=gate, sleep=c.sleep, clock=c) is False
+            "verify", {}, lambda _n: None, gate=gate, sleep=c.sleep, clock=c) is False
 
 
 def test_gate_error_fails_open():
     def boom():
         raise RuntimeError("guard down")
-    assert runner_mod._wait_for_session_headroom("plan", {}, lambda _n: None, gate=boom)
+    assert runner_mod._wait_for_session_headroom("verify", {}, lambda _n: None, gate=boom)
 
 
 def test_stage_loop_pauses_before_a_claude_stage(vault, tmp_path):  # noqa: F811
@@ -166,7 +166,7 @@ def test_stage_loop_pauses_before_a_claude_stage(vault, tmp_path):  # noqa: F811
             mock.patch.object(StagedExecutor, "_live_sibling_hold", return_value=None),
             mock.patch.object(StagedExecutor, "_acquire_checkout_lease", return_value=None),
             mock.patch.object(runner_mod.disk_guard, "ensure_free_space", return_value={}),
-            mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("research",)),
+            mock.patch.object(StagedExecutor, "_pipeline_for", return_value=("implement",)),
             mock.patch("todo_system.worker.runner_heartbeat_start"),
             mock.patch.object(stages, "run_stage_subprocess", side_effect=fake_run),
             mock.patch("subprocess.run", side_effect=fake_run),
@@ -177,4 +177,4 @@ def test_stage_loop_pauses_before_a_claude_stage(vault, tmp_path):  # noqa: F811
         StagedExecutor().execute(msg, _agent(), progress=progress.append)
     first_stage = order.index("stage")
     assert order[:first_stage] == ["gate:held", "gate:go"], order
-    assert any("pausing before stage research" in p for p in progress), progress
+    assert any("pausing before stage implement" in p for p in progress), progress

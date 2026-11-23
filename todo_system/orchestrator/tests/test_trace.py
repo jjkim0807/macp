@@ -37,25 +37,26 @@ class TraceTest(unittest.TestCase):
         for rid in RUN_IDS:
             (self.runs / rid).mkdir()
         # run 1 ran everything and verified FAIL
-        self._research(RUN_IDS[0], author=RUN_IDS[0])
+        self._implement(RUN_IDS[0])
         self._verify(RUN_IDS[0], "fail")
-        # runs 2-4 inherited run 1's research; none of them verified
+        # runs 2-4 inherited run 1's implement; none of them verified
         for rid in RUN_IDS[1:4]:
-            self._research(rid, author=RUN_IDS[0], inherited_from=RUN_IDS[0])
+            self._implement(rid, inherited_from=RUN_IDS[0])
         # run 5 inherited too, and verified PASS
-        self._research(RUN_IDS[4], author=RUN_IDS[0], inherited_from=RUN_IDS[0])
+        self._implement(RUN_IDS[4], inherited_from=RUN_IDS[0])
         self._verify(RUN_IDS[4], "pass")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _research(self, run_id, *, author, inherited_from=None):
-        p = self.runs / run_id / stages.STAGE_ARTIFACT["research"]
-        p.write_text(f"---\nstage: research\nrun_id: {author}\n---\n\n# R\n본문\n",
-                     encoding="utf-8")
+    def _implement(self, run_id, *, inherited_from=None):
+        # run.log carries no frontmatter; an inherited copy is marked by the
+        # append-safe boundary line (stages.APPENDED_ARTIFACTS)
+        p = self.runs / run_id / stages.STAGE_ARTIFACT["implement"]
+        p.write_text("\n=== implement (rc=0) ===\n본문\n", encoding="utf-8")
         if inherited_from:
-            stages.stamp_inherited(p, inherited_from)
-        stages.record_stage(self.runs / run_id, "research")
+            stages.stamp_inherited(p, inherited_from, appended=True)
+        stages.record_stage(self.runs / run_id, "implement")
 
     def _verify(self, run_id, verdict):
         # shape copied from a real verify.md — it DOES carry run_id, which is what
@@ -109,10 +110,10 @@ class TraceTest(unittest.TestCase):
 
     def test_unstamped_copy_is_flagged_not_silently_trusted(self):
         # a pre-stamp inheritance: the file says another run wrote it, no stamp
-        p = self.runs / RUN_IDS[4] / stages.STAGE_ARTIFACT["plan"]
-        p.write_text(f"---\nstage: plan\nrun_id: {RUN_IDS[0]}\n---\n\n# P\n",
+        p = self.runs / RUN_IDS[4] / stages.STAGE_ARTIFACT["report"]
+        p.write_text(f"---\nstage: report\nrun_id: {RUN_IDS[0]}\n---\n\n# P\n",
                      encoding="utf-8")
-        stages.record_stage(self.runs / RUN_IDS[4], "plan")
+        stages.record_stage(self.runs / RUN_IDS[4], "report")
         md = self._render()
         self.assertIn("출처 불명", md)
         self.assertIn(RUN_IDS[0], md)

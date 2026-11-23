@@ -1211,7 +1211,7 @@ class RetryReconfirmTest(unittest.TestCase):
     def test_blocked_reply_parks_instead_of_retrying(self):
         # bean-cards-2 (2026-08-05): verify measured origin/main, found the
         # upstream PR unmerged, created no branch and said so in `blocked_on`.
-        # Retrying re-bought research+plan+implement against the same gap.
+        # Retrying re-bought implement against the same gap.
         a = self.orch.dispatch(Task("armchair-commander"))
         self.mb.send(m.Envelope(to=m.ORCHESTRATOR, type=m.FAIL, frm="armchair-commander",
                                 task_id=a.task_id, corr_id=a.corr_id,
@@ -2257,7 +2257,7 @@ class ReviewNotifyTest(unittest.TestCase):
     def test_the_artifact_comes_from_the_last_completed_stage(self):
         """A full 5-stage run points at report.md — mapping, not a new hardcode."""
         sent = self._collect(m.RESULT, self._payload(
-            stages=["research", "plan", "implement", "verify", "report"]))
+            stages=["implement", "verify", "report"]))
         self.assertIn("report.md", sent[0])
 
     def test_rebase_conflict_summary_rides_into_the_parked_note(self):
@@ -2268,7 +2268,7 @@ class ReviewNotifyTest(unittest.TestCase):
         summary = ("staged pipeline complete (5 stages) — 동시 실행 충돌 — 겹침 오판 "
                    "(rebase 충돌; 자동 해결 안 함, 사람 검토)")
         self._collect(m.RESULT, self._payload(
-            stages=["research", "plan", "implement", "verify", "report"],
+            stages=["implement", "verify", "report"],
             summary=summary, pr_url="https://x/pull/9"))
         row = self.ledger.load("t")
         self.assertEqual(row.state, A.AWAITING_HUMAN)
@@ -2316,7 +2316,7 @@ class ReviewNotifyTest(unittest.TestCase):
         a = self.orch.dispatch(Task("t", {"summary": "x"}))
         msg = m.Envelope(to=m.ORCHESTRATOR, type=m.FAIL, frm="w", task_id="t",
                          corr_id=a.corr_id,
-                         payload={"stages": ["research", "plan", "implement"],
+                         payload={"stages": ["implement"],
                                   "run_dir": "/v/Worker/runs/x-t"})
         self.orch._notify_review(a, msg)
 
@@ -2387,7 +2387,7 @@ class NoOpCloseNotifyTest(unittest.TestCase):
     def _payload(self, **kw):
         p = {"branch": "worker/t", "run_dir": "/v/Worker/runs/20261107T233711-t",
              "repo": "git@github.com:x/y.git",
-             "stages": ["research", "plan", "implement", "verify", "report"]}
+             "stages": ["implement", "verify", "report"]}
         p.update(kw)
         return p
 
@@ -2474,7 +2474,7 @@ class AlertKindStampTest(unittest.TestCase):
         a = self.orch.dispatch(Task("t", {"summary": "x"}))
         msg = m.Envelope(to=m.ORCHESTRATOR, type=m.FAIL, frm="w", task_id="t",
                          corr_id=a.corr_id,
-                         payload={"stages": ["research", "plan", "implement"],
+                         payload={"stages": ["implement"],
                                   "run_dir": "/v/Worker/runs/x-t"})
         self.orch._notify_review(a, msg)
         self.assertEqual(a.last_alert_kind, "failure-suspected")
