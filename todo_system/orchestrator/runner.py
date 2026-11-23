@@ -1597,10 +1597,16 @@ class StagedExecutor(ClaudeCodeExecutor):
                     # stages — byte-identical to the inline path. A non-claude CLI runs in
                     # the checkout (working_dir) with plain stage_env: it does not use the
                     # claude tool wrappers, so the owner env would be dead weight.
+                    # The recall layer rides the same way: the stages that hold the
+                    # macp-recall rule get this run's recall.log and the task slug, so
+                    # each lookup is recorded where the report stage counts them.
                     stage_cwd = (str(stages._VAULT_DATA_ROOT) if is_claude
                                  else (working_dir or str(stages._VAULT_DATA_ROOT)))
-                    stage_env_run = (stages.with_emulator_owner(
-                        stage, stages.with_browser_owner(stage, stage_env, run_id), run_id)
+                    stage_env_run = (stages.with_recall_env(
+                        stage, stages.with_emulator_owner(
+                            stage, stages.with_browser_owner(stage, stage_env, run_id),
+                            run_id),
+                        run_dir, msg.task_id)
                         if is_claude else stage_env)
                     stage_started = time.monotonic()
                     try:

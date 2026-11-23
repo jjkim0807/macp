@@ -173,7 +173,7 @@ def test_literal_argv_implement_mcp_on_usage_on(monkeypatch, tmp_path):
         "Bash(pnpm:*)", "Bash(node:*)", "Bash(npx:*)", "Bash(flutter:*)",
         "Bash(dart:*)", "Bash(macp-sms:*)", "Bash(macp-browser:*)",
         "Bash(macp-remote-gate:*)", "Bash(macp-emulator:*)", "Bash(macp-mail:*)",
-        "mcp__macp-browser__*",
+        "Bash(macp-recall:*)", "mcp__macp-browser__*",
         "--add-dir", str(wr),
     ]
 

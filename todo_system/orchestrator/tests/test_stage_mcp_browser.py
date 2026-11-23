@@ -160,7 +160,7 @@ class StageMcpWiringTest(unittest.TestCase):
         self.assertEqual(tools[:-1], [*default, "Bash(gcloud:*)"])
         for rule in (stages.SMS_TOOL_RULE, stages.BROWSER_TOOL_RULE,
                      stages.REMOTE_GATE_TOOL_RULE, stages.EMULATOR_TOOL_RULE,
-                     stages.MAIL_TOOL_RULE):
+                     stages.MAIL_TOOL_RULE, stages.RECALL_TOOL_RULE):
             self.assertIn(rule, tools)
         self.assertEqual(tools[-1], "mcp__macp-browser__*")
 
