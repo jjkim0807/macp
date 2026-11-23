@@ -70,7 +70,7 @@ related:
 | ③ | **방향 선택** — 설계 갈림길, 정보 부족 | 스테이지에서 사람에게 묻는 채널이 없다. 질문 도구 AskUserQuestion 은 `-p` 에서 **권한 호스트가 있을 때만** 제공되는데(V3) 지금 argv 엔 호스트가 없다. 백그라운드를 켰던 시절의 헤드리스는 "Awaiting user input." 으로 끝났다(`stages.py:3113-3116`). 그래서 에이전트는 추측하거나 `blocked_on` 으로 파킹된다 | ⛔ 1회(`blocked_on` 인 경우), 그 뒤 AWAITING_HUMAN 재알림 백오프(기본 1d/3d/7d — `orchestrator.py:1770-1772`, `:1823-1843`) | `/decide`(reply 는 `kind: human` 일 때만 — `decide.md:25-35`), `human reply` CLI(`concepts.md:182-190`), md 수정 + resume. 셋 다 터미널이 필요하다 | 파이프라인 전체 |
 | ④ | **로그인·2FA·캡차** | 2FA **인증번호**는 사람이 필요 없다 — 상시 규칙 `macp-sms`·`macp-mail` 로 읽는다(`stages.py:280-298`; (볼트) CLAUDE.md §11·§11b). **로그아웃**이면 에이전트는 로그인하지 않고 멈춰 `blocked_on` 을 쓴다(메타데이터 `stages.py:619-621`). 사람은 (볼트) CLAUDE.md §12 의 재로그인 절차를 밟는다. 캡차·폰 앱 간편인증은 같은 모양으로 보이나 엔진 경로로 확인하지 못했다 — 미확인 | browser_watch 경보(볼트 운영 — 미확인) + ⛔ | 재로그인 뒤 `cli resume` | 파이프라인 전체 |
 | ⑤ | (부수) **스테이지 타임아웃** — 사람 입력은 아니지만 "기다림 = 프로세스 종료"라는 구조가 같다 | 러너가 `TimeoutExpired` 를 잡아 implement 면 WIP rescue → `checkpoint_push`(`runner.py:1324-1387`). 연속 2회면 파킹(`orchestrator.py:1233-1244`) | 2회째 파킹 때 경보(`:1244`) | 1회째는 `_retry` 가 origin/<branch> 를 이어받는다(`runner.py:1130-1142` "CONTINUE it") | 끊긴 스테이지의 세션 문맥과 그 스테이지의 미커밋 작업(implement 외) |
-| ⑥ | (부수) **러너 재시작 뒤 재전달** | 지금 NEEDS_INPUT 을 보내는 유일한 곳(`runner.py:2309-2332`). FAIL 이 아닌 이유가 주석에 있다 — FAIL 이면 `_retry` 로 가서 막으려던 재실행을 일으킨다(`:2317-2321`). collect 가 AWAITING_HUMAN 으로 바꾼다(`orchestrator.py:1185-1186`) | **없음** — collect 의 NEEDS_INPUT 분기는 상태만 바꾸고, 첫 재알림은 백오프가 지난 뒤다(`:1823-1843`) | 사람이 판단해 resume | 사람이 resume 하면 ①과 같다 |
+| ⑥ | (부수) **러너 재시작 뒤 재전달** | 지금 NEEDS_INPUT 을 보내는 유일한 곳(`runner.py:2309-2332`). FAIL 이 아닌 이유가 주석에 있다 — FAIL 이면 `_retry` 로 가서 막으려던 재실행을 일으킨다(`:2317-2321`). collect 가 AWAITING_HUMAN 으로 바꾼다(`orchestrator.py:1185-1186`). **2026-11-23 이후 바뀜**: ORPHAN(같은 호스트·pid 죽음)은 `FAIL` 로 답해 `_retry` 가 다시 디스패치하고, UNKNOWN 만 NEEDS_INPUT 이다 | **없음** — collect 의 NEEDS_INPUT 분기는 상태만 바꾸고, 첫 재알림은 백오프가 지난 뒤다(`:1823-1843`) | 사람이 판단해 resume | 사람이 resume 하면 ①과 같다 |
 
 **읽는 법.** ①~④ 는 처리 모양이 하나다 — **스테이지가 끝나야** 사람에게 닿고, 답은 **터미널**로만 돌아오며,
 돌아온 답은 **새 run_id** 에서만 효과가 난다. 엔진이 "사람이 필요하다"를 런 **중간에** 아는 경로는 하나도 없다.
@@ -82,7 +82,7 @@ related:
 | **`_retry`** (verify FAIL, 일반 실패) | retry_context 로 넘기는 진단문뿐 | 새 run_id · 새 corr_id · `attempts+1`. 직전 verify 가 FAIL 이면 research·plan·implement·verify 전부 | `orchestrator.py:1728-1767`, `stages.py:2520-2537`, `runner.py:1126-1144` |
 | **`cli resume --after-commit`** | 직전 run 의 verify 가 FAIL 이 아니면 completed 스테이지 — implement 는 origin/<branch> 가 있을 때만(`runner.py:1145-1158`) | 새 run_id. `refail_count=0 → state=FAILED → blocked_on=''` 순서로 바꾼 뒤 일반 디스패치(`resume.py:320-333`) | `stages.py:2511-2539`, `resume.py:382-394` |
 | **타임아웃·용량 재시도** | origin/<branch> 의 커밋(rescue + checkpoint) | 끊긴 스테이지를 새 세션으로 처음부터 | `runner.py:1360-1378`, `:1449-1466`, `:1130-1142` |
-| **재전달 NEEDS_INPUT** | 런을 다시 돌리지 않는다(그것이 목적) | 사람이 resume 하면 위 둘째 행 | `runner.py:2309-2332` |
+| **재전달 NEEDS_INPUT** (2026-11-23 이후 UNKNOWN 판정만 — ORPHAN 은 `FAIL` 이라 첫 행) | 런을 다시 돌리지 않는다(그것이 목적) | 사람이 resume 하면 위 둘째 행 | `runner.py:2309-2332` |
 
 **언제나 버리는 것** 셋이 있다. ⓐ **스테이지 세션 문맥** — 호출마다 `--session-id` 를 새로 받는다
 (`stages.py:696-700`). 같은 세션을 다시 여는 코드는 엔진 어디에도 없다. ⓑ **이미 쓴 턴** — implement 상한 200턴
@@ -401,7 +401,7 @@ V3 에서 결정에 쓰인 사실을 더 적는다. ⓐ 한 턴에 호출이 여
 
 | 상태 \ 사건 | 러너 재시작 | 대시보드 재시작 | 오케스트레이터 재시작 | 호스트 재부팅 |
 |---|---|---|---|---|
-| **인라인 대기 중** | 스테이지 프로세스 트리가 죽는다 — 러너 유닛은 KillMode=control-group 으로 서술돼 있다(`jobs.py:111-116`, 실제 유닛 설정은 미확인). 대기 중이던 권한 프롬프트는 답 없이 끝난다(V2). 카드는 디스크에 남고 재전달 NEEDS_INPUT(`runner.py:2309-2332`)이 AWAITING_HUMAN 으로 만든다. sweep 이 그 런의 열린 카드를 입양하고, 답이 오면 `--resume` + `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`(V2)로 잇는다 | 대기와 무관하다(저장소는 파일). 진행 중이던 POST 는 실패할 수 있고, 재전송은 409 와 함께 기존 결정을 받는다 | 무관(틱은 원래 일회성) | 러너 재시작과 대시보드 재시작을 합친 것과 같다 |
+| **인라인 대기 중** | 스테이지 프로세스 트리가 죽는다 — 러너 유닛은 KillMode=control-group 으로 서술돼 있다(`jobs.py:111-116`, 실제 유닛 설정은 미확인). 대기 중이던 권한 프롬프트는 답 없이 끝난다(V2). 카드는 디스크에 남고 재전달 NEEDS_INPUT(`runner.py:2309-2332`)이 AWAITING_HUMAN 으로 만든다(2026-11-23 이후 이 전제는 바뀌었다 — 같은 호스트의 죽은 런은 ORPHAN → `FAIL` → `_retry` 로 새 런이 돈다). sweep 이 그 런의 열린 카드를 입양하고, 답이 오면 `--resume` + `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`(V2)로 잇는다 | 대기와 무관하다(저장소는 파일). 진행 중이던 POST 는 실패할 수 있고, 재전송은 409 와 함께 기존 결정을 받는다 | 무관(틱은 원래 일회성) | 러너 재시작과 대시보드 재시작을 합친 것과 같다 |
 | **일시정지 중** | 무관 — 도는 프로세스가 없다. 세션은 30일 보존(V3), 카드는 디스크 | 무관 | 무관 | 무관 |
 | **답은 왔지만 sweep 전** | 무관 — `answer.json` 이 있고 `consumed` 가 없으니 다음 sweep 이 한 번 소비한다 | 무관 | 다음 틱이 소비한다 | 무관 |
 

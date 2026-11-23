@@ -157,14 +157,15 @@ class RunnerClaimTest(unittest.TestCase):
         self.assertEqual(self.ex.calls, [])           # the pipeline did NOT re-run
         self.assertEqual(self.mb.receive(self.agent.id), [])   # and it is consumed
         replies = self.mb.receive(m.ORCHESTRATOR)
-        self.assertEqual([r.type for r in replies], [m.NEEDS_INPUT])
+        # FAIL: a dead run takes the orchestrator's ordinary retry path instead
+        # of waiting for a person. Same keys as before, so no new flag rides along.
+        self.assertEqual([r.type for r in replies], [m.FAIL])
+        self.assertEqual(sorted(replies[0].payload),
+                         ["claim", "evidence", "reason", "redelivered", "verdict"])
         self.assertEqual(replies[0].payload["verdict"], claims.ORPHAN)
         self.assertTrue(replies[0].payload["redelivered"])
         self.assertEqual(replies[0].payload["claim"]["task_id"], "core-loop")
         self.assertIn("4242", replies[0].payload["evidence"])
-        # never FAIL: orchestrator._retry() would re-dispatch the task, which is
-        # the very re-run this whole mechanism exists to prevent.
-        self.assertNotIn(m.FAIL, [r.type for r in replies])
 
     def test_live_run_is_left_alone_and_recorded(self):
         msg = self._assign()
@@ -179,6 +180,29 @@ class RunnerClaimTest(unittest.TestCase):
         hist = self.runner.claims.read(msg.msg_id)["redeliveries"]
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["verdict"], claims.LIVE)
+
+    def test_unknown_verdict_still_asks_a_human(self):
+        msg = self._assign()
+        # claimed on another host: its pid cannot be probed from here, so the run
+        # may still be alive and nothing may start a second copy.
+        self.runner.claims.open(msg, pid=4242, host="some-other-box")
+
+        self.assertEqual(self.runner.poll_once(), 1)
+
+        self.assertEqual(self.ex.calls, [])
+        [reply] = self.mb.receive(m.ORCHESTRATOR)
+        self.assertEqual((reply.type, reply.payload["verdict"]),
+                         (m.NEEDS_INPUT, claims.UNKNOWN))
+
+    def test_parallel_poll_answers_an_orphan_the_same_way(self):
+        msg = self._assign()
+        self.runner.claims.open(msg, pid=4242)
+
+        with self._dead_pid():
+            self.assertEqual(self.runner.poll_parallel(1), 1)
+
+        self.assertEqual(self.ex.calls, [])
+        self.assertEqual([r.type for r in self.mb.receive(m.ORCHESTRATOR)], [m.FAIL])
 
     def test_corrupt_cursor_leaves_the_claim_as_the_only_defence(self):
         # `_load_seen` swallows JSONDecodeError and returns an empty set, so a
@@ -207,7 +231,7 @@ class RunnerClaimTest(unittest.TestCase):
 
         self.assertEqual(self.ex.calls, [])
         self.assertEqual([r.type for r in self.mb.receive(m.ORCHESTRATOR)],
-                         [m.NEEDS_INPUT])
+                         [m.FAIL])
 
     # -- direction 2: an UNCLAIMED envelope keeps at-least-once ------------
     def test_unstarted_message_is_never_acked_or_claimed(self):

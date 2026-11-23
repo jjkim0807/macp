@@ -22,7 +22,7 @@ from todo_system import usage_guard, vault_git_lock, worker
 from todo_system.orchestrator import orchestrator as orch_mod
 from todo_system.orchestrator import assignment as A
 from todo_system.orchestrator import message as m
-from todo_system.orchestrator import dashboard, repos, stages, tasks, trace
+from todo_system.orchestrator import claims, dashboard, repos, stages, tasks, trace
 from todo_system.orchestrator.assignment import Assignment, Ledger
 from todo_system.orchestrator.lease import Lease
 from todo_system.orchestrator.mailbox import FileMailbox
@@ -41,7 +41,7 @@ from todo_system.orchestrator.orchestrator import (
     _touches_disjoint,
 )
 from todo_system.orchestrator.registry import Agent, Registry
-from todo_system.orchestrator.runner import BackgroundClaudeExecutor, make_executor
+from todo_system.orchestrator.runner import BackgroundClaudeExecutor, Runner, make_executor
 
 # Sentinel for _hermetic_tick(usage_hold=...): leave the real `usage_hold()` in
 # place because the test patches something deeper down that seam.
@@ -503,6 +503,33 @@ class OrchestratorTest(unittest.TestCase):
                                 corr_id=a.corr_id))
         self.orch.collect()
         self.assertEqual(self.ledger.load(a.task_id).state, A.AWAITING_HUMAN)
+
+    def test_orphan_redelivery_is_redispatched_without_parking(self):
+        # A runner died mid-run and restarted: its un-acked envelope comes back
+        # with the claim still on disk. Real Runner.poll_once + real tick(): the
+        # dead run is retried by the ordinary FAIL path, never parked for a person.
+        agent = self.reg.get("armchair-commander")
+        runner = Runner(self.mb, agent, make_executor("shadow"), log=lambda *_: None,
+                        ledger_root=self.ledger.root)
+        task = Task(agent.id, {"task_path": self._md("status: open\n")})
+        with mock.patch.object(tasks, "task_status", return_value="open"):
+            _hermetic_tick(self.orch, [task])                     # dispatched
+            first = self.ledger.load(task.slug)
+            [env] = self.mb.receive(agent.id)
+            runner.claims.open(env, pid=4242)     # the run started, then its process died
+            with mock.patch.object(claims, "_alive_default", lambda pid: False):
+                self.assertEqual(runner.poll_once(), 1)           # redelivered -> ORPHAN
+            _hermetic_tick(self.orch, [task], live=("collect",))  # the reply is collected
+        row = self.ledger.load(task.slug)
+        self.assertEqual((row.state, row.attempts), (A.DISPATCHED, 2))
+        self.assertNotEqual(row.corr_id, first.corr_id)
+        self.assertNotIn(m.NEEDS_INPUT, [h["type"] for h in row.history])
+        self.assertEqual(row.last_alert_kind, "")                 # no human alert framing
+        [again] = self.mb.receive(agent.id)                       # exactly one fresh envelope
+        self.assertEqual(again.corr_id, row.corr_id)
+        self.assertEqual(runner.poll_once(), 1)                   # unclaimed: it really runs
+        self.assertEqual([r.type for r in self.mb.receive(m.ORCHESTRATOR)],
+                         [m.ACCEPT, m.PROGRESS, m.RESULT])
 
     def test_human_dispatch_parks_and_nudges(self):
         a = self.orch.dispatch(Task("withdrawal-a2-final-decision",
