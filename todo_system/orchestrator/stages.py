@@ -388,8 +388,8 @@ RECALL_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 # Where a stage's calls are recorded, and whose task the stage is running (that
 # task's own document is left out of an answer): handed to the CLI through the
 # stage env (with_recall_env). The names are todo_system.recall's LOG_ENV /
-# TASK_ENV / LOG_FILENAME — mirrored, not imported, like the worker constants
-# above, and a test pins the two modules together.
+# TASK_ENV / LOG_FILENAME — spelled again here rather than imported (this module
+# imports no sibling at the top), and a test pins the two modules together.
 RECALL_LOG_ENV = "MACP_RECALL_LOG"
 RECALL_TASK_ENV = "MACP_RECALL_TASK"
 RECALL_LOG_FILENAME = "recall.log"

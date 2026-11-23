@@ -41,7 +41,8 @@ Environment (read at call time):
                      document is left out of the answer
 
 Exit status: 0 when the question was answered (no results included), 1 when the
-index could not be read (the reason is one line on stderr), 2 on a usage error.
+lookup could not be made (no index, a failing query — the reason is one line on
+stderr, never a traceback), 2 on a usage error.
 
     macp-recall "gradle daemon disappeared during the beta build"
     macp-recall "room migration test seam" --k 8
@@ -365,10 +366,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         answer = search(query, k=k, root=named,
                         exclude=(os.environ.get(TASK_ENV, "").strip(),))
-    except RecallUnavailable as exc:
+    except Exception as exc:    # noqa: BLE001 - one line for the agent, never a traceback
+        reason = (str(exc) if isinstance(exc, RecallUnavailable)
+                  else f"unexpected {type(exc).__name__}: {exc}")
         if log is not None:
-            append_log(log, query=query, k=k, results=(), error=str(exc))
-        print(f"macp-recall: {exc}", file=sys.stderr)
+            append_log(log, query=query, k=k, results=(), error=reason)
+        print(f"macp-recall: {_clip(reason, 2 * NOTE_MAX_CHARS)}", file=sys.stderr)
         return 1
     page = render(query, answer, root=named if named is not None else rc.vault_root())
     sys.stdout.write(page.text)

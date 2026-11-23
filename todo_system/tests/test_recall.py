@@ -538,6 +538,27 @@ def test_a_failed_call_is_logged_with_its_reason(vault, tmp_path, monkeypatch, c
     assert entry["error"].startswith("no memory index at ")
 
 
+def test_an_unexpected_failure_is_one_line_and_still_logged(vault, tmp_path, monkeypatch, capsys):
+    _write_task(vault.root)
+    _embed(vault.root)
+    log = tmp_path / recall.LOG_FILENAME
+    monkeypatch.setenv(recall.LOG_ENV, str(log))
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("query layer exploded\nwith a second line")
+
+    monkeypatch.setattr(gm, "query_related", _boom)
+
+    assert recall.main([QUERY]) == 1
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ("macp-recall: unexpected RuntimeError: query layer exploded "
+                            "with a second line\n")
+    (entry,) = _log_lines(log)
+    assert entry["results"] == [] and entry["error"].startswith("unexpected RuntimeError")
+
+
 def test_an_unwritable_log_does_not_fail_the_lookup(vault, tmp_path, monkeypatch, capsys):
     _write_task(vault.root)
     _embed(vault.root)
