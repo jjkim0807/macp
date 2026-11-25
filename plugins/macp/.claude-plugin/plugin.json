@@ -1,0 +1,13 @@
+{
+  "name": "macp",
+  "version": "0.1.0",
+  "description": "Run the macp CLI from any Claude Code session: /macp init, /macp add \"<sentence>\", /macp up --once, /macp status",
+  "author": {
+    "name": "The macp authors",
+    "url": "https://github.com/jjkim0807/macp"
+  },
+  "homepage": "https://github.com/jjkim0807/macp",
+  "repository": "https://github.com/jjkim0807/macp",
+  "license": "MIT",
+  "keywords": ["macp", "worker", "tasks", "orchestration"]
+}
