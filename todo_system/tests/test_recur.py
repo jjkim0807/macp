@@ -291,8 +291,8 @@ def test_a_date_only_scheduled_moves_too():
 
 
 def test_what_one_round_owns_alone_does_not_travel():
-    # A second file naming the same tracker issue would be updated, and reported
-    # done, in place of the first.
+    # The copy must not carry the closed round's completion stamp or claim its
+    # external identity.
     text = ("---\nstatus: done\nexternal_ref: jira:PROJ-123\n"
             "external_updated_at: 2026-11-20T10:00:00Z\n"
             'completed: "2026-11-27 10:40"\nrecur: weekly\n---\nbody\n')

@@ -12,7 +12,6 @@ import pytest
 from todo_system import cli, graph_memory, session_log, worker
 from todo_system.frontmatter_lists import parse_inline_list
 from todo_system.orchestrator import repos
-from todo_system.trackers import base as trackers_base
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +79,9 @@ PARSERS = [
     pytest.param(lambda c: worker.parse_frontmatter(c)[0], id="worker"),
     pytest.param(lambda c: session_log.parse_frontmatter(c)[0], id="session_log"),
     pytest.param(lambda c: graph_memory.parse_frontmatter(c)[0], id="graph_memory"),
-    pytest.param(lambda c: trackers_base.parse_frontmatter(c)[0], id="trackers_base"),
     pytest.param(_repos_yaml, id="repos_yaml"),
 ]
-HAND_PARSERS = PARSERS[:5]
+HAND_PARSERS = PARSERS[:4]
 
 
 def _doc(*lines: str) -> str:
@@ -92,7 +90,7 @@ def _doc(*lines: str) -> str:
     return "---\n" + "\n".join(lines) + "\n---\n# T\n"
 
 
-# Block fixtures use UNQUOTED items on purpose: cli and trackers.base do not
+# Block fixtures use UNQUOTED items on purpose: cli does not
 # strip quotes off block-list items, so a quoted block item would differ from
 # the inline form for reasons unrelated to this change.
 LIST_CASES = [

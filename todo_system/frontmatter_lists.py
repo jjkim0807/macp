@@ -1,7 +1,7 @@
 """One-line YAML flow lists (``key: [a, b]``) for the hand-rolled frontmatter parsers.
 
 The engine has several small line-based ``parse_frontmatter`` functions
-(``cli``, ``worker``, ``session_log``, ``graph_memory``, ``trackers.base``).
+(``cli``, ``worker``, ``session_log``, ``graph_memory``).
 They all understand block lists::
 
     tags:

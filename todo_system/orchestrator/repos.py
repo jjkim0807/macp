@@ -192,20 +192,6 @@ def read_task_model_tier(md_path: str | Path) -> str | None:
     return task_model_tier_from_fm(_frontmatter(md_path))
 
 
-def task_agent_from_fm(fm: dict) -> str | None:
-    v = _clean(fm.get("agent"))
-    return v.lower() if v else None
-
-
-def read_task_agent(md_path: str | Path) -> str | None:
-    """A task's `agent:` — the vendor id the stages run as ('claude' default, or
-    'upstage' for the Solar single-stage path; see orchestrator.solar_stage).
-    Lowercased; None when absent/placeholder. Like `model_tier` this only RIDES
-    the payload (tasks.load_dispatchable) — the runner decides what to do with
-    it; a value the runner does not route simply runs the normal claude path."""
-    return task_agent_from_fm(_frontmatter(md_path))
-
-
 def task_max_turns_from_fm(fm: dict) -> int | None:
     """A task's `max_turns:` as a positive int, else None. The legacy worker
     honoured it as a per-task turn budget (worker.py); the staged pipeline

@@ -28,12 +28,10 @@ You write tasks as small markdown files. macp then:
 
 macp aims to be **orthogonal to the coding agent**. The agent writes the code; macp
 decides what gets worked on, with which resources, and when. Agents sit behind an
-`Executor` interface, and stage execution behind a vendor-neutral `AgentBackend`.
-[Claude Code](https://code.claude.com) (`claude -p`) runs every stage; a task can route a
-stage to another agent by its `agent:` frontmatter or account — the Gemini CLI on the
-`quick` lane today — and a dispatch-time capability gate refuses a backend that can't meet
-a stage's needs (e.g. the tool allowlist a read-only stage relies on) instead of silently
-weakening it.
+`Executor` interface, and stage execution behind an `AgentBackend` interface.
+[Claude Code](https://code.claude.com) (`claude -p`) runs every stage; a dispatch-time
+capability gate refuses a backend that can't meet a stage's needs (e.g. the tool allowlist
+a read-only stage relies on) instead of silently weakening it.
 
 **In use.** From 2026-07-20 to 2026-10-20 the author's instance completed **1,080
 tasks** on its own across **22 independent repositories**. In October 2026 that was
@@ -66,13 +64,9 @@ directory you own: tasks, memory, run records, secrets. This repository is the e
 and holds no personal data. [How it works](docs/concepts.md) has the full picture.
 
 Orchestration state — the assignment ledger, the mailboxes and the planner's notes —
-is **git-backed by default**, living in the vault tree (`Worker/assignments/`,
-`Worker/agents/`) so a second host can take over from git alone. Setting
-`MACP_STATE_BACKEND=external` (or `state_backend = "external"` in `.macp/config.toml`)
-instead keeps it in a host-local SQLite file outside the vault tree
-(`~/.local/share/macp/state.sqlite`, overridable with `MACP_STATE_SQLITE_PATH`), so a
-stray `git checkout`/`reset`/`stash` can never resurrect an acked message or rewind
-the ledger; the derived `todo.db` task cache is unaffected either way.
+is **git-backed**, living in the vault tree (`Worker/assignments/`, `Worker/agents/`)
+so a second host can take over from git alone; the derived `todo.db` task cache is
+rebuilt from the task markdown.
 
 ## Try it in five minutes
 

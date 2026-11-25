@@ -12,6 +12,12 @@ related:
 
 # 그래프 메모리 v2 — 설계 노트
 
+> **전제 일부 철회(2026-11-25).** 이 초안이 기반으로 삼은 외부 상태 저장소(external 모드 `state.sqlite`와
+> ⑦ 본부 HTTP 상태 API)는 사용 0회로 엔진에서 삭제됐다. 철회 기록은 `docs/design/state-store.md`에
+> 있다. 이미 구현된 leaf(G1~G4)는 git 모드 `Memory/relations.sqlite` 위에 있다. external 축에 기대는
+> 나머지(§3.4의 같은 DB 공동 배치·원격 질의, §4.2의 G5, §4.3의 external 이관)는 구현 전에 다시
+> 설계해야 한다.
+
 > **이 노트의 성격**: 분석·설계 전용. 이 태스크는 코드를 한 줄도 바꾸지 않는다 —
 > `docs/design/graph-memory.md` 한 파일만 추가한다. 실제 구현은 §4 분할안의 후속
 > leaf 가, 설계 머지 뒤 **사람이 게이트를 풀 때** 맡는다. 본문의 `파일:줄` 앵커는 전부
@@ -397,7 +403,7 @@ G4 평가 하니스(`eval_memory table`)가 **2026-11-09 골든셋으로 채운 
 
 임베더는 설정값 **`MACP_EMBEDDER=hash|local|vertex`** 로 선택 가능하다(`todo_system/graph_memory.py`
 의 호출 시점 해석 — 색인·질의 양쪽이 같은 백엔드를 따른다). 선택 우선순위는 **① env `MACP_EMBEDDER`
-→ ② `.macp/config.toml` 의 `embedder` 키(영속 설정, `paths.state_backend` 와 같은 패턴) → ③ 기본값
+→ ② `.macp/config.toml` 의 `embedder` 키(영속 설정, `paths.repo_slug` 와 같은 패턴) → ③ 기본값
 `hash`** 이며, 두 소스 중 어느 쪽이든 알 수 없는 이름은 조용히 hash 로 떨어지지 않고 `ValueError` 로
 거부한다. **기본값은 `hash` 그대로**다(아래는
 권장일 뿐 전환이 아니다). dim 이 달라지는 백엔드로 바꿀 때는 vec0 를 `--rebuild` 로 재구축한다.

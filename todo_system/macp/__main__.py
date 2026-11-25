@@ -10,7 +10,6 @@
   python -m todo_system.macp account list [--profile P]        # one detailed line per account
   python -m todo_system.macp account status [--profile P]      # resolved active account + runtime state
   python -m todo_system.macp account remove NAME [--profile P] # drop from the profile (dir left on disk)
-  python -m todo_system.macp account probe NAME [--tier T]     # one real Solar call → one line of JSON
   python -m todo_system.macp use PROFILE            # set the global default profile
 
 `account add` for a claude account without --config-dir creates
@@ -28,7 +27,6 @@ anything and never deletes or moves a file.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -170,18 +168,8 @@ def _account_line(x, active_name, state) -> str:
     and the live parallel ``slots=used/max``. A non-claude account keeps the
     short ``name [agent]: command`` form. The config dir stays immediately after
     ``[agent]: `` so the terse form remains a prefix of the rich one, and
-    ``slots`` is last so appending it never disturbs the earlier tokens.
-
-    An upstage account has no config dir and no auth files; it gets its own form
-    carrying ``priority``, where its API key would come FROM (``key=env|file|
-    missing`` — :func:`accounts.key_source`, origin only) and the resolved
-    tier→model mapping. Neither the key nor the key file's path is printed."""
+    ``slots`` is last so appending it never disturbs the earlier tokens."""
     mark = "* " if x.name == active_name else "  "
-    if x.agent == "upstage":
-        models = "/".join(C.solar_model_for(x, t)
-                          for t in ("heavy", "standard", "light"))
-        return (f"{mark}{x.name} [{x.agent}]: priority={getattr(x, 'priority', 100)} "
-                f"key={ACC.key_source(x)} models={models}")
     if x.agent != "claude":
         return f"{mark}{x.name} [{x.agent}]: {x.command or '(no command)'}"
     cfg = x.claude_config_dir or ACC.LEGACY_CONFIG_DIR   # shown as configured; existence uses the resolved dir
@@ -194,24 +182,6 @@ def _account_line(x, active_name, state) -> str:
             f"slots={_slots_for(x.name)}")
 
 
-def _parse_models(spec: str) -> dict:
-    """``'light=solar-mini4-260922,heavy=solar-pro4-260806'`` → dict, or
-    ValueError with a one-line reason. An unknown tier is rejected rather than
-    stored: a typo would otherwise sit in the profile doing nothing."""
-    out: dict[str, str] = {}
-    for part in (p.strip() for p in spec.split(",")):
-        if not part:
-            continue
-        tier, sep, model = part.partition("=")
-        tier, model = tier.strip(), model.strip()
-        if not sep or not tier or not model:
-            raise ValueError(f"--models entry {part!r} is not 'tier=model'")
-        if tier not in C.SOLAR_TIER_MODELS:
-            raise ValueError(f"--models: unknown tier {tier!r}")
-        out[tier] = model
-    return out
-
-
 def _cmd_account(a) -> int:
     if a.action == "env":
         return _cmd_account_env(a)
@@ -221,8 +191,6 @@ def _cmd_account(a) -> int:
         return _cmd_account_status(a)
     if a.action == "remove":
         return _cmd_account_remove(a)
-    if a.action == "probe":
-        return _cmd_account_probe(a)
     prof = C.load_profile(a.profile)
     if not prof:
         print(f"error: profile '{a.profile}' not found (macp profile add {a.profile})")
@@ -239,7 +207,7 @@ def _cmd_account(a) -> int:
         return 0
     if not a.name:
         print("usage: macp account add NAME [--agent V] [--profile P] [--config-dir D] "
-              "[--command T] [--priority N] [--key-file F] [--models tier=model,…]")
+              "[--command T] [--priority N]")
         return 2
     if any(x.name == a.name for x in prof.accounts):
         print(f"account '{a.name}' already exists in profile '{a.profile}'")
@@ -268,27 +236,12 @@ def _cmd_account(a) -> int:
     else:
         # Explicit --config-dir (register only, as before) or a non-claude agent.
         config_dir = a.config_dir if a.config_dir is not None else ACC.LEGACY_CONFIG_DIR
-    try:
-        models = _parse_models(getattr(a, "models", "") or "")
-    except ValueError as e:
-        print(f"error: {e}")
-        print("usage: --models tier=model[,tier=model]  (tiers: "
-              + " | ".join(C.SOLAR_TIER_MODELS) + ")")
-        return 2
     priority = getattr(a, "priority", None)
     prof.accounts.append(C.Account(
         name=a.name, agent=a.agent, claude_config_dir=config_dir,
-        command=a.command or "", priority=100 if priority is None else priority,
-        key_file=getattr(a, "key_file", "") or "", models=models))
+        command=a.command or "", priority=100 if priority is None else priority))
     C.write_profile(prof)
-    if a.agent == "claude":
-        detail = config_dir
-    elif a.agent == "upstage":
-        # the key file's path is operator-facing config, not the secret; the
-        # VALUE is never read here (accounts.read_api_key does that at call time)
-        detail = f"key file {a.key_file or ACC.DEFAULT_UPSTAGE_KEY_FILE}"
-    else:
-        detail = a.command
+    detail = config_dir if a.agent == "claude" else a.command
     print(f"added account '{a.name}' [{a.agent}] ({detail}) to profile '{a.profile}'")
     print(f"  profile '{a.profile}' now has {len(prof.accounts)} account(s) "
           f"= parallel capacity {len(prof.accounts)}x")
@@ -299,42 +252,6 @@ def _cmd_account(a) -> int:
     if login_hint:
         print(f"  next: {login_hint}")
     return 0
-
-
-def _cmd_account_probe(a) -> int:
-    """``account probe NAME`` — ONE real chat completion through an upstage
-    account, printed as one line of JSON: ``ok``, the model that answered,
-    ``elapsed_s``, token counts and ``error_kind``. This is the only path that
-    spends a live API call, so it never retries (the measured tier 429s after
-    ~45 consecutive calls, and ``error_kind: "rate_limit"`` is itself the result
-    worth recording).
-
-    rc 0 = the call succeeded, 1 = it failed (the JSON says how), 2 = no such
-    upstage account, 3 = no key available — in which case nothing is called and
-    the key file's path is named so a human knows where to put it.
-    """
-    prof = C.load_profile(a.profile)
-    if not prof:
-        print(f"error: profile '{a.profile}' not found (macp profile add {a.profile})")
-        return 2
-    if not a.name:
-        print("usage: macp account probe NAME [--profile P] [--tier T] [--prompt P]")
-        return 2
-    acct = next((x for x in prof.accounts if x.name == a.name), None)
-    if acct is None:
-        print(f"error: no account '{a.name}' in profile '{a.profile}'")
-        return 2
-    if acct.agent != "upstage":
-        print(f"error: account '{a.name}' is [{acct.agent}]; probe needs an upstage account")
-        return 2
-    if ACC.read_api_key(acct) is None:
-        print(f"probe: skipped (no {ACC.UPSTAGE_KEY_ENV} in the env or "
-              f"{ACC.upstage_key_file(acct)})")
-        return 3
-    from . import upstage as UP
-    res = UP.chat(a.prompt, account=acct, tier=a.tier)
-    print(json.dumps({"account": a.name, "tier": a.tier, **res}, sort_keys=False))
-    return 0 if res.get("ok") else 1
 
 
 def _cmd_account_env(a) -> int:
@@ -665,31 +582,20 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--model")
     pp.set_defaults(fn=_cmd_profile)
 
-    pa = sub.add_parser("account", help="manage a profile's agent accounts (multi-vendor, parallel)")
+    pa = sub.add_parser("account", help="manage a profile's agent accounts (parallel capacity)")
     pa.add_argument("action",
-                    choices=["add", "list", "env", "use", "status", "remove", "probe"])
+                    choices=["add", "list", "env", "use", "status", "remove"])
     pa.add_argument("name", nargs="?")
     pa.add_argument("--profile", default="default")
     pa.add_argument("--agent", default="claude",
-                    help="vendor: claude | codex | cursor | gemini | aider | upstage | custom")
+                    help="backend id (default claude; a non-claude CLI agent needs --command)")
     pa.add_argument("--config-dir", default=None,
                     help="CLAUDE_CONFIG_DIR for a claude account (default: "
                          "<accounts_root>/NAME created with the shared layout)")
     pa.add_argument("--command", default="", help="invocation template for non-claude ('{prompt}')")
     pa.add_argument("--priority", type=int, default=None,
                     help="selection order among the profile's accounts (lower first, "
-                         "default 100); give an upstage account a HIGHER number to "
-                         "keep it behind the claude default")
-    pa.add_argument("--key-file", default="",
-                    help="path to the file holding `UPSTAGE_API_KEY=…` (0600) for an "
-                         "upstage account; only the PATH is stored — the key value "
-                         "never enters the profile, a log, a commit or a PR")
-    pa.add_argument("--models", default="",
-                    help="model_tier overrides, 'tier=model' comma-separated "
-                         "(e.g. light=solar-mini4-260922,heavy=solar-pro4-260806)")
-    pa.add_argument("--tier", default="light", choices=["heavy", "standard", "light"],
-                    help="model_tier for `account probe` (default: light)")
-    pa.add_argument("--prompt", default="ping", help="prompt for `account probe`")
+                         "default 100)")
     pa.set_defaults(fn=_cmd_account)
 
     pm = sub.add_parser("memory", help="manage this project's .macp/memory/")

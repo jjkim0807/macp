@@ -58,12 +58,8 @@ class MacpTest(unittest.TestCase):
         C.write_profile(prof)
         loaded = C.load_profile("work")
         self.assertEqual([a.name for a in loaded.accounts], ["a", "b"])
-        pc = C.ProjectConfig(profile="work", account="b")
-        self.assertEqual(C.account_for(loaded, pc).name, "b")   # pinned wins
-        self.assertIn(C.account_for(loaded, C.ProjectConfig(profile="work"), "t").name,
-                      {"a", "b"})   # else round-robin
 
-    def test_multivendor_accounts_and_invocation(self):
+    def test_multivendor_accounts_roundtrip(self):
         C = self.C
         prof = C.Profile(name="mix")
         prof.accounts = [C.Account("cc", agent="claude", claude_config_dir="~/.claude-2"),
@@ -73,18 +69,6 @@ class MacpTest(unittest.TestCase):
         loaded = C.load_profile("mix")
         self.assertEqual([(a.name, a.agent) for a in loaded.accounts],
                          [("cc", "claude"), ("cx", "codex"), ("cd", "claude")])
-        # claude w/ NON-default config dir → claude -p + CLAUDE_CONFIG_DIR override
-        argv, env = C.build_invocation(loaded.accounts[0], "do it", ["--model", "x"])
-        self.assertEqual(argv[:3], ["claude", "-p", "do it"])
-        self.assertIn("--model", argv)
-        self.assertIn("CLAUDE_CONFIG_DIR", env)
-        # claude w/ DEFAULT ~/.claude → NO override (else it ignores the keychain auth)
-        _, env_def = C.build_invocation(loaded.accounts[2], "do it")
-        self.assertNotIn("CLAUDE_CONFIG_DIR", env_def)
-        # codex → its own command, claude flags ignored
-        argv2, _ = C.build_invocation(loaded.accounts[1], "do it", ["--model", "x"])
-        self.assertEqual(argv2, ["codex", "exec", "do it"])
-        self.assertNotIn("--model", argv2)
 
     def test_project_memory_and_context_linkage(self):
         from todo_system.macp import memory as MEM

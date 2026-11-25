@@ -25,11 +25,9 @@ The planes talk only through **messages** (`TASK_ASSIGN`, `PROGRESS`, `RESULT`,
 `NEEDS_INPUT`, …) in file mailboxes, and through the ledger. A runner does not know how
 tasks are chosen, and the orchestrator does not know how code gets written. That
 separation is what keeps macp independent of any particular agent. The runner calls an
-`Executor` (`todo_system/orchestrator/runner.py`), and stage execution sits behind a
-vendor-neutral `AgentBackend` (`todo_system/orchestrator/agent_backend.py`). Claude Code
-(`claude -p`) runs every stage; a task may route a stage to another agent by its `agent:`
-frontmatter or account — the Gemini CLI on the `quick` lane, and the Upstage Solar HTTP
-backend on `quick`/`delegate` — and a capability gate refuses, before dispatch, a backend
+`Executor` (`todo_system/orchestrator/runner.py`), and stage execution sits behind an
+`AgentBackend` (`todo_system/orchestrator/agent_backend.py`). Claude Code
+(`claude -p`) runs every stage; a capability gate refuses, before dispatch, a backend
 that can't meet a stage's required capabilities (e.g. the tool allowlist a read-only stage
 needs) rather than silently dropping the guarantee.
 
@@ -81,17 +79,10 @@ Ledger states: `dispatched`, `accepted`, `in_progress`, `done`, `failed`, `rejec
 orchestrator owns it. To change what happens to a task, edit its markdown or reply
 through the human CLI.
 
-By default this state is **git-backed**: the ledger lives in the vault tree as
+This state is **git-backed**: the ledger lives in the vault tree as
 `Worker/assignments/*.json` and the mailboxes as `Worker/agents/*/inbox/*.json`,
 committed and synced like everything else, so a second host can take over from git
-alone. An **opt-in external backend** (`MACP_STATE_BACKEND=external`, or
-`state_backend = "external"` in `.macp/config.toml`) instead keeps the ledger,
-mailbox and planner state in a single host-local SQLite file *outside* the vault
-tree (`~/.local/share/macp/state.sqlite` by default, overridable with
-`MACP_STATE_SQLITE_PATH`). That removes the one git-manipulation hazard the git
-backend carries — a stray `checkout`, `reset --hard` or `stash` in the vault can no
-longer resurrect an already-acked message or rewind the ledger. `todo.db` is a
-derived cache of the task markdown and is **not** migrated either way.
+alone. `todo.db` is a derived cache of the task markdown.
 
 ## The staged pipeline
 

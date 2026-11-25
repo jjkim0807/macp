@@ -13,8 +13,8 @@ from .accounts import (  # noqa: F401
 from .config import (  # noqa: F401
     Account, Profile, ProjectConfig,
     HOME, PROFILES, PROJECT_DIR, WORKER_MODES,
-    account_for, active_config_dir, active_credentials_file, active_token_file,
-    build_invocation, current_account, default_profile, find_project_root,
+    active_config_dir, active_credentials_file, active_token_file,
+    current_account, default_profile, find_project_root,
     list_profiles, load_profile, load_project, resolve, set_default_profile,
     write_profile, write_project,
 )

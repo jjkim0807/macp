@@ -1,27 +1,19 @@
-"""Git-op regression suite for the state store — leaf ⑥, design §⑤.
+"""Git-op regression suite for the git state store.
 
-Three vault git operations the design calls out — an old worker-branch
-checkout → return (§5.1), a `git reset --hard` (§5.2), and a `git stash push -u`
-/ apply (§5.3) — are automated against a throwaway git vault (``tmp_path``), once
-per backend:
+Three vault git operations — an old worker-branch checkout → return (§5.1), a
+`git reset --hard` (§5.2), and a `git stash push -u` / apply (§5.3) — are
+automated against a throwaway git vault (``tmp_path``):
 
-* **external mode** proves the authoritative state (the host-local SQLite ledger
-  and mailbox, kept *outside* the vault tree) is INVARIANT under every vault git
-  op — the win this backend buys (acceptance #1).
-* **git mode** is a phenomenon-pinning control (acceptance #2): it reproduces the
-  file-level resurrection / rollback of the TRACKED ledger + inbox the git
-  backend is still exposed to, AND pins that the gitignored reader cursor
-  (`Worker/agents/_state/<agent>/cursor.json`, `seen` + ack tombstones —
-  mailbox.py:47-55) survives those ops and still suppresses re-delivery. Both
-  backends' tests PASS: the "RED control" pins existing behaviour, it is not a
-  failing test.
+* **git mode** pins the phenomenon: it reproduces the file-level resurrection /
+  rollback of the TRACKED ledger + inbox the git backend is exposed to, AND pins
+  that the gitignored reader cursor (`Worker/agents/_state/<agent>/cursor.json`,
+  `seen` + ack tombstones — mailbox.py:47-55) survives those ops and still
+  suppresses re-delivery. The tests PASS: they pin existing behaviour.
 
 Mirrors the fixtures in ``todo_system/orchestrator/tests/test_state_store.py``
 and is stdlib-only (``subprocess`` / ``json`` + pytest), so
 ``scripts/check_engine_isolation.sh`` stays ``RESULT: PASS``. Every store is built
-on a tmp vault; nothing uses the real ``vault_root``, and the SQLite file lives
-OUTSIDE the vault working tree (``tmp_path/"state.sqlite"``, a sibling of
-``vault/``) so a tree op cannot reach it.
+on a tmp vault; nothing uses the real ``vault_root``.
 """
 
 from __future__ import annotations
@@ -40,7 +32,6 @@ from todo_system.orchestrator.assignment import (
 from todo_system.orchestrator.mailbox import DEFAULT_ROOT
 from todo_system.orchestrator.message import Envelope
 from todo_system.orchestrator.state_store import GitStateStore
-from todo_system.orchestrator.state_store_sqlite import ExternalStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +101,6 @@ def _git_store(vault):
     return GitStateStore(vault, planner_state_path=vault / "planner_state.json")
 
 
-def _external_store(vault, tmp_path):
-    # A git vault is still needed: the git OPS run on the tree. The SQLite lives
-    # OUTSIDE it (sibling of vault/), so a tree op cannot reach it.
-    _git_vault(vault)
-    return ExternalStateStore(sqlite_path=tmp_path / "state.sqlite", vault_root=vault)
-
-
 def _inbox_path(vault, agent, msg):
     return vault / "Worker" / "agents" / agent / "inbox" / f"{msg.msg_id}.json"
 
@@ -171,40 +155,6 @@ def test_checkout_old_branch_git_resurrects_inbox_but_cursor_suppresses(vault):
     assert not path_m.exists()  # gone again on main
 
 
-def test_checkout_old_branch_external_leaves_sqlite_invariant(vault, tmp_path):
-    """external: the SQLite ledger/mailbox live outside the tree, so an old
-    worker-branch checkout → return cannot touch them. msg_m stays permanently
-    consumed (row deleted) — no tombstone needed."""
-    store = _external_store(vault, tmp_path)
-    mb, led = store.mailbox(), store.ledger()
-
-    msg_m = Envelope(to="orchestrator", type=m.TASK_ASSIGN, task_id="A")
-    msg_n = Envelope(to="orchestrator", type=m.PING)
-    mb.send(msg_m)  # SQLite rows; nothing in the tree
-    mb.send(msg_n)
-    led.save(_assignment(IN_PROGRESS))
-    mb.ack("orchestrator", msg_m)  # SqliteMailbox DELETEs the msg_m row
-
-    before_led = led.load("A").to_json()
-    before_recv = [e.msg_id for e in mb.receive("orchestrator")]
-    assert before_recv == [msg_n.msg_id]
-
-    # A real tree swap: a dummy tracked file that differs between the branches.
-    (vault / "dummy.txt").write_text("v1\n", encoding="utf-8")
-    _commit(vault, "dummy v1")
-    _git(vault, "branch", "worker/old")
-    (vault / "dummy.txt").write_text("v2\n", encoding="utf-8")
-    _commit(vault, "dummy v2")
-    _git(vault, "checkout", "-q", "worker/old")
-    assert (vault / "dummy.txt").read_text() == "v1\n"  # the tree really moved
-    _git(vault, "checkout", "-q", "main")
-    assert (vault / "dummy.txt").read_text() == "v2\n"
-
-    assert led.load("A").to_json() == before_led
-    assert led.load("A").state == IN_PROGRESS
-    assert [e.msg_id for e in mb.receive("orchestrator")] == before_recv
-
-
 # ---------------------------------------------------------------------------
 # §5.2 — git reset --hard
 # ---------------------------------------------------------------------------
@@ -233,34 +183,6 @@ def test_reset_hard_git_rolls_back_ledger_but_cursor_suppresses(vault):
     assert led.load("A").state == DISPATCHED  # rolled back with the tree
     # The cursor is gitignored → untouched by reset --hard → still suppresses.
     assert _inbox_path(vault, "orchestrator", msg_m).is_file()
-    assert mb.receive("orchestrator") == []
-
-
-def test_reset_hard_external_leaves_sqlite_invariant(vault, tmp_path):
-    """external: reset only rewinds the tree, which holds no ledger in external
-    mode → SQLite ledger/mailbox byte-identical, A's progress state preserved."""
-    store = _external_store(vault, tmp_path)
-    mb, led = store.mailbox(), store.ledger()
-
-    msg_m = Envelope(to="orchestrator", type=m.TASK_ASSIGN, task_id="A")
-    mb.send(msg_m)
-    mb.ack("orchestrator", msg_m)  # SqliteMailbox deletes the row
-    led.save(_assignment(DISPATCHED))
-    led.save(_assignment(IN_PROGRESS))
-    before_led = led.load("A").to_json()
-    assert led.load("A").state == IN_PROGRESS
-    assert mb.receive("orchestrator") == []
-
-    # Two dummy tracked commits so `reset --hard HEAD~1` actually rewinds a tree.
-    (vault / "dummy.txt").write_text("v1\n", encoding="utf-8")
-    _commit(vault, "dummy v1")
-    (vault / "dummy.txt").write_text("v2\n", encoding="utf-8")
-    _commit(vault, "dummy v2")
-    _git(vault, "reset", "--hard", "HEAD~1")
-    assert (vault / "dummy.txt").read_text() == "v1\n"  # the tree really rewound
-
-    assert led.load("A").to_json() == before_led
-    assert led.load("A").state == IN_PROGRESS  # SQLite untouched
     assert mb.receive("orchestrator") == []
 
 
@@ -299,34 +221,4 @@ def test_stash_git_removes_dirty_ledger_but_cursor_suppresses(vault):
     _git(vault, "stash", "apply", _stash_ref(vault, "macp-test-5-3"))
     assert led.load("A").state == FAILED  # dirty edit restored
     assert (vault / "Worker" / "assignments" / "scratch.tmp").exists()
-    assert mb.receive("orchestrator") == []
-
-
-def test_stash_external_leaves_sqlite_invariant(vault, tmp_path):
-    """external: stash only moves tree changes → SQLite ledger/mailbox invariant
-    across `stash push -u` and `apply`."""
-    store = _external_store(vault, tmp_path)
-    mb, led = store.mailbox(), store.ledger()
-
-    msg_m = Envelope(to="orchestrator", type=m.TASK_ASSIGN, task_id="A")
-    mb.send(msg_m)
-    mb.ack("orchestrator", msg_m)
-    led.save(_assignment(IN_PROGRESS))
-    before_led = led.load("A").to_json()
-    assert mb.receive("orchestrator") == []
-
-    (vault / "dummy.txt").write_text("v1\n", encoding="utf-8")
-    _commit(vault, "dummy v1")
-    (vault / "dummy.txt").write_text("dirty\n", encoding="utf-8")  # tracked, dirty
-    (vault / "untracked.tmp").write_text("x\n", encoding="utf-8")  # untracked
-    _git(vault, "stash", "push", "-u", "-m", "macp-test-5-3-ext")
-    assert (vault / "dummy.txt").read_text() == "v1\n"  # the tree really cleaned
-    assert not (vault / "untracked.tmp").exists()
-
-    assert led.load("A").to_json() == before_led
-    assert led.load("A").state == IN_PROGRESS  # SQLite outside the tree → invariant
-    assert mb.receive("orchestrator") == []
-
-    _git(vault, "stash", "apply", _stash_ref(vault, "macp-test-5-3-ext"))
-    assert led.load("A").to_json() == before_led  # still invariant
     assert mb.receive("orchestrator") == []
