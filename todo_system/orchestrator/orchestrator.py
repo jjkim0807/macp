@@ -1561,6 +1561,14 @@ class Orchestrator:
                         run_dir = str((msg.payload or {}).get("run_dir") or "").strip()
                         if run_dir:
                             a.payload["last_run_dir"] = Path(run_dir).name
+                        # A remote runner's park (macbook·desktop-wsl) carried its
+                        # split plan INLINE because its run dir lives on another host
+                        # — HQ has no rescope.json to read. Restore it to HQ's own run
+                        # dir now, BEFORE _rescope_pending, so that gate and
+                        # reconcile_rescope run the ordinary local path exactly as for
+                        # an HQ run. No field (HQ run, or no viable plan) → no-op.
+                        self._persist_remote_rescope(
+                            run_dir, (msg.payload or {}).get("rescope"))
                         # Auto-rescope: if the park carries a viable plan, suppress the
                         # ⛔ (stamp ALERT_RESCOPE_PENDING instead) and let
                         # reconcile_rescope split the task; otherwise alert as before.
@@ -1901,6 +1909,24 @@ class Orchestrator:
         self._notify_routed(text, link,
                             event_key=f"review:{a.last_alert_kind}:{a.task_id}",
                             cooldown_s=REVIEW_RENOTIFY_COOLDOWN_S)
+
+    def _persist_remote_rescope(self, run_dir: str, plan) -> None:
+        """A remote runner's plan-stage park carried its split plan inline (its run
+        dir lives on another host, so HQ has no rescope.json). Write it to HQ's own
+        `Worker/runs/<run-id>/rescope.json` using the SAME run-id basename collect()
+        stored as `last_run_dir`, so `_rescope_pending` and `reconcile_rescope` find
+        it on the ordinary local path. Best-effort: never raises into collect, does
+        nothing without a dict `plan`, and `save_remote_rescope` never overwrites an
+        HQ run's own file — so the existing HQ path is untouched."""
+        try:
+            if not run_dir or not isinstance(plan, dict):
+                return
+            from . import rescope
+            runs_dir = Path(self.ledger.root).parent / "runs"
+            rescope.save_remote_rescope(runs_dir, Path(run_dir).name, plan)
+        except Exception as e:  # noqa: BLE001 — never break collect
+            print(f"[orchestrator] _persist_remote_rescope skipped "
+                  f"({type(e).__name__}: {e})")
 
     def _rescope_pending(self, a: Assignment, run_dir: str) -> bool:
         """True if this blocked park carries a machine-readable split plan that is
