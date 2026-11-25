@@ -13,7 +13,6 @@ set -uo pipefail
 # unchanged behaviour).
 ENGINE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VAULT_DIR="${MAESTRO_VAULT_DIR:-${MACP_VAULT_ROOT:-$ENGINE_DIR}}"
-LOG_DIR="$VAULT_DIR/logs"
 
 # The orchestrator resolves its defaults (ledger, registry, dashboard paths,
 # hq-host marker, the git pull) against its cwd, so the cwd stays the vault and
@@ -47,7 +46,6 @@ if [[ "$VAULT_DIR" != "$ENGINE_DIR" ]]; then
 fi
 
 cd "$VAULT_DIR" || exit 1
-mkdir -p "$LOG_DIR"
 
 if [[ "$INSTALLED" -eq 1 ]]; then
   M=("$MACP_PYTHON" -P -m todo_system.orchestrator.orchestrator
@@ -56,12 +54,12 @@ else
   M=(uv run --project "$ENGINE_DIR" "${PY[@]}" -m todo_system.orchestrator.orchestrator
      --uri "file://$VAULT_DIR/Worker/agents")
 fi
-# Both legs always run; the dashboard is how a failed tick gets seen. With
-# pipefail, $? right after each pipeline is the orchestrator's status (or
-# tee's, if the log write failed). An auto failure outranks the dashboard's.
-"${M[@]}" --lease "$VAULT_DIR/Worker/orchestrator.lock" auto --db "$VAULT_DIR/Todo/todo.db" \
-  2>&1 | tee -a "$LOG_DIR/orchestrator.out.log"
+# Both legs always run; the dashboard is how a failed tick gets seen. $? right
+# after each leg is the orchestrator's status; an auto failure outranks the
+# dashboard's. Output goes to stdout only — the service manager writes the log
+# (systemd: logs/macp-orchestrator.out.log, launchd: logs/orchestrator.out.log).
+"${M[@]}" --lease "$VAULT_DIR/Worker/orchestrator.lock" auto --db "$VAULT_DIR/Todo/todo.db" 2>&1
 rc_auto=$?
-"${M[@]}" dashboard 2>&1 | tee -a "$LOG_DIR/orchestrator.out.log"
+"${M[@]}" dashboard 2>&1
 rc_dash=$?
 exit $(( rc_auto != 0 ? rc_auto : rc_dash ))

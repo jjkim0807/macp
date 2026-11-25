@@ -118,7 +118,7 @@ related:
 | D5 | `macp init`은 멱등: 볼트 보장 → 리포 등록 → 로그인 확인(막지 않음) | 단계마다 기존 함수 | ② |
 | D6 | 로그인은 프로세스 환경을 그대로 물려준다. 계정·프로필을 만들지 않는다 | `todo_system/orchestrator/runner.py:356-357` | ③ |
 | D7 | `macp add`는 `claude -p` 한 번으로 JSON만 받고, 파일·검증·DB·커밋은 CLI가 한다 | 가짜 `claude`로 테스트할 수 있고 도구 권한이 필요 없다 | ④ |
-| D8 | `macp up`은 단일 스레드 루프. 틱 인자는 틱 스크립트와 같고 러너는 `poll_once`다 | `scripts/orchestrator_tick.sh:54-63`, `todo_system/orchestrator/runner.py:3292` | ⑤ |
+| D8 | `macp up`은 단일 스레드 루프. 틱 인자는 틱 스크립트와 같고 러너는 `poll_once`다 | `scripts/orchestrator_tick.sh:52-61`, `todo_system/orchestrator/runner.py:3292` | ⑤ |
 | D9 | `--once`는 사용량 페이싱 없이 바로 돈다. 루프와 서비스는 본부와 같이 페이싱한다 | 지켜보는 한 번의 실행을 막아 지킬 것이 없다 | ⑤ |
 | D10 | 끝 상태는 PR(URL 원격 + `gh`) 또는 사용자 리포의 로컬 브랜치 `worker/<slug>`. 머지는 사람이 한다 | `auto_merge: false`를 명시한다 | ⑤ |
 | D11 | 첫 태스크는 `quick` 레인을 먼저 고른다. 5분은 목표치다 | `quick`은 `claude -p` 한 번 (`todo_system/orchestrator/stages.py:165`) | ⑤ |
@@ -545,7 +545,7 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
 `macp up`은 시작하면서 세 가지를 한다.
 
 - 볼트로 `chdir`한다. 틱 스크립트와 유닛이 그렇게 돈다
-  (`scripts/orchestrator_tick.sh:50`; 유닛의 `WorkingDirectory`
+  (`scripts/orchestrator_tick.sh:48`; 유닛의 `WorkingDirectory`
   `scripts/systemd/gen_units.py:119`, `:129`). 현재 디렉터리 기준 상대 경로를 쓰는 곳이
   아직 있어서다 (`todo_system/orchestrator/runner.py:600`,
   `todo_system/orchestrator/mailbox.py:39`).
@@ -556,7 +556,7 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
   호스트에서 바로 회수된다 (`todo_system/orchestrator/lease.py:147-160`). 긴 런 동안
   갱신하지 못하므로 만료 시간은 길게 준다(생성자 인자 `ttl`).
 - 메일박스 주소는 `file://<볼트>/Worker/agents`다. 본부의 유닛과 틱이 쓰는 것과 같다
-  (`scripts/systemd/gen_units.py:195`, `scripts/orchestrator_tick.sh:54-58`). 엔진 CLI의
+  (`scripts/systemd/gen_units.py:195`, `scripts/orchestrator_tick.sh:52-56`). 엔진 CLI의
   기본값 `git://`는 메시지마다 볼트에 커밋한다
   (`todo_system/orchestrator/orchestrator.py:3608`,
   `todo_system/orchestrator/mailbox.py:358`).
@@ -566,7 +566,7 @@ URL이면 그 URL, 아니면 리포 최상위의 절대 경로다. URL 판정은
 | 순서 | 하는 일 | 호출 |
 |---|---|---|
 | 1 | 태스크 파일이 바뀌었으면 DB에 반영 | `import_markdown_to_db` (`todo_system/cli.py:1212`). 본부에서는 todo-sync 유닛이 하는 일이다 (`todo_system/cli.py:1395`, `:1433-1447`) |
-| 2 | 틱: 라우팅·디스패치 | `orchestrator._main(["--uri", <주소>, "--lease", "<볼트>/Worker/orchestrator.lock", "auto", "--db", "<볼트>/Todo/todo.db"])` — 틱 스크립트의 인자 그대로 (`scripts/orchestrator_tick.sh:54-63`) |
+| 2 | 틱: 라우팅·디스패치 | `orchestrator._main(["--uri", <주소>, "--lease", "<볼트>/Worker/orchestrator.lock", "auto", "--db", "<볼트>/Todo/todo.db"])` — 틱 스크립트의 인자 그대로 (`scripts/orchestrator_tick.sh:52-61`) |
 | 3 | 러너 한 번: 받은 태스크의 파이프라인을 끝까지 실행 | `runner._main(["--agent", "worker-default", "--mode", "live-staged", "--uri", <주소>, "--once"])` (`todo_system/orchestrator/runner.py:3283-3292`). 인자는 러너 유닛과 같고 `--daemon`만 `--once`다 (`scripts/systemd/gen_units.py:195`) |
 | 4 | 수거 | `orchestrator._main(["--uri", <주소>, "collect"])` (`todo_system/orchestrator/orchestrator.py:3726-3729`) |
 | 5 | 틱: 닫기·정리 | 2와 같은 호출 |

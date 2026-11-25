@@ -74,7 +74,6 @@ LATEST_FILE = STATE_DIR / "latest.json"     # newest report, for `scan --daemon`
 QUEUE = ROOT / "Worker" / "queue.json"
 ASSIGN_DIR = ROOT / "Worker" / "assignments"
 LOG_DIR = ROOT / "logs"
-ORCH_LOG = LOG_DIR / "orchestrator.out.log"
 STALL = ROOT / "Worker" / "stall.json"
 SNAPSHOT = ROOT / "Todo" / "Snapshots" / "latest.json"
 SNAPSHOT_STALE_H = 48                               # latest.json older than this = stuck
@@ -506,6 +505,20 @@ TICK_RE = re.compile(r"candidates=\d+ dispatched=\d+")
 _HOLD_TOKEN = "USAGE-HOLD ("
 
 
+def orch_log(log_dir: Path | None = None) -> Path:
+    """The orchestrator tick's log, as its service manager writes it.
+
+    orchestrator_tick.sh prints to stdout only. systemd (gen_units) appends that
+    to logs/macp-orchestrator.out.log, launchd (install_orchestrator_launchagent.sh)
+    to logs/orchestrator.out.log. The unit's file wins where it exists: on a
+    systemd host logs/orchestrator.out.log is the copy the tick used to tee, and
+    it no longer grows.
+    """
+    d = LOG_DIR if log_dir is None else log_dir
+    unit = d / "macp-orchestrator.out.log"
+    return unit if unit.exists() else d / "orchestrator.out.log"
+
+
 def usage_hold_reason(log_path: Path | None = None) -> str | None:
     """The reason the orchestrator's most recent tick was held by the usage
     guard, or None if that tick was not held (or nothing is readable).
@@ -524,11 +537,11 @@ def usage_hold_reason(log_path: Path | None = None) -> str | None:
     dropping the final ')' is safe precisely because orchestrator.py appends
     this token last on the line (see `auto` command, `budget` suffix).
 
-    `log_path` is resolved at call time rather than defaulted to ORCH_LOG at
+    `log_path` is resolved at call time rather than defaulted to orch_log() at
     def time, so tests can point it at a fixture without monkeypatching a
     module constant frozen at import.
     """
-    path = ORCH_LOG if log_path is None else log_path
+    path = orch_log() if log_path is None else log_path
     try:
         tail = path.read_text(errors="replace").splitlines()[-40:]
     except Exception:
@@ -745,7 +758,8 @@ def check_orchestrator_noop(findings: list, assigns: dict) -> None:
     suppressed, a firing means candidates exist that are neither running, nor
     cooling down, nor parked — i.e. genuinely unroutable or cooldown-stuck.
     """
-    if not ORCH_LOG.exists():
+    log = orch_log()
+    if not log.exists():
         return
     held_on_purpose = any(
         a.get("state") in _IN_FLIGHT_STATES
@@ -756,7 +770,7 @@ def check_orchestrator_noop(findings: list, assigns: dict) -> None:
     if held_on_purpose:
         return
     try:
-        tail = ORCH_LOG.read_text(errors="replace").splitlines()[-40:]
+        tail = log.read_text(errors="replace").splitlines()[-40:]
     except Exception:
         return
     # A tick held by the usage guard prints USAGE-HOLD on the same line —

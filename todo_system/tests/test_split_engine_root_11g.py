@@ -165,9 +165,7 @@ def _assert_split(h: _Harness, r, engine: Path, vault: Path) -> None:
         assert "--directory" not in call["argv"], call
         assert call["cwd"] == str(vault), call
 
-    out = vault / "logs" / "orchestrator.out.log"
-    assert out.is_file()
-    assert "stub-orch" in out.read_text(encoding="utf-8")
+    assert "stub-orch" in r.stdout, (r.stdout, r.stderr)
     for name in ("logs", "Worker", "Todo"):
         assert not (engine / name).exists(), name
 
@@ -246,7 +244,7 @@ def test_combined_layout_resolves_everything_to_script_parent(tmp_path, env_mode
         assert call["cwd"] == str(combined), call
         assert "-P" not in call["argv"], call
         assert call["MACP_VAULT_ROOT"] is None and call["PYTHONPATH"] is None, call
-    assert "stub-orch" in (combined / "logs" / "orchestrator.out.log").read_text(encoding="utf-8")
+    assert "stub-orch" in r.stdout, (r.stdout, r.stderr)
 
 
 def test_orchestrator_tick_declares_two_anchors():

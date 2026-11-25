@@ -221,7 +221,6 @@ def test_installed_layout_uses_macp_python_and_never_uv(tmp_path, name):
             assert _opt(call["argv"], "--uri") == f"file://{h.vault}/Worker/agents", call
         assert _opt(auto[0]["argv"], "--lease") == f"{h.vault}/Worker/orchestrator.lock"
         assert _after(auto[0]["argv"], "auto", "--db") == f"{h.vault}/Todo/todo.db"
-        assert (h.vault / "logs" / "orchestrator.out.log").is_file()
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert not (engine / "logs").exists()
 

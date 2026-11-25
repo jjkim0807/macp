@@ -1,7 +1,7 @@
 """orchestrator_tick.sh exit status: a failed auto leg must reach the exit code.
 
-The tick runs two pipelines (auto, then dashboard) under `set -uo pipefail`
-without `set -e`. It used to end on the dashboard pipeline, so the script's
+The tick runs two legs (auto, then dashboard) under `set -uo pipefail`
+without `set -e`. It used to end on the dashboard leg, so the script's
 exit code was the dashboard's and a failed auto dispatch still exited 0 — the
 oneshot unit recorded success. Both legs must always run (the dashboard is how
 a failed tick gets seen) and the auto failure outranks the dashboard's.
@@ -120,14 +120,17 @@ def test_both_fail_auto_code_wins(tmp_path):
     assert r.returncode == 3, (r.stdout, r.stderr)
 
 
-def test_success_path_exit_zero_and_log_unchanged(tmp_path):
+def test_success_path_exit_zero_and_output_on_stdout(tmp_path):
+    # The service manager writes the tick's stdout to the log; the script no
+    # longer tees a second copy into logs/orchestrator.out.log.
     r, root, log = _run(tmp_path)
     _assert_both_legs_ran(log, r)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    lines = (root / "logs" / "orchestrator.out.log").read_text(encoding="utf-8").splitlines()
+    lines = r.stdout.splitlines()
     assert len(lines) == 2, lines
     assert lines[0].startswith("stub-orch") and "'auto'" in lines[0], lines
     assert lines[1].startswith("stub-orch") and "'dashboard'" in lines[1], lines
+    assert not (root / "logs" / "orchestrator.out.log").exists()
 
 
 def test_tick_script_has_no_set_e_and_dashboard_unconditional():
