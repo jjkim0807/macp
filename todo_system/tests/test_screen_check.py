@@ -296,14 +296,11 @@ def test_is_app_repo(tmp_path):
     assert screen_check.is_app_repo(tmp_path) is True
 
 
-def test_cap_seconds_default_frontmatter_and_env(monkeypatch):
-    monkeypatch.delenv(screen_check._CAP_ENV, raising=False)
+def test_cap_seconds_default_and_frontmatter():
     assert screen_check.cap_seconds({}) == 1200
     assert screen_check.cap_seconds({"screen_check_cap_min": 5}) == 300
     assert screen_check.cap_seconds({"screen_check_cap_min": 0}) == 1200     # non-positive → default
     assert screen_check.cap_seconds({"screen_check_cap_min": "x"}) == 1200   # unparseable → default
-    monkeypatch.setenv(screen_check._CAP_ENV, "42")
-    assert screen_check.cap_seconds({"screen_check_cap_min": 5}) == 42       # env wins
 
 
 def test_gradle_task_default_and_override():

@@ -12,6 +12,7 @@ from todo_system import calendar_sync as CS
 
 D = dt.datetime
 PINNED_NOW = D(2026, 11, 19, 16, 53)
+_REAL_RESCHEDULE = CS.reschedule_overdue_blocks   # `pinned` stubs it; one wiring test restores it
 
 
 # --- a Google-like stateful fake ------------------------------------------------
@@ -105,8 +106,7 @@ def pinned(monkeypatch):
     monkeypatch.setattr(CS, "_event_timezone", lambda: "Asia/Seoul")
     from zoneinfo import ZoneInfo
     monkeypatch.setattr(CS, "_event_tzinfo", lambda: ZoneInfo("Asia/Seoul"))
-    monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "0")
-    monkeypatch.delenv("MACP_CALENDAR_DONE_KEEP_DAYS", raising=False)
+    monkeypatch.setattr(CS, "reschedule_overdue_blocks", lambda *_a, **_k: [])
 
 
 def _task_md(d: Path, slug: str, *, status: str = "done",
@@ -183,16 +183,6 @@ def test_done_title_is_idempotent():
     assert CS._done_title("✅ x") == "✅ x"
     assert CS._done_title("✅ ✅ x") == "✅ x"
     assert CS._done_title("✅x") == "✅ x"
-
-
-def test_done_keep_days(monkeypatch):
-    monkeypatch.delenv("MACP_CALENDAR_DONE_KEEP_DAYS", raising=False)
-    assert CS._done_keep_days() == 30
-    monkeypatch.setenv("MACP_CALENDAR_DONE_KEEP_DAYS", "7")
-    assert CS._done_keep_days() == 7
-    for junk in ("abc", "0", "-3", ""):
-        monkeypatch.setenv("MACP_CALENDAR_DONE_KEEP_DAYS", junk)
-        assert CS._done_keep_days() == 30
 
 
 @pytest.mark.parametrize(
@@ -305,8 +295,8 @@ def test_done_events_are_cleaned_after_keep_days(tmp_path, pinned, monkeypatch):
     assert sorted(events.deleted) == ["d1", "m-old"]
     assert events.inserted == [] and events.patched == []
 
-    # A shorter window via env also counts.
-    monkeypatch.setenv("MACP_CALENDAR_DONE_KEEP_DAYS", "1")
+    # A shorter window also counts.
+    monkeypatch.setattr(CS, "DONE_KEEP_DAYS", 1)
     _run_sync(con, events, monkeypatch)
     assert "m-new" in events.deleted
     assert "own" not in events.deleted
@@ -370,7 +360,7 @@ def test_done_path_keeps_and_trims_block_and_reschedule_pull_leave_it(tmp_path, 
     monkeypatch.setattr(cli, "ROOT", root)
     monkeypatch.setattr(cli, "ITEMS_DIR", items)
     monkeypatch.setattr(CS, "ROOT", root)
-    monkeypatch.setenv("MACP_CALENDAR_DONE_KEEP_DAYS", "100000")   # pinned 2026 never ages out
+    monkeypatch.setattr(CS, "DONE_KEEP_DAYS", 100000)   # pinned 2026 never ages out
     con = cli.db_connect(root / "todo.db")
     cli.init_db(con)
     events = _GEvents()
@@ -396,7 +386,7 @@ def test_done_path_keeps_and_trims_block_and_reschedule_pull_leave_it(tmp_path, 
     assert 'completed: "2026-11-19 16:53"' in done_md.read_text(encoding="utf-8")
     sched_before = _sched_line(done_md)
 
-    monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "1")      # the real mover runs this tick
+    monkeypatch.setattr(CS, "reschedule_overdue_blocks", _REAL_RESCHEDULE)   # the real mover runs this tick
     _run_sync(con, events, monkeypatch)
 
     assert eid not in events.deleted

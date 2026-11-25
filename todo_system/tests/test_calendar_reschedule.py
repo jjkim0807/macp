@@ -146,13 +146,6 @@ def test_sync_path_does_not_move_a_decision_block(tmp_path, monkeypatch):
     assert "자동 재배치" in Path(plain).read_text(encoding="utf-8")
 
 
-def test_host_switch_disables(monkeypatch, tmp_path):
-    monkeypatch.setenv("MACP_RESCHEDULE_OVERDUE", "0")
-    p = _md(tmp_path, "late", "2026-11-10 10:00~10:30")
-    assert CS.reschedule_overdue_blocks(_Svc(), [{"slug": "late", "path": p}], ["cal"],
-                                        now=D(2026, 11, 16, 13, 20)) == []
-
-
 def test_sync_path_moves_an_overdue_block(tmp_path, monkeypatch):
     """Wiring: sync_due_tasks_to_calendar itself calls the mover after upserts."""
     from todo_system.tests.test_calendar_sync import _FakeEvents, _FakeService, _db

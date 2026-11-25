@@ -31,7 +31,6 @@ def probe(tmp_path, monkeypatch):
     d.mkdir()
     (d / "login-check.mjs").write_text("// stub\n")
     monkeypatch.setenv("MACP_BROWSER_DIR", str(d))
-    monkeypatch.delenv("MACP_BROWSER_WATCH_INTERVAL_S", raising=False)
     monkeypatch.delenv("MACP_HQ_SSH_HINT", raising=False)
     return d / "login-check.mjs"
 
@@ -123,20 +122,6 @@ def test_interval_gate_skips_the_probe(probe):
     assert len(calls) == 1
     check(state_run("logged_in", calls), T0 + HOUR + 1, sent)
     assert len(calls) == 2
-
-
-def test_interval_is_configurable(probe, monkeypatch):
-    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", "60")
-    calls, sent = [], []
-    check(state_run("logged_in", calls), T0, sent)
-    check(state_run("logged_in", calls), T0 + 61, sent)
-    assert len(calls) == 2
-
-
-@pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
-def test_bad_interval_falls_back_to_default(monkeypatch, raw):
-    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", raw)
-    assert bw.interval_s() == bw.DEFAULT_INTERVAL_S
 
 
 def test_clock_stepped_back_does_not_suppress(probe):
@@ -489,7 +474,7 @@ def test_bad_reprobe_alerts_with_reprobed_state(browser_sh, tmp_path, monkeypatc
 
 
 def test_restart_backoff_thirty_minutes(browser_sh, monkeypatch):
-    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", "60")
+    monkeypatch.setattr(bw, "INTERVAL_S", 60.0)
     rcalls, sent = [], []
     check_r(seq_run(["no_chrome"]), restart_runner(1, rcalls), T0, sent)
     assert len(rcalls) == 1 and len(sent) == 1
@@ -544,7 +529,7 @@ def test_missing_browser_sh_falls_back(probe):
 
 
 def test_later_successful_restart_recovers(browser_sh, tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("MACP_BROWSER_WATCH_INTERVAL_S", "60")
+    monkeypatch.setattr(bw, "INTERVAL_S", 60.0)
     path = _ops_task(tmp_path, monkeypatch)
     probe_run = seq_run(["no_chrome", "no_chrome", "logged_in"])
     sent = []

@@ -265,14 +265,11 @@ def test_smoke_skippable_empty_diff_is_false():
 # cap_seconds + alert_throttled
 # ---------------------------------------------------------------------------
 
-def test_cap_seconds_default_cfg_env(monkeypatch):
-    monkeypatch.delenv(bs._CAP_ENV, raising=False)
+def test_cap_seconds_default_and_cfg():
     assert bs.cap_seconds({}) == 1800
     assert bs.cap_seconds({"cap_min": 5}) == 300
     assert bs.cap_seconds({"cap_min": 0}) == 1800
     assert bs.cap_seconds({"cap_min": "x"}) == 1800
-    monkeypatch.setenv(bs._CAP_ENV, "42")
-    assert bs.cap_seconds({"cap_min": 5}) == 42
 
 
 def test_alert_throttled_fires_once_per_window():

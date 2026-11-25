@@ -20,7 +20,6 @@ Environment (read at call time):
   MACP_BROWSER_NODE              node binary; default ``node``.
   MACP_BROWSER_WATCH_DIR         state directory (outside git); default
                                  ~/.local/share/macp/browser.
-  MACP_BROWSER_WATCH_INTERVAL_S  seconds between probes; default 3600.
   MACP_HQ_SSH_HINT               ``gcloud compute ssh`` target in the re-login
                                  steps; default is a neutral placeholder.
 
@@ -66,7 +65,7 @@ UNKNOWN_ALERT_STREAK = 3
 RUN_TIMEOUT_S = 90  # the probe's own watchdog is 60s
 RESTART_TIMEOUT_S = 120  # `browser.sh up`; a timeout is a failed restart
 RESTART_BACKOFF_S = 1800.0  # one restart attempt per 30 minutes
-DEFAULT_INTERVAL_S = 3600.0
+INTERVAL_S = 3600.0  # seconds between probes
 DEFAULT_SSH_HINT = "<hq-instance> --zone <zone> --project <project>"
 
 _EXIT_STATES = {0: "logged_in", 1: "logged_out", 2: "no_chrome"}
@@ -107,14 +106,6 @@ def state_dir() -> Path:
 
 def state_path() -> Path:
     return state_dir() / "login_watch.json"
-
-
-def interval_s() -> float:
-    try:
-        value = float(_env("MACP_BROWSER_WATCH_INTERVAL_S") or DEFAULT_INTERVAL_S)
-    except ValueError:
-        return DEFAULT_INTERVAL_S
-    return value if value > 0 else DEFAULT_INTERVAL_S
 
 
 def ssh_hint() -> str:
@@ -387,7 +378,7 @@ def check_login_watch(now: float | None = None, *,
         prev = _read_state()
         elapsed = now - prev["last_checked_at"]
         # A last check in the future (clock stepped back) does not suppress.
-        if 0 <= elapsed < interval_s():
+        if 0 <= elapsed < INTERVAL_S:
             return None
         observed = run_login_check(script, run=run)
         if observed is None:
