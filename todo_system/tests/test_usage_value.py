@@ -1005,11 +1005,17 @@ def test_brief_section_skipped_when_todays_file_has_it(tmp_path):
     assert uv.brief_due(d, today) is False
 
 
+def _with_playbook_line(vault, table: str) -> str:
+    """The weekly section ends with the repo playbooks' keep/delete line."""
+    return f"{table}\n\n{uv.playbook_line(vault.root, NOW.date())}"
+
+
 def test_brief_section_is_the_rendered_model_when_due(vault):
     vault.install(*CASE_NAMES)
     section = uv.brief_section(vault.root, now=NOW)
-    assert section == uv.render_brief(uv.build(vault_root=vault.root, now=NOW))
+    assert section == _with_playbook_line(vault, uv.render_brief(uv.build(vault_root=vault.root, now=NOW)))
     assert section.startswith(uv.BRIEF_MARKER + "\n## 📈 ")
+    assert section.rsplit("\n", 1)[-1].startswith("리포 플레이북 — 같은 원인 FAIL 재발")
     # once a brief of the week carries it, nothing more is printed
     d = vault.root / "Todo" / "Briefings"
     d.mkdir(parents=True)
@@ -1017,6 +1023,17 @@ def test_brief_section_is_the_rendered_model_when_due(vault):
     assert uv.brief_section(vault.root, now=NOW) == ""
     assert uv.brief_section(vault.root, now=NOW + dt.timedelta(days=6)) == ""
     assert uv.brief_section(vault.root, now=NOW + dt.timedelta(days=7)).startswith(uv.BRIEF_MARKER)
+
+
+def test_a_failing_playbook_line_leaves_the_table(vault, monkeypatch):
+    from todo_system import playbooks
+    vault.install(*CASE_NAMES)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("no runs dir")
+
+    monkeypatch.setattr(playbooks, "brief_line", boom)
+    assert uv.brief_section(vault.root, now=NOW) == uv.render_brief(uv.build(vault_root=vault.root, now=NOW))
 
 
 def test_brief_section_empty_without_runs(vault):
@@ -1109,7 +1126,7 @@ def test_cli_brief_section_prints_the_section_once_a_week(vault, monkeypatch, ca
     argv = ["brief-section", "--vault-root", str(vault.root), "--now", NOW.isoformat()]
     assert uv.main(argv) == 0
     out = capsys.readouterr().out
-    assert out == uv.render_brief(uv.build(vault_root=vault.root, now=NOW)) + "\n"
+    assert out == _with_playbook_line(vault, uv.render_brief(uv.build(vault_root=vault.root, now=NOW))) + "\n"
     d = vault.root / "Todo" / "Briefings"
     d.mkdir(parents=True)
     (d / "2026-11-20.md").write_text("# Brief\n\n" + out, encoding="utf-8")

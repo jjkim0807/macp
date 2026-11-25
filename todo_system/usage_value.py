@@ -730,7 +730,20 @@ def brief_section(vault_root=None, *, now: dt.datetime | None = None) -> str:
     model = build(root, now=now)
     if not any(p["rows"] for p in model["periods"]):
         return ""
-    return render_brief(model)
+    section = render_brief(model)
+    line = playbook_line(root, now.date())
+    return f"{section}\n\n{line}" if line else section
+
+
+def playbook_line(root: Path, today: dt.date) -> str:
+    """The repo playbooks' keep/delete measure (playbooks.brief_line): same-cause
+    FAIL repeats per week, one line under this weekly table. "" on any error —
+    the table must not be lost over it."""
+    try:
+        from . import playbooks
+        return playbooks.brief_line(root, today=today)
+    except Exception:       # noqa: BLE001
+        return ""
 
 
 # --- diagnostics and the CLI ------------------------------------------------------------------
