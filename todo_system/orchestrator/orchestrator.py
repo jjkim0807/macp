@@ -557,9 +557,9 @@ class Orchestrator:
         # instead of wherever the process was started.
         self._mb_base = mailbox_base
         self._agent_mb: dict[str, Mailbox] = {}
-        # Side channel set by usage_hold(): {"kind", "release_eta"} of the last
-        # blocked verdict (usage_guard.hold_kind / decision["release_eta"]), None
-        # when not blocked. usage_hold() itself keeps returning str | None.
+        # Side channel set by usage_hold(): {"release_eta"} of the last blocked
+        # verdict (decision["release_eta"]), None when not blocked. usage_hold()
+        # itself keeps returning str | None.
         self.usage_hold_info: dict | None = None
 
     def _runs_today(self) -> int:
@@ -3312,8 +3312,8 @@ class Orchestrator:
         (leaf 4, `usage_guard.refresh_inactive_accounts`: TTL ×4, their own
         lock/backoff) for the dashboard and the runner's `exhausted_until` —
         never part of the verdict, and its failure is swallowed on its own.
-        A blocked verdict also sets `self.usage_hold_info` ({"kind",
-        "release_eta"}) for the tick log line."""
+        A blocked verdict also sets `self.usage_hold_info` ({"release_eta"})
+        for the tick log line."""
         self.usage_hold_info = None
         try:
             from todo_system import usage_guard
@@ -3338,11 +3338,7 @@ class Orchestrator:
             except Exception:
                 pass
             if not d.get("allowed", True):
-                try:
-                    self.usage_hold_info = {"kind": usage_guard.hold_kind(d),
-                                            "release_eta": d.get("release_eta")}
-                except Exception:
-                    self.usage_hold_info = None
+                self.usage_hold_info = {"release_eta": d.get("release_eta")}
                 return d.get("reason") or "usage guard blocked"
         except Exception:
             pass

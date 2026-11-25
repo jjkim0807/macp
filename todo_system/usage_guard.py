@@ -603,19 +603,9 @@ def _eval_window(name: str, info: dict | None, window_s: float,
         hard_cap = _ur.effective_weekly_cap(hard_cap, resets, resets_at, now)
         out["hard_cap"] = hard_cap
     if util >= hard_cap:
-        until, why = resets_at, "until reset"
-        if resets and resets.get("autoclaim"):
-            # An auto-claimed limit reset lifts this hold before the window
-            # resets; report that time so the dashboard ETA is not the reset.
-            from . import usage_resets as _ur
-            eta = _ur.hard_cap_release_at(util, resets_at, window_s, allowance,
-                                          int(resets.get("available") or 0),
-                                          int(resets.get("claimed") or 0))
-            if eta is not None and eta < resets_at:
-                until, why = max(eta, now), "until an auto-claimed limit reset"
         out.update({
-            "blocked": True, "blocked_until": until,
-            "reason": f"{name} {util:.0f}% >= hard cap {hard_cap:.0f}% ({why})",
+            "blocked": True, "blocked_until": resets_at,
+            "reason": f"{name} {util:.0f}% >= hard cap {hard_cap:.0f}% (until reset)",
         })
         return out
     if resets:
@@ -673,55 +663,6 @@ def evaluate(usage: dict, now: float | None = None, resets: dict | None = None) 
         "windows": windows,
         "checked_at": now,
     }
-
-
-def hold_kind(decision: dict | None) -> str | None:
-    """Classify a decision's hold. Pure; never raises.
-
-    - None: not a hold (allowed, or the guard is disabled).
-    - "paused": every account unavailable (`_paused_decision`).
-    - "no_data": a carried no-data hold, or any hold with no windows.
-    - "hard_cap": some blocked window is at/over its hard cap.
-    - "pace": blocked windows exist and none is at its hard cap.
-    - "unknown": anything else (e.g. a hand-built `{"allowed": False}`).
-
-    Derived from the existing window fields plus `_cfg()`, so the decision
-    shape stays as it was.
-    """
-    try:
-        if not decision or decision.get("disabled") or decision.get("allowed", True):
-            return None
-        if decision.get("paused"):
-            return "paused"
-        if decision.get("carried"):
-            return "no_data"
-        windows = decision.get("windows")
-        if isinstance(windows, list) and not windows:
-            return "no_data"
-        blocked = [w for w in windows or [] if isinstance(w, dict) and w.get("blocked")]
-        if not blocked:
-            return "unknown"
-        cfg = _cfg()
-        kinds = set()
-        for w in blocked:
-            name = w.get("name")
-            util = w.get("utilization")
-            if "hard cap" in str(w.get("reason") or ""):
-                kinds.add("hard_cap")
-            elif name not in ("session", "weekly") or util is None:
-                kinds.add("unknown")
-            elif float(util) >= float(w.get("hard_cap") or (
-                    session_admission_cap(cfg) if name == "session"
-                    else cfg[f"{name}_hard_cap"])):
-                kinds.add("hard_cap")
-            else:
-                kinds.add("pace")
-        for k in ("hard_cap", "unknown"):
-            if k in kinds:
-                return k
-        return "pace"
-    except Exception:
-        return "unknown"
 
 
 def window_slack(w: dict, cfg: dict | None = None) -> float | None:

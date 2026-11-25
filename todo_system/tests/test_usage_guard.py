@@ -555,7 +555,7 @@ def test_disable_switch_only_on_exact_one(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# release ETA (pure pace_release_at), hold kind
+# release ETA (pure pace_release_at)
 # ---------------------------------------------------------------------------
 
 _R = NOW + 10 * 86400.0  # an arbitrary reset epoch for the pure-function table
@@ -586,60 +586,43 @@ def test_pace_release_at_matches_eval_window():
         ug.pace_release_at(40.0, reset, ug.WEEKLY_WINDOW_S, 12.0))
 
 
-def test_pace_hold_has_release_eta_and_kind():
+def test_pace_hold_has_release_eta():
     d = ug.evaluate(_usage(weekly_util=40.0, weekly_reset_in=7 * 86400.0), NOW)
     assert not d["allowed"]
     assert d["release_eta"] == ug._iso_utc(d["blocked_until"])
     assert d["release_eta"].endswith("+00:00")
     assert datetime.fromisoformat(d["release_eta"]).timestamp() == \
         pytest.approx(d["blocked_until"], abs=1)
-    assert ug.hold_kind(d) == "pace"
 
 
-def test_weekly_hard_cap_hold_kind_and_eta_is_reset():
+def test_weekly_hard_cap_eta_is_reset():
     d = ug.evaluate(_usage(weekly_util=ug._cfg()["weekly_hard_cap"] + 1.0), NOW)
-    assert ug.hold_kind(d) == "hard_cap"
     weekly = next(w for w in d["windows"] if w["name"] == "weekly")
     assert d["release_eta"] == ug._iso_utc(weekly["resets_at"])
 
 
-def test_session_hard_cap_hold_kind():
-    d = ug.evaluate(_usage(session_util=ug._cfg()["session_hard_cap"] + 1.0), NOW)
-    assert ug.hold_kind(d) == "hard_cap"
-
-
-def test_mixed_pace_and_hard_cap_is_hard_cap_with_max_eta():
+def test_mixed_pace_and_hard_cap_eta_is_the_later_one():
     # session ahead of pace (just started, 50% used) + weekly at the hard cap
     d = ug.evaluate(_usage(session_util=50.0, session_reset_in=ug.SESSION_WINDOW_S,
                            weekly_util=ug._cfg()["weekly_hard_cap"] + 1.0), NOW)
     assert all(w["blocked"] for w in d["windows"])
-    assert ug.hold_kind(d) == "hard_cap"
     assert d["release_eta"] == ug._iso_utc(max(w["blocked_until"] for w in d["windows"]))
 
 
-def test_allowed_decision_has_no_kind_or_eta():
+def test_allowed_decision_has_no_eta():
     d = ug.evaluate(_usage(), NOW)
     assert d["allowed"]
-    assert ug.hold_kind(d) is None
     assert d["release_eta"] is None
-    assert ug.hold_kind({"allowed": True, "disabled": True}) is None
 
 
-def test_no_data_decisions_kind_and_eta():
+def test_no_data_decisions_eta():
     cfg = ug._cfg()
     carried = ug._no_data_decision(_blocked_state(blocked_until=NOW + 3600), cfg, NOW)
     assert carried["carried"] is True
-    assert ug.hold_kind(carried) == "no_data"
     assert carried["release_eta"] == ug._iso_utc(NOW + 3600)
 
     fresh = ug._no_data_decision({"error": "offline"}, cfg, NOW)
     assert fresh["release_eta"] is None
-
-
-def test_hold_kind_paused_and_unknown():
-    assert ug.hold_kind({"allowed": False, "paused": True,
-                         "windows": [], "reason": "all accounts unavailable"}) == "paused"
-    assert ug.hold_kind({"allowed": False, "reason": "x"}) == "unknown"
 
 
 def test_check_persists_release_eta(tmp_path, monkeypatch):
@@ -676,7 +659,6 @@ def test_session_line_is_the_stage_cap(monkeypatch):
     # 4h into the 5h window: pace line 80+30 -> the cap decides
     d = ug.evaluate(_session_usage(81.0, now, resets_in=3600.0), now=now)
     assert not d["allowed"] and "hard cap 80%" in d["reason"]
-    assert ug.hold_kind(d) == "hard_cap"
     ok = ug.evaluate(_session_usage(75.0, now, resets_in=3600.0), now=now)
     assert ok["allowed"]
     s = [w for w in ok["windows"] if w["name"] == "session"][0]

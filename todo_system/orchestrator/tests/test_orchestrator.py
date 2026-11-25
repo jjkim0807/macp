@@ -3490,5 +3490,5 @@ class UsageHoldInfoTest(unittest.TestCase):
         self.assertEqual(r["dispatched"], [])
         self.assertEqual(self.mb.receive("w"), [])
         self.assertEqual(r["usage_hold_eta"], self.ETA)
-        self.assertEqual(self.orch.usage_hold_info["kind"], "pace")
+        self.assertEqual(self.orch.usage_hold_info, {"release_eta": self.ETA})
         self.assertIsNone(self._tick([], {"allowed": True})["usage_hold_eta"])
