@@ -242,7 +242,6 @@ def test_wall_cap_raises_weekly_cap_only_with_a_claimable_grant():
     at_wall = dict(usage, seven_day={"utilization": 98.0, "resets_at": _iso(resets_at)})
     d = G.evaluate(at_wall, now=now, resets={"available": 1, "claimed": 0, "autoclaim": True})
     assert not d["allowed"] and "hard cap 98%" in d["reason"]
-    assert G.hold_kind(d) == "hard_cap"
 
 
 def test_wall_cap_not_applied_when_claim_no_longer_allowed():

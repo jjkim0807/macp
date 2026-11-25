@@ -104,9 +104,9 @@ EXIT_BLOCKED = 3
 
 
 def _cfg() -> dict:
-    """Thresholds. Caps, allowances and parallel steps are env-overridable (read
-    per call so a resident daemon picks up changes without a restart — see the
-    stages.py import-time-constant lesson); the fetch timings are fixed.
+    """Thresholds. Caps and allowances are env-overridable (read per call so a
+    resident daemon picks up changes without a restart — see the stages.py
+    import-time-constant lesson); the fetch timings are fixed.
 
     - hard_cap: block outright above this utilization %, until the window
       resets. Weekly defaults lower than session because a blown weekly locks
@@ -148,20 +148,12 @@ def _cfg() -> dict:
         # the very outage it is reacting to.
         "backoff_base_s": 60.0,
         "backoff_max_s": 1800.0,
-        # Parallel pacing (see parallel_slots): each full `step` of slack below a
-        # window's gate line buys one more concurrent run. Weekly is the scarce
-        # window, so its step is the finest. Session was 15pp, which held the
-        # runner at 2 slots early in every 5h window even with the week ~97%
-        # unused (2026-10-12); its own pace/hard-cap gate already stops runaway
-        # use, so the step only needs to taper fan-out near that line.
-        "session_parallel_step": f("USAGE_GUARD_SESSION_PARALLEL_STEP", 8.0),
         # In-flight brake (2026-11-18): the gates above only stop NEW runs, so 2–3
         # heavy runs already in flight rode a 5h window from 58% to 100% after
         # the hold. At this session utilization an in-flight run does not START
         # its next Claude stage (runner `_wait_for_session_headroom`); the 20pp
         # left covers stages already running plus the human. 0 disables.
         "session_stage_cap": f("USAGE_GUARD_SESSION_STAGE_CAP", 80.0),
-        "weekly_parallel_step": f("USAGE_GUARD_WEEKLY_PARALLEL_STEP", 5.0),
     }
 
 
@@ -675,63 +667,14 @@ def evaluate(usage: dict, now: float | None = None, resets: dict | None = None) 
     }
 
 
-def hold_kind(decision: dict | None) -> str | None:
-    """Classify a decision's hold. Pure; never raises.
-
-    - None: not a hold (allowed, or the guard is disabled).
-    - "paused": every account unavailable (`_paused_decision`).
-    - "no_data": a carried no-data hold, or any hold with no windows.
-    - "hard_cap": some blocked window is at/over its hard cap.
-    - "pace": blocked windows exist and none is at its hard cap.
-    - "unknown": anything else (e.g. a hand-built `{"allowed": False}`).
-
-    Derived from the existing window fields plus `_cfg()`, so the decision
-    shape stays as it was.
-    """
-    try:
-        if not decision or decision.get("disabled") or decision.get("allowed", True):
-            return None
-        if decision.get("paused"):
-            return "paused"
-        if decision.get("carried"):
-            return "no_data"
-        windows = decision.get("windows")
-        if isinstance(windows, list) and not windows:
-            return "no_data"
-        blocked = [w for w in windows or [] if isinstance(w, dict) and w.get("blocked")]
-        if not blocked:
-            return "unknown"
-        cfg = _cfg()
-        kinds = set()
-        for w in blocked:
-            name = w.get("name")
-            util = w.get("utilization")
-            if "hard cap" in str(w.get("reason") or ""):
-                kinds.add("hard_cap")
-            elif name not in ("session", "weekly") or util is None:
-                kinds.add("unknown")
-            elif float(util) >= float(w.get("hard_cap") or (
-                    session_admission_cap(cfg) if name == "session"
-                    else cfg[f"{name}_hard_cap"])):
-                kinds.add("hard_cap")
-            else:
-                kinds.add("pace")
-        for k in ("hard_cap", "unknown"):
-            if k in kinds:
-                return k
-        return "pace"
-    except Exception:
-        return "unknown"
-
-
 def window_slack(w: dict, cfg: dict | None = None) -> float | None:
     """Percentage points between a window's utilization and the line the guard
     would block at (`min(elapsed% + allowance, hard_cap)`), floored at 0. Pure.
 
     None when the window is not session/weekly or its numbers are missing, so
-    callers can tell "no evidence" apart from "no headroom". Shared by
-    `parallel_slots` and the planner's aggressive-mode verdict
-    (todo_system/orchestrator/planner_mode.py) so both read headroom the same way.
+    callers can tell "no evidence" apart from "no headroom". Read by the
+    planner's aggressive-mode verdict (todo_system/orchestrator/planner_mode.py)
+    and by `account_slots` to rank accounts, so both read headroom the same way.
     """
     name = w.get("name")
     if name not in ("session", "weekly"):
@@ -751,35 +694,19 @@ def window_slack(w: dict, cfg: dict | None = None) -> float | None:
 def parallel_slots(decision: dict, max_slots: int) -> int:
     """How many runs may execute at once under `decision`. Pure (unit-testable).
 
-    The gate above is binary — start work or don't — so a week with most of its
-    budget unused still ran one task at a time while dispatched work queued for
-    hours behind it. This widens the gate when there is room: per window, the
-    slack is the distance from utilization to the line the guard would block at
-    (`min(elapsed% + allowance, hard_cap)`), and every full `*_parallel_step` of
-    it earns one more slot. The tighter window decides; `max_slots` caps it.
-
     0 when blocked (the existing hold). 1 whenever the numbers can't be trusted —
     no windows (fail-open no-data) or a stale snapshot — so an outage never
-    fans out: parallelism is only ever granted on fresh evidence of headroom.
+    fans out: the caps are only as good as the snapshot they read. Otherwise
+    `max_slots`; the caps, the pace line and the in-flight stage brake decide
+    when to stop.
     """
     if max_slots <= 0 or not decision.get("allowed", True):
         return 0
-    if max_slots == 1:
-        return 1
     windows = [w for w in decision.get("windows") or []
                if w.get("utilization") is not None and w.get("elapsed_pct") is not None]
     if not windows or decision.get("stale"):
         return 1
-    cfg = _cfg()
-    slots = max_slots
-    for w in windows:
-        slack = window_slack(w, cfg)
-        if slack is None:
-            continue
-        step = cfg[f"{w['name']}_parallel_step"]
-        earned = 1 + int(slack // step) if step > 0 else 1
-        slots = min(slots, earned)
-    return max(1, slots)
+    return max_slots
 
 
 def _no_data_decision(state: dict, cfg: dict, now: float) -> dict:

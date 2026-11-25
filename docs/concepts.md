@@ -156,15 +156,15 @@ declare `touches` lists that do not overlap. Global caps are the profile fields
 
 **Usage pacing.** The usage guard reads your Claude subscription's 5-hour and weekly
 utilization. It holds new dispatch (`USAGE-HOLD`) when automation runs ahead of the
-elapsed share of the window, and above a hard cap. Slack below the line buys extra
-parallel slots. A single task can pass a pacing hold with `bypass_guard: true`.
+elapsed share of the window, and above a hard cap. A single task can pass a pacing
+hold with `bypass_guard: true`.
 A task's `long_job` is still started and checked during a hold, because that uses no
 Claude. Once the job has finished, the task waits for the hold like any other.
 
 **Free slots.** Every runner tells the orchestrator how many runs it can hold right
 now and how many it holds (`slots: {max, used}` in each `HEARTBEAT`). `max` is the
-registry `concurrency`, narrowed by usage headroom and free memory, and 0 while the
-runner drains for a restart. The orchestrator assigns a task only to a worker with
+registry `concurrency`, narrowed by free memory, 1 while the usage guard cannot read
+fresh numbers, and 0 during a usage hold or while the runner drains for a restart. The orchestrator assigns a task only to a worker with
 `max − used > 0`, so nothing waits in a mailbox. A worker that has never announced is
 given its registry `concurrency`; one whose heartbeat stopped (15 minutes) is given
 nothing. An assignment no worker started within 30 minutes is taken back: the

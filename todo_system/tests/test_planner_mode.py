@@ -35,7 +35,7 @@ def _clean_env(monkeypatch):
     for name in _KNOB_ENVS:
         monkeypatch.delenv(name, raising=False)
     # USAGE_GUARD_* is scanned by prefix (not hardcoded) so a host override of
-    # any current or future knob (hard caps, allowances, parallel steps, ...)
+    # any current or future knob (hard caps, allowances, stage cap, ...)
     # can't desync planner_aggressiveness()'s math — see test_usage_guard.py's
     # matching fixture for why this must be a prefix scan, not a fixed list.
     for name in list(os.environ):
@@ -134,7 +134,7 @@ def test_only_one_window_is_normal():
     assert mode == "normal" and "weekly" in reason
 
 
-def test_session_slack_threshold_is_one_parallel_step(monkeypatch):
+def test_session_slack_threshold_default_is_8pp(monkeypatch):
     # line 90: util 83 -> slack 7 < 8; util 82 -> slack 8 == 8 passes
     # (stage cap off: it would lower the session line to 80 — pinned separately
     # in test_usage_guard.test_session_line_is_the_stage_cap)
@@ -210,7 +210,7 @@ def test_invalid_env_values_fall_back_to_defaults():
     env = {"MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_WEEKLY": "lots",
            "MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_SESSION": "-3",
            "MAESTRO_PLANNER_AGGRESSIVE_MAX_QUEUE": "many"}
-    # defaults: weekly step 5 refuses slack 4.1; queue limit 0 refuses 1
+    # defaults: weekly 5pp refuses slack 4.1; queue limit 0 refuses 1
     assert pm.planner_aggressiveness(_headroom(weekly_util=65.0), 0, 0, env=env)[0] == "normal"
     assert pm.planner_aggressiveness(_headroom(), 1, 0, env=env)[0] == "normal"
     assert pm.planner_aggressiveness(_headroom(), 0, 0, env=env)[0] == "aggressive"
