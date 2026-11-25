@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""A stand-in `claude` CLI for the lite-mode path test and the isolation gate's
+README leg (todo_system/tests/test_lite.py, scripts/check_engine_isolation.sh).
+
+It answers the three call shapes lite mode makes, told apart by the prompt:
+
+* the model probe (``claude -p "Reply with just: ok" …``)  -> prints ``ok``
+* ``macp add`` (prompt from todo_system/prompts/lite-add.md) -> prints one JSON task
+* a worker stage (prompt ends in the "Run metadata" block)   -> for ``quick``:
+  commits one README line in ``working_dir``, pushes ``branch`` to origin and
+  writes ``<run_dir>/quick.md`` with ``overall_status: pass``
+
+Test-only knobs (environment): FAKE_CLAUDE_LOG — append one line per call;
+FAKE_CLAUDE_ADD_REPLY — the literal text to print for ``macp add``;
+FAKE_CLAUDE_ADD_RC — its exit code. No output ever mentions a usage limit:
+the runner would read that as a capacity hold.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ADD_MARK = "## The request (verbatim)"
+META_MARK = "# Run metadata (injected by orchestrator)"
+
+
+def log(kind: str) -> None:
+    path = os.environ.get("FAKE_CLAUDE_LOG")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(kind + "\n")
+
+
+def prompt_of(argv: list) -> str:
+    return argv[argv.index("-p") + 1] if "-p" in argv else ""
+
+
+def meta(prompt: str, key: str) -> str:
+    m = re.search(r"^- " + re.escape(key) + r": `([^`]*)`", prompt, re.M)
+    return m.group(1) if m else ""
+
+
+def git(cwd: str, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def answer_add() -> int:
+    reply = os.environ.get("FAKE_CLAUDE_ADD_REPLY")
+    if reply is None:
+        reply = json.dumps({
+            "slug": "readme-install-line",
+            "title": "Add an install line to the README",
+            "outcome": "README.md has a one-line install instruction",
+            "next_action": "Append the install line to README.md",
+            "if_then": "When the worker opens it -> edit README.md",
+            "acceptance_criteria": ["README.md contains an 'Install' line"],
+            "worker_mode": "quick",
+            "estimate_p50": "10m",
+            "estimate_p90": "20m",
+            "touches": ["README.md"],
+            "tags": ["docs"],
+        })
+    print(reply)
+    return int(os.environ.get("FAKE_CLAUDE_ADD_RC", "0"))
+
+
+def answer_stage(prompt: str) -> int:
+    stage = meta(prompt, "stage")
+    slug = meta(prompt, "slug")
+    run_dir = Path(meta(prompt, "run_dir"))
+    work = meta(prompt, "working_dir")
+    branch = meta(prompt, "branch")
+    if stage != "quick" or not (work and branch and slug):
+        print(f"fake claude: stage {stage!r} is not supported")
+        return 1
+    readme = Path(work) / "README.md"
+    with readme.open("a", encoding="utf-8") as f:
+        f.write("\nInstall: `pip install example`\n")
+    git(work, "add", "README.md")
+    git(work, "-c", "user.name=fake-worker", "-c", "user.email=fake@example.invalid",
+        "commit", "-q", "-m", f"chore(worker): {slug} — add an install line")
+    git(work, "push", "-q", "origin", branch)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "quick.md").write_text(
+        "---\n"
+        f"stage: quick\nrun_id: {meta(prompt, 'run_id')}\nslug: {slug}\nbranch: {branch}\n"
+        "generated: 2026-01-01T00:00:00\noverall_status: pass\nno_op: false\n"
+        "---\n\n"
+        f"# Quick — {slug}\n\n- change: one README line\n"
+        f"- PR: none (local branch {branch})\n- merged: no (auto_merge=false)\n",
+        encoding="utf-8")
+    print(f"quick complete: {branch} status=pass")
+    return 0
+
+
+def main() -> int:
+    prompt = prompt_of(sys.argv[1:])
+    if prompt.strip() == "Reply with just: ok":
+        log("probe")
+        print("ok")
+        return 0
+    if ADD_MARK in prompt:
+        log("add")
+        return answer_add()
+    if META_MARK in prompt:
+        log(f"stage {meta(prompt, 'stage')}")
+        return answer_stage(prompt)
+    log("unknown")
+    print("fake claude: unrecognised call")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

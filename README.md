@@ -70,40 +70,50 @@ rebuilt from the task markdown.
 
 ## Try it in five minutes
 
-No agent is called and nothing leaves your machine. You need Linux or macOS,
-Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/) and `git`.
+A real Claude Code worker finishes one small task in a repository of yours and leaves
+you a pull request — or a local branch, if the repository has no GitHub remote.
+Nothing is merged for you.
+
+You need Linux or macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`, and
+the [Claude Code](https://code.claude.com) CLI, logged in. Install macp once:
+
+    uv tool install git+https://github.com/jjkim0807/macp
+
+Then, inside a git repository you own:
 
 ```bash
-git clone https://github.com/jjkim0807/macp ~/macp && cd ~/macp
-uv sync
-
-cp -r vault-template ~/my-vault            # your vault: tasks, runs, memory
-export MACP_VAULT_ROOT=~/my-vault
-export USAGE_GUARD_DISABLE=1               # nothing to pace yet (see below)
-
-uv run python -m todo_system.cli new hello-world --template auto-worker
-#   edit ~/my-vault/Todo/items/hello-world.md:
-#   write an outcome, and change `worker_mode: blocked` to `worker_mode: auto`
-uv run python -m todo_system.cli validate hello-world   # → worker contract OK (open tasks)
-uv run python -m todo_system.cli import-md              # → imported tasks: 1
-
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
-#   → dispatched hello-world -> worker-default
-uv run --project ~/macp python -m todo_system.orchestrator.runner \
-    --agent worker-default --mode shadow --once
-#   → RESULT: shadow run for 'hello-world' (no agent spawned)
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator status
-#   → done           hello-world                              worker-default
+macp init                                   # makes ~/.macp/vault, registers this repository
+macp add "Add an install section to the README"
+macp up --once                              # dispatch → worker → result, then exit
 ```
 
-That is the whole loop: a task file was imported, routed, dispatched, executed (in
-shadow mode) and collected. `USAGE_GUARD_DISABLE=1` skips usage pacing. Without it, a
-machine where Claude Code is logged in is paced against that account's real usage,
-and dispatch can be held. [Getting started](docs/getting-started.md) walks through the
-same steps with explanations, then a first **real** run against one of your
-repositories. `bash scripts/check_engine_isolation.sh` runs this loop in a clean HOME
-and fails if any step or expected output above changes.
+- `macp init` creates your vault (tasks, run records, memory) under `~/.macp/` and
+  marks this repository as managed. There are no environment variables to set and no
+  vault repository to create. It changes `.macp/` (and `CLAUDE.md` / `AGENTS.md`) in
+  your repository and commits nothing.
+- `macp add` turns the sentence into a validated task file. You never edit frontmatter.
+  The worker sees committed work only — pushed work, when the repository has a remote.
+- `macp up --once` runs one pass of the same orchestrator and runner the 24/7 setup
+  uses. The worker works in its own clone under `~/.macp/work`, on the branch
+  `worker/<slug>`. Your checkout is not touched.
+
+When it finishes, `macp status` shows the task waiting for your review, with the pull
+request link. Without a GitHub remote the result is the branch `worker/<slug>` in your
+repository: look at it with `git diff ...worker/<slug>`, merge it, then run
+`macp complete <slug>`.
+
+`macp up` keeps the loop running in the foreground and paces itself against your
+Claude subscription usage; `macp up --once` runs what you queued right away.
+`macp up --service` installs the loop as one systemd user unit.
+
+The worker is a headless agent with your user account's permissions — read
+[SECURITY.md](SECURITY.md) first. [Getting started](docs/getting-started.md) explains
+each step and still documents the manual loop. `bash scripts/check_engine_isolation.sh`
+runs these three commands in a clean HOME, with a stand-in for `claude`, and fails if
+any of them or the result above changes.
+
+`macp` from the install line above is the command these docs mean. A development
+checkout's `scripts/macp` wrapper is a different program (the project/profile CLI).
 
 ## Who it's for
 

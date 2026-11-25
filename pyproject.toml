@@ -82,12 +82,17 @@ packages = ["todo_system"]
 # todo_system/tests/test_installed_wheel_smoke_13a.py pins the wheel's 0755.
 "scripts" = "todo_system/_engine/scripts"
 ".claude/commands" = "todo_system/_engine/.claude/commands"
+# The vault skeleton `macp init` copies (todo_system/lite.py reads it as
+# paths.engine_root() / "vault-template", which is the checkout's own copy there).
+"vault-template" = "todo_system/_engine/vault-template"
 
 [tool.hatch.build.targets.sdist]
 # `uv build` builds the wheel FROM the sdist, so the force-include sources must
 # be in it — and nothing else: this file lives in a vault checkout whose
 # Todo/ Memory/ Worker/ .macp/ trees must never be swept into an archive.
-only-include = ["todo_system", "scripts", ".claude/commands", "pyproject.toml"]
+# (vault-template/ is the engine's skeleton, not a live vault's data.)
+only-include = ["todo_system", "scripts", ".claude/commands", "vault-template",
+                "pyproject.toml"]
 
 [tool.ruff]
 # Notes/ holds one-off analysis scripts kept for reproducibility (e.g. the

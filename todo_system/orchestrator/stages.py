@@ -752,6 +752,14 @@ def vault_worktree_meta(stage: str, working_dir: str, branch: str) -> list[str]:
     return lines
 
 
+def is_url_remote(repo: str | None) -> bool:
+    """True when ``repo`` names a hosted remote (``scheme://…`` or ``git@…``) —
+    the same test the runner's ``_origin_repo_arg`` applies to ``origin`` —
+    and False for a local path."""
+    url = (repo or "").strip()
+    return "://" in url or url.startswith("git@")
+
+
 def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
                      branch: str, repo: str | None = None,
                      working_dir: str | None = None, auto_merge: bool = False,
@@ -870,6 +878,16 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
             meta.append(_build_tests_hint(working_dir))
         meta.append("- **External repo task**: Implement/Verify operate on the "
                     "checkout; vault run_dir artifacts are read-only references.\n")
+        if not is_url_remote(repo):
+            # A repo given as a local path (lite mode: `macp add` in a repository
+            # with no URL remote). `origin` is that path, so no `gh` call can
+            # find it. Never true for a URL repo, so those prompts are unchanged.
+            meta.append(
+                "- **origin is a local path, not a hosting service**: there is no "
+                "pull request. Wherever these instructions say to push and open a "
+                "PR, push the branch to `origin` and stop there — do not call `gh`, "
+                "and record `PR: none (local branch <branch>)`. The pushed branch is "
+                "the result; a person reviews and merges it.\n")
     elif _is_vault_worktree(working_dir):
         # A vault task (no `repo`) whose branch is in a linked worktree of the
         # vault. Only that shape opens this arm: with no `working_dir`, or one

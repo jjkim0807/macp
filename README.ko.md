@@ -47,38 +47,46 @@ macp는 **특정 코딩 에이전트에 묶이지 않는 운영 계층**을 지�
 
 ## 5분 체험
 
-에이전트를 호출하지 않고 외부로 아무것도 보내지 않습니다. Linux 또는 macOS,
-Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`이 필요합니다.
+실제 Claude Code 워커가 내 저장소에서 작은 태스크 하나를 끝내고 풀 리퀘스트를 남깁니다.
+저장소에 GitHub 원격이 없으면 로컬 브랜치를 남깁니다. 머지는 하지 않습니다.
+
+Linux 또는 macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`, 그리고
+로그인된 [Claude Code](https://code.claude.com) CLI가 필요합니다. macp는 한 번만 설치합니다:
+
+    uv tool install git+https://github.com/jjkim0807/macp
+
+그다음 내 git 저장소 안에서:
 
 ```bash
-git clone https://github.com/jjkim0807/macp ~/macp && cd ~/macp
-uv sync
-
-cp -r vault-template ~/my-vault            # 볼트: 태스크·실행 기록·메모리
-export MACP_VAULT_ROOT=~/my-vault
-export USAGE_GUARD_DISABLE=1               # 체험 중에는 사용량 페이싱 끔
-
-uv run python -m todo_system.cli new hello-world --template auto-worker
-#   ~/my-vault/Todo/items/hello-world.md 를 열어 outcome을 쓰고
-#   `worker_mode: blocked` 를 `worker_mode: auto` 로 바꿉니다
-uv run python -m todo_system.cli validate hello-world   # → worker contract OK (open tasks)
-uv run python -m todo_system.cli import-md              # → imported tasks: 1
-
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
-#   → dispatched hello-world -> worker-default
-uv run --project ~/macp python -m todo_system.orchestrator.runner \
-    --agent worker-default --mode shadow --once
-#   → RESULT: shadow run for 'hello-world' (no agent spawned)
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator auto
-uv run --project ~/macp python -m todo_system.orchestrator.orchestrator status
-#   → done           hello-world                              worker-default
+macp init                                   # ~/.macp/vault 를 만들고 이 저장소를 등록
+macp add "README에 설치 방법 절을 추가"
+macp up --once                              # 디스패치 → 워커 → 결과, 그리고 종료
 ```
 
-태스크 파일이 가져오기 → 라우팅 → 디스패치 → 실행(shadow) → 수집까지 한 바퀴 돌았습니다.
-실제 저장소에 대한 첫 실행은 [시작하기](docs/getting-started.md) 2부를 보세요. 실제
-실행 전에는 반드시 [SECURITY.md](SECURITY.md)를 읽으세요. 워커는 사용자 권한으로 코드를
-실행하고 GitHub에 push할 수 있습니다. `bash scripts/check_engine_isolation.sh`가 이 과정을
-깨끗한 HOME에서 그대로 돌립니다. 위의 명령이나 기대 출력이 하나라도 바뀌면 실패합니다.
+- `macp init`은 `~/.macp/` 아래에 볼트(태스크·실행 기록·메모리)를 만들고 이 저장소를
+  관리 대상으로 표시합니다. 설정할 환경변수도, 따로 만들 볼트 저장소도 없습니다.
+  저장소의 `.macp/`(그리고 `CLAUDE.md`·`AGENTS.md`)만 바꾸고 아무것도 커밋하지 않습니다.
+- `macp add`는 문장을 검증된 태스크 파일로 바꿉니다. frontmatter를 손으로 쓰지 않습니다.
+  워커는 커밋된 것만 봅니다. 원격이 있는 저장소라면 push된 것만 봅니다.
+- `macp up --once`는 24시간 운영과 같은 오케스트레이터와 러너를 한 번 돌립니다. 워커는
+  `~/.macp/work` 아래 자기 클론에서 `worker/<slug>` 브랜치로 일합니다. 내 체크아웃은
+  건드리지 않습니다.
+
+끝나면 `macp status`가 검토를 기다리는 태스크와 풀 리퀘스트 링크를 보여 줍니다. GitHub
+원격이 없으면 결과는 내 저장소의 `worker/<slug>` 브랜치입니다. `git diff ...worker/<slug>`로
+보고 머지한 뒤 `macp complete <slug>`를 실행하세요.
+
+`macp up`은 포그라운드에서 루프를 계속 돌리며 Claude 구독 사용량에 맞춰 페이스를 조절합니다.
+`macp up --once`는 쌓인 태스크를 바로 처리합니다. `macp up --service`는 루프를 systemd
+사용자 유닛 하나로 설치합니다.
+
+워커는 내 사용자 권한으로 도는 헤드리스 에이전트입니다. 먼저 [SECURITY.md](SECURITY.md)를
+읽으세요. [시작하기](docs/getting-started.md)가 각 단계를 설명하고, 수동 루프도 그대로
+안내합니다. `bash scripts/check_engine_isolation.sh`가 이 세 명령을 깨끗한 HOME에서 `claude`
+대역으로 돌립니다. 명령이나 위의 결과가 하나라도 바뀌면 실패합니다.
+
+이 문서들이 말하는 `macp`는 위 설치 줄로 설치한 명령입니다. 개발 체크아웃의 `scripts/macp`
+래퍼는 다른 프로그램(프로젝트/프로필 CLI)입니다.
 
 ## 누구에게 맞는가
 

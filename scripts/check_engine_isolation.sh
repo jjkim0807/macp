@@ -11,20 +11,22 @@
 #      vault-template/ + pyproject.toml · uv.lock · README.md · LICENSE — pyproject's
 #      readme/license metadata is needed for the build) into an isolated temp dir
 #      (ENGINE_TMP) with `git archive HEAD`.
-#   2. Makes two throwaway vaults, each a copy of the archived vault-template/ (the
-#      same skeleton a newcomer copies):
-#        VAULT_TMP — for the prime step and legs A/B.
-#        TRY_VAULT — for leg T only.
+#   2. Makes a throwaway vault, VAULT_TMP, a copy of the archived vault-template/
+#      (the same skeleton the manual setup copies), for the prime step and legs A/B.
 #   3. With MACP_VAULT_ROOT pointed at VAULT_TMP, runs 2 read-only CLIs from
 #      cwd=ENGINE_TMP (the engine archive) and judges each rc/observation.
-#   4. Leg T runs the README "Try it in five minutes" commands in the same order
-#      (cli new → set worker_mode: auto + outcome → cli validate → cli import-md →
-#      orchestrator auto → runner --mode shadow --once → orchestrator auto →
-#      orchestrator status). It runs with a fresh HOME, every MACP_* and
-#      USAGE_GUARD_* variable unset, and only MACP_VAULT_ROOT=TRY_VAULT and
-#      USAGE_GUARD_DISABLE=1 set. UV_CACHE_DIR / UV_PYTHON_INSTALL_DIR keep their
-#      real (pre-HOME-swap) locations so uv still works offline. Each step must exit 0
-#      and print the output the README promises.
+#   4. Leg T runs the README "Try it in five minutes" commands in the same order,
+#      inside a throwaway git repository with no remote: `macp init` →
+#      `macp add "…"` → `macp up --once`, then `macp status` and a look at the
+#      branch the worker left. It runs with a fresh HOME and every MACP_*,
+#      USAGE_GUARD_* and CLAUDE_* variable unset — nothing exported at all: lite
+#      mode makes the vault (~/.macp/vault) itself. `claude` is the stand-in
+#      todo_system/tests/fixtures/lite_fake_claude/claude (from the archive), first
+#      on PATH, so the real orchestrator and runner run with no model call.
+#      UV_CACHE_DIR / UV_PYTHON_INSTALL_DIR keep their real (pre-HOME-swap)
+#      locations so uv still works offline. The README's command block must still be
+#      exactly those three commands, each step must exit 0, and each must print the
+#      output the README promises.
 #
 # Why the engine (ENGINE_TMP) and the vault (VAULT_TMP) are separated (the key point):
 #   - worker.py's ROOT / usage_guard.py (via PR #167) and orchestrator/human.py ·
@@ -58,9 +60,10 @@ TMPROOT="$(mktemp -d)"
 ENGINE_TMP="$TMPROOT/engine"
 VAULT_TMP="$TMPROOT/vault"
 TRY_ROOT="$TMPROOT/try"
-TRY_VAULT="$TRY_ROOT/my-vault"
+TRY_REPO="$TRY_ROOT/my-project"
 TRY_HOME="$TRY_ROOT/home"
-mkdir -p "$ENGINE_TMP" "$VAULT_TMP" "$TRY_VAULT" "$TRY_HOME"
+TRY_BIN="$TRY_ROOT/bin"
+mkdir -p "$ENGINE_TMP" "$VAULT_TMP" "$TRY_REPO" "$TRY_HOME" "$TRY_BIN"
 # Clean up only this specific path — no broad rm/glob.
 trap 'rm -rf "$TMPROOT"' EXIT
 
@@ -68,7 +71,7 @@ echo "== check_engine_isolation =="
 echo "repo:       $REPO"
 echo "engine_tmp: $ENGINE_TMP"
 echo "vault_tmp:  $VAULT_TMP"
-echo "try_vault:  $TRY_VAULT"
+echo "try_repo:   $TRY_REPO"
 echo
 
 # --- Phase 1: archive only the engine tree (from the HEAD commit tree) ---------
@@ -82,12 +85,11 @@ git -C "$REPO" archive HEAD todo_system scripts .claude/commands vault-template 
 echo "[phase1] engine files extracted: $(find "$ENGINE_TMP" -type f | wc -l)"
 echo
 
-# --- Phase 2: throwaway vaults = copies of the archived vault-template ---------
-# The same skeleton the README tells a newcomer to `cp -r`. The real vault is never
-# touched — everything is a throwaway under mktemp.
-echo "[phase2] copying vault-template -> $VAULT_TMP and $TRY_VAULT"
+# --- Phase 2: throwaway vault = a copy of the archived vault-template ----------
+# The same skeleton the manual setup copies. The real vault is never touched —
+# everything is a throwaway under mktemp. (Leg T makes its own vault: `macp init`.)
+echo "[phase2] copying vault-template -> $VAULT_TMP"
 cp -R "$ENGINE_TMP/vault-template/." "$VAULT_TMP/"
-cp -R "$ENGINE_TMP/vault-template/." "$TRY_VAULT/"
 echo "[phase2] vault fixture ready ($(find "$VAULT_TMP" -type f | wc -l) file(s))"
 echo
 
@@ -155,12 +157,16 @@ echo "[phase3] leg B rc=$B_RC"
 echo
 
 # --- Leg T (required): the README "Try it in five minutes" loop ----------------
-# Same commands, same order, same shape as the README: the cli commands run with
-# cwd = the engine checkout, the orchestrator/runner with `--project <engine>`.
-# The env is what a newcomer's fresh shell would have: a fresh HOME, no MACP_* /
-# USAGE_GUARD_* variable except the two the README exports. The variable names are
-# listed at run time (compgen -e), not from a fixed list, so a new MACP_* knob in
-# the caller's shell cannot leak in.
+# The README's three commands, in order, from inside a git repository of the
+# user's (TRY_REPO: one commit, no remote). `macp` is the console script of the
+# archived engine (`uv run --project <engine> macp …` stands in for the
+# `uv tool install` line). The env is what a newcomer's fresh shell would have: a
+# fresh HOME and no MACP_* / USAGE_GUARD_* / CLAUDE_* variable at all — the README
+# exports nothing. The variable names are listed at run time (compgen -e), not from
+# a fixed list, so a new knob in the caller's shell cannot leak in. `claude` on PATH
+# is the archive's stand-in (fixtures/lite_fake_claude): it answers the model probe,
+# `macp add`'s JSON request and the quick stage, so the real orchestrator and runner
+# run end to end with no model call and nothing leaving the machine.
 # uv keeps its cache and managed Pythons under HOME. Read their real locations before
 # swapping HOME and pass them through, so the leg works offline (the pytest gate
 # runs this script with UV_OFFLINE=1). If `uv python dir` fails, it is skipped.
@@ -169,13 +175,23 @@ REAL_UV_PYTHON="$(uv python dir 2>/dev/null || true)"
 TRY_ENV=(env)
 while IFS= read -r name; do
   case "$name" in
-    MACP_*|USAGE_GUARD_*) TRY_ENV+=(-u "$name") ;;
+    MACP_*|USAGE_GUARD_*|CLAUDE_*) TRY_ENV+=(-u "$name") ;;
   esac
 done < <(compgen -e)
-TRY_ENV+=(-u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV
-          HOME="$TRY_HOME" MACP_VAULT_ROOT="$TRY_VAULT" USAGE_GUARD_DISABLE=1)
+TRY_ENV+=(-u MAESTRO_VAULT_DIR -u KAKAO_VAULT_DIR -u VIRTUAL_ENV -u PYTHONPATH
+          HOME="$TRY_HOME" PATH="$TRY_BIN:$PATH")
 if [ -n "$REAL_UV_CACHE" ]; then TRY_ENV+=(UV_CACHE_DIR="$REAL_UV_CACHE"); fi
 if [ -n "$REAL_UV_PYTHON" ]; then TRY_ENV+=(UV_PYTHON_INSTALL_DIR="$REAL_UV_PYTHON"); fi
+
+# The stand-in `claude`, and the user's repository: one commit, no remote. The
+# identity is passed inline (the fresh HOME has none); nothing global is written.
+cp "$ENGINE_TMP/todo_system/tests/fixtures/lite_fake_claude/claude" "$TRY_BIN/claude"
+chmod 0755 "$TRY_BIN/claude"
+git -C "$TRY_REPO" init -q -b main
+printf '# my project\n' > "$TRY_REPO/README.md"
+git -C "$TRY_REPO" add README.md
+git -C "$TRY_REPO" -c user.name=newcomer -c user.email=newcomer@example.invalid \
+  commit -q -m "first commit"
 
 capture_try() {
   set +e
@@ -191,8 +207,8 @@ TRY_OK=1
 TRY_FAIL=""
 TRY_STEPS=0
 TRY_EXPECTS=0
-TRY_STEP_TOTAL=8
-TRY_EXPECT_TOTAL=5
+TRY_STEP_TOTAL=6
+TRY_EXPECT_TOTAL=6
 
 # try_step <n> <fixed|regex|none> <needle> <cmd...>
 try_step() {
@@ -229,47 +245,40 @@ try_step() {
   esac
 }
 
-# The README's hand edit: write an outcome and switch worker_mode blocked → auto.
-# Portable sed (no -i: GNU and BSD differ). If the scaffold no longer has the lines
-# the README tells the user to change, that is template drift and the leg fails.
-try_edit_task() {
-  if [ "$TRY_OK" -ne 1 ]; then return 0; fi
-  local f="$TRY_VAULT/Todo/items/hello-world.md"
-  echo "[phase3] leg T step 2: edit Todo/items/hello-world.md (outcome, worker_mode: auto)"
-  if [ -f "$f" ] \
-    && sed -e 's/^worker_mode: blocked$/worker_mode: auto/' \
-           -e 's/^outcome: .*/outcome: "hello-world runs through the shadow loop"/' \
-           "$f" > "$f.tmp" \
-    && mv "$f.tmp" "$f" \
-    && grep -q '^worker_mode: auto$' "$f" \
-    && grep -q '^outcome: "hello-world runs through the shadow loop"$' "$f"; then
+# Step 0: the README's command block is still exactly the three commands run below
+# (comments dropped, first two words compared). One more command in the block — the
+# number a newcomer has to type — fails the leg instead of drifting past it.
+README_CMDS_EXPECTED=$'macp init\nmacp add\nmacp up'
+try_readme_block() {
+  local got
+  echo "[phase3] leg T step 0: README 'Try it in five minutes' command block"
+  got="$(awk '/^## Try it in five minutes/ {s = 1} s && /^```bash/ {b = 1; next}
+              b && /^```/ {exit} b {print}' "$ENGINE_TMP/README.md" \
+         | sed -e 's/[[:space:]]#.*$//' -e '/^[[:space:]]*$/d' \
+         | awk '{print $1, $2}' || true)"
+  printf '%s\n' "$got" | sed 's/^/    T| /'
+  if [ "$got" = "$README_CMDS_EXPECTED" ]; then
     TRY_STEPS=$((TRY_STEPS + 1))
-    echo "[phase3] leg T step 2 ok"
+    TRY_EXPECTS=$((TRY_EXPECTS + 1))
   else
     TRY_OK=0
-    TRY_FAIL="step 2: template drift (worker_mode/outcome lines not found)"
-    echo "[phase3] leg T step 2 FAILED: template drift"
+    TRY_FAIL="step 0: README command block is not 'macp init / macp add / macp up'"
   fi
 }
 
-echo "[phase3] leg T: README five-minute try (clean HOME, MACP_VAULT_ROOT=TRY_VAULT)"
-pushd "$ENGINE_TMP" >/dev/null
-try_step 1 none "" \
-  uv run python -m todo_system.cli new hello-world --template auto-worker
-try_edit_task
-try_step 3 fixed "worker contract OK" \
-  uv run python -m todo_system.cli validate hello-world
-try_step 4 fixed "imported tasks: 1" \
-  uv run python -m todo_system.cli import-md
-try_step 5 fixed "dispatched hello-world -> worker-default" \
-  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator auto
-try_step 6 fixed "shadow run for 'hello-world' (no agent spawned)" \
-  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.runner \
-    --agent worker-default --mode shadow --once
-try_step 7 none "" \
-  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator auto
-try_step 8 regex 'done[[:space:]]+hello-world[[:space:]]+worker-default' \
-  uv run --project "$ENGINE_TMP" python -m todo_system.orchestrator.orchestrator status
+echo "[phase3] leg T: README five-minute try (clean HOME, nothing exported, stand-in claude)"
+try_readme_block
+pushd "$TRY_REPO" >/dev/null
+try_step 1 fixed "vault created: $TRY_HOME/.macp/vault" \
+  uv run --project "$ENGINE_TMP" macp init
+try_step 2 fixed "task added: readme-install-line (quick)" \
+  uv run --project "$ENGINE_TMP" macp add "Add an install section to the README"
+try_step 3 fixed "dispatched readme-install-line -> worker-default" \
+  uv run --project "$ENGINE_TMP" macp up --once
+try_step 4 regex 'awaiting_human[[:space:]]+readme-install-line[[:space:]]+worker-default' \
+  uv run --project "$ENGINE_TMP" macp status
+try_step 5 fixed "chore(worker): readme-install-line" \
+  git -C "$TRY_REPO" log --format=%s main..worker/readme-install-line
 popd >/dev/null
 if [ "$TRY_OK" -eq 1 ]; then
   T_RC=0
@@ -290,7 +299,7 @@ printf '| %s | %s | %s | %s |\n' \
 printf '| %s | %s | %s | %s |\n' \
   "python -m todo_system.session_log list"          "$B_RC" "예 (paths.vault_root→env, stdlib)"                 "$B_OBS"
 printf '| %s | %s | %s | %s |\n' \
-  "README five-minute try (clean HOME)"             "$T_RC" "예 (MACP_VAULT_ROOT=TRY_VAULT, HOME=mktemp)"      "$T_OBS"
+  "README five-minute try (clean HOME)"             "$T_RC" "env 없음 (macp init → ~/.macp/vault, HOME=mktemp)" "$T_OBS"
 printf '%s\n' "(prime: cli import-md rc=$PRIME_RC)"
 echo "======================================================="
 echo

@@ -3755,6 +3755,13 @@ def _pull_main(root: Path, _run=None, *, attempts: int = 3, _sleep=None) -> None
                 fetched = git("fetch", "origin", "main")
                 if fetched.returncode != 0:
                     detail = (fetched.stderr or fetched.stdout or "").strip()
+                    # A vault with no `origin` at all (the lite-mode vault that
+                    # `macp init` creates) has nothing to catch up with: stop
+                    # quietly instead of three retries and an error-looking line
+                    # every tick. Asked only after a failed fetch, so a vault that
+                    # has a remote runs the same git calls as before up to here.
+                    if i == 0 and git("remote", "get-url", "origin").returncode != 0:
+                        return
                     if i + 1 < attempts:
                         sleep(1)
                     continue
