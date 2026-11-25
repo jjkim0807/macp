@@ -63,22 +63,47 @@ WAIT_RANK = {
 }
 
 
+# jobs.poll() states in which a long_job task's NEXT dispatch only starts the
+# detached job (`absent`) or polls it (`running`): StagedExecutor._long_job_gate
+# returns before any account, agent or Claude stage. `done` / `failed` mean the
+# job is over (rc file written, or the process died without one), and that
+# dispatch runs the pipeline or records the failure.
+LONG_JOB_PHASE_STATES = frozenset({"absent", "running"})
+
+
+def long_job_phase(payload: dict | None, job_state: str | None) -> bool:
+    """Is this task's next dispatch only its long_job's start or poll?
+
+    Pure: `job_state` is jobs.poll()'s state for the task's slug on this host
+    (Orchestrator._job_state reads it). Such a dispatch spends no Claude, so the
+    usage hold does not apply to it (hold_wait) and it needs no usage-paced slot
+    (_slot_gate). Once the job is over the task waits for the hold like any
+    other. A job that ran on another host reads `absent` here; the dispatch that
+    finds it done goes on into the pipeline, where the runner's in-flight brake
+    (`_wait_for_session_headroom`) still paces every Claude stage.
+    """
+    return bool((payload or {}).get("long_job")) and job_state in LONG_JOB_PHASE_STATES
+
+
 def hold_wait(payload: dict | None, *, paused: bool, usage_hold: str | None,
-              budget_exceeded: bool) -> str | None:
+              budget_exceeded: bool, job_state: str | None = None) -> str | None:
     """Which tick-wide hold keeps this task out of `runnable`, or None.
 
-    Pure: the three hold inputs are passed in, so tick() feeds its own reads and
+    Pure: the hold inputs are passed in, so tick() feeds its own reads and
     the queue view feeds read-only ones (it must never call `usage_hold()`, which
     refreshes usage state). PAUSED stops everything — a human saying stop, which
     a task file cannot countermand. `bypass_guard: true` lets a task through the
-    COST holds (quota pacing, daily run budget) only. When both cost holds apply,
-    usage_hold is reported: they share one display tier.
+    COST holds (quota pacing, daily run budget) only. The usage hold also lets
+    through a dispatch that is only a long_job's start or poll
+    (`long_job_phase(payload, job_state)`); the daily budget still applies to it.
+    When both cost holds apply, usage_hold is reported: they share one display
+    tier.
     """
     if paused:
         return WAIT_PAUSED
     if (payload or {}).get("bypass_guard"):
         return None
-    if usage_hold:
+    if usage_hold and not long_job_phase(payload, job_state):
         return WAIT_USAGE_HOLD
     if budget_exceeded:
         return WAIT_BUDGET
@@ -674,13 +699,16 @@ class Orchestrator:
                        if a.state in _IN_FLIGHT and a.task_id != skip)
 
     def _slot_gate(self, agent: Agent, payload: dict | None = None,
-                   busy: Counter | None = None, now: float | None = None) -> SlotGate:
+                   busy: Counter | None = None, now: float | None = None, *,
+                   job_state: str | None = None) -> SlotGate:
         """Room on `agent` for one more run of `payload`, read-only.
 
         A `bypass_guard` task always has a capacity of at least 1: its worker
         may announce 0 because its usage headroom is gone, and a bypass task is
-        the one kind allowed to run then, one at a time. A worker that stopped
-        announcing (MACP_REMOTE_ONLINE_S) has no slot for anything."""
+        allowed to run then, one at a time. So is a long_job's start or poll
+        (`long_job_phase(payload, job_state)`), which needs no usage headroom at
+        all. A worker that stopped announcing (MACP_REMOTE_ONLINE_S) has no slot
+        for anything."""
         now = now if now is not None else dt.datetime.now().timestamp()
         used = (busy if busy is not None else self._busy_by_agent()).get(agent.id, 0)
         cap = max(1, int(agent.concurrency or 1))          # never announced
@@ -693,19 +721,35 @@ class Orchestrator:
                 cap, used = int(rec["max"]), max(used, int(rec.get("used") or 0))
         except Exception:  # noqa: BLE001 - an unreadable record = never announced
             pass
-        if (payload or {}).get("bypass_guard"):
+        if (payload or {}).get("bypass_guard") or long_job_phase(payload, job_state):
             cap = max(cap, 1)
         return SlotGate(cap - used, cap, used)
+
+    def _job_state(self, slug: str | None, payload: dict | None) -> str | None:
+        """jobs.poll() state of `slug`'s long_job on this host — what
+        `long_job_phase` judges — or None for a task without a long_job.
+        Read-only (a file read and a signal-0 probe), so the queue view calls it
+        too. Never raises: None keeps the task under the usage hold, as before."""
+        if not slug or not (payload or {}).get("long_job"):
+            return None
+        try:
+            from . import jobs
+            return jobs.poll(slug).get("state")
+        except Exception:  # noqa: BLE001 - fail toward the existing hold
+            return None
 
     def _assignable(self, agent: Agent, payload: dict | None,
                     skip: str | None = None) -> bool:
         """May `payload` be sent to `agent` right now? The one judgment every
         assignment passes: this tick's holds (pause, usage, daily budget —
-        `bypass_guard` passes the cost holds) and a free slot on that worker."""
-        if hold_wait(payload, **self._hold) is not None:
+        `bypass_guard` passes the cost holds, a long_job's start or poll the
+        usage hold) and a free slot on that worker. `skip` is the task's own id:
+        its row is left out of the busy count, and its long_job state is read."""
+        job_state = self._job_state(skip, payload)
+        if hold_wait(payload, **self._hold, job_state=job_state) is not None:
             return False
         return agent.is_human or self._slot_gate(
-            agent, payload, self._busy_by_agent(skip)).free > 0
+            agent, payload, self._busy_by_agent(skip), job_state=job_state).free > 0
 
     def _fail_cooldown(self, refail_count: int) -> float:
         """Tiered backoff: a first failure retries fast (transient stage flakes
@@ -782,7 +826,8 @@ class Orchestrator:
         repo_dir = self._heavy_repo_dir(payload)
         device = needs_device(payload, repo_dir, self._app_paths(payload))
         pick = self._pick_heavy_remote(existing, need_device=device,
-                                       payload=payload, busy=busy)
+                                       payload=payload, busy=busy,
+                                       job_state=self._job_state(slug, payload))
         return (pick, base) if pick is not None else (base, None)
 
     @staticmethod
@@ -822,12 +867,14 @@ class Orchestrator:
                            now: float | None = None, *,
                            need_device: bool = False,
                            payload: dict | None = None,
-                           busy: Counter | None = None) -> Agent | None:
+                           busy: Counter | None = None,
+                           job_state: str | None = None) -> Agent | None:
         """The first heavy-capable remote (registry order) that is usable now.
 
         This is THE single "is this remote available?" check — online by
         agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
-        counts as offline — agent_mode.py), with a free slot (_slot_gate),
+        counts as offline — agent_mode.py), with a free slot (_slot_gate, which
+        reads `job_state` the way it reads `bypass_guard`),
         and not the agent that last REJECTED this very task (or that it was just
         rerouted away from and now waits in the queue for its fallback — without
         that bar it would bounce straight back), and whose mailbox can
@@ -853,7 +900,7 @@ class Orchestrator:
                 continue
             if a.id == refused:
                 continue
-            if self._slot_gate(a, payload, busy, now).free <= 0:
+            if self._slot_gate(a, payload, busy, now, job_state=job_state).free <= 0:
                 continue
             why = self._mailbox_for(a).can_send()
             if why:
@@ -1293,7 +1340,8 @@ class Orchestrator:
             # flight, cooling down, poison to quarantine) is dispatch()'s to refuse.
             if (agent is not None and not agent.is_human
                     and self._ledger_gate(self.ledger.load(t.slug)).kind == "go"):
-                sg = self._slot_gate(agent, t.payload, busy)
+                sg = self._slot_gate(agent, t.payload, busy,
+                                     job_state=self._job_state(t.slug, t.payload))
                 if sg.free <= 0:
                     full.setdefault(agent.id, [sg, 0])[1] += 1
                     continue          # stays in the queue, for any later tick
@@ -1343,13 +1391,14 @@ class Orchestrator:
             if lg.kind in ("done", "busy") or self.route(t.slug) is None:
                 continue
             key = self._checkout_key(t.payload)
+            job_state = self._job_state(t.slug, t.payload)
             h = hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
-                          budget_exceeded=budget_exceeded)
+                          budget_exceeded=budget_exceeded, job_state=job_state)
             agent = self._route_for(t, busy) if h is None else None
             remote = agent is not None and agent.is_remote
             cg = (self._checkout_gate(t, key, live, cap) if h is None and not remote
                   else CheckoutGate(None))
-            sg = (self._slot_gate(agent, t.payload, busy, now)
+            sg = (self._slot_gate(agent, t.payload, busy, now, job_state=job_state)
                   if agent is not None and not agent.is_human and cg.wait is None
                   else None)
             slot = (agent.id, sg) if sg is not None and sg.free <= 0 else None
@@ -3458,14 +3507,20 @@ class Orchestrator:
         # `bypass_guard: true` lets one task through a COST hold — quota pacing or
         # the daily run budget — for work that is worth spending out of turn. It
         # deliberately does NOT override an explicit pause: that is a human saying
-        # stop, and a task file should not be able to countermand it. The verdict
-        # is hold_wait(), which the queue view shares.
+        # stop, and a task file should not be able to countermand it. A long_job
+        # whose job is still to start or still running passes the usage hold too:
+        # that dispatch only starts or polls the job and spends no Claude
+        # (long_job_phase). The verdict is hold_wait(), which the queue view shares.
         runnable = tasks if not hold else [
             t for t in tasks if hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
-                                          budget_exceeded=budget) is None]
+                                          budget_exceeded=budget,
+                                          job_state=self._job_state(t.slug, t.payload))
+            is None]
         if hold and runnable:
             for t in runnable:
-                print(f"[orchestrator] {t.slug}: bypass_guard — dispatching despite "
+                why = ("bypass_guard" if (t.payload or {}).get("bypass_guard")
+                       else "long_job start/poll")
+                print(f"[orchestrator] {t.slug}: {why} — dispatching despite "
                       f"hold ({usage_hold or 'daily budget'})")
         # BEFORE dispatch on purpose: the reservation back-dates `updated_ts` past
         # the fail cooldown, so the freed task goes out in THIS tick's dispatch
