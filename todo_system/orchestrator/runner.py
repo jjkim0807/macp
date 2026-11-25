@@ -2217,7 +2217,6 @@ def _cancel_requested_now() -> bool:
 # stage, wait while the 5h session window is at/over the stage cap
 # (usage_guard.stage_gate). The admission gates only stop NEW runs; runs already
 # in flight used to ride the window to 100%.
-STAGE_GATE_ENV = "RUNNER_STAGE_USAGE_GATE"          # "0" disables
 STAGE_GATE_POLL_S = 60.0
 STAGE_GATE_PROGRESS_S = 600.0                        # < the stale-reap bound
 STAGE_GATE_MAX_S = 5.5 * 3600                        # one 5h window + slack
@@ -2228,12 +2227,10 @@ def _wait_for_session_headroom(stage: str, payload: dict, progress, *, gate=None
     """Block before `stage` while the session window is at its stage cap.
     Returns False when the orchestrator cancelled the run during the wait (the
     caller stops at this boundary), else True (go). `bypass_guard: true` tasks
-    and RUNNER_STAGE_USAGE_GATE=0 never wait. Emits a PROGRESS line every
+    never wait. Emits a PROGRESS line every
     STAGE_GATE_PROGRESS_S so the waiting run is not reaped as stale. Bounded by
     STAGE_GATE_MAX_S and by the window's own reset; never raises."""
     try:
-        if os.environ.get(STAGE_GATE_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
-            return True
         if (payload or {}).get("bypass_guard"):
             return True
         if gate is None:

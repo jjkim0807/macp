@@ -110,14 +110,6 @@ def test_check_fail_open_without_data(tmp_path, monkeypatch):
     assert state["decision"]["allowed"] is True
 
 
-def test_check_fail_closed_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("USAGE_GUARD_FAIL_CLOSED", "1")
-    monkeypatch.setattr(ug, "_fetch_usage",
-                        lambda: (_ for _ in ()).throw(RuntimeError("offline")))
-    assert not ug.check(now=NOW)["allowed"]
-
-
 def test_check_uses_cached_snapshot_and_blocks(tmp_path, monkeypatch):
     monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
     (tmp_path / "latest.json").write_text(json.dumps({
@@ -175,8 +167,6 @@ def _http_429(headers=None):
 
 def test_failure_backoff_is_exponential_without_retry_after(tmp_path, monkeypatch):
     monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("USAGE_GUARD_BACKOFF_BASE_S", "60")
-    monkeypatch.setenv("USAGE_GUARD_BACKOFF_MAX_S", "1800")
     calls = []
     monkeypatch.setattr(ug, "_fetch_usage",
                         lambda: calls.append(1) or _http_429()())
@@ -200,15 +190,13 @@ def test_failure_backoff_is_exponential_without_retry_after(tmp_path, monkeypatc
 
 def test_failure_backoff_caps_at_max(tmp_path, monkeypatch):
     monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("USAGE_GUARD_BACKOFF_BASE_S", "60")
-    monkeypatch.setenv("USAGE_GUARD_BACKOFF_MAX_S", "300")
     # a large prior fail_count would blow past the cap without the min()
     (tmp_path / "latest.json").write_text(json.dumps({"fail_count": 20}))
     monkeypatch.setattr(ug, "_fetch_usage", _http_429())
     ug.check(now=NOW)
     state = json.loads((tmp_path / "latest.json").read_text())
     assert state["fail_count"] == 21
-    assert state["next_retry_at"] == pytest.approx(NOW + 300)  # capped, not 60*2**20
+    assert state["next_retry_at"] == pytest.approx(NOW + 1800)  # capped, not 60*2**20
 
 
 def test_retry_after_seconds_is_honored(tmp_path, monkeypatch):
@@ -355,18 +343,6 @@ def test_repeated_no_data_ticks_neither_nest_nor_extend(tmp_path, monkeypatch):
     assert third["held_reason"] == first["held_reason"]
     assert third["reason"].count("holding last known block") == 1
     assert second["reason"] == first["reason"]
-
-
-def test_fail_closed_still_wins_when_nothing_to_carry(tmp_path, monkeypatch):
-    monkeypatch.setenv("USAGE_GUARD_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("USAGE_GUARD_FAIL_CLOSED", "1")
-    (tmp_path / "latest.json").write_text(
-        json.dumps(_blocked_state(blocked_until=NOW - 1)))
-    monkeypatch.setattr(ug, "_fetch_usage",
-                        lambda: (_ for _ in ()).throw(RuntimeError("offline")))
-    d = ug.check(now=NOW)
-    assert not d["allowed"]
-    assert "fail-closed" in d["reason"]
 
 
 # --- no-data visibility: `status` must surface the last good snapshot ---
@@ -649,7 +625,7 @@ def test_allowed_decision_has_no_kind_or_eta():
     assert ug.hold_kind({"allowed": True, "disabled": True}) is None
 
 
-def test_no_data_decisions_kind_and_eta(monkeypatch):
+def test_no_data_decisions_kind_and_eta():
     cfg = ug._cfg()
     carried = ug._no_data_decision(_blocked_state(blocked_until=NOW + 3600), cfg, NOW)
     assert carried["carried"] is True
@@ -658,10 +634,6 @@ def test_no_data_decisions_kind_and_eta(monkeypatch):
 
     fresh = ug._no_data_decision({"error": "offline"}, cfg, NOW)
     assert fresh["release_eta"] is None
-    monkeypatch.setenv("USAGE_GUARD_FAIL_CLOSED", "1")
-    closed = ug._no_data_decision({"error": "offline"}, ug._cfg(), NOW)
-    assert not closed["allowed"]
-    assert ug.hold_kind(closed) == "no_data"
 
 
 def test_hold_kind_paused_and_unknown():

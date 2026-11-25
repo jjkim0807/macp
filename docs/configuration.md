@@ -169,7 +169,6 @@ session window and the weekly window before every dispatch:
 | `USAGE_GUARD_WEEKLY_ALLOWANCE` | 12 | percentage points the weekly window may run ahead of pace |
 | `USAGE_GUARD_SESSION_ALLOWANCE` | 30 | the same for the 5-hour window |
 | `USAGE_GUARD_WEEKLY_HARD_CAP`, `USAGE_GUARD_SESSION_HARD_CAP` | 90 | block outright above this % |
-| `USAGE_GUARD_FAIL_CLOSED` | unset | `1` = hold when usage cannot be read (the default lets work through) |
 
 A single task can pass a pacing hold with `bypass_guard: true` in its frontmatter.
 

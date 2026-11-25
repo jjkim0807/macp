@@ -258,7 +258,7 @@ def pacing_inputs(usage: dict | None, now: float | None = None) -> dict | None:
     """{available, claimed} full resets for the weekly pace line, or None (no
     change). Reads only the cached status — the network read happens in
     `maybe_claim` (orchestrator tick), never on a runner's hot path."""
-    if disabled() or os.environ.get("USAGE_RESETS_PACING", "1") in ("0", "false", "no", "off"):
+    if disabled():
         return None
     now = time.time() if now is None else now
     state = _load()
@@ -279,29 +279,22 @@ def weekly_line(elapsed_pct: float, allowance: float, available: int, claimed: i
     return elapsed_pct * mult - 100.0 * max(0, claimed) + allowance
 
 
-WALL_CAP_DEFAULT = 98.0
-
-
-def wall_cap() -> float:
-    """Weekly cap while a full grant waits for auto-claim (USAGE_RESETS_WALL_CAP,
-    default 98). The claim zeroes the window, so stopping at the normal cap
-    (90) threw the last ~10% away; the 2pp left covers in-flight overshoot."""
-    try:
-        return float(os.environ.get("USAGE_RESETS_WALL_CAP") or WALL_CAP_DEFAULT)
-    except ValueError:
-        return WALL_CAP_DEFAULT
+# Weekly cap while a full grant waits for auto-claim. The claim zeroes the
+# window, so stopping at the normal cap (90) threw the last ~10% away; the 2pp
+# left covers in-flight overshoot.
+WALL_CAP = 98.0
 
 
 def effective_weekly_cap(base_cap: float, resets: dict | None, resets_at: float | None,
                          now: float) -> float:
-    """The weekly hard cap to apply: raised to `wall_cap()` only while a full
+    """The weekly hard cap to apply: raised to `WALL_CAP` only while a full
     grant is usable, autoclaim is on, and a claim is still allowed (≥
     CLAIM_MIN_HOURS_TO_RESET before the weekly reset). Otherwise `base_cap`. Pure."""
     if not resets or not resets.get("autoclaim") or int(resets.get("available") or 0) <= 0:
         return base_cap
     if resets_at is None or resets_at - now < CLAIM_MIN_HOURS_TO_RESET * 3600.0:
         return base_cap
-    return max(base_cap, wall_cap())
+    return max(base_cap, WALL_CAP)
 
 
 def hard_cap_release_at(util: float, resets_at: float, window_s: float, allowance: float,
@@ -389,7 +382,7 @@ def maybe_claim(usage: dict | None, *, now: float | None = None, fetch=None,
         state = _load()
         resets_at = (usage.get("seven_day") or {}).get("resets_at")
         claimed = claimed_in_window(resets_at, state) if resets_at else 0
-        plan = plan_claim(usage, st, now, hard_cap=max(cfg["weekly_hard_cap"], wall_cap()),
+        plan = plan_claim(usage, st, now, hard_cap=max(cfg["weekly_hard_cap"], WALL_CAP),
                           allowance=cfg["weekly_allowance"], claimed=claimed,
                           last_attempt=float(state.get("last_attempt") or 0))
         if plan is None:

@@ -93,7 +93,9 @@ class _HarnessMixin:
         self.addCleanup(env.stop)
         os.environ.pop(sup.KILL_ENV, None)
         # No usage pause in the loop (the wait returns at once, unpatched).
-        os.environ[runner_mod.STAGE_GATE_ENV] = "0"
+        gate = mock.patch("todo_system.usage_guard.stage_gate", return_value=None)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     # -- the fake stage -----------------------------------------------------
     def _run_dir(self) -> Path:
