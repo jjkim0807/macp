@@ -1389,6 +1389,15 @@ class StagedExecutor(ClaudeCodeExecutor):
         })
         if rel:
             progress(rel)
+        # The repo's playbook, rebuilt before the first stage: implement and
+        # verify read it into their prompt (stages.playbook_section), so it has
+        # to be as of now — the FAIL→PASS pairs other tasks of this repo closed
+        # since the last run included. External repos only (a playbook is per
+        # repo); one line when the file changed.
+        if repo_url:
+            pb = stages.record_playbook(repo_url)
+            if pb:
+                progress(pb)
         if on_run_start is not None:
             # Tell the claim which run this envelope became, the moment it exists.
             # This is the back-reference that replaces the report stage guessing

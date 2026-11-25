@@ -145,6 +145,18 @@ result. implement, verify, quick and delegate hold that rule by default. Each ca
 recorded in the run's `recall.log`, and the report states how many calls a run made and
 how many of the results it went on to cite.
 
+**Repo playbooks.** A task that has a `repo` also gets that repo's playbook, fixed into
+its implement and verify prompts rather than searched for: `Memory/playbooks/<repo>.md`, at
+most 2 KB, a short list of the pitfalls the repo's earlier runs hit. The runner rebuilds it
+at the start of every run of that repo from three sources: verify FAIL→PASS pairs of one task
+(the failure's cause by a fixed rule, the fixing commits, and the lesson the PASS run's
+episode recorded), and the interactive memories about the repo. Repeats merge into one
+line, run lessons older than 60 days drop out, and every source passes the same privacy
+filter as `related.md`. Only the HQ host writes the file. The weekly usage table in the
+brief ends with one line that counts same-cause FAIL repeats per week, which is how to tell
+whether the playbooks earn their keep; `python -m todo_system.playbooks recurrence` prints
+the full table. `MACP_RELATED_CONTEXT=0` turns playbooks off together with `related.md`.
+
 **Isolation and concurrency.** Every run gets its own git worktree on
 `worker/<slug>` — a vault task too, so the vault you work in stays on its default
 branch while it runs ([where a run works](running.md#where-a-run-works)). Two tasks on the same repository run at the same time only when both

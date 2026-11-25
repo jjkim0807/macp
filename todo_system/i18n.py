@@ -333,6 +333,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "usage_value.col.per_merge": "머지당 토큰",
         "usage_value.more_rows": "외 {n}행은 대시보드에 있어요",
         "usage_value.no_runs": "런 없음",
+        # repo playbooks (playbooks.py): the keep/delete measure, one line a week
+        "playbooks.brief_line": (
+            "리포 플레이북 — 같은 원인 FAIL 재발/전체 FAIL(skip 포함), 주별 최근 {weeks}주: "
+            "{cells}. 4주 동안 재발이 줄지 않으면 플레이북을 지운다 "
+            "(`python -m todo_system.playbooks recurrence`)"),
     },
     "en": {
         "hold.cap": "cap reached — at most {cap} concurrent runs per repo",
@@ -666,6 +671,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "usage_value.col.per_merge": "Tokens per merge",
         "usage_value.more_rows": "{n} more row(s) on the dashboard",
         "usage_value.no_runs": "no runs",
+        # repo playbooks (playbooks.py): the keep/delete measure, one line a week
+        "playbooks.brief_line": (
+            "Repo playbooks — same-cause FAIL repeats / all FAILs (skip included), weekly, "
+            "last {weeks} weeks: {cells}. If repeats do not fall over 4 weeks, delete the "
+            "playbooks (`python -m todo_system.playbooks recurrence`)"),
     },
 }
 

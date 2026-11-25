@@ -104,6 +104,15 @@ real ``Memory/relations.sqlite`` (or, under the gate command's
 created, so a forgotten seam finds an empty vault rather than the live one. The
 module's own tests lift the switch and build a tmp vault there.
 
+The repo playbooks (``todo_system/playbooks.py``) — every external-repo
+``StagedExecutor._execute`` rebuilds ``Memory/playbooks/<repo>.md`` under the vault
+root before its first stage (``stages.record_playbook``), and ``build_stage_argv``
+reads that file into the implement/verify prompts. Unisolated, a runner test would
+write a playbook into the live vault (or vault-template), and a real playbook named
+like a test's repo would change the argv every golden test compares.
+``_playbooks_isolated`` points ``playbooks.VAULT_ROOT`` at a tmp dir that is never
+created; the module's own tests point it at a tmp vault they build.
+
 The ``auto`` tick's own side effects — ``orchestrator main auto`` reaches three
 things no test may do for real. ``usage_hold()`` calls ``usage_guard.check()``,
 whose ``get_snapshot`` sends a GET to the Anthropic OAuth usage endpoint (its
@@ -198,6 +207,7 @@ from todo_system import (
     maintenance_embed,
     ops_alerts,
     paths,
+    playbooks,
     usage_guard,
     worker,
 )
@@ -583,6 +593,14 @@ def _embed_tick_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(maintenance_embed, "DB_PATH",
                         base / "vault" / "Memory" / "relations.sqlite")
     monkeypatch.setattr(maintenance_embed, "STATE_DIR", base / "state")
+
+
+@pytest.fixture(autouse=True)
+def _playbooks_isolated(tmp_path_factory, monkeypatch):
+    # See the module docstring. Never created, so a forgotten seam finds no
+    # playbook to read and writes nothing into a real vault.
+    monkeypatch.setattr(playbooks, "VAULT_ROOT",
+                        tmp_path_factory.mktemp("playbooks") / "vault")
 
 
 @pytest.fixture(autouse=True)

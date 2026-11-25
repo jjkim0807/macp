@@ -473,7 +473,10 @@ def test_brief_and_status_show_the_same_table(pv, served, tmp_path):
 
     marked = h.with_table()
     assert len(marked) == 1, h.briefs()
-    assert marked[0] == _AGENT_BRIEF + "\n" + usage_value.render_brief(model) + "\n"
+    # the dashboard's table, then the repo playbooks' keep/delete line under it
+    # (usage_value.playbook_line — brief only, the wire model has no such key)
+    assert marked[0] == (_AGENT_BRIEF + "\n" + usage_value.render_brief(model) + "\n\n"
+                         + usage_value.playbook_line(Path(pv.root), day) + "\n")
     assert "brief.sh: appended the weekly usage-vs-results table" in r.stdout
 
     # the same numbers, cell by cell, as the dashboard rows

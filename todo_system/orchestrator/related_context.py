@@ -40,6 +40,12 @@ and byte-identical. The recall rule is granted by ``stages.STAGE_TOOLS`` to the
 four stages that already run commands; the planner's and the brief's whitelists
 are not touched.
 
+The repo playbooks (``todo_system.playbooks``) are the other reader that carries
+text out: one scrubbed line per pitfall, fixed into a repo's implement/verify
+prompts. They read every source through :func:`read_document` /
+:func:`r5_allows`, the same document filter as :func:`doc_card`, and they obey
+the same kill switch.
+
 Fail-open by contract. Every public function swallows its own errors and
 degrades, in this order:
 
@@ -65,8 +71,9 @@ vault, and untracked files under ``Memory/`` stall the 5-minute queue
 
 Environment (read at call time):
 
-  MACP_RELATED_CONTEXT   "0" switches every path off — ``related.md`` and both
-                         prompt sections. The runtime rollback for this wiring.
+  MACP_RELATED_CONTEXT   "0" switches every path off — ``related.md``, both
+                         prompt sections, and the repo playbooks' refresh and
+                         prompt section. The runtime rollback for this wiring.
 
 CLI (``planner_tick.sh`` / ``brief.sh``; always exits 0):
 
@@ -298,14 +305,50 @@ def doc_card(root: Path, slug: str, source_file: str | None = None) -> DocCard |
     own = _own_doc(base, slug, source_file)
     if own is None:
         return None
+    doc = read_document(base, own)
+    if doc is None:
+        return None
+    rel, fm, body = doc
+    return DocCard(slug=slug, path=rel, title=_title_from(fm, body, slug), gist=gist_for(fm))
+
+
+# -- the R5 document boundary, for readers that carry text out -----------------
+# Two readers take more than metadata out of a document: the recall card above
+# (one summary field) and the repo playbooks (``todo_system.playbooks``: one
+# line per pitfall, from run artifacts, episodes and interactive memory, fixed
+# into a repo's implement/verify prompts). Both decide what they may read HERE,
+# so the boundary stays one function: a document is read only when it is inside
+# the vault and ``graph_memory.is_embeddable`` lets it through, checked on the
+# file as it is now.
+
+def r5_allows(rel_path: str | Path, fm: Mapping[str, Any]) -> bool:
+    """Whether a document (vault-relative path + frontmatter) is inside the R5
+    boundary. Never raises: a check that cannot be made answers no."""
     try:
-        rel = own.resolve().relative_to(base.resolve()).as_posix()
-        fm, body = gm.parse_frontmatter(own.read_text(encoding="utf-8"))
+        return bool(gm.is_embeddable(rel_path, dict(fm)))
+    except Exception:       # noqa: BLE001 - unknown means not shown
+        return False
+
+
+def read_document(root: Path, path: Path, *,
+                  head: int | None = None) -> tuple[str, dict, str] | None:
+    """``(vault-relative path, frontmatter, body)`` of ``path``, or ``None``.
+
+    ``None`` for a file outside ``root`` (symlinks resolved), one that cannot
+    be read or decoded as UTF-8, and one outside the R5 boundary
+    (:func:`r5_allows`). ``head`` reads only the first ``head`` characters —
+    enough for the frontmatter of a long task file."""
+    base = Path(root)
+    try:
+        rel = Path(path).resolve().relative_to(base.resolve()).as_posix()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(head) if head else fh.read()
+        fm, body = gm.parse_frontmatter(text)
     except (OSError, ValueError):
         return None
-    if not gm.is_embeddable(rel, fm):
+    if not r5_allows(rel, fm):
         return None
-    return DocCard(slug=slug, path=rel, title=_title_from(fm, body, slug), gist=gist_for(fm))
+    return rel, fm, body
 
 
 # -- the query ----------------------------------------------------------------
