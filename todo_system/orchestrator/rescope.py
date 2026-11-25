@@ -159,7 +159,10 @@ def read_rescope_for_payload(run_dir, *, max_bytes: int = RESCOPE_MAX_BYTES) -> 
     if not isinstance(plan, dict):
         return None
     try:
-        if len(json.dumps(plan, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        # Measure the indented form — that is what the envelope serializer and
+        # save_remote_rescope write, so a plan the runner carries is one HQ will
+        # also accept (no boundary case where the runner sends it but HQ drops it).
+        if len(json.dumps(plan, ensure_ascii=False, indent=2).encode("utf-8")) > max_bytes:
             return None
     except Exception:  # noqa: BLE001 — unserializable plan → carry nothing (fail-closed)
         return None
