@@ -828,7 +828,9 @@ class Orchestrator:
         This is THE single "is this remote available?" check — online by
         agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
         counts as offline — agent_mode.py), with a free slot (_slot_gate),
-        and not the agent that last REJECTED this very task, and whose mailbox can
+        and not the agent that last REJECTED this very task (or that it was just
+        rerouted away from and now waits in the queue for its fallback — without
+        that bar it would bounce straight back), and whose mailbox can
         publish right now (Mailbox.can_send). With `need_device`
         (needs_device) a remote must also advertise `device`. Any future
         availability rule belongs here."""
@@ -838,7 +840,8 @@ class Orchestrator:
         liveness = self.agent_liveness(stale_after_s=self._remote_online_s(), now=now)
         modes = self.agent_modes()
         rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
-        refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
+        refused = (rr.get("agent") if rr.get("reason") == REROUTE_REJECTED
+                   or is_requeued(existing) else None)
         if busy is None:
             busy = self._busy_by_agent()
         for a in remotes:
@@ -1286,7 +1289,10 @@ class Orchestrator:
                       f"cap {self.max_parallel_gradle_builds} reached "
                       f"({cg.gradle_runs} live)")
                 continue
-            if agent is not None and not agent.is_human:
+            # Only a row dispatch() would send needs a slot; anything else (in
+            # flight, cooling down, poison to quarantine) is dispatch()'s to refuse.
+            if (agent is not None and not agent.is_human
+                    and self._ledger_gate(self.ledger.load(t.slug)).kind == "go"):
                 sg = self._slot_gate(agent, t.payload, busy)
                 if sg.free <= 0:
                     full.setdefault(agent.id, [sg, 0])[1] += 1

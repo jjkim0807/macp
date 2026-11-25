@@ -278,8 +278,8 @@ stage (so no PR and no merge), no delegate publish, no reply. A report stage tha
 already running when the CANCEL arrived cannot be stopped, so its PR may still open.
 
 **Heartbeats carry slots.** Every runner sends a `HEARTBEAT` with
-`slots: {max, used}` when either number changes and at least every 300 seconds, idle or
-busy. The orchestrator assigns only to a free slot (see
+`slots: {max, used}` when either number changes (at most once a minute) and at least
+every 300 seconds, idle or busy. The orchestrator assigns only to a free slot (see
 [Concepts — free slots](concepts.md#choosing-resources)), so this message is what brings work to a
 runner. A remote runner also sends `HEARTBEAT {status: busy}` every
 `RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) from a separate thread while it is

@@ -173,6 +173,17 @@ class FreeSlotTickTest(_Base):
         self.assertEqual(self.ledger.load("alpha").state, A.DONE)
         self.assertEqual(self.ledger.load("beta").agent_id, DEFAULT)
 
+    def test_a_full_worker_does_not_delay_a_poison_quarantine(self):
+        r, _ex = self.runner()
+        r._announce(0)
+        self.ledger.save(Assignment(task_id="broken", agent_id=DEFAULT, corr_id="c",
+                                    state=A.FAILED, kind="ai-local", refail_count=3,
+                                    updated_ts=_ago(86400)))
+        with mock.patch.object(self.orch, "_notify_poison") as alert:
+            self.tick([self.task("broken")])
+        self.assertEqual(self.ledger.load("broken").state, A.AWAITING_HUMAN)
+        alert.assert_called_once()
+
     def test_the_announced_number_decides_not_the_registry(self):
         r, _ex = self.runner()
         r._announce(0)                                     # e.g. every account at its cap
@@ -217,6 +228,36 @@ class FreeSlotTickTest(_Base):
         self.assertIsNone(self.ledger.load("h3"))
         self.assertEqual([e.task_id for e in self.inbox(REMOTE)], ["h1"])
         self.assertEqual([e.task_id for e in self.inbox(DEFAULT)], ["h2"])
+
+    def test_a_reroute_waits_in_the_queue_when_the_fallback_is_full(self):
+        local, _ = self.runner(DEFAULT)
+        remote, _ = self.runner(REMOTE)
+        local._announce(1)
+        remote._announce(1)
+        heavy, plain = self.task("h1", heavy=True), self.task("p1")
+        self.tick([heavy, plain])                          # h1 -> remote, p1 -> default
+        self.assertEqual((self.ledger.load("h1").agent_id,
+                          self.ledger.load("p1").agent_id), (REMOTE, DEFAULT))
+        row = self.ledger.load("h1")                       # the remote never accepts it
+        old_corr, row.updated_ts = row.corr_id, _ago(700)
+        self.ledger.save(row)
+        res = self.tick([heavy, plain])
+        self.assertEqual(self.slugs(res["rerouted"]), ["h1"])
+        row = self.ledger.load("h1")
+        # The fallback has no free slot: the task goes back to the queue, not into
+        # the fallback's mailbox, and not straight back to the remote it left.
+        self.assertTrue(A.is_requeued(row))
+        self.assertEqual((row.rerouted_from["agent"], row.refail_count), (REMOTE, 0))
+        self.assertEqual([e.task_id for e in self.inbox(DEFAULT)], ["p1"])
+        self.assertEqual([e.corr_id for e in self.inbox(REMOTE, m.CANCEL)], [old_corr])
+        self.assertEqual(len(self.inbox(REMOTE)), 1)       # only the cancelled one
+        # The fallback frees its slot: the next tick assigns it there.
+        done = self.ledger.load("p1")
+        done.state = A.DONE
+        self.ledger.save(done)
+        res = self.tick([heavy])
+        self.assertEqual(self.slugs(res["dispatched"]), ["h1"])
+        self.assertEqual(self.ledger.load("h1").agent_id, DEFAULT)
 
     def test_a_plain_task_never_spills_to_the_heavy_remote(self):
         local, _ = self.runner(DEFAULT)
@@ -384,6 +425,10 @@ class RunnerSlotsTest(_Base):
                          [{"max": 3, "used": 0}, {"max": 3, "used": 1}])
         self.assertEqual([b["status"] for b in beats], ["idle", "busy"])
         self.assertTrue(r._announce(3, interval=0))             # the periodic repeat
+        # A change inside the minimum gap waits (memory hovering at its floor
+        # must not flood the mailbox); the poll loop sends it once the gap passed.
+        self.assertFalse(r._announce(2, min_gap=60))
+        self.assertTrue(r._announce(2, min_gap=0))
 
     def test_memory_pressure_closes_the_extra_slots(self):
         r, ex = self.runner()

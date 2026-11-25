@@ -2305,6 +2305,9 @@ _CANCEL = threading.local()
 # PROGRESS) would look dead and its task would run twice.
 BUSY_HEARTBEAT_ENV = "RUNNER_BUSY_HEARTBEAT_S"
 DEFAULT_BUSY_HEARTBEAT_S = 300.0
+# At most one slots announcement per this many seconds from the poll loop. The
+# orchestrator reads them once per tick (minutes), so a minute loses nothing.
+ANNOUNCE_MIN_GAP_S = 60.0
 
 
 def _cancel_requested_now() -> bool:
@@ -3098,20 +3101,24 @@ class Runner:
             slots_max = used
         return {"max": slots_max, "used": used}
 
-    def _announce(self, slots_max: int, *, interval: float = 300.0) -> bool:
+    def _announce(self, slots_max: int, *, interval: float = 300.0,
+                  min_gap: float = 0.0) -> bool:
         """Tell the orchestrator how many slots this runner has (HEARTBEAT
         `slots`), when the numbers changed or `interval` seconds have passed.
 
         The orchestrator assigns a task only to a free slot, so this is what
         brings work here — and the same message is the liveness signal. Sent
         whether idle or busy: a runner with one of four slots in use still has
-        three to offer. `interval` bounds the mailbox churn. Never raises."""
+        three to offer. `min_gap` spaces two announcements (free memory hovering
+        at its floor would otherwise flip `max` on every poll) and `interval`
+        repeats an unchanged one; both bound the mailbox churn. Never raises."""
         try:
             self._slots_max = slots_max
             slots = self._slots(slots_max)
             now = time.monotonic()
             last = self._announced
-            if last is not None and last[0] == slots and now - last[1] < interval:
+            if last is not None and now - last[1] < (
+                    interval if last[0] == slots else min_gap):
                 return False
             with self._lock:
                 self.mailbox.send(m.Envelope(
@@ -3243,7 +3250,8 @@ class Runner:
                 else:
                     slots = 1
                     self.poll_once()
-                self._announce(slots, interval=heartbeat_interval)
+                self._announce(slots, interval=heartbeat_interval,
+                               min_gap=ANNOUNCE_MIN_GAP_S)
             except Exception as e:  # a bad message must not kill the standby loop
                 self.log(f"poll error (continuing): {e}")
             time.sleep(interval)
