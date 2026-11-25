@@ -1272,6 +1272,7 @@ class Orchestrator:
             a = self.ledger.load(msg.task_id)
             if a and (not a.corr_id or a.corr_id == msg.corr_id):
                 if a.apply_reply(msg):
+                    self._adopt_renamed_branch(a, msg)
                     orphaned = (msg.payload or {}).get("orphaned_commits")
                     orphaned = orphaned if isinstance(orphaned, dict) else None
                     if msg.type == m.FAIL and orphaned:
@@ -1410,6 +1411,36 @@ class Orchestrator:
                           f"(expected {a.corr_id}, got {msg.corr_id})")
             self.mb.ack(m.ORCHESTRATOR, msg)
         return updated
+
+    @staticmethod
+    def _adopt_renamed_branch(a: Assignment, msg: m.Envelope) -> None:
+        """Follow the runner onto its `-rN` branch.
+
+        A run whose origin/<branch> held an older, diverged lineage pushes under
+        `<root>-rN` instead of force-pushing (stages.resolve_push_branch), and
+        says so in its reply payload's `branch`. The ledger row must follow:
+        reconcile_merged looks the PR up by `payload["branch"]`, and a retry
+        re-dispatches that same payload — so a row left on the old name would
+        never see its PR merge and would retry onto the stale lineage.
+
+        Only a `-rN` sibling of the row's current branch is adopted; any other
+        reply `branch` (the usual echo of the dispatch name) changes nothing.
+        Never raises: a malformed payload leaves the row as it was."""
+        try:
+            from . import stages
+            new = (msg.payload or {}).get("branch")
+            cur = (a.payload or {}).get("branch") or f"worker/{a.task_id}"
+            if not isinstance(new, str) or not stages.is_suffix_successor(new, cur):
+                return
+            if a.payload is None:
+                a.payload = {}
+            a.payload["branch"] = new
+            a.history.append({"ts": m.now_iso(), "type": "branch-renamed",
+                              "from": "orchestrator", "old": cur, "new": new})
+            print(f"[orchestrator] {a.task_id}: branch {cur} -> {new} "
+                  "(origin had a diverged older run; no force-push)")
+        except Exception:  # noqa: BLE001 - never break collect
+            return
 
     def _superseded_reason(self, a: Assignment, msg: m.Envelope) -> str:
         """Why this reply's outcome is dropped without a park, an alert or a

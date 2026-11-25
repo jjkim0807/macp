@@ -2254,6 +2254,128 @@ def checkpoint_push(repo_dir: Path, branch: str,
     return out
 
 
+# A worker branch that had to move off a diverged origin/<branch> is named
+# `<root>-r<N>`, N >= 2. The suffix is stripped before a new one is added, so a
+# second divergence goes -r2 -> -r3, never -r2-r2.
+_SUFFIX_BRANCH_RE = re.compile(r"-r(\d+)$")
+_SUFFIX_BRANCH_MAX = 20     # candidates tried before giving up (keeps the name)
+
+
+def suffix_branch_root(branch: str) -> str:
+    """`worker/x-r3` -> `worker/x`; any other name is its own root."""
+    return _SUFFIX_BRANCH_RE.sub("", branch)
+
+
+def is_suffix_successor(candidate: str, branch: str) -> bool:
+    """True if `candidate` is a `-rN` sibling of `branch` (same root, N >= 2,
+    and not `branch` itself) — the only rename resolve_push_branch makes. The
+    orchestrator uses it to adopt a runner's rename and nothing else."""
+    if not candidate or candidate == branch:
+        return False
+    m_ = _SUFFIX_BRANCH_RE.search(candidate)
+    return (m_ is not None and int(m_.group(1)) >= 2
+            and suffix_branch_root(candidate) == suffix_branch_root(branch))
+
+
+def _remote_branch_sha(repo_dir: Path, branch: str) -> tuple[str | None, bool]:
+    """(sha, known): origin's tip of `branch`. (None, True) = origin has no such
+    branch; (None, False) = could not ask."""
+    r = _git(repo_dir, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    if r.returncode != 0:
+        return None, False
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == f"refs/heads/{branch}":
+            return parts[0], True
+    return None, True
+
+
+def resolve_push_branch(repo_dir: Path, branch: str,
+                        progress: Callable[[str], None] | None = None) -> dict:
+    """Pick the name this run's branch can be pushed under WITHOUT force.
+
+    The case (mulkko-171, 2026-11-19): origin/worker/<slug> still carried an
+    older run's commit from another host, Implement rebased the work onto the
+    default branch, and the result was non-fast-forward against that old tip.
+    The pre-push guard refused the push (correctly: force-push is a hard rule),
+    so the Report stage stopped with no push and no PR, and a person had to push
+    a `-r2` branch by hand. Re-routing and remote runners make this recur.
+
+    So: when origin/<branch> exists and is NOT an ancestor of the local
+    <branch>, rename the local branch to the first `<root>-r<N>` (N >= 2) that
+    neither origin nor the local repo has, and return that name. The old remote
+    branch is left exactly as it is. A missing remote branch or a fast-forward
+    keeps the name. Anything that cannot be decided (ls-remote fails, the old
+    tip cannot be fetched, the rename fails) keeps the name too — the push then
+    behaves exactly as before this helper existed, which is not a reason to
+    invent a branch.
+
+    Returns `{"branch": str, "renamed_from": str|None, "note": str}`. NEVER
+    raises. Pushes nothing — the caller's FF-only push does that."""
+    out: dict = {"branch": branch, "renamed_from": None, "note": ""}
+    try:
+        tip = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if tip.returncode != 0 or not tip.stdout.strip():
+            out["note"] = f"no local {branch}"
+            return out
+        if branch == default_branch(repo_dir):
+            out["note"] = f"{branch} is the default branch — not renamed"
+            return out
+        remote_sha, known = _remote_branch_sha(repo_dir, branch)
+        if not known:
+            out["note"] = f"could not read origin/{branch}; keeping the name"
+            return out
+        if remote_sha is None:
+            out["note"] = f"origin has no {branch}"
+            return out
+        anc = _git(repo_dir, "merge-base", "--is-ancestor", remote_sha, f"refs/heads/{branch}")
+        if anc.returncode not in (0, 1):
+            # The old tip is not in this clone yet (another host pushed it). Fetch
+            # it into a remote-tracking ref and ask once more.
+            _git(repo_dir, "fetch", "origin",
+                 f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+            anc = _git(repo_dir, "merge-base", "--is-ancestor", remote_sha,
+                       f"refs/heads/{branch}")
+        if anc.returncode == 0:
+            out["note"] = f"origin/{branch} is an ancestor — fast-forward"
+            return out
+        if anc.returncode != 1:
+            out["note"] = (f"could not tell whether origin/{branch} is an ancestor; "
+                           "keeping the name")
+            return out
+        root = suffix_branch_root(branch)
+        for n in range(2, _SUFFIX_BRANCH_MAX + 1):
+            cand = f"{root}-r{n}"
+            if cand == branch:
+                continue
+            local = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{cand}")
+            if local.returncode == 0:
+                continue
+            sha, known = _remote_branch_sha(repo_dir, cand)
+            if not known:
+                out["note"] = f"could not read origin/{cand}; keeping {branch}"
+                return out
+            if sha is not None:
+                continue
+            mv = _git(repo_dir, "branch", "-m", branch, cand)
+            if mv.returncode != 0:
+                out["note"] = (f"rename {branch} -> {cand} failed: "
+                               + ((mv.stderr or mv.stdout or "").strip()[:200] or "no output"))
+                return out
+            out.update(branch=cand, renamed_from=branch,
+                       note=(f"origin/{branch} ({remote_sha[:8]}) is not an ancestor of "
+                             f"this run's {branch} — moved to {cand} (no force-push; "
+                             f"origin/{branch} left as it is)"))
+            if progress is not None:
+                progress(out["note"])
+            return out
+        out["note"] = f"no free {root}-rN name up to r{_SUFFIX_BRANCH_MAX}; keeping {branch}"
+        return out
+    except Exception as e:  # noqa: BLE001 - never raises; keep the name
+        out["note"] = f"resolve_push_branch failed ({type(e).__name__}); keeping {branch}"
+        return out
+
+
 def rescue_uncommitted(repo_dir: Path, branch: str, slug: str,
                        progress: Callable[[str], None] | None = None) -> dict:
     """Commit an Implement stage's leftover WIP onto `branch` so checkpoint_push

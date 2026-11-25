@@ -195,6 +195,12 @@ entry `failed` fights the worker's own retry reset — so do not edit it.
 
 **NOTE**: The Verify stage normally does not push; under the `ci: actions` opt-in it may have. Check before pushing to avoid errors.
 
+**`worker/<slug>` in this section means the `branch` from Run metadata.** When
+origin's `worker/<slug>` held an older run's diverged commits, the engine has
+already moved this run to `worker/<slug>-r<N>` and pushed it (no force-push; the
+old branch is left alone). Push, open the PR and merge on the metadata branch —
+never on the old name, and never force-push to make the old name fit.
+
 **For vault tasks** (no `working_dir` in Run metadata) — check and push from vault root:
 
 ```bash

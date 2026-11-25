@@ -1347,6 +1347,11 @@ class CleanupHookTest(unittest.TestCase):
                 # test_runner_implement_rescue.py.
                 mock.patch.object(stages, "rescue_uncommitted",
                                   return_value={"committed": False, "sha": None, "note": ""}),
+                # Same reason: the push-branch check's git calls would land in the
+                # mocked seam. Its own behaviour lives in test_push_branch_suffix.py.
+                mock.patch.object(stages, "resolve_push_branch",
+                                  side_effect=lambda repo, branch, progress=None:
+                                  {"branch": branch, "renamed_from": None, "note": ""}),
                 mock.patch.object(stages, "checkpoint_push", self.checkpoint),
                 mock.patch.object(stages, "cleanup_build_daemons", cleanup),
                 mock.patch.object(stages, "remove_worktree", self.remove_wt),
