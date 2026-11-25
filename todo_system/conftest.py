@@ -135,6 +135,18 @@ on a test, class or method. Limits: a spawned process sees only the env
 redirect, not the fetch or git block, and a test that reloads either module
 (``importlib.reload``) gets the real functions back for the rest of that test.
 
+The ``auto`` tick's recur step — ``orchestrator.auto_recur`` WRITES task files
+(``Todo/items/<series>-<YYYYMMDD>.md``, the next round of a ``recur:`` task) and
+then runs ``cli import-md`` in the vault it was pointed at. Every ``main auto``
+test that leaves ``--items-dir`` at its default points it at a real root: this
+checkout's ``vault-template`` on a fresh clone, the live vault when
+``MACP_VAULT_ROOT`` names it (a worker stage). ``Todo/items/`` is not under the
+tripwire, so a live task carrying ``recur`` would get its next round written by
+whichever test ran first. ``_recur_step_isolated`` closes it: called with an
+items directory at or under a real root, ``auto_recur`` returns ``[]`` without
+reading, writing or importing anything. Any other directory — a test's own tmp
+vault — gets the real function, so the step's own tests need no mark.
+
 The vault worktree (``orchestrator/repos.py``) — every ``StagedExecutor._execute``
 of a task with no ``repo:`` cuts a linked worktree of the VAULT repository under
 the worker root (``<worker root>/vault.wt/<slug>``) and runs the task's branch
@@ -425,6 +437,7 @@ _REAL_UG_STATE_PATH = usage_guard._state_path
 _REAL_UG_STATE_DIR = os.path.realpath(usage_guard.ROOT / "Worker" / "_state" / "usage_guard")
 _REAL_PULL_MAIN = _orch_mod._pull_main
 _REAL_CHECK_DIVERGENCE = _orch_mod._check_divergence
+_REAL_AUTO_RECUR = _orch_mod.auto_recur
 # The real roots no test may cut a vault worktree from: the vault each module
 # resolved (MACP_VAULT_ROOT can name the live one) and this checkout.
 # Captured at import, like the seams above.
@@ -623,6 +636,28 @@ def _is_real_root(path) -> bool:
         return False                        # not a path: nothing real to protect
 
 
+def _under_real_root(path) -> bool:
+    """Whether ``path`` is a real root or anything below one (``Todo/items``)."""
+    try:
+        real = os.path.realpath(path)
+    except (TypeError, ValueError):
+        return False                        # not a path: nothing real to protect
+    return any(real == root or real.startswith(root + os.sep) for root in _REAL_ROOTS)
+
+
+@pytest.fixture(autouse=True)
+def _recur_step_isolated(monkeypatch):
+    # See the module docstring. Production reaches the step through the module
+    # attribute (`_main` calls `auto_recur(...)` as a global), which is what makes
+    # this rebind take effect; a test's own patch runs after this and wins.
+    def _guarded_auto_recur(items_dir, *args, **kwargs):
+        if _under_real_root(items_dir):
+            return []
+        return _REAL_AUTO_RECUR(items_dir, *args, **kwargs)
+
+    monkeypatch.setattr(_orch_mod, "auto_recur", _guarded_auto_recur)
+
+
 @pytest.fixture(autouse=True)
 def _vault_worktree_isolated(tmp_path_factory, monkeypatch):
     # See the module docstring. mktemp rather than tmp_path, like the runtime
@@ -715,6 +750,7 @@ def real_auto_side_effects():
         "ug_state_dir": _REAL_UG_STATE_DIR,
         "pull_main": _REAL_PULL_MAIN,
         "check_divergence": _REAL_CHECK_DIVERGENCE,
+        "auto_recur": _REAL_AUTO_RECUR,
     })
 
 

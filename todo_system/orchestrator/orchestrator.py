@@ -3271,6 +3271,17 @@ def _usage_hold_suffix(result: dict) -> str:
     return f" USAGE-HOLD ({hold}; eta {eta})" if eta else f" USAGE-HOLD ({hold})"
 
 
+def _import_md(items_dir: Path) -> None:
+    """Rebuild todo.db from the task markdown (`cli import-md`) of the vault that
+    `items_dir` belongs to, so the rest of this tick reads what a pre-dispatch
+    step just wrote into it. A non-zero exit is not an error here — the todo-sync
+    daemon imports the same files on its next pass; a timeout raises."""
+    subprocess.run(
+        [sys.executable, "-P", "-m", "todo_system.cli", "import-md"],
+        cwd=str(Path(items_dir).parent.parent), check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+
+
 def auto_unblock(db: Path, items_dir: Path, *, _apply=None, _import=None) -> list:
     """Flip `blocked` tasks whose every `depends_on` is done (task_deps) and, when
     anything flipped, sync todo.db so this tick's load_dispatchable sees them.
@@ -3291,15 +3302,53 @@ def auto_unblock(db: Path, items_dir: Path, *, _apply=None, _import=None) -> lis
         print(f"[orchestrator] auto-unblocked {slug} -> worker_mode {mode} (deps done)")
     try:
         if _import is None:
-            import subprocess
-            _import = lambda: subprocess.run(  # noqa: E731
-                [sys.executable, "-P", "-m", "todo_system.cli", "import-md"],
-                cwd=str(Path(items_dir).parent.parent), check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-        _import()
+            _import_md(items_dir)
+        else:
+            _import()
     except Exception as e:
         print(f"[orchestrator] import-md after unblock failed (fail-open): {e}")
     return flips
+
+
+def auto_recur(items_dir: Path, *, _generate=None, _import=None) -> list:
+    """Write the next round of every `recur:` series whose newest round has reached
+    its `not_before` (todo_system.recur.generate_due) and, when anything was
+    written, sync todo.db so the new round is listed as upcoming at once.
+
+    This is the one place a repeating task gets its next round. It runs on every
+    tick, before the candidates are read — so the next round of a worker task is
+    on disk before the current one is dispatched and cannot be lost with a failed
+    run — and it needs no worker at all, so a person's own task repeats too.
+
+    The new file is plain vault state under Todo/items: the todo-sync commit
+    (worker.sync_vault_state) carries it to the remote like any task a tick wrote.
+
+    Idempotent (the round just written is not due until its own `not_before`) and
+    fail-open: any error is one log line and an empty result, never a dead tick.
+    A vault in which no task carries `recur` is only read — no write, no import,
+    no output."""
+    try:
+        if _generate is None:
+            from .. import recur
+            _generate = recur.generate_due
+        created = _generate(
+            items_dir, warn=lambda why: print(f"[orchestrator] recur skipped {why}"))
+    except Exception as e:
+        print(f"[orchestrator] recur sweep skipped (fail-open): {e}")
+        return []
+    if not created:
+        return []
+    for c in created:
+        print(f"[orchestrator] recur: created {c.slug} from {c.source} "
+              f"(not_before {c.not_before})")
+    try:
+        if _import is None:
+            _import_md(items_dir)
+        else:
+            _import()
+    except Exception as e:
+        print(f"[orchestrator] import-md after recur failed (fail-open): {e}")
+    return created
 
 
 # How long a tick's `_pull_main` waits for the vault git lock before it skips
@@ -3763,6 +3812,10 @@ def _main(argv: list[str] | None = None) -> int:
         # the ones that landed in a HUMAN mode — those have no worker to pick them
         # up, and before 2026-11-09 nothing announced them at all.
         flips = auto_unblock(db, base / args.items_dir)
+        # Repeating tasks (`recur:`), also on every tick and also before the
+        # candidates are read: a round whose `not_before` has come gets its next
+        # round written beside it now, whatever then happens to this round's run.
+        auto_recur(base / args.items_dir)
         try:
             cands = tasks.load_dispatchable(db)
         except sqlite3.OperationalError:
