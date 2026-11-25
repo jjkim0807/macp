@@ -55,7 +55,6 @@ maintenance tick copies them to `~/.local/bin/` after it pulls the engine checko
 |---|---|
 | `claude_auth_watch.py` | alert when the Claude Code CLI credential dies |
 | `claude_model_autoswitch.py` (+ installer) | keep the legacy config dir pointed at a model that can run |
-| `claude_accounts_migrate.py` | one-shot migration of a single Claude config dir into the multi-account layout (with `--rollback`) |
 | `devtunnel_watchdog.py` | restart a dev tunnel host that is alive but no longer hosting |
 
 ## Author integrations (opt-in)
