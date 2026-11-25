@@ -248,10 +248,34 @@ class FreeSlotTickTest(_Base):
                                 payload={"reason": "verify failed"}))
         self.tick([a], usage_hold="session 91% >= hard cap 80%")
         row = self.ledger.load("alpha")
-        self.assertTrue(A.is_requeued(row))                # back in the queue
-        self.assertEqual(row.display_state, A.DEFERRED)
-        self.assertEqual((row.attempts, row.refail_count), (1, 0))
+        # No in-place retry under the hold: the failure stands and the ordinary
+        # re-dispatch path (cooldown, then a free slot) takes it from the queue.
+        self.assertEqual((row.state, row.attempts), (A.FAILED, 1))
+        self.assertEqual(row.history[-1]["type"], "retry-held")
+        self.assertEqual(self.orch._ledger_gate(row).kind, "cooldown")
         self.assertEqual(self.inbox(DEFAULT), [])          # nothing waits in the mailbox
+
+    def test_a_failed_run_is_retried_in_place_when_its_slot_is_free(self):
+        r, ex = self.runner()
+        r._announce(1)
+        a = self.task("alpha")
+        self.tick([a])
+        first = self.ledger.load("alpha").corr_id
+        r.poll_parallel(1)
+        self.wait(lambda: ex.started == ["alpha"])
+        r._announce(1)                                     # full: used 1 of 1
+        self.tick([a])
+        # The run fails; the runner says FAIL and then announces the freed slot.
+        self.mb.send(m.Envelope(to=m.ORCHESTRATOR, frm=DEFAULT, type=m.FAIL,
+                                task_id="alpha", corr_id=first,
+                                payload={"reason": "verify failed"}))
+        ex.release.set()
+        self.wait(lambda: not r._inflight)
+        r._announce(1)
+        self.tick([a])
+        row = self.ledger.load("alpha")
+        self.assertEqual((row.state, row.attempts), (A.DISPATCHED, 2))
+        self.assertNotEqual(row.corr_id, first)
 
 
 class RequeueUnstartedTest(_Base):

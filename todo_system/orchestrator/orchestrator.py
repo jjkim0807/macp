@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -25,10 +26,11 @@ from typing import NamedTuple
 from . import agent_mode, human, message as m, stages
 from .. import i18n, kakao_format, not_before as _nb, paths
 from ..vault_git_lock import vault_git_lock
+from .atomic_io import atomic_write_text
 from .dashboard import _MERGED_BUT_BLOCKED
 from .assignment import (
-    ACCEPTED, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS, REJECTED,
-    Assignment, Ledger,
+    ACCEPTED, ASSIGN_TTL_S, AWAITING_HUMAN, DISPATCHED, DONE, FAILED, IN_PROGRESS,
+    REJECTED, REQUEUED, Assignment, Ledger, is_requeued,
 )
 from .lease import Lease
 
@@ -49,13 +51,14 @@ WAIT_PAUSED = "paused"
 WAIT_BUDGET = "budget"
 WAIT_COOLDOWN = "cooldown"
 WAIT_CAPACITY = "capacity"
+WAIT_NO_SLOT = "no_slot"          # its worker has no free slot right now
 # Outermost gate wins when several apply (lower rank = further out). Display
 # priority only — tick() still evaluates the gates in its own order.
 WAIT_RANK = {
     WAIT_PAUSED: 0,
     WAIT_USAGE_HOLD: 1, WAIT_BUDGET: 1,
     WAIT_COOLDOWN: 2, WAIT_CAPACITY: 2,
-    WAIT_CHECKOUT_BUSY: 3, WAIT_GRADLE_CAP: 3,
+    WAIT_NO_SLOT: 3, WAIT_CHECKOUT_BUSY: 3, WAIT_GRADLE_CAP: 3,
     WAIT_NEXT_TICK: 4,
 }
 
@@ -107,6 +110,21 @@ class CheckoutGate(NamedTuple):
     holder: str = ""
     reason: str = ""
     gradle_runs: int = 0
+
+
+class SlotGate(NamedTuple):
+    """One worker's room for one more run (`Orchestrator._slot_gate`).
+
+    free = cap − used. `cap` is what the worker last announced in a HEARTBEAT
+    (`slots.max`), or its registry `concurrency` when it has never announced.
+    `used` is the larger of the ledger's in-flight rows on it and its announced
+    `slots.used`. `silent_s` is set — and free is 0 — when it stopped
+    announcing: seconds since its last slots heartbeat.
+    """
+    free: int
+    cap: int = 0
+    used: int = 0
+    silent_s: float | None = None
 
 # What one agent's mailbox read can legitimately raise: an unreachable or
 # unreadable root, a failed git subprocess, an unknown transport, or a
@@ -477,7 +495,8 @@ class Orchestrator:
                  job_poll_cooldown_s: float = 300,
                  default_uri: str = f"git://{DEFAULT_ROOT}",
                  mailbox_base: Path | None = None,
-                 alert_route=None):
+                 alert_route=None,
+                 assign_timeout_s: float = ASSIGN_TTL_S):
         self.mb = mailbox                 # default; used for collect (pulls replies)
         self.reg = registry
         self.ledger = ledger
@@ -513,6 +532,13 @@ class Orchestrator:
         self.job_poll_cooldown_s = job_poll_cooldown_s  # re-check delay while a
                                                         # detached long_job runs
         self.stale_timeout_s = stale_timeout_s
+        # How long a row may stay DISPATCHED before requeue_unstarted takes it
+        # back (the runner uses the same bound for an envelope it finds late).
+        self.assign_timeout_s = assign_timeout_s
+        # This tick's hold verdicts (hold_wait's inputs). tick() sets them before
+        # anything is sent, so _retry / _reroute judge an assignment exactly as
+        # the dispatch pass does. Outside a tick (CLI collect / serve): no hold.
+        self._hold = {"paused": False, "usage_hold": None, "budget_exceeded": False}
         self.default_uri = default_uri
         # Base for RELATIVE mailbox uris opened later, per agent (`_mailbox_for`).
         # None = open_mailbox's own default (the cwd), so every existing caller
@@ -611,6 +637,76 @@ class Orchestrator:
             out[ag.id] = {"status": status, "last_seen": ts, "age_s": round(age)}
         return out
 
+    # -- Worker slots (free-slot dispatch) ---------------------------------
+    def _slots_path(self) -> Path:
+        return self.ledger.root.parent / "_state" / "agent_slots.json"
+
+    def agent_slots(self) -> dict:
+        """`{agent_id: {"max", "used", "ts"}}` — the slots each runner last
+        announced in a HEARTBEAT, stamped with this host's clock at collect.
+        `{}` on any error. Gitignored state, beside agent_seen.json."""
+        try:
+            d = json.loads(self._slots_path().read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _record_slots(self, msg: m.Envelope) -> None:
+        """Keep the `slots` a runner's HEARTBEAT carries. A heartbeat without
+        them (a runner on older code) changes nothing. Never raises."""
+        try:
+            slots = (msg.payload or {}).get("slots")
+            rec = {"max": max(0, int(slots["max"])),
+                   "used": max(0, int(slots.get("used") or 0)), "ts": m.now_iso()}
+            known = self.agent_slots()
+            known[msg.frm] = rec
+            p = self._slots_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(p, json.dumps(known, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+        except Exception:
+            pass
+
+    def _busy_by_agent(self, skip: str | None = None) -> Counter:
+        """agent id -> how many of its ledger rows are in flight (`skip` = a
+        task id to leave out: the row a retry is about to re-send)."""
+        return Counter(a.agent_id for a in self.ledger.all()
+                       if a.state in _IN_FLIGHT and a.task_id != skip)
+
+    def _slot_gate(self, agent: Agent, payload: dict | None = None,
+                   busy: Counter | None = None, now: float | None = None) -> SlotGate:
+        """Room on `agent` for one more run of `payload`, read-only.
+
+        A `bypass_guard` task always has a capacity of at least 1: its worker
+        may announce 0 because its usage headroom is gone, and a bypass task is
+        the one kind allowed to run then, one at a time. A worker that stopped
+        announcing (MACP_REMOTE_ONLINE_S) has no slot for anything."""
+        now = now if now is not None else dt.datetime.now().timestamp()
+        used = (busy if busy is not None else self._busy_by_agent()).get(agent.id, 0)
+        cap = max(1, int(agent.concurrency or 1))          # never announced
+        try:
+            rec = self.agent_slots().get(agent.id)
+            if isinstance(rec, dict):
+                silent = now - _parse_ts(rec.get("ts"))
+                if silent >= self._remote_online_s():
+                    return SlotGate(0, 0, used, silent)
+                cap, used = int(rec["max"]), max(used, int(rec.get("used") or 0))
+        except Exception:  # noqa: BLE001 - an unreadable record = never announced
+            pass
+        if (payload or {}).get("bypass_guard"):
+            cap = max(cap, 1)
+        return SlotGate(cap - used, cap, used)
+
+    def _assignable(self, agent: Agent, payload: dict | None,
+                    skip: str | None = None) -> bool:
+        """May `payload` be sent to `agent` right now? The one judgment every
+        assignment passes: this tick's holds (pause, usage, daily budget —
+        `bypass_guard` passes the cost holds) and a free slot on that worker."""
+        if hold_wait(payload, **self._hold) is not None:
+            return False
+        return agent.is_human or self._slot_gate(
+            agent, payload, self._busy_by_agent(skip)).free > 0
+
     def _fail_cooldown(self, refail_count: int) -> float:
         """Tiered backoff: a first failure retries fast (transient stage flakes
         shouldn't stall a project for hours), and repeated failures back off
@@ -647,16 +743,19 @@ class Orchestrator:
 
     # -- Router -----------------------------------------------------------
     def route(self, slug: str, payload: dict | None = None, *,
-              existing: Assignment | None = None) -> Agent | None:
+              existing: Assignment | None = None,
+              busy: Counter | None = None) -> Agent | None:
         """The agent a task goes to. With no payload this is the plain
         for_project owner — every slug-only caller (queue view, human-owned
         check) keeps its exact old answer. With a payload, a dispatchable
         non-decision task a human owns only by glob goes to the most specific
-        non-human agent (see _route_decision)."""
-        return self._route_decision(slug, payload, existing)[0]
+        non-human agent (see _route_decision). `busy` = in-flight rows per
+        agent, for a caller that simulates claims (default: the ledger)."""
+        return self._route_decision(slug, payload, existing, busy)[0]
 
     def _route_decision(self, slug: str, payload: dict | None,
                         existing: Assignment | None = None,
+                        busy: Counter | None = None,
                         ) -> tuple[Agent | None, Agent | None]:
         """(agent, fallback). `fallback` is the for_project owner when the heavy
         router picked a remote instead of it, else None. Only an AI-local owner
@@ -674,7 +773,7 @@ class Orchestrator:
                 and _worker_mode_beats_human_glob(payload)):
             alt = self.reg.for_project(slug, skip_human_globs=True)
             # No log line here: route() also runs on every tick's remote-queue
-            # view (_routes_remote), so a print would repeat each tick.
+            # view (_route_for), so a print would repeat each tick.
             if alt is not None and not alt.is_human:
                 base = alt
         if (payload is None or base is None or base.is_human or base.is_remote
@@ -682,7 +781,8 @@ class Orchestrator:
             return base, None
         repo_dir = self._heavy_repo_dir(payload)
         device = needs_device(payload, repo_dir, self._app_paths(payload))
-        pick = self._pick_heavy_remote(existing, need_device=device)
+        pick = self._pick_heavy_remote(existing, need_device=device,
+                                       payload=payload, busy=busy)
         return (pick, base) if pick is not None else (base, None)
 
     @staticmethod
@@ -718,18 +818,16 @@ class Orchestrator:
     def _remote_accept_timeout_s() -> float:
         return _env_seconds(REMOTE_ACCEPT_TIMEOUT_ENV, DEFAULT_REMOTE_ACCEPT_TIMEOUT_S)
 
-    def _inflight_count(self, agent_id: str) -> int:
-        return sum(1 for a in self.ledger.all()
-                   if a.state in _IN_FLIGHT and a.agent_id == agent_id)
-
     def _pick_heavy_remote(self, existing: Assignment | None = None,
                            now: float | None = None, *,
-                           need_device: bool = False) -> Agent | None:
+                           need_device: bool = False,
+                           payload: dict | None = None,
+                           busy: Counter | None = None) -> Agent | None:
         """The first heavy-capable remote (registry order) that is usable now.
 
         This is THE single "is this remote available?" check — online by
         agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
-        counts as offline — agent_mode.py), below its `concurrency` in flight,
+        counts as offline — agent_mode.py), with a free slot (_slot_gate),
         and not the agent that last REJECTED this very task, and whose mailbox can
         publish right now (Mailbox.can_send). With `need_device`
         (needs_device) a remote must also advertise `device`. Any future
@@ -741,6 +839,8 @@ class Orchestrator:
         modes = self.agent_modes()
         rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
         refused = rr.get("agent") if rr.get("reason") == REROUTE_REJECTED else None
+        if busy is None:
+            busy = self._busy_by_agent()
         for a in remotes:
             if need_device and CAP_DEVICE not in (a.capabilities or []):
                 continue
@@ -750,7 +850,7 @@ class Orchestrator:
                 continue
             if a.id == refused:
                 continue
-            if self._inflight_count(a.id) >= max(1, int(a.concurrency or 1)):
+            if self._slot_gate(a, payload, busy, now).free <= 0:
                 continue
             why = self._mailbox_for(a).can_send()
             if why:
@@ -901,7 +1001,10 @@ class Orchestrator:
             # is no evidence about the task at all. Counting that as a failure
             # would let a busy sibling quarantine a perfectly healthy task.
             checkout_busy = getattr(existing, "checkout_busy", False)
-            deferred = job_running or checkout_busy
+            # Ditto a row taken back into the queue (_requeue): nothing ran, and
+            # the only thing it waits for is a free slot — no cooldown at all.
+            requeued = is_requeued(existing)
+            deferred = job_running or checkout_busy or requeued
             if not (capacity or deferred) \
                     and existing.refail_count >= self.poison_threshold \
                     and not existing.kind.startswith("human"):
@@ -909,6 +1012,8 @@ class Orchestrator:
                 # tiered cooldown alone would re-dispatch it every 6h indefinitely.
                 # Capacity limits never poison — they aren't the task's fault.
                 return LedgerGate("poison", None, deferred, capacity)
+            if requeued:
+                return LedgerGate("go", None, deferred, capacity)
             now = now if now is not None else dt.datetime.now().timestamp()
             # a usage/rate limit just needs to wait for capacity, not the escalating
             # fail backoff (which is for genuinely broken tasks). A long_job poll is
@@ -975,14 +1080,14 @@ class Orchestrator:
         except KeyError:
             return False
 
-    def _routes_remote(self, t: Task) -> bool:
-        """Would `t` go to a remote agent this tick? Such a run uses the remote's
-        own clone, so this host's checkout / gradle gates do not apply to it."""
+    def _route_for(self, t: Task, busy: Counter | None = None) -> Agent | None:
+        """The agent `t` would go to this tick. A remote one runs in its own
+        clone, so this host's checkout / gradle gates do not apply to it."""
         try:
-            agent = self.route(t.slug, t.payload, existing=self.ledger.load(t.slug))
-        except Exception:  # noqa: BLE001 - unknown → apply the local gates (old behaviour)
-            return False
-        return agent is not None and agent.is_remote
+            return self.route(t.slug, t.payload, existing=self.ledger.load(t.slug),
+                              busy=busy)
+        except Exception:  # noqa: BLE001 - unknown → the plain owner, local gates
+            return self.route(t.slug)
 
     def _is_gradle_checkout(self, key: str) -> bool:
         """Does this checkout key resolve to a Gradle project (a `gradlew` at its
@@ -1143,6 +1248,13 @@ class Orchestrator:
         once the checkout is quiescent. A wedged in-flight assignment cannot block
         its checkout forever — reap_stale() runs first in tick() and moves it to a
         terminal state, which releases the key.
+
+        And never hand a worker more than it has room for (`_slot_gate`): a task
+        whose worker has no free slot stays in the queue, where any tick can
+        still give it to whichever worker frees up, instead of in one worker's
+        mailbox. Until 2026-11-25 every runnable task was pushed out at once and
+        the runner judged usage and slots again before taking one; seven tasks
+        sat `dispatched` on one worker for up to five days that way.
         """
         # cap=1: any non-empty `held` trips `len(held) >= cap`, which
         # short-circuits the `or` BEFORE _can_run_concurrently is ever evaluated,
@@ -1152,16 +1264,15 @@ class Orchestrator:
         # serialises via _can_run_concurrently, only disjoint-touches pairs run
         # together — so a profile can still pin cap=1 to force every repo serial.
         live = self._checkout_inflight()
+        busy = self._busy_by_agent()
         cap = max(1, int(self.max_parallel_per_repo))   # guard against 0/negative: never below serial
         dispatched: list[Assignment] = []
+        full: dict[str, list] = {}       # agent id -> [SlotGate, tasks waiting on it]
         for t in runnable:
-            if self._routes_remote(t):
-                a = self.dispatch(t)
-                if a is not None:
-                    dispatched.append(a)   # claims no local checkout
-                continue
+            agent = self._route_for(t, busy)
+            remote = agent is not None and agent.is_remote   # claims no local checkout
             key = self._checkout_key(t.payload)
-            cg = self._checkout_gate(t, key, live, cap)
+            cg = CheckoutGate(None) if remote else self._checkout_gate(t, key, live, cap)
             if cg.wait == WAIT_CHECKOUT_BUSY:
                 print(f"[orchestrator] {t.slug}: deferred — checkout "
                       f"{key} is busy (serial per repo; {cg.reason})")
@@ -1175,12 +1286,30 @@ class Orchestrator:
                       f"cap {self.max_parallel_gradle_builds} reached "
                       f"({cg.gradle_runs} live)")
                 continue
+            if agent is not None and not agent.is_human:
+                sg = self._slot_gate(agent, t.payload, busy)
+                if sg.free <= 0:
+                    full.setdefault(agent.id, [sg, 0])[1] += 1
+                    continue          # stays in the queue, for any later tick
             a = self.dispatch(t)
             if a is None:
-                continue          # dedup/cooldown/unroutable: claims no checkout
+                continue          # dedup/cooldown/unroutable: claims nothing
             dispatched.append(a)
-            live.setdefault(key, []).append(a)
+            busy[a.agent_id] += 1
+            if not remote:
+                live.setdefault(key, []).append(a)
+        for agent_id, (sg, n) in full.items():      # one line per full worker
+            print(f"[orchestrator] {n} task(s) wait in the queue — "
+                  f"{self._slot_text(agent_id, sg)}")
         return dispatched
+
+    @staticmethod
+    def _slot_text(agent_id: str, sg: SlotGate) -> str:
+        """One Korean-language line: why `agent_id` has no free slot."""
+        if sg.silent_s is not None:
+            return (f"`{agent_id}` 슬롯 하트비트 없음 ({int(sg.silent_s // 60)}분) "
+                    "— 러너가 다시 알리면 배정")
+        return f"`{agent_id}` 빈 슬롯 없음 ({sg.used}/{sg.cap} 사용 중)"
 
     # -- Queue view (read-only) -------------------------------------------
     def queue_snapshot(self, tasks: list[Task], *, now: float | None = None,
@@ -1190,15 +1319,16 @@ class Orchestrator:
 
         Read-only: no ledger/mailbox write, no print, no usage refresh — the hold
         inputs are passed in. It runs the SAME gates tick() runs (hold_wait →
-        _checkout_gate → _ledger_gate) and simulates this tick's claims the way
-        _dispatch_serial_per_checkout does, so a later same-checkout task reads
-        `checkout_busy` behind an earlier `next_tick` one. Rows that tick() can
-        never dispatch — DONE, in-flight, AWAITING_HUMAN, unroutable — are left
-        out rather than shown as `next_tick`. When several gates apply the
-        outermost (WAIT_RANK) is reported.
+        _slot_gate → _checkout_gate → _ledger_gate) and simulates this tick's
+        claims the way _dispatch_serial_per_checkout does, so a later task reads
+        `no_slot` or `checkout_busy` behind an earlier `next_tick` one. Rows
+        that tick() can never dispatch — DONE, in-flight, AWAITING_HUMAN,
+        unroutable — are left out rather than shown as `next_tick`. When several
+        gates apply the outermost (WAIT_RANK) is reported.
         """
         now = now if now is not None else dt.datetime.now().timestamp()
         live = self._checkout_inflight()
+        busy = self._busy_by_agent()
         cap = max(1, int(self.max_parallel_per_repo))
         out: list[dict] = []
         for t in tasks:
@@ -1209,23 +1339,32 @@ class Orchestrator:
             key = self._checkout_key(t.payload)
             h = hold_wait(t.payload, paused=paused, usage_hold=usage_hold,
                           budget_exceeded=budget_exceeded)
-            remote = h is None and self._routes_remote(t)
+            agent = self._route_for(t, busy) if h is None else None
+            remote = agent is not None and agent.is_remote
             cg = (self._checkout_gate(t, key, live, cap) if h is None and not remote
                   else CheckoutGate(None))
+            sg = (self._slot_gate(agent, t.payload, busy, now)
+                  if agent is not None and not agent.is_human and cg.wait is None
+                  else None)
+            slot = (agent.id, sg) if sg is not None and sg.free <= 0 else None
             lw = {"poll": WAIT_COOLDOWN, "cooldown": WAIT_COOLDOWN,
                   "poison": WAIT_COOLDOWN, "capacity": WAIT_CAPACITY}.get(lg.kind)
-            waits = [w for w in (h, lw, cg.wait) if w]
+            waits = [w for w in (h, lw, cg.wait, WAIT_NO_SLOT if slot else None) if w]
             wait = min(waits, key=WAIT_RANK.__getitem__) if waits else WAIT_NEXT_TICK
-            if h is None and cg.wait is None and lg.kind == "go" and not remote:
-                # what dispatch() would return this tick — claims the checkout for
-                # the rest of the pass, never saved
-                live.setdefault(key, []).append(Assignment(
-                    task_id=t.slug, agent_id="", corr_id="", payload=t.payload))
+            if h is None and cg.wait is None and slot is None and lg.kind == "go":
+                # what dispatch() would return this tick — claims a slot, and for
+                # a local run the checkout, for the rest of the pass; never saved
+                if sg is not None:
+                    busy[agent.id] += 1
+                if not remote:
+                    live.setdefault(key, []).append(Assignment(
+                        task_id=t.slug, agent_id="", corr_id="", payload=t.payload))
             holder = cg.holder if wait == WAIT_CHECKOUT_BUSY else ""
             out.append({
                 "slug": t.slug,
                 "wait": wait,
-                "wait_text": self._wait_text(wait, lg, existing, cg, key, usage_hold, now),
+                "wait_text": (self._slot_text(*slot) if wait == WAIT_NO_SLOT else
+                              self._wait_text(wait, lg, existing, cg, key, usage_hold, now)),
                 "holder": holder,
                 "checkout": self._checkout_label(key),
                 "since": _local_iso(existing.updated_ts) if existing else "",
@@ -1264,9 +1403,16 @@ class Orchestrator:
     def collect(self) -> list[Assignment]:
         """Consume agent replies from the orchestrator inbox, advance state."""
         updated: list[Assignment] = []
-        for msg in self.mb.receive(m.ORCHESTRATOR):
+        msgs = self.mb.receive(m.ORCHESTRATOR)
+        # Slots first, whatever the arrival order: a FAIL's in-place retry below
+        # needs the slot its own run just gave back, which the runner announces
+        # right after that FAIL.
+        for msg in msgs:
+            if msg.type == m.HEARTBEAT:
+                self._record_slots(msg)
+        for msg in msgs:
             self._record_seen(msg.frm)      # every message = a liveness signal
-            if msg.type == m.HEARTBEAT:      # idle liveness ping, no assignment
+            if msg.type == m.HEARTBEAT:      # liveness + slots, no assignment
                 self.mb.ack(m.ORCHESTRATOR, msg)
                 continue
             a = self.ledger.load(msg.task_id)
@@ -2000,6 +2146,17 @@ class Orchestrator:
             # later reopen is left alone rather than read as a lost close.
             a.close_fingerprint = tasks.md_fingerprint(a.task_id)
             return   # caller (collect) persists via ledger.save
+        try:
+            agent = self.reg.get(a.agent_id)
+        except KeyError:
+            agent = None
+        if agent is not None and not self._assignable(agent, a.payload, skip=a.task_id):
+            # A hold, or no free slot on its worker: no in-place retry. The row
+            # stays FAILED and the ordinary re-dispatch path takes it (cooldown,
+            # then a free slot) — it does not wait in a mailbox.
+            a.history.append({"ts": m.now_iso(), "type": "retry-held",
+                              "from": "orchestrator"})
+            return
         a.attempts += 1
         a.state = DISPATCHED
         env = m.Envelope(to=a.agent_id, type=m.TASK_ASSIGN, task_id=a.task_id,
@@ -2108,6 +2265,75 @@ class Orchestrator:
                 reaped.append(a)
         return reaped
 
+    # -- Back to the queue ---------------------------------------------------
+    def _cancel(self, agent_id: str, a: Assignment, sweep: str, reason: str,
+                **extra) -> None:
+        """Tell `agent_id` to drop `a`'s current dispatch (its corr_id): an
+        unstarted envelope is skipped, a running one stops at its next stage
+        boundary without pushing. A send failure is one log line."""
+        cancel = m.Envelope(to=agent_id, type=m.CANCEL, task_id=a.task_id,
+                            corr_id=a.corr_id, payload={"reason": reason, **extra})
+        try:
+            try:
+                mb = self._mailbox_for(self.reg.get(agent_id))
+            except KeyError:
+                mb = self.mb
+            mb.send(cancel)
+        except Exception as e:  # noqa: BLE001 - the caller still proceeds
+            print(f"[orchestrator] {sweep}: {a.task_id} — CANCEL to {agent_id} "
+                  f"failed: {e}")
+
+    @staticmethod
+    def _requeue(a: Assignment, note: str) -> None:
+        """Put a row back in the queue. Nothing ran, so nothing counts against
+        the task: no refail, no cooldown, no alert — `_ledger_gate` reads the
+        `requeued` history entry as "go" and every view shows the row as
+        waiting. A fresh corr_id makes a late reply to the old dispatch a
+        logged drop instead of a revival. The caller saves the row."""
+        ts = m.now_iso()
+        a.state = FAILED
+        a.updated_ts = ts
+        a.corr_id = m.new_id()
+        a.last_note = note[:200]
+        a.history.append({"ts": ts, "type": REQUEUED, "from": "orchestrator",
+                          "note": note[:200]})
+
+    def requeue_unstarted(self, now: float | None = None) -> list[Assignment]:
+        """Take back assignments no worker started within `assign_timeout_s`.
+
+        A task is assigned only to a worker with a free slot, so `dispatched`
+        means "about to start". A row still DISPATCHED after 30 minutes was not
+        started — its worker lost the slot, went down, or the row predates
+        free-slot dispatch — and would otherwise sit in that one mailbox while
+        other workers idle. CANCEL the envelope and requeue the row (`_requeue`:
+        no refail, no poison, no alert); the next dispatch pass gives it to
+        whichever worker has room. Runs after collect(), so a row whose ACCEPT
+        arrived this tick is already ACCEPTED and is left alone. Humans are
+        parked AWAITING_HUMAN, never DISPATCHED. Fail-open, per-row isolated."""
+        out: list[Assignment] = []
+        try:
+            now = now if now is not None else dt.datetime.now().timestamp()
+            tally = _SkipTally("requeue_unstarted")
+            for a in self.ledger.all():
+                try:
+                    age = now - _parse_ts(a.updated_ts)
+                    if a.state != DISPATCHED or age < self.assign_timeout_s:
+                        continue
+                    self._cancel(a.agent_id, a, "requeue",
+                                 f"not started within {int(self.assign_timeout_s // 60)} min")
+                    self._requeue(a, f"{a.agent_id}에서 {int(age // 60)}분 동안 시작되지 "
+                                     "않음 — 큐로 되돌림")
+                    self.ledger.save(a)
+                    out.append(a)
+                    print(f"[orchestrator] {a.task_id}: not started on {a.agent_id} "
+                          f"for {int(age // 60)} min — back in the queue (no refail)")
+                except Exception as e:  # noqa: BLE001 - one row never kills the sweep
+                    tally.record(a.task_id, e)
+            tally.flush()
+        except Exception as e:  # noqa: BLE001 - fail-open
+            print(f"[orchestrator] requeue_unstarted skipped (fail-open): {e}")
+        return out
+
     # -- Heavy-remote reroute ----------------------------------------------
     @staticmethod
     def _is_late_rerouted(a: Assignment, msg: m.Envelope) -> bool:
@@ -2193,21 +2419,9 @@ class Orchestrator:
             print(f"[orchestrator] reroute: {a.task_id} — no usable fallback agent "
                   f"({a.fallback_agent or '?'}); left on {old_agent}")
             return False
-        # Tell the remote to drop the old run: an unstarted envelope is skipped,
-        # a running one stops at its next stage boundary without pushing.
-        cancel = m.Envelope(to=old_agent, type=m.CANCEL, task_id=a.task_id,
-                            corr_id=old_corr,
-                            payload={"reason": f"rerouted: {reason}",
-                                     "rerouted_to": target.id})
-        try:
-            try:
-                mb = self._mailbox_for(self.reg.get(old_agent))
-            except KeyError:
-                mb = self.mb
-            mb.send(cancel)
-        except Exception as e:  # noqa: BLE001 - the reroute still proceeds
-            print(f"[orchestrator] reroute: {a.task_id} — CANCEL to {old_agent} "
-                  f"failed: {e}")
+        # Tell the remote to drop the old run (see _cancel).
+        self._cancel(old_agent, a, "reroute", f"rerouted: {reason}",
+                     rerouted_to=target.id)
         ts = m.now_iso()
         a.rerouted_from = {"agent": old_agent, "reason": reason, "ts": ts,
                            "corr_id": old_corr}
@@ -2222,6 +2436,15 @@ class Orchestrator:
             self.ledger.save(a)
             print(f"[orchestrator] reroute: {a.task_id} from {old_agent} ({reason}) "
                   "— task closed, not re-dispatched")
+            return True
+        if not self._assignable(target, a.payload, skip=a.task_id):
+            # A hold, or no free slot on the fallback: back to the queue rather
+            # than into its mailbox. The dispatch pass re-sends it when it can.
+            self._requeue(a, f"rerouted from {old_agent}: {reason} — "
+                             f"{target.id}에 빈 슬롯이 날 때까지 큐에서 대기")
+            self.ledger.save(a)
+            print(f"[orchestrator] reroute: {a.task_id} from {old_agent} ({reason}) "
+                  f"— {target.id} cannot take it now, back in the queue")
             return True
         # The ledger payload never carries `requires: [heavy]` (envelope-only), so
         # the default agent gets exactly the task's own payload.
@@ -3211,16 +3434,21 @@ class Orchestrator:
 
     def tick(self, tasks: list[Task], now: float | None = None, *,
              unblock_flips: list | None = None) -> dict:
-        # FIRST: a heavy task whose remote went quiet (or refused) moves back to
-        # its default agent on the no-refail path before reap_stale could fail
-        # it, and before a REJECTED row reaches dispatch()'s refail+1 cooldown.
-        rerouted = self.reroute_remote(now)
-        reaped = self.reap_stale(now)
+        # The holds come first: every send below — a reroute, a retry, the
+        # dispatch pass — passes the same assignment-time judgment (_assignable).
+        # This is the ONE place usage is judged; a runner starts what it is given.
         usage_hold = self.usage_hold()
         # stop starting new work; in-flight replies below are still collected
         paused = self.paused()
         budget = self.budget_exceeded()
+        self._hold = {"paused": paused, "usage_hold": usage_hold,
+                      "budget_exceeded": budget}
         hold = budget or paused or bool(usage_hold)
+        # A heavy task whose remote went quiet (or refused) moves back to its
+        # default agent on the no-refail path before reap_stale could fail it,
+        # and before a REJECTED row reaches dispatch()'s refail+1 cooldown.
+        rerouted = self.reroute_remote(now)
+        reaped = self.reap_stale(now)
         # `bypass_guard: true` lets one task through a COST hold — quota pacing or
         # the daily run budget — for work that is worth spending out of turn. It
         # deliberately does NOT override an explicit pause: that is a human saying
@@ -3242,8 +3470,13 @@ class Orchestrator:
         # is tidied and the first sub-task's DB row is written this tick (dispatch
         # picks it up next tick). Fail-open — never raises into the tick.
         rescoped = self.reconcile_rescope()    # parked rescope plan -> auto-split
+        # Replies BEFORE dispatch (they were after it until 2026-11-25): a slot
+        # heartbeat or a RESULT that arrived since the last tick frees its slot
+        # and its checkout for THIS tick's dispatch instead of the next one.
+        # Still collected under a hold — only the dispatch pass is gated.
+        updated = self.collect()
+        returned = self.requeue_unstarted(now)  # not started in 30 min -> queue
         dispatched = self._dispatch_serial_per_checkout(runnable)
-        updated = self.collect()          # still collect replies from in-flight work
         # AFTER collect (a child closed THIS tick is already in todo.db — mark_done
         # refreshes it synchronously) and BEFORE reconcile_merged, so this
         # gh-INDEPENDENT close transitions the parked row to DONE first and
@@ -3262,7 +3495,7 @@ class Orchestrator:
         requeued = self.reconcile_queue()      # #22: terminal ledger -> queue view
         self._beta_sweep_tick()                # unpublished main → beta catch-up (fail-open, detached)
         self._server_deploy_watch_tick()       # merged server change not in production → one alert (fail-open, 10-min throttle)
-        return {"rerouted": rerouted,
+        return {"rerouted": rerouted, "returned": returned,
                 "reaped": reaped, "dispatched": dispatched, "updated": updated,
                 "reconciled": reconciled, "closed": closed,
                 "resumed": resumed,
@@ -3876,7 +4109,10 @@ def _main(argv: list[str] | None = None) -> int:
               f"human_ready={len(result.get('human_ready', []))}"
               # Only when something moved, so an ordinary tick line is unchanged.
               + (f" rerouted={len(result['rerouted'])}" if result.get("rerouted") else "")
+              + (f" returned={len(result['returned'])}" if result.get("returned") else "")
               + budget)
+        for a in result.get("returned") or []:
+            print(f"  returned {a.task_id} ({a.last_note})")
         for a in result.get("rerouted") or []:
             rr = a.rerouted_from or {}
             print(f"  rerouted {a.task_id} {rr.get('agent', '?')} -> {a.agent_id} "

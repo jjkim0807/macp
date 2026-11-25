@@ -39,12 +39,14 @@ def _fail_line(a) -> str:
 
 
 def _deferred_line(a) -> str:
-    """A FAILED-but-waiting row (checkout_busy / job_running / scheduled resume): what it is waiting
-    on, no retry count — a deferral never counts against the task."""
+    """A FAILED-but-waiting row (checkout_busy / job_running / back in the queue / scheduled
+    resume): what it is waiting on, no retry count — a deferral never counts against the task."""
     if getattr(a, "job_running", False):
         what = "long_job 실행 중"
     elif getattr(a, "checkout_busy", False):
         what = "체크아웃 대기"
+    elif A.is_requeued(a):
+        what = "빈 슬롯 대기"
     else:
         what = "예약 재개 — 재디스패치 대기"
     why = f" — {a.last_note}" if a.last_note else ""

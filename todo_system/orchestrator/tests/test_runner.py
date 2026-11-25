@@ -220,32 +220,18 @@ class RunnerClaimTest(unittest.TestCase):
             runner.poll_once()
         self.assertEqual(self.ex.calls, [])                  # gate 2 held
 
-    def test_bypass_path_is_claimed_too(self):
-        # a bypass_guard run that dies mid-pipeline is the same accident, so the
-        # classification sits AFTER the only_bypass filter, not before it.
-        msg = self._assign(bypass_guard=True)
-        self.runner.claims.open(msg, pid=4242)
-
-        with self._dead_pid():
-            self.assertEqual(self.runner.poll_once(only_bypass=True), 1)
-
-        self.assertEqual(self.ex.calls, [])
-        self.assertEqual([r.type for r in self.mb.receive(m.ORCHESTRATOR)],
-                         [m.FAIL])
-
     # -- direction 2: an UNCLAIMED envelope keeps at-least-once ------------
     def test_unstarted_message_is_never_acked_or_claimed(self):
         """The opposite accident: acking before execution would silently lose a
-        task that never ran. Filtered-out messages must stay exactly as they were."""
-        msg = self._assign()                       # no bypass_guard, no claim
-
-        self.assertEqual(self.runner.poll_once(only_bypass=True), 0)
+        task that never ran. An envelope nobody polled stays exactly as it was."""
+        msg = self._assign()                       # no claim, never polled
 
         self.assertEqual(self.ex.calls, [])
         self.assertEqual([e.msg_id for e in self.mb.receive(self.agent.id)],
                          [msg.msg_id])             # still queued, still un-acked
         self.assertIsNone(self.runner.claims.read(msg.msg_id))
-        # and it still runs normally when the guard clears
+        # and it runs when the runner polls: there is no usage gate at pickup,
+        # the orchestrator judged usage when it assigned
         self.assertEqual(self.runner.poll_once(), 1)
         self.assertEqual(self.ex.calls, ["core-loop"])
 
@@ -2432,7 +2418,7 @@ class RunnerParallelTest(unittest.TestCase):
             self.assertEqual(self.runner._assign_account({}, "t", cap, {}), "dev")
             # dev at its cap → spill to school
             self.assertEqual(self.runner._assign_account({}, "t", cap, {"dev": 2}), "school")
-            # all accounts at cap → None (the caller skips this envelope)
+            # all accounts at cap → None (the run starts on the default account)
             self.assertIsNone(self.runner._assign_account({}, "t", cap, {"dev": 2, "school": 2}))
         # a project pin wins over order AND ignores the per-account count
         with mock.patch("todo_system.macp.resolve",
@@ -2457,15 +2443,20 @@ class RunnerParallelTest(unittest.TestCase):
         self.assertEqual(sorted(v for v in self.runner._inflight_acct.values() if v),
                          ["dev", "school"])
 
-    def test_poll_parallel_skips_when_the_only_account_is_full(self):
+    def test_poll_parallel_starts_an_assigned_run_when_the_only_account_is_full(self):
+        # The orchestrator assigns only to a free slot and judged usage then; an
+        # envelope that still arrives with every account at its cap (a race, or
+        # a bypass_guard task under a hold) starts on the default account
+        # instead of waiting in the mailbox.
         self._assign("a", repo="https://example.com/a.git")
         self._assign("b", repo="https://example.com/b.git")
         cap = {"total": 1, "per_account": {"school": 1}, "slack": {},
                "order": ["school"], "active": "school"}
-        self.assertEqual(self.runner.poll_parallel(4, cap=cap), 1)   # only one school slot
-        self._wait_started(1)
-        self.assertEqual(self.runner.poll_parallel(4, cap=cap), 0)   # b cannot get a slot
-        self.assertEqual(self.ex.started, ["a"])
+        self.assertEqual(self.runner.poll_parallel(4, cap=cap), 2)
+        self._wait_started(2)
+        self.assertEqual(sorted(self.ex.started), ["a", "b"])
+        self.assertEqual(sorted(self.runner._inflight_acct.values(), key=str),
+                         [None, "school"])     # one on school, one on the default
 
     def test_poll_parallel_no_account_model_leaves_inflight_acct_empty(self):
         self._assign("a", repo="https://example.com/a.git")

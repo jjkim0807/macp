@@ -748,7 +748,10 @@ class SerialPerCheckoutTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mb = FileMailbox(self.tmp / "agents")
         self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        # concurrency: the worker has room — the slot gate has its own tests
+        # (test_free_slot_dispatch); the per-checkout rule is the subject here.
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x",
+                                   concurrency=8)])
         self.orch = Orchestrator(self.mb, self.reg, self.ledger,
                                  notify=lambda *a, **k: None)
 
@@ -932,7 +935,8 @@ class SerialPerCheckoutCapTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mb = FileMailbox(self.tmp / "agents")
         self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x",
+                                   concurrency=8)])
         self.orch = Orchestrator(self.mb, self.reg, self.ledger,
                                  notify=lambda *a, **k: None,
                                  max_parallel_per_repo=2)
@@ -999,7 +1003,8 @@ class ConcurrentDispatchE2ETest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mb = FileMailbox(self.tmp / "agents")
         self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x",
+                                   concurrency=8)])
         self.orch = Orchestrator(self.mb, self.reg, self.ledger,
                                  notify=lambda *a, **k: None)   # default cap (now 2)
 
@@ -1063,7 +1068,8 @@ class GlobalGradleBuildCapTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mb = FileMailbox(self.tmp / "agents")
         self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x",
+                                   concurrency=8)])
         self.orch = self._make_orch(gradle_cap=0)
 
     def tearDown(self):

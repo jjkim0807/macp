@@ -792,39 +792,6 @@ class ResumeInExecuteTest(unittest.TestCase):
         prog = json.loads((new[0] / stages.STAGE_PROGRESS).read_text(encoding="utf-8"))
         self.assertEqual(set(prog["usage"]), {"verify", "report"})
 
-    def test_poll_only_bypass_leaves_ordinary_messages_queued(self):
-        """Both the orchestrator and the runner enforce the guard. A bypass that
-        cleared only dispatch would leave the message in the mailbox forever —
-        dispatched on paper, never run."""
-        from todo_system.orchestrator import claims
-        from todo_system.orchestrator import message as m
-        from todo_system.orchestrator.runner import Runner
-        seen, acked = [], []
-        mb = mock.Mock()
-        urgent, ordinary = (
-            m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="urgent",
-                       payload={"bypass_guard": True}),
-            m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="ordinary", payload={}),
-        )
-        mb.receive.return_value = [urgent, ordinary]
-        mb.ack.side_effect = lambda a, msg: acked.append(msg.task_id)
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        r = Runner.__new__(Runner)
-        r.mailbox, r.agent = mb, mock.Mock(id="w")
-        r.claims = claims.ClaimStore(tmp, "w")   # __new__ skips __init__
-        r._lock, r._inflight, r._busy = threading.RLock(), {}, 0
-        r.handle = lambda msg: seen.append(msg.task_id)
-
-        self.assertEqual(r.poll_once(only_bypass=True), 1)
-        self.assertEqual(seen, ["urgent"])
-        self.assertEqual(acked, ["urgent"])      # the ordinary one stays un-acked
-        # …and it was never claimed either: a message filtered out before handling
-        # has not started, so nothing about it is recorded and its at-least-once
-        # redelivery is preserved.
-        self.assertIsNone(r.claims.read(ordinary.msg_id))
-        self.assertIsNone(r.claims.read(urgent.msg_id))   # closed after its ack
-
     def test_successful_external_run_removes_its_worktree(self):
         # Switchover: the external repo is now a per-run worktree, not a shared
         # clone parked on the task branch. A SUCCESSFUL run (a) still restores the

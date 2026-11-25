@@ -46,7 +46,7 @@ from . import agent_backend
 from . import stages
 from . import superseded as superseded_mod
 from . import worktree_sweep
-from .assignment import DONE, Ledger
+from .assignment import ASSIGN_TTL_S, DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
 from .registry import Agent, KIND_AI_LOCAL, load_registry
 from .state_store import open_state_store
@@ -2470,6 +2470,8 @@ class Runner:
     ledger_root: Path | None = None
     _cancelled: frozenset = frozenset()   # inert default; __init__ makes it a set
     _busy_beat_thread = None
+    _slots_max = 1                        # last capacity announced (see _announce)
+    _announced: tuple | None = None       # (slots, monotonic time) of the last one
 
     def __init__(self, mailbox: Mailbox, agent: Agent, executor: Executor,
                  log: Callable[[str], None] = print,
@@ -2622,6 +2624,12 @@ class Runner:
           above missed it. The row left DISPATCHED is reaped to FAILED and then
           closed by `reconcile_merged`'s todo-closed fallback, so no reply is needed.
 
+        - The envelope is older than ASSIGN_TTL_S. The orchestrator assigns only
+          to a free slot, so an assignment is started within minutes; one that
+          waited this long is taken back by the orchestrator (CANCEL + queue)
+          and must not also start here. It also keeps a runner that comes up
+          on this code from starting a backlog an older orchestrator pushed.
+
         The caller sends no reply on skip. FAIL would trigger `_retry`,
         NEEDS_INPUT would overwrite DONE with AWAITING_HUMAN, and ACCEPT or even a
         HEARTBEAT rewrites the row via `apply_reply`. Fail-open: anything that
@@ -2664,6 +2672,10 @@ class Runner:
                         return "task md worker_mode: off"
                     if _truthy(fm.get("auto_rescoped")) or _truthy(fm.get("is_parent")):
                         return "task md is a rescoped parent (auto_rescoped/is_parent)"
+            age = time.time() - dt.datetime.fromisoformat(msg.ts).timestamp()
+            if age > ASSIGN_TTL_S:
+                return (f"assignment expired ({age / 60:.0f} min old) — "
+                        "the orchestrator puts it back in the queue")
         except Exception as e:  # noqa: BLE001 - fail-open: run as before
             self.log(f"  skip-guard failed (running anyway): {e}")
         return None
@@ -2771,13 +2783,9 @@ class Runner:
                        claim=claim)
         return verdict
 
-    def poll_once(self, only_bypass: bool = False) -> int:
-        """Consume the mailbox. `only_bypass` handles just the messages whose task
-        carries `bypass_guard`, leaving the rest queued and un-acked.
-
-        Both the orchestrator and this loop enforce the usage guard, so a bypass
-        that cleared only the dispatch side would put the message in the mailbox
-        and leave it there — dispatched on paper, never run.
+    def poll_once(self) -> int:
+        """Consume the mailbox. Usage is judged once, by the orchestrator when it
+        assigns: whatever is in the mailbox was given to a free slot and runs.
 
         Claim-before-handle: the fact that execution STARTED is written to disk
         before `handle()` is entered, because `finally` only covers exceptions.
@@ -2809,10 +2817,6 @@ class Runner:
         msgs = controls + assignments
         handled = 0
         for i, msg in enumerate(msgs):
-            if only_bypass and not (msg.payload or {}).get("bypass_guard"):
-                continue                      # stays queued, un-acked, for later
-            # NOTE: after the only_bypass filter on purpose — a bypass run that
-            # dies mid-pipeline is the same accident and gets the same treatment.
             prior = self.claims.read(msg.msg_id)
             if prior is not None:
                 self._divert_redelivery(msg, prior)
@@ -2855,8 +2859,8 @@ class Runner:
         # Deliberately NOT at poll entry — that fires every 15s whether or
         # not there is work, which would make the file permanently fresh and
         # rebuild the constant-busy defect this replaced. Deliberately after
-        # the only_bypass filter and the redelivery `continue` too: neither
-        # path does any work, so neither may hold the heartbeat.
+        # the redelivery `continue` too: that path does no work, so it may
+        # not hold the heartbeat.
         self._work_begin()
         if msg.type == m.TASK_ASSIGN:
             _CANCEL.check = lambda: self._cancel_requested(msg)
@@ -2912,7 +2916,8 @@ class Runner:
                             payload={"mode": getattr(getattr(self, "executor", None),
                                                      "mode", ""),
                                      "status": "busy",
-                                     "capabilities": list(self.agent.capabilities)}))
+                                     "capabilities": list(self.agent.capabilities),
+                                     "slots": self._slots(self._slots_max)}))
                 except Exception as e:  # noqa: BLE001 - liveness must not kill a run
                     log = getattr(self, "log", None)
                     if log is not None:
@@ -2927,8 +2932,7 @@ class Runner:
             if self._busy == 0:
                 _worker.runner_heartbeat_clear()
 
-    def poll_parallel(self, slots: int, only_bypass: bool = False,
-                      cap: dict | None = None) -> int:
+    def poll_parallel(self, slots: int, cap: dict | None = None) -> int:
         """Non-blocking poll: start up to `slots` concurrent runs on threads.
 
         The same claim/handle/ack sequence as poll_once, per envelope, plus:
@@ -2948,8 +2952,10 @@ class Runner:
         claude account (`_assign_account`: project pin, else the widest-slack
         account with a free per-account slot), recorded in `_inflight_acct` and
         carried to `_account_env` via the per-thread `_ASSIGNED_ACCOUNT`. When
-        `cap` is None / empty (serial, direct test calls, no profile) the
-        assignment is skipped entirely and the dispatch is byte-identical.
+        no account has a free slot the run still starts, on the default account
+        resolution: the orchestrator judged usage when it assigned. When `cap`
+        is None / empty (serial, direct test calls, no profile) the assignment
+        is skipped entirely and the dispatch is byte-identical.
         Returns how many envelopes it started or consumed this poll."""
         has_accounts = bool(cap and (cap.get("order") or cap.get("per_account")))
         with self._lock:
@@ -2977,8 +2983,6 @@ class Runner:
                     continue
                 running = len(self._inflight)
                 busy_keys = set(self._inflight.values())
-            if only_bypass and not (msg.payload or {}).get("bypass_guard"):
-                continue
             prior = self.claims.read(msg.msg_id)
             if prior is not None:
                 self._divert_redelivery(msg, prior)
@@ -3006,9 +3010,6 @@ class Runner:
             acct = None
             if has_accounts:
                 acct = self._assign_account(msg.payload, msg.task_id, cap, inflight_counts)
-                if acct is None:
-                    continue               # no account has a free slot for this
-                                           # msg; a later one (pin / free acct) may
             with self._lock:
                 self._inflight[msg.msg_id] = key
                 if has_accounts:
@@ -3030,10 +3031,9 @@ class Runner:
         knows — ignoring the per-account count, since a pin is a hard routing,
         not load balancing). Else the first account in `cap["order"]` (widest
         slack, then priority) whose in-flight count is below its per-account slot
-        cap. None = nothing fits this poll → the caller skips this envelope (a
-        later one may still land on a free account or its pin). The anchor is the
-        existing external clone if present, else the vault — a clone is never
-        forced here. Never raises (→ None, caller gates nothing)."""
+        cap. None = no account has a free slot → the run starts on the default
+        account resolution. The anchor is the existing external clone if present,
+        else the vault — a clone is never forced here. Never raises (→ None)."""
         per = cap.get("per_account") or {}
         order = cap.get("order") or []
         try:
@@ -3087,33 +3087,44 @@ class Runner:
         self._mem_hold_logged = not ok
         return ok
 
-    def _heartbeat(self) -> None:
-        """Proactively tell the control plane 'I'm alive' when idle (active work
-        already emits PROGRESS = a liveness signal). Lets the orchestrator report
-        agent health without a manual SSH check. Never break the loop on failure."""
+    def _slots(self, slots_max: int) -> dict:
+        """`{"max", "used"}` — how many runs this runner can hold right now and
+        how many it holds. An extra run needs free memory (`_mem_ok`), so under
+        memory pressure `max` shrinks to what is already running."""
+        with self._lock:
+            used = max(len(self._inflight), self._busy)
+        slots_max = max(0, int(slots_max))
+        if used and slots_max > used and not self._mem_ok():
+            slots_max = used
+        return {"max": slots_max, "used": used}
+
+    def _announce(self, slots_max: int, *, interval: float = 300.0) -> bool:
+        """Tell the orchestrator how many slots this runner has (HEARTBEAT
+        `slots`), when the numbers changed or `interval` seconds have passed.
+
+        The orchestrator assigns a task only to a free slot, so this is what
+        brings work here — and the same message is the liveness signal. Sent
+        whether idle or busy: a runner with one of four slots in use still has
+        three to offer. `interval` bounds the mailbox churn. Never raises."""
         try:
-            self.mailbox.send(m.Envelope(
-                to=m.ORCHESTRATOR, frm=self.agent.id, type=m.HEARTBEAT,
-                payload={"mode": self.executor.mode, "status": "idle",
-                         "capabilities": list(self.agent.capabilities)}))
+            self._slots_max = slots_max
+            slots = self._slots(slots_max)
+            now = time.monotonic()
+            last = self._announced
+            if last is not None and last[0] == slots and now - last[1] < interval:
+                return False
+            with self._lock:
+                self.mailbox.send(m.Envelope(
+                    to=m.ORCHESTRATOR, frm=self.agent.id, type=m.HEARTBEAT,
+                    payload={"mode": self.executor.mode,
+                             "status": "busy" if slots["used"] else "idle",
+                             "capabilities": list(self.agent.capabilities),
+                             "slots": slots}))
+            self._announced = (slots, now)
+            return True
         except Exception as e:
             self.log(f"heartbeat failed (continuing): {e}")
-
-    def _usage_blocked(self) -> str | None:
-        """Reason when the Claude-usage guard says not to start work, else None.
-
-        Evaluated per poll (NOT at import/startup — a resident daemon must not
-        freeze a decision the way the old import-time STAGE_MODEL did). Fail-open
-        and never raises: guard trouble must not kill the standby loop.
-        """
-        try:
-            from todo_system import usage_guard
-            d = usage_guard.check()
-            if not d.get("allowed", True):
-                return d.get("reason") or "usage guard blocked"
-        except Exception:
-            pass
-        return None
+            return False
 
     def _max_parallel(self) -> int:
         """Configured concurrency ceiling: RUNNER_MAX_PARALLEL, else the
@@ -3190,8 +3201,6 @@ class Runner:
                     heartbeat_interval: float = 300.0) -> None:
         self.log(f"runner up: agent={self.agent.id} mode={self.executor.mode} "
                  f"interval={interval}s")
-        last_beat = 0.0
-        usage_block_logged: str | None = None
         max_n = self._max_parallel()
         slots_logged: int | None = None
         if max_n > 1:
@@ -3208,6 +3217,7 @@ class Runner:
             # we only wait out the runs already on threads. systemd's
             # Restart=always brings the process back on the new code.
             if self._drain_requested:
+                self._announce(0, interval=heartbeat_interval)   # no slot here
                 with self._lock:
                     idle = not self._inflight and self._busy == 0
                 if idle:
@@ -3216,57 +3226,24 @@ class Runner:
                 time.sleep(interval)
                 continue
             try:
-                # Usage guard: while blocked, leave already-dispatched messages
-                # queued in the mailbox (unclaimed, un-acked) instead of burning
-                # quota on them. They resume untouched when the guard clears.
+                # Usage is judged once, by the orchestrator when it assigns. This
+                # loop says how many runs it can hold (`_announce`) and starts
+                # what it is given, up to its own ceiling.
                 if max_n > 1:
-                    # Parallel: the per-account slot SUM decides the hold, not the
-                    # single active account's check(). An account with slack runs
-                    # even while another is blocked (that is the capacity this
-                    # task adds); the whole loop holds only when every usable
-                    # account is at its cap (total 0), and then still lets a
-                    # bypass_guard task through.
+                    # Parallel: the per-account slot SUM is the capacity — an
+                    # account with slack adds slots even while another is at its
+                    # cap; 0 when every usable account is.
                     cap = self._account_slots()
                     self._write_slots_snapshot(cap)   # dashboard / CLI read this
                     slots = cap["total"]
-                    if slots <= 0:
-                        blocked = self._usage_blocked() or "all accounts at capacity"
-                        if blocked != usage_block_logged:
-                            self.log(f"usage guard blocked — deferring queued work: {blocked}")
-                            usage_block_logged = blocked
-                        handled = self.poll_parallel(1, only_bypass=True)
-                        if handled:
-                            self.log(f"bypass_guard: ran {handled} task(s) despite the hold")
-                    else:
-                        if usage_block_logged is not None:
-                            self.log("usage guard cleared — resuming")
-                            usage_block_logged = None
-                        if slots != slots_logged:
-                            self.log(f"parallel slots: {slots}/{max_n}")
-                            slots_logged = slots
-                        handled = self.poll_parallel(slots, cap=cap)
+                    if slots != slots_logged:
+                        self.log(f"parallel slots: {slots}/{max_n}")
+                        slots_logged = slots
+                    self.poll_parallel(max(max_n, slots), cap=cap)
                 else:
-                    # Serial: one active account, byte-identical to before.
-                    blocked = self._usage_blocked()
-                    if blocked:
-                        if blocked != usage_block_logged:
-                            self.log(f"usage guard blocked — deferring queued work: {blocked}")
-                            usage_block_logged = blocked
-                        # …except a task explicitly marked worth spending out of turn.
-                        handled = self.poll_once(only_bypass=True)
-                        if handled:
-                            self.log(f"bypass_guard: ran {handled} task(s) despite the hold")
-                    else:
-                        if usage_block_logged is not None:
-                            self.log("usage guard cleared — resuming")
-                            usage_block_logged = None
-                        handled = self.poll_once()
-                now = time.time()
-                # heartbeat only when idle + throttled, to bound git-mailbox churn
-                if (handled == 0 and not self._inflight
-                        and now - last_beat >= heartbeat_interval):
-                    self._heartbeat()
-                    last_beat = now
+                    slots = 1
+                    self.poll_once()
+                self._announce(slots, interval=heartbeat_interval)
             except Exception as e:  # a bad message must not kill the standby loop
                 self.log(f"poll error (continuing): {e}")
             time.sleep(interval)

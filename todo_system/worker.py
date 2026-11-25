@@ -109,9 +109,9 @@ def todo_sync_heartbeat_clear() -> None:
 # work and re-touched at the top of every pipeline stage, read by _runner_idle.
 # Present-and-fresh = a stage is executing; absent = the runner is standing by
 # and safe to kickstart. Same shape as the todo-sync heartbeat above, for the
-# same reason: the ledger cannot answer this question. While the usage guard
-# holds messages in the mailbox (run_forever's only_bypass path) a `dispatched`
-# row sits untouched for DAYS with nothing running (2026-08-21 moksori-2).
+# same reason: the ledger cannot answer this question. A `dispatched` row is an
+# assignment, not a running stage: on 2026-08-21 (moksori-2) one sat untouched
+# for DAYS with nothing running while the usage guard held.
 RUNNER_HEARTBEAT_PATH = WORKER_DIR / "_state" / "runner_heartbeat"
 # A todo-sync tick is seconds; a runner tick is a five-stage pipeline, so the
 # cutoff cannot be "how long a tick takes". It is instead the hard bound between
@@ -2715,10 +2715,11 @@ def _runner_idle(pid: int) -> bool:
 
     What this gate deliberately does NOT read is the ledger's in-flight STATE
     (dispatched/accepted/in_progress). Those rows record what the orchestrator
-    DECIDED, not what is executing. While the usage guard holds, run_forever
-    polls with `only_bypass=True` and leaves every non-bypass envelope queued
-    and un-acked — so a `dispatched` row sits there for DAYS with no process
-    behind it. On 2026-08-21 that read as busy and deferred the runner restart
+    DECIDED, not what is executing. Until 2026-11-25 the runner left every
+    non-bypass envelope queued and un-acked while the usage guard held — so a
+    `dispatched` row sat there for DAYS with no process behind it (it is now
+    taken back to the queue after 30 minutes, but the row is still not a
+    process). On 2026-08-21 that read as busy and deferred the runner restart
     73 times in 6 hours (moksori-2), i.e. the same can-never-restart failure
     _todo_sync_idle had. Each signal kept below answers something the state
     field cannot:

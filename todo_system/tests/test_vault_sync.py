@@ -1074,8 +1074,8 @@ class IdleGateTest(unittest.TestCase):
 
     def test_dispatched_rows_without_a_live_tick_are_idle(self):
         # 2026-08-21 moksori-2, and the reason this gate was rewritten: while
-        # the usage guard holds, run_forever polls with only_bypass=True and
-        # leaves every non-bypass envelope queued and un-acked, so its ledger
+        # the usage guard held, the runner of that time left every non-bypass
+        # envelope queued and un-acked, so its ledger
         # row sits at `dispatched` for DAYS with no process behind it. Reading
         # that as busy deferred the runner restart 73 times in 6 hours. A row
         # records what the orchestrator DECIDED; only the tick heartbeat knows
@@ -1344,33 +1344,23 @@ class RunnerHeartbeatWiringTest(unittest.TestCase):
             self.assertEqual(r.poll_once(), 1)
         self.assertFalse(hb.exists())
 
-    def test_guard_deferred_dispatch_reads_idle_end_to_end(self):
-        """The 2026-08-21 condition, reproduced through the real code path.
-
-        Guard blocked -> run_forever calls poll_once(only_bypass=True) -> a
-        non-bypass envelope stays queued and un-acked and nothing executes, yet
-        its ledger row still says `dispatched`. The restart gate must call that
-        idle. Placing the heartbeat by hand would prove nothing here; the point
-        is that poll_once declines to take one on the path that does no work.
+    def test_a_dispatched_row_nobody_polled_reads_idle_end_to_end(self):
+        """A `dispatched` row whose envelope no poll has reached yet (the moment
+        between an assignment and the runner's next poll) holds no heartbeat,
+        so the restart gate must call the runner idle.
         """
         (self.d / "assignments").mkdir()
         (self.d / "assignments" / "t1.json").write_text(
             json.dumps({"task_id": "t1", "agent_id": "ai-worker",
                         "corr_id": "c1", "state": "dispatched"}),
             encoding="utf-8")
-        r, _ = self._runner(payload={})           # no bypass_guard
         hb = self.hb
-        with mock.patch.object(worker, "RUNNER_HEARTBEAT_PATH", hb), \
-             mock.patch.object(Runner, "handle",
-                               side_effect=AssertionError("must not run")):
-            self.assertEqual(r.poll_once(only_bypass=True), 0)
-        r.mailbox.ack.assert_not_called()         # still queued for later
         self.assertFalse(hb.exists())
         with mock.patch.object(worker, "RUNNER_HEARTBEAT_PATH", hb), \
              mock.patch.object(worker, "WORKER_DIR", self.d), \
              mock.patch.object(worker, "_pgrep", return_value=""):
             self.assertTrue(worker._runner_idle(999),
-                            "a dispatched row the guard never ran must not "
+                            "a dispatched row nothing is running for must not "
                             "defer the runner restart")
 
 

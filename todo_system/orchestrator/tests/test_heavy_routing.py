@@ -50,7 +50,7 @@ REPO = "https://example.invalid/acme/heavy-app.git"
 _STUBBED = ("collect", "reconcile_merged", "reconcile_closed", "reconcile_queue",
             "reconcile_parents", "reap_stale",
             "reconcile_resumes", "reconcile_rescope", "reconcile_split_parents",
-            "reconcile_human_ready",
+            "reconcile_human_ready", "requeue_unstarted",
             "_advote_bridge_tick", "_beta_sweep_tick")
 
 
