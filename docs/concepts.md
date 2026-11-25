@@ -25,11 +25,9 @@ The planes talk only through **messages** (`TASK_ASSIGN`, `PROGRESS`, `RESULT`,
 `NEEDS_INPUT`, …) in file mailboxes, and through the ledger. A runner does not know how
 tasks are chosen, and the orchestrator does not know how code gets written. That
 separation is what keeps macp independent of any particular agent. The runner calls an
-`Executor` (`todo_system/orchestrator/runner.py`), and stage execution sits behind a
-vendor-neutral `AgentBackend` (`todo_system/orchestrator/agent_backend.py`). Claude Code
-(`claude -p`) runs every stage; a task may route a stage to another agent by its `agent:`
-frontmatter or account — the Gemini CLI on the `quick` lane, and the Upstage Solar HTTP
-backend on `quick`/`delegate` — and a capability gate refuses, before dispatch, a backend
+`Executor` (`todo_system/orchestrator/runner.py`), and stage execution sits behind an
+`AgentBackend` (`todo_system/orchestrator/agent_backend.py`). Claude Code
+(`claude -p`) runs every stage; a capability gate refuses, before dispatch, a backend
 that can't meet a stage's required capabilities (e.g. the tool allowlist a read-only stage
 needs) rather than silently dropping the guarantee.
 

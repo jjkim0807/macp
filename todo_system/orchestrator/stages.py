@@ -176,62 +176,6 @@ STAGES_QUICK = ("quick",)   # right-sizing: one combined call for trivial change
 # tree by prompt; the runner closes it on RESULT like any vault task.
 STAGES_DISCOVER = ("discover",)
 
-# The stages the Solar (upstage) harness can run: the single-stage lanes only.
-# `solar_stage.run` has read/write/finish file tools and no shell — so it cannot
-# do quick's self-verify + self-merge + `gh pr` or the 5-stage pipeline's
-# git/build work; `delegate` ("do the work, edit files, write delegate.md") is
-# exactly what it can do. quick is listed so a quick task CAN be routed once a
-# key-authenticated vendor grows a verify path, but delegate is the lane opened
-# now (runner._solar_account + runner._select_backend → SolarAgentBackend).
-SOLAR_STAGES = STAGES_QUICK + STAGES_DELEGATE
-# Gemini CLI (the first CLI non-claude backend, user decision 2026-11-04) starts
-# on the quick lane ONLY (design §4 Q4: the smallest safe start — one combined
-# self-verify+merge stage, the same lane Solar opened on). Widening to delegate /
-# the 5-stage pipeline is a later leaf.
-GEMINI_STAGES = STAGES_QUICK
-
-# Which single-stage lanes each non-claude vendor runs via its own backend. This
-# is the general form of the old single-vendor route_to_solar gate: the runner
-# routes `stage` to a vendor backend when the task's `agent` names one here and
-# the vendor actually has an account configured. Everything not listed stays on
-# the claude path. Add a vendor by adding a row (+ its account resolver + backend).
-NON_CLAUDE_LANES = {
-    "upstage": SOLAR_STAGES,    # HTTP tool loop (solar_stage.run)
-    "gemini": GEMINI_STAGES,    # CLI subprocess (agent_backend.GeminiAgentBackend)
-}
-
-
-def vendor_lane_for(agent: str | None) -> tuple[str, ...]:
-    """The stages a non-claude `agent` runs via its own backend (NON_CLAUDE_LANES).
-    Empty tuple for claude, None, or an unknown agent → every stage stays on the
-    claude path. Case-insensitive, pure and total."""
-    return NON_CLAUDE_LANES.get((agent or "").lower(), ())
-
-
-def routes_to_vendor(agent: str | None, stage: str) -> bool:
-    """The general routing gate (replaces the single-vendor route_to_solar as the
-    runner's mechanism): does this task's `agent` run THIS `stage` via a non-claude
-    backend? Pure — the runner's one selector (runner._select_backend) ALSO gates
-    on an actually-resolved vendor account, so a True here with no account
-    configured still never routes. Every vendor, upstage included, is selected
-    through this one gate."""
-    return stage in vendor_lane_for(agent)
-
-
-def route_to_solar(agent: str | None, stage: str) -> bool:
-    """Whether this stage runs via the Solar harness instead of `claude -p`: the
-    task's resolved `agent` is upstage AND the stage is a single-stage lane. A
-    thin compatibility wrapper over routes_to_vendor (upstage is one row of
-    NON_CLAUDE_LANES): the runner no longer calls it — it selects upstage through
-    the general routes_to_vendor gate (runner._select_backend) — but the named
-    helper stays for callers/tests that ask the Solar question directly. Pure
-    and total — the runner ALSO gates on an
-    actually-resolved upstage account, so this returning True for a task with no
-    upstage account configured still never routes (and every claude task returns
-    False here regardless)."""
-    return (agent or "").lower() == "upstage" and routes_to_vendor(agent, stage)
-
-
 # Stages whose read-only / test-only guarantee the pipeline TRUSTS when it reads
 # their artifact: verify is test-only by design, discover reads a throwaway clone. That guarantee is enforced today
 # by the stage's tool allowlist (STAGE_TOOLS has no Edit for them / TASK_TOOLS_STAGES

@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .accounts import (
-    LEGACY_CONFIG_DIR, UPSTAGE_KEY_ENV, config_dir_for, credentials_file_for,
-    load_runtime_state, read_api_key, resolve_active, token_file_for,
+    LEGACY_CONFIG_DIR, config_dir_for, credentials_file_for,
+    load_runtime_state, resolve_active, token_file_for,
 )
 
 HOME = Path(os.environ.get("MACP_HOME") or (Path.home() / ".macp"))
@@ -34,40 +34,25 @@ PROJECT_DIR = ".macp"                  # marker dir inside a managed project
 
 WORKER_MODES = ("auto", "quick", "review", "delegate", "discover", "manual")
 
-# Default model_tier → Upstage Solar model id. These are DATE-PINNED snapshots,
-# the only ids whose existence was measured (2026-10-19); undated aliases are
-# not known to be served, and an alias default that 404s turns a live smoke into
-# "model not found" instead of a measurement. Swap a pin per account with
-# `macp account add … --models light=<id>` / `models = { … }` in the profile —
-# that configurability is the point, not the default value.
-SOLAR_TIER_MODELS = {
-    "heavy": "solar-pro4-260806",
-    "standard": "solar-pro4-260806",
-    "light": "solar-mini4-260922",
-}
-
 
 @dataclass
 class Account:
     """One agent execution identity. Multiple accounts under a profile = parallel
-    capacity, and they can be from **different vendors** (Claude Code, OpenAI
-    Codex, Cursor, Gemini CLI, Aider, …).
-      - agent: vendor id ('claude' default, or codex/cursor/gemini/aider/custom).
+    capacity. ``claude`` is the only backend the orchestrator runs today; the
+    remaining fields are a declarative schema kept for a future non-Claude backend.
+      - agent: backend id ('claude' default).
       - claude_config_dir: auth isolation for Claude (CLAUDE_CONFIG_DIR).
-      - command: invocation template for non-Claude agents; '{prompt}' is
-        substituted (e.g. 'codex exec {prompt}', 'aider --message {prompt}').
+      - command: invocation template for a non-Claude CLI agent; '{prompt}' is
+        substituted (appended if absent).
       - env: extra environment (config dirs, non-secret settings) for this
         account. **Never an API key**: `write_profile` serializes this verbatim
         into the profile TOML and `account list` prints `command`, so a secret
-        placed here leaks. Keys are read at call time —
-        `accounts.read_api_key` for upstage; see `key_file` below.
+        placed here leaks.
       - priority: selection order among a profile's accounts (lower first,
         ties by listing order; default 100). Written only when non-default.
-      - key_file: for a key-authenticated vendor (upstage), the path to the file
-        holding `UPSTAGE_API_KEY=…` (0600). The PATH only — the value is
-        resolved by `accounts.read_api_key` when a call is made.
-      - models: model_tier → vendor model id overrides (e.g.
-        `{"light": "solar-mini4-260922"}`); see `solar_model_for`.
+      - key_file: path to a 0600 file holding a key-authenticated agent's key
+        (the PATH only, resolved at call time).
+      - models: model_tier → model id overrides for a non-Claude agent.
     The last two are appended: the schema test pins existing field order."""
     name: str
     agent: str = "claude"
@@ -205,16 +190,6 @@ def resolve(start: Path | str | None = None) -> dict:
             "profile": load_profile(prof_name)}
 
 
-def solar_model_for(account: Account | None, tier: str) -> str:
-    """The Upstage Solar model id for a ``model_tier`` — the account's ``models``
-    override first, then :data:`SOLAR_TIER_MODELS`. An unknown tier string falls
-    back to ``standard`` rather than raising, so a new worker tier name never
-    breaks a dispatch."""
-    over = (getattr(account, "models", None) or {}) if account is not None else {}
-    return str(over.get(tier) or SOLAR_TIER_MODELS.get(tier)
-               or SOLAR_TIER_MODELS["standard"])
-
-
 def account_for(profile: Profile, project: ProjectConfig | None, task_id: str = "",
                 agent: str | None = "claude") -> Account | None:
     """Pick the account to run with: the project's pinned account if set, else
@@ -222,10 +197,9 @@ def account_for(profile: Profile, project: ProjectConfig | None, task_id: str = 
 
     Only accounts of ``agent`` are candidates (default ``claude``, as in
     ``accounts.pick_account``; ``agent=None`` considers every account). The
-    filter is what keeps the round-robin stable when a profile gains a
-    non-claude account: the index is ``hash(task_id) % len(candidates)``, so
-    without it registering one upstage account would re-shuffle every existing
-    task's claude mapping.
+    filter keeps the round-robin stable: the index is
+    ``hash(task_id) % len(candidates)``, so a profile that gains a non-claude
+    account does not re-shuffle every existing task's claude mapping.
     """
     if not profile or not profile.accounts:
         return None
@@ -272,36 +246,16 @@ def active_credentials_file(start: Path | str | None = None) -> Path:
 
 def build_invocation(account: Account, prompt: str,
                      extra_args: list[str] | None = None) -> tuple[list[str], dict]:
-    """(argv, env) to run `prompt` with this account's agent — vendor-neutral.
+    """(argv, env) to run `prompt` with this account's agent.
     - claude (default / no command): `claude -p <prompt> [extra_args]` + CLAUDE_CONFIG_DIR.
-    - other vendor: account.command with '{prompt}' substituted (appended if no
+    - other agent: account.command with '{prompt}' substituted (appended if no
       placeholder), plus account.env. `extra_args` (claude-specific flags) are
-      ignored for non-claude agents.
-    - upstage: HTTP-only by default. Without a `command` there is no CLI to run,
-      so this RAISES ValueError instead of falling through to the claude branch
-      (`agent == "claude" or not account.command`) and silently launching
-      `claude` under an upstage account's name — use `upstage.chat()` for the
-      API path. With a `command` it takes the generic vendor branch and the key
-      is injected into the returned env at call time (`accounts.read_api_key`,
-      never from the profile).
+      ignored for a non-claude agent.
 
-    The returned env is the caller's to pass to a subprocess; this function
-    prints nothing, so an injected key stays out of every log.
+    The returned env is the caller's to pass to a subprocess.
     """
     import shlex
     env = dict(account.env or {})
-    if account.agent == "upstage":
-        if not account.command:
-            raise ValueError(
-                f"upstage account '{account.name}' has no CLI command; "
-                "call the HTTP client (todo_system.macp.upstage.chat) instead")
-        key = read_api_key(account)
-        if key:
-            env[UPSTAGE_KEY_ENV] = key
-        argv = [p.replace("{prompt}", prompt) for p in shlex.split(account.command)]
-        if "{prompt}" not in account.command:
-            argv.append(prompt)
-        return argv, env
     if account.agent == "claude" or not account.command:
         argv = ["claude", "-p", prompt, *(extra_args or [])]
         cfg = os.path.expanduser(account.claude_config_dir or "")
