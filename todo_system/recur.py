@@ -28,7 +28,7 @@ one line. That is the only moment a round is created:
 What moves in the copy: the slug date and ``not_before`` become the new time,
 and the dates in ``due`` and ``scheduled`` move by the same number of days (a
 ``HH:MM~HH:MM`` block keeps its clock times, hence its length). What one round
-owns alone does not travel: ``completed`` and the external-tracker link.
+owns alone does not travel: ``completed`` and any external-system link.
 
 The time the next round is counted from is the current round's ``not_before``;
 a round without one falls back to its ``scheduled`` date, then the date in its
@@ -83,9 +83,8 @@ _H2_RE = re.compile(r"^## ", re.M)
 _MAX_TAKEN_SLOTS = 400
 
 # Frontmatter that belongs to one round and must not ride into its copy: the
-# calendar's stamp of when that round was closed, and its link to an external
-# tracker issue (two task files naming one issue make `tracker pull` update
-# whichever it finds first, and `tracker push` report the same issue twice).
+# calendar's stamp of when that round was closed, and any link to an external
+# system's issue (a copy must never claim the original round's external identity).
 _ROUND_ONLY_KEYS = ("completed", "external_ref", "external_updated_at")
 
 

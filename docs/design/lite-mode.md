@@ -132,7 +132,7 @@ related:
 
 | 이름 | 실체 | 어디에 있나 | 하위명령 |
 |---|---|---|---|
-| 콘솔 스크립트 `macp` | todo CLI. `pyproject.toml:60` → `todo_system/_entry.py:23` → `cli.main` (`todo_system/cli.py:2170`) | wheel을 설치하면 PATH에 놓인다 | `init-db` `import-md` `validate` `new` `list` `today` `audit` `weekly-review` `queue` `complete` `reopen` `set` `daemon` `now` `focus` `calendar-sync` `calendar-fetch` `unified` `session-end` `resume` `tracker` (`todo_system/cli.py:1991-2164`) |
+| 콘솔 스크립트 `macp` | todo CLI. `pyproject.toml:60` → `todo_system/_entry.py:23` → `cli.main` (`todo_system/cli.py:2170`) | wheel을 설치하면 PATH에 놓인다 | `init-db` `import-md` `validate` `new` `list` `today` `audit` `weekly-review` `queue` `complete` `reopen` `set` `daemon` `now` `focus` `calendar-sync` `calendar-fetch` `unified` `session-end` `resume` (`todo_system/cli.py`) |
 | bash 래퍼 `scripts/macp` | 프로젝트/프로필 CLI `python -m todo_system.macp` | 개발 체크아웃에만 있다 (`scripts/macp:9-15`) | `init` `status` `profile` `account` `memory` `use` `deps` `impact` `link` `propagate` (`todo_system/macp/__main__.py:649-725`) |
 
 새 동사 `init` `add` `up` `status` `dashboard` `memory`는 todo CLI의 하위명령과 하나도

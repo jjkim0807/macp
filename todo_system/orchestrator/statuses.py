@@ -1,7 +1,7 @@
 """The one definition of "this task is closed".
 
 A task md may record a cancelled task as `cancelled` (two l's, the engine's own
-spelling) or `canceled` (one l, the US spelling a human or an external tracker
+spelling) or `canceled` (one l, the US spelling a human sometimes
 writes). Both mean closed. Before this module every caller kept its own copy of
 the set, and several copies knew only `cancelled` — so a `canceled` task's failed
 queue entry was auto-retried, and dashboard/metrics counts left it out.
