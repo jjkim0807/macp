@@ -198,13 +198,15 @@ def test_plan_park_auto_splits_end_to_end(vault, tmp_path):
     out, progress = _execute_plan_stage(root, tmp_path / "clone", SLUG, CHAT_SHAPE_PLAN)
 
     # 1. runner: the park outcome is unchanged, and the split plan sits beside it
+    #    AND rides the payload inline (so a remote runner's park reaches HQ with it)
     assert out.ok is False
     assert out.summary == PARK_SUMMARY
-    assert set(out.payload) == PARK_KEYS
+    assert set(out.payload) == PARK_KEYS | {"rescope"}
     run_dir = Path(out.payload["run_dir"])
     assert run_dir.parent == runs
     plan = rescope.load_rescope(run_dir)
     assert plan is not None
+    assert out.payload["rescope"] == plan
     assert [s["slug"] for s in plan["subtasks"]] == [f"{SLUG}-p{k}" for k in (1, 2, 3, 4)]
     assert any(p.startswith("plan split: rescope.json written") for p in progress), progress
 
@@ -345,14 +347,16 @@ def test_1118_plan_block_splits_through_the_tick(vault, tmp_path, monkeypatch):
     out, progress = _execute_plan_stage(root, tmp_path / "clone", PARENT,
                                         with_block(PLAN_1118))
 
-    # 1. runner: the park outcome is unchanged; the split plan is the block's
+    # 1. runner: the park outcome is unchanged; the split plan is the block's,
+    #    and it rides the payload inline for a remote runner's park
     assert out.ok is False
     assert out.summary == PARK_SUMMARY
-    assert set(out.payload) == PARK_KEYS
+    assert set(out.payload) == PARK_KEYS | {"rescope"}
     run_dir = Path(out.payload["run_dir"])
     assert run_dir.parent == runs
     plan = rescope.load_rescope(run_dir)
     assert plan is not None
+    assert out.payload["rescope"] == plan
     assert [s["slug"] for s in plan["subtasks"]] == CHILDREN
     assert plan["source"] == "plan-split-block"
     assert any(p.startswith("plan split: rescope.json written") for p in progress), progress
