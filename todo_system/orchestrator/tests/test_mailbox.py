@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -204,6 +205,54 @@ class GitMailboxTest(unittest.TestCase):
         self.assertEqual([e.type for e in back], [m.RESULT])
         self.assertEqual(back[0].payload["branch"], "worker/sc1-homeland-1")
         self.assertEqual(back[0].corr_id, assign.corr_id)
+
+    # -- cache clone self-heal (MACP_MAILBOX_CACHE_CLONE) ------------------
+    def _git(self, d: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(d), *args], capture_output=True, text=True)
+
+    def _stuck_cache_clone(self) -> GitMailbox:
+        """Host B ends with the 2026-11-19 shape: a tracked file it still has
+        locally modified was deleted upstream, so the autostash pop after the
+        rebase conflicts and leaves unmerged entries behind."""
+        led = Path("Worker") / "assignments" / "t.json"
+        (self.hostA / led).parent.mkdir(parents=True, exist_ok=True)
+        (self.hostA / ".gitignore").write_text("Worker/agents/_state/\n", encoding="utf-8")
+        (self.hostA / led).write_text("{}", encoding="utf-8")
+        self._git(self.hostA, "add", "-A")
+        self._git(self.hostA, "commit", "-qm", "ledger row")
+        self._git(self.hostA, "push", "-q", "origin", "main")
+        self._git(self.hostB, "pull", "-q", "--rebase", "origin", "main")
+        (self.hostB / led).write_text('{"local": 1}', encoding="utf-8")       # dirty on B
+        self._git(self.hostA, "rm", "-q", str(led))                          # deleted upstream
+        self._git(self.hostA, "commit", "-qm", "drop row")
+        self._git(self.hostA, "push", "-q", "origin", "main")
+        cursor = self.hostB / "Worker" / "agents" / "_state" / "b" / "cursor.json"
+        cursor.parent.mkdir(parents=True, exist_ok=True)
+        cursor.write_text('{"seen": ["m1"]}', encoding="utf-8")              # ignored
+        return GitMailbox(self.hostB / "Worker" / "agents")
+
+    def test_cache_clone_resets_a_stuck_pull_to_origin(self):
+        mb = self._stuck_cache_clone()
+        with mock.patch.dict(os.environ, {"MACP_MAILBOX_CACHE_CLONE": "1"}):
+            mb._pull()
+        self.assertFalse(mb._unmerged())
+        head = self._git(self.hostB, "rev-parse", "HEAD").stdout.strip()
+        origin = self._git(self.hostB, "rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(head, origin)
+        self.assertEqual(self._git(self.hostB, "status", "--porcelain").stdout.strip(), "")
+        # the ignored mailbox cursor survives, so nothing is delivered twice
+        cursor = self.hostB / "Worker" / "agents" / "_state" / "b" / "cursor.json"
+        self.assertEqual(cursor.read_text(encoding="utf-8"), '{"seen": ["m1"]}')
+        # and the next pull works again
+        self.assertEqual(self._git(self.hostB, "pull", "-q", "--rebase", "origin", "main").returncode, 0)
+
+    def test_without_cache_clone_a_stuck_pull_is_left_alone(self):
+        mb = self._stuck_cache_clone()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACP_MAILBOX_CACHE_CLONE", None)
+            mb._pull()
+        # unchanged behaviour off the remote relay clones (HQ's live vault)
+        self.assertTrue(mb._unmerged())
 
 
 class GitMailboxHelperTest(unittest.TestCase):
