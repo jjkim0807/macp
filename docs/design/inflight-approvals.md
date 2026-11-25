@@ -17,6 +17,11 @@ related:
 
 # 실행 중 승인 카드 — 설계 노트
 
+> **전제 일부 철회(2026-11-25).** 이 초안이 기대는 본부 HTTP 상태 API(`state_store_remote`)와
+> 비-Claude 백엔드(Solar 루프·Gemini CLI)는 사용 0회로 엔진에서 삭제됐다. 철회 기록은
+> `docs/design/state-store.md`·`docs/design/agent-backends.md`에 있다. 그 위에 선 부분(§3.7의
+> Solar·Gemini 서술, §4.5 원격 러너 경로, §6.1의 A7 leaf)은 구현 전에 다시 설계해야 한다.
+
 > **이 노트의 성격**: 분석·설계 전용. 코드를 한 줄도 바꾸지 않고 `docs/design/inflight-approvals.md` 한 파일만
 > 추가한다. 실제 구현은 §6 분할안의 leaf 가, 설계 머지 뒤 **사람이 게이트를 풀 때** 맡는다. 본문의 `파일:줄`
 > 앵커는 전부 이 리포 HEAD `76ccee6` 트리를 **읽어** 확인한 것이다. 볼트 쪽 파일은 `(볼트)` 로 표시하고, 이

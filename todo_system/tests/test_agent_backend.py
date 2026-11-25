@@ -164,7 +164,7 @@ def test_report_usage_timeout_path(monkeypatch, tmp_path):
 
 def test_report_usage_returns_none_for_stub_argv_without_session_id(tmp_path):
     # the real record_stage_usage: a stub argv has no --session-id, so nothing is
-    # recorded and None comes back (the Solar-shaped inert case).
+    # recorded and None comes back (the inert case).
     assert ab.ClaudeAgentBackend().report_usage("implement", tmp_path, ["true"]) is None
 
 

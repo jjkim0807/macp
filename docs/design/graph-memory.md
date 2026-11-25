@@ -12,6 +12,12 @@ related:
 
 # 그래프 메모리 v2 — 설계 노트
 
+> **전제 일부 철회(2026-11-25).** 이 초안이 기반으로 삼은 외부 상태 저장소(external 모드 `state.sqlite`와
+> ⑦ 본부 HTTP 상태 API)는 사용 0회로 엔진에서 삭제됐다. 철회 기록은 `docs/design/state-store.md`에
+> 있다. 이미 구현된 leaf(G1~G4)는 git 모드 `Memory/relations.sqlite` 위에 있다. external 축에 기대는
+> 나머지(§3.4의 같은 DB 공동 배치·원격 질의, §4.2의 G5, §4.3의 external 이관)는 구현 전에 다시
+> 설계해야 한다.
+
 > **이 노트의 성격**: 분석·설계 전용. 이 태스크는 코드를 한 줄도 바꾸지 않는다 —
 > `docs/design/graph-memory.md` 한 파일만 추가한다. 실제 구현은 §4 분할안의 후속
 > leaf 가, 설계 머지 뒤 **사람이 게이트를 풀 때** 맡는다. 본문의 `파일:줄` 앵커는 전부
