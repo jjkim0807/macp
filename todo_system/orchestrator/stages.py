@@ -725,6 +725,22 @@ def recall_report_line(run_dir: Path | str, task_id: str) -> str:
         "run.log or verify.md.\n")
 
 
+# The stages whose prompt carries the repo's playbook (todo_system.playbooks):
+# the two that write and judge the repo's code. Only tasks with a `repo`.
+PLAYBOOK_STAGES = ("implement", "verify")
+
+
+def playbook_section(repo: str | None) -> str:
+    """`<vault>/Memory/playbooks/<repo>.md` as a prompt section (≤ 2 KB), or ""
+    — no repo, no file, the related-context kill switch. Never raises: the
+    prompt builder must not acquire a way to fail."""
+    try:
+        from .. import playbooks
+        return playbooks.prompt_section(repo)
+    except Exception:       # noqa: BLE001
+        return ""
+
+
 # Stages of a vault task that change its branch: they get the full worktree rule.
 # research/plan only read; every other stage gets the bare `working_dir` line.
 VAULT_WORKTREE_WRITE_STAGES = ("implement", "verify", "report", "quick", "delegate")
@@ -931,6 +947,13 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
     if project_context:
         meta.append("\n## Project memory (.macp/memory — accumulated context)\n\n"
                     + project_context + "\n")
+    if repo and stage in PLAYBOOK_STAGES:
+        # The repo's playbook (todo_system.playbooks): fixed, not searched — the
+        # pitfalls this repo's earlier runs hit, capped at 2 KB. "" (nothing
+        # appended, the prompt byte-identical) without a playbook file.
+        section = playbook_section(repo)
+        if section:
+            meta.append("\n" + section + "\n")
     if retry_context:
         meta.append(
             "\n## ⚠ Previous attempt FAILED — fix these specific issues\n\n"
@@ -2629,6 +2652,23 @@ def record_related(run_dir: Path, task: dict) -> str | None:
     try:
         from .related_context import write_related
         return write_related(run_dir, task, run_id=Path(run_dir).name)
+    except Exception:       # noqa: BLE001 - a hint never breaks a run
+        return None
+
+
+def record_playbook(repo: str | None) -> str | None:
+    """Rebuild the repo's playbook (`<vault>/Memory/playbooks/<repo>.md`,
+    todo_system.playbooks.refresh) before the run's first stage, so implement
+    and verify read it as of this run's start (`playbook_section`).
+
+    Returns the one progress line when the file changed, else None (unchanged,
+    nothing to say, not the HQ host, kill switch). Best-effort like every
+    `record_*`: a run never fails over a hint."""
+    if not repo:
+        return None
+    try:
+        from .. import playbooks
+        return playbooks.refresh(repo)
     except Exception:       # noqa: BLE001 - a hint never breaks a run
         return None
 
