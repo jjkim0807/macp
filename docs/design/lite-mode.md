@@ -853,6 +853,26 @@ plugins/macp/README.md
 - 스킬 frontmatter의 `allowed-tools`에 `Bash(macp:*)` 같은 패턴을 쓸 수 있는지. 예제는
   도구 이름만 나열한다.
 
+**3단계에서 확정한 것** (2026-11-26. 공식 문서 `code.claude.com/docs/en/plugins/`의
+create-marketplace·manifest-reference·marketplace-reference·host-marketplace와 `…/en/skills`를
+읽어서다. 그 런에서는 `claude`를 실행하지 못했다.)
+
+- 마켓플레이스 추가는 `/plugin marketplace add <소유자>/<리포>`(셸에서는
+  `claude plugin marketplace add …`), 설치는 `/plugin install <플러그인>@<마켓플레이스>` —
+  여기서는 `macp@macp`다.
+- `claude plugin validate <경로>`가 있다. 마켓플레이스 루트와 플러그인 디렉터리를 받고, 통과하면
+  마지막 줄이 `✔ Validation passed`다. 그 규칙(필드·이름·`./` 경로·엔트리 이름 = 매니페스트
+  이름·`version`은 한 곳)을 `todo_system/tests/test_claude_plugin.py`가 `claude` 없이 검사한다.
+- 스킬 `allowed-tools`는 `Bash(macp *)` 꼴의 규칙을 받고, 그 스킬을 부른 턴에만 사전 승인한다.
+- 플러그인 스킬의 정식 이름은 `/macp:macp`다. 다른 명령이 `/macp`를 쓰지 않는 곳에서는 맨이름
+  `/macp`로도 불린다. 이 리포처럼 `.claude/commands/macp.md`가 있으면 `/macp`는 그 프로젝트
+  명령이다.
+- 세션의 Bash 명령은 기본 2분, 명시하면 최대 10분이다. 그래서 스킬은 `up`(`--service` 제외)과
+  `dashboard`를 세션 백그라운드로 띄우고, 나머지는 10분 제한으로 포그라운드에서 돌린다.
+- 배치는 D13 그대로다. 스킬 하나는 `disable-model-invocation: true`라 사람이 `/macp`로만 부른다.
+  `version`은 `plugin.json`에만 두고 `pyproject.toml`의 버전과 같게 유지한다(설치본은 버전이 바뀔
+  때만 새로 받는다).
+
 ## ⑧ 본부 모드와의 경계
 
 ### 기본값만 다른 것
@@ -1146,7 +1166,7 @@ sdist에 `vault-template` 넣기) · `README.md` · `README.ko.md` · `docs/gett
 | ⑤ | 실제로 걸리는 시간 | 주간 점검, 실제 사용 |
 | ⑥ | 유닛의 실제 기동, `uv tool install`로 깔린 인터프리터 경로가 `ExecStart`에 맞는지 | 2단계 |
 | ⑥ | macOS launchd | 후속 과제 |
-| ⑦ | 마켓플레이스 추가 문법, `claude plugin validate`, 스킬의 `allowed-tools` 패턴, 맨이름 `/macp`의 해석, 세션의 명령 제한 시간 | 3단계 |
+| ⑦ | 마켓플레이스 추가 문법, `claude plugin validate`, 스킬의 `allowed-tools` 패턴, 맨이름 `/macp`의 해석, 세션의 명령 제한 시간 | 3단계 — 공식 문서로 확정(⑦ "3단계에서 확정한 것"). 실제 `claude plugin validate` 출력은 첫 실제 사용 |
 | README | `README.ko.md`·`docs/concepts.md` 본문. 이 런에서 읽지 않았다 | 2단계 |
 
 ### 열린 질문과 답한 곳
