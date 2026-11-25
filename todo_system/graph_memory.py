@@ -871,7 +871,7 @@ _EMBEDDER_BACKENDS: dict[str, Callable[[], tuple[Callable[[str], Sequence[float]
 def embedder_name(start: Path | None = None) -> str:
     """The configured backend name, resolved **at call time** from three sources.
 
-    Resolution order (mirrors :func:`paths.state_backend`):
+    Resolution order (mirrors :func:`paths.repo_slug`):
 
     1. The ``MACP_EMBEDDER`` environment variable, if set and non-empty.
     2. The ``embedder`` key of the nearest ``.macp/config.toml`` found by walking
@@ -882,11 +882,11 @@ def embedder_name(start: Path | None = None) -> str:
 
     An unknown value from *either* env or config raises :class:`ValueError` listing
     the allowed names — a typo must not silently fall back to hash and mislabel a
-    whole bench row (the same "no silent fallback" rule :func:`paths.state_backend`
-    enforces). Validation reads the **live** :data:`_EMBEDDER_BACKENDS` registry, so
+    whole bench row (an unknown value is a hard error, never a silent
+    fallback). Validation reads the **live** :data:`_EMBEDDER_BACKENDS` registry, so
     a test-registered backend is honoured.
 
-    ``start`` is the same test seam as :func:`paths.state_backend`: runtime callers
+    ``start`` is the same test seam as :func:`paths.repo_slug`: runtime callers
     (:func:`resolve_embedder`) invoke ``embedder_name()`` with no args, so the config
     walk begins at the current working directory.
     """

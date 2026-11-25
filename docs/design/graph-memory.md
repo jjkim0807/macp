@@ -397,7 +397,7 @@ G4 평가 하니스(`eval_memory table`)가 **2026-11-09 골든셋으로 채운 
 
 임베더는 설정값 **`MACP_EMBEDDER=hash|local|vertex`** 로 선택 가능하다(`todo_system/graph_memory.py`
 의 호출 시점 해석 — 색인·질의 양쪽이 같은 백엔드를 따른다). 선택 우선순위는 **① env `MACP_EMBEDDER`
-→ ② `.macp/config.toml` 의 `embedder` 키(영속 설정, `paths.state_backend` 와 같은 패턴) → ③ 기본값
+→ ② `.macp/config.toml` 의 `embedder` 키(영속 설정, `paths.repo_slug` 와 같은 패턴) → ③ 기본값
 `hash`** 이며, 두 소스 중 어느 쪽이든 알 수 없는 이름은 조용히 hash 로 떨어지지 않고 `ValueError` 로
 거부한다. **기본값은 `hash` 그대로**다(아래는
 권장일 뿐 전환이 아니다). dim 이 달라지는 백엔드로 바꿀 때는 vec0 를 `--rebuild` 로 재구축한다.
