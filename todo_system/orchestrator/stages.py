@@ -667,7 +667,7 @@ PLAYBOOK_STAGES = ("implement", "verify")
 
 def playbook_section(repo: str | None) -> str:
     """`<vault>/Memory/playbooks/<repo>.md` as a prompt section (≤ 2 KB), or ""
-    — no repo, no file, the related-context kill switch. Never raises: the
+    — no repo, no file. Never raises: the
     prompt builder must not acquire a way to fail."""
     try:
         from .. import playbooks
@@ -2596,7 +2596,7 @@ def record_playbook(repo: str | None) -> str | None:
     and verify read it as of this run's start (`playbook_section`).
 
     Returns the one progress line when the file changed, else None (unchanged,
-    nothing to say, not the HQ host, kill switch). Best-effort like every
+    nothing to say, not the HQ host). Best-effort like every
     `record_*`: a run never fails over a hint."""
     if not repo:
         return None
@@ -2724,7 +2724,7 @@ def stage_usage(argv, *, env: dict | None = None, returncode: int | None = None,
                 duration_ms: int | None = None, timed_out: bool = False) -> dict | None:
     """One stage invocation's stages.json record: the USAGE_KEYS, or
     {"unavailable": "<why>"}. None — record nothing — when `argv` carries no
-    session id (kill switch off, or a stub argv). `duration_ms` is the runner's
+    session id (a stub argv). `duration_ms` is the runner's
     own wall clock for the subprocess."""
     sid = argv_session_id(argv)
     if sid is None:
@@ -2773,8 +2773,8 @@ def record_stage_usage(run_dir: Path, stage: str, argv, *, env: dict | None = No
                        returncode: int | None = None, duration_ms: int | None = None,
                        timed_out: bool = False) -> dict | None:
     """The runner's one call per stage invocation: stage_usage(), then
-    record_usage(). Returns what was recorded — None when nothing was, which is
-    always the case with the kill switch off. Never raises: a reader that does is
+    record_usage(). Returns what was recorded — None when nothing was (a stub
+    argv with no session id). Never raises: a reader that does is
     recorded as unavailable instead, because the stage's outcome must not depend
     on whether its tokens could be counted."""
     try:

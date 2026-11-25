@@ -43,8 +43,7 @@ are not touched.
 The repo playbooks (``todo_system.playbooks``) are the other reader that carries
 text out: one scrubbed line per pitfall, fixed into a repo's implement/verify
 prompts. They read every source through :func:`read_document` /
-:func:`r5_allows`, the same document filter as :func:`doc_card`, and they obey
-the same kill switch.
+:func:`r5_allows`, the same document filter as :func:`doc_card`.
 
 Fail-open by contract. Every public function swallows its own errors and
 degrades, in this order:
@@ -69,12 +68,6 @@ would create ``relations.sqlite-wal`` / ``-shm``, which are NOT gitignored in th
 vault, and untracked files under ``Memory/`` stall the 5-minute queue
 (CLAUDE.md §10.1).
 
-Environment (read at call time):
-
-  MACP_RELATED_CONTEXT   "0" switches every path off — ``related.md``, both
-                         prompt sections, and the repo playbooks' refresh and
-                         prompt section. The runtime rollback for this wiring.
-
 CLI (``planner_tick.sh`` / ``brief.sh``; always exits 0):
 
     python -m todo_system.orchestrator.related_context emit-context \
@@ -89,15 +82,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from .. import graph_memory as gm
-
-KILL_ENV = "MACP_RELATED_CONTEXT"
 
 MAX_ITEMS = 8          # AC#1: "최대 8개" per task, in related.md and per prompt row
 DEFAULT_TASKS = 5      # planner passes --limit 5; brief passes --limit 3
@@ -117,11 +107,6 @@ DB_PATH: Path | None = None      # None → derived from VAULT_ROOT, else graph_
 
 
 # -- config -------------------------------------------------------------------
-
-def enabled() -> bool:
-    """Only an explicit "0" disables the wiring (``maintenance_disk.enabled``'s rule)."""
-    return os.environ.get(KILL_ENV, "").strip() != "0"
-
 
 def vault_root() -> Path:
     """``gm.ROOT`` is read as an ATTRIBUTE here, not imported as a value: tests
@@ -357,13 +342,13 @@ def related_items(task: Mapping[str, Any], *, limit: int = MAX_ITEMS,
                   con: sqlite3.Connection | None = None) -> list:
     """Up to ``limit`` :class:`graph_memory.RelatedItem` for one task identity.
 
-    The single choke point for the kill switch and for the fail-open contract:
-    **no exception leaves this function** and a disabled switch yields ``[]``, so
+    The single choke point for the fail-open contract:
+    **no exception leaves this function**, so
     every consumer degrades to "no hint" by doing nothing special. Pass ``con``
     to reuse one read-only connection across several tasks (the CLI does);
     otherwise one is opened and closed here.
     """
-    if not enabled() or limit <= 0:
+    if limit <= 0:
         return []
     own_con = con is None
     try:
@@ -577,7 +562,7 @@ def write_related(run_dir: Path, task: Mapping[str, Any], *, run_id: str | None 
                   limit: int = MAX_ITEMS) -> str | None:
     """Write ``<run_dir>/related.md`` and return the one progress line, or ``None``.
 
-    ``None`` means "no file" and is the normal answer for: the kill switch set,
+    ``None`` means "no file" and is the normal answer for:
     no DB, no ``edges`` table, a query failure, or simply zero related records
     (the ``record_orphaned_commits`` rule — nothing to say, so nothing written).
     The caller must treat ``None`` as success; AC#1 forbids blocking the
@@ -601,8 +586,6 @@ def emit_context(*, limit: int = DEFAULT_TASKS, per_task: int = MAX_ITEMS,
                  root: Path | None = None, heading: str = PROMPT_HEADING) -> str:
     """The prompt block for the top ``limit`` open tasks; ``""`` when there is
     nothing to say (so both shell callers keep a byte-identical prompt)."""
-    if not enabled():
-        return ""
     base = Path(root) if root is not None else vault_root()
     tasks = top_open_tasks(base, limit=limit)
     if not tasks:

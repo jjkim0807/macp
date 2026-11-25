@@ -31,8 +31,6 @@ import io
 import json
 from contextlib import redirect_stderr, redirect_stdout
 
-import pytest
-
 from todo_system import graph_memory as gm
 from todo_system.orchestrator import related_context as rc
 
@@ -144,17 +142,6 @@ def test_a_raising_query_is_silent_not_fatal(isolated_vault, monkeypatch):
     monkeypatch.setattr(gm, "query_related", _boom)
 
     assert rc.related_items(_task()) == []
-
-
-def test_the_kill_switch_stops_the_query(isolated_vault, monkeypatch):
-    _seed(isolated_vault, 2)
-    calls = []
-    monkeypatch.setattr(gm, "query_related", lambda *a, **k: calls.append(a) or [])
-    monkeypatch.setenv(rc.KILL_ENV, "0")
-
-    assert rc.related_items(_task()) == []
-    assert calls == [], "the switch must stop the query, not just its output"
-    assert rc.enabled() is False
 
 
 # -- titles -------------------------------------------------------------------
@@ -392,19 +379,6 @@ def test_an_explicit_vault_root_moves_the_db_too(isolated_vault, tmp_path):
     assert rc.emit_context(limit=3, root=other) == "", "read another vault's edges"
 
 
-def test_the_cli_prints_nothing_when_the_switch_is_off(isolated_vault, monkeypatch):
-    _seed(isolated_vault, 2)
-    _snapshot(isolated_vault, [TASK_SLUG])
-    monkeypatch.setenv(rc.KILL_ENV, "0")
-
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        code = rc.main(["emit-context"])
-
-    assert code == 0
-    assert out.getvalue() == ""
-
-
 def test_the_cli_prints_the_block_and_always_exits_zero(isolated_vault):
     _seed(isolated_vault, 2)
     _snapshot(isolated_vault, [TASK_SLUG])
@@ -451,9 +425,3 @@ def test_the_module_is_importable_without_sqlite_vec():
     import sys
 
     assert imported - set(sys.stdlib_module_names) - {"todo_system"} == set()
-
-
-@pytest.mark.parametrize("value,expected", [("0", False), ("", True), ("1", True)])
-def test_only_an_explicit_zero_disables(monkeypatch, value, expected):
-    monkeypatch.setenv(rc.KILL_ENV, value)
-    assert rc.enabled() is expected

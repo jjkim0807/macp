@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -88,10 +87,6 @@ class _HarnessMixin:
         self.ran: list[str] = []
         self.on_stage: dict = {}
         self.progress: list[str] = []
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop(sup.KILL_ENV, None)
         # No usage pause in the loop (the wait returns at once, unpatched).
         gate = mock.patch("todo_system.usage_guard.stage_gate", return_value=None)
         gate.start()
@@ -318,11 +313,6 @@ class FailOpenTest(_Harness):
     def test_a_raising_check_runs_all_stages(self):
         with mock.patch.object(sup, "check_run", side_effect=RuntimeError("boom")):
             out, mk = self._run()
-        self._assert_ran_to_the_end(out, mk)
-
-    def test_kill_switch_runs_all_stages(self):
-        os.environ[sup.KILL_ENV] = "0"
-        out, mk = self._run()
         self._assert_ran_to_the_end(out, mk)
 
     def test_payload_without_task_path_runs_all_stages(self):

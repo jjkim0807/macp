@@ -146,7 +146,7 @@ line, run lessons older than 60 days drop out, and every source passes the same 
 filter as `related.md`. Only the HQ host writes the file. The weekly usage table in the
 brief ends with one line that counts same-cause FAIL repeats per week, which is how to tell
 whether the playbooks earn their keep; `python -m todo_system.playbooks recurrence` prints
-the full table. `MACP_RELATED_CONTEXT=0` turns playbooks off together with `related.md`.
+the full table.
 
 **Isolation and concurrency.** Every run gets its own git worktree on
 `worker/<slug>` — a vault task too, so the vault you work in stays on its default

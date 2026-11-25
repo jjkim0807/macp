@@ -71,9 +71,6 @@ task's own retries already get their failure back). The weekly usage section of
 the brief carries it as one line (:func:`brief_line`, appended by
 ``usage_value.brief_section``); ``recurrence`` on the CLI prints the table.
 
-No new switch: ``MACP_RELATED_CONTEXT=0`` (the related-context kill switch)
-turns refresh and injection off with the rest of the engine-computed memory.
-
 CLI (only ``refresh`` writes):
 
     python -m todo_system.playbooks show --repo URL [--vault-root DIR] [--today YYYY-MM-DD]
@@ -847,7 +844,7 @@ def refresh(repo: str | None, *, root: Path | None = None, today: dt.date | None
     Writes only on the HQ host (``hq_host.check`` — fail-open like every caller
     of it: no marker means a single-host vault), only when the bytes differ,
     and removes the file when the repo has nothing left to say."""
-    if not repo or not rc.enabled():
+    if not repo:
         return None
     try:
         base = Path(root) if root is not None else vault_root()
@@ -876,11 +873,11 @@ def refresh(repo: str | None, *, root: Path | None = None, today: dt.date | None
 def prompt_section(repo: str | None, *, root: Path | None = None,
                    max_bytes: int = MAX_BYTES) -> str:
     """The playbook of ``repo`` as a prompt section (≤ ``max_bytes`` UTF-8), or
-    "" — no repo, the kill switch, no file, or no item line. Never raises.
+    "" — no repo, no file, or no item line. Never raises.
 
     Re-capped at read time, line by line, so a hand-edited file cannot push a
     stage prompt past the limit."""
-    if not repo or not rc.enabled():
+    if not repo:
         return ""
     try:
         key = repo_key(repo)

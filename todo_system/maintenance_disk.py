@@ -32,7 +32,7 @@ in `_delete`:
 * `<gradle home>/caches/<version>/` (a directory whose name is a Gradle
   version) when that version is in neither the ~/Worker wrappers nor any live
   Gradle daemon, or when it is but nothing at depth ≤ 2 below it changed for
-  MAX_AGE_DAYS (default 30). When the protected version set cannot be read (an
+  MAX_AGE_DAYS (30). When the protected version set cannot be read (an
   unparseable wrapper, a version-less or unreadable Gradle daemon, or no /proc),
   no version directory is a candidate — build-cache still prunes.
 * `<gradle home>/caches/build-cache-1/<hash>` (a regular file with a hex name)
@@ -64,11 +64,6 @@ missing `uv` or an odd exit code becomes a skip reason.
 
 Environment (read at call time):
 
-  MACP_DISK_PRUNE                 "0" switches the step off entirely.
-  MACP_DISK_PRUNE_MIN_FREE_GIB    trigger and alert threshold; default 8.
-  MACP_DISK_PRUNE_TARGET_GIB      stop deleting at this much free; default
-                                  trigger + 2 (never below the trigger).
-  MACP_DISK_PRUNE_MAX_AGE_DAYS    N for "unused for N days"; default 30.
   MACP_DISK_PRUNE_STATE_DIR       state dir; default ~/.local/share/macp/disk.
   MACP_UV_BIN                     uv binary; default $UV, then PATH, then
                                   ~/.local/bin/uv.
@@ -98,9 +93,9 @@ from .kakao_format import compose_alert
 from .orchestrator import disk_guard
 
 GIB = disk_guard.GIB
-DEFAULT_MIN_FREE_GIB = 8.0
-TARGET_GAP_GIB = 2.0           # default target = trigger + this (hysteresis)
-DEFAULT_MAX_AGE_DAYS = 30.0
+MIN_FREE_GIB = 8.0             # trigger and alert threshold
+TARGET_GAP_GIB = 2.0           # target = trigger + this (hysteresis)
+MAX_AGE_DAYS = 30.0            # N in "unchanged for N days"
 PASS_INTERVAL_S = 1800         # while still low, one pass per 30 min, not per tick
 ALERT_COOLDOWN_S = 24 * 3600   # check_work_starvation's cadence
 UV_TIMEOUT_S = 90
@@ -112,10 +107,6 @@ UV_HOLDER_CHARS = 120          # per-holder cmdline cap
 VERSION_DEPTH = 2              # how deep "last used" looks below caches/<version>
 UV_ARGS = ("cache", "prune")
 
-KILL_ENV = "MACP_DISK_PRUNE"
-MIN_FREE_ENV = "MACP_DISK_PRUNE_MIN_FREE_GIB"
-TARGET_ENV = "MACP_DISK_PRUNE_TARGET_GIB"
-MAX_AGE_ENV = "MACP_DISK_PRUNE_MAX_AGE_DAYS"
 STATE_DIR_ENV = "MACP_DISK_PRUNE_STATE_DIR"
 UV_BIN_ENV = "MACP_UV_BIN"
 
@@ -157,30 +148,17 @@ class Refused(ValueError):
 
 # -- config ------------------------------------------------------------------
 
-def enabled() -> bool:
-    """Only an explicit "0" disables the step (disk_guard.enabled's rule)."""
-    return os.environ.get(KILL_ENV, "").strip() != "0"
-
-
-def _env_pos(name: str, default: float) -> float:
-    try:
-        value = float(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
 def min_free_bytes() -> int:
-    return int(_env_pos(MIN_FREE_ENV, DEFAULT_MIN_FREE_GIB) * GIB)
+    return int(MIN_FREE_GIB * GIB)
 
 
 def target_bytes(lo: int | None = None) -> int:
     lo = min_free_bytes() if lo is None else lo
-    return max(lo, int(_env_pos(TARGET_ENV, lo / GIB + TARGET_GAP_GIB) * GIB))
+    return lo + int(TARGET_GAP_GIB * GIB)
 
 
 def max_age_days() -> float:
-    return _env_pos(MAX_AGE_ENV, DEFAULT_MAX_AGE_DAYS)
+    return MAX_AGE_DAYS
 
 
 def home_dir() -> Path:
@@ -718,11 +696,9 @@ def compose_low_disk_alert(res: dict) -> str:
 
 def check_and_prune(*, notify: Callable[[str], object] | None = None,
                     now: float | None = None) -> str | None:
-    """The maintenance step. Returns the line to print, or None (healthy,
-    disabled, or a pass ran less than PASS_INTERVAL_S ago). Never raises."""
+    """The maintenance step. Returns the line to print, or None (healthy, or a
+    pass ran less than PASS_INTERVAL_S ago). Never raises."""
     try:
-        if not enabled():
-            return None
         home = home_dir()
         gh = gradle_home(home)
         lo = min_free_bytes()
@@ -797,8 +773,6 @@ def main(argv: list[str] | None = None) -> int:
                    else "healthy — a tick stays silent")
         print(f"free space: {_gib(free)} of {_gib(total)} ({_pct(free, total)}% used, "
               f"trigger <{_gib(lo)}, target {_gib(target)}) — {verdict}")
-    print(f"kill switch {KILL_ENV}: "
-          + ("off (prune enabled)" if enabled() else "ON — the prune is disabled"))
     uv = uv_bin()
     print(f"uv: {uv} — a pass runs `uv cache prune`" if uv else "uv: not found — skipped")
     current, why = protected_versions()

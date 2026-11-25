@@ -1655,7 +1655,7 @@ class Orchestrator:
         exactly as before. Human rows are never touched."""
         try:
             from . import superseded
-            if not superseded.enabled() or a.kind.startswith("human"):
+            if a.kind.startswith("human"):
                 return ""
             p = msg.payload or {}
             if msg.type == m.RESULT:

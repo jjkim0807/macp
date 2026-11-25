@@ -39,15 +39,17 @@ from todo_system import maintenance_embed as me
 
 DOC_A = "Notes/sample-note-a.md"
 DOC_B = "Notes/sample-note-b.md"
+_REAL_EMBED_TICK = me.embed_tick   # bound at import, before conftest stubs it per test
 
 
 @pytest.fixture
 def tick_vault(isolated_vault, monkeypatch, tmp_path):
-    """Lift the suite-wide kill switch and point every seam at the tmp vault.
+    """Restore the real step the suite-wide fixture stubs out and point every
+    seam at the tmp vault.
 
     Requested (not autouse), so it runs AFTER ``_embed_tick_isolated`` and its
     ``setattr`` wins — the conftest tmp paths stay behind it as a second belt."""
-    monkeypatch.setenv(me.KILL_ENV, "1")
+    monkeypatch.setattr(me, "embed_tick", _REAL_EMBED_TICK)
     monkeypatch.setattr(me, "VAULT_ROOT", isolated_vault.root)
     monkeypatch.setattr(me, "DB_PATH", isolated_vault.db_path)
     monkeypatch.setattr(me, "STATE_DIR", tmp_path / "embed-state")
@@ -71,26 +73,6 @@ def _fake_embed(result, calls):
         print("embed_vault's own stdout line")   # must not reach the tick's output
         return result
     return _embed
-
-
-# -- the kill switch ----------------------------------------------------------
-
-def test_the_kill_switch_stops_the_step_before_it_opens_anything(tick_vault, monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(gm, "embed_vault", _fake_embed(FakeResult(embedded=3), calls))
-    monkeypatch.setattr(gm, "init_relations_db",
-                        lambda *_a, **_k: pytest.fail("opened the DB with the switch off"))
-    monkeypatch.setenv(me.KILL_ENV, "0")
-
-    assert me.embed_tick() is None
-    assert calls == []
-    assert me.enabled() is False
-
-
-@pytest.mark.parametrize("value,expected", [("0", False), ("", True), ("1", True)])
-def test_only_an_explicit_zero_disables(monkeypatch, value, expected):
-    monkeypatch.setenv(me.KILL_ENV, value)
-    assert me.enabled() is expected
 
 
 # -- silence vs one line ------------------------------------------------------
@@ -528,9 +510,9 @@ def test_the_module_is_importable_without_sqlite_vec():
 
 def test_the_suite_wide_isolation_fixture_is_live():
     """Negative control for conftest's `_embed_tick_isolated`: without the
-    `tick_vault` fixture the switch is OFF and every seam is in a tmp dir, so an
+    `tick_vault` fixture the step is stubbed and every seam is in a tmp dir, so an
     unisolated cmd_maintenance test cannot embed the real vault."""
-    assert os.environ.get(me.KILL_ENV) == "0"
+    assert me.embed_tick is not _REAL_EMBED_TICK
     assert me.embed_tick() is None
     assert "embed-tick" in str(me.state_dir()) or "embed-tick" in str(me.state_path())
     assert not me.vault_root().exists()

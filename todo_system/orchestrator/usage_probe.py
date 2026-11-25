@@ -45,7 +45,7 @@ def _record(*, source: str, dest: str, session_id: str, rc: int | None,
         argv += ["--model", model]
     rec = stages.stage_usage(argv, returncode=rc, duration_ms=duration_ms)
     if rec is None:
-        # No session id survived argv_session_id (kill switch off, or an empty /
+        # No session id survived argv_session_id (an empty /
         # non-canonical sid): there is nothing to record. Mirrors the stage loop.
         return
     row = {"source": source,

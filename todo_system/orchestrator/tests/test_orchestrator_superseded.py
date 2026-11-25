@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import shutil
 import tempfile
 import unittest
@@ -100,10 +99,6 @@ class _Fixture(unittest.TestCase):
         patcher = mock.patch.object(cli, "ITEMS_DIR", self.items)
         patcher.start()
         self.addCleanup(patcher.stop)
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop(sup.KILL_ENV, None)
 
     # -- helpers ----------------------------------------------------------
     def _write_md(self, status: str) -> bytes:
@@ -354,28 +349,6 @@ class FailOpenTest(_Fixture):
         with mock.patch.object(sup, "md_closed_status", side_effect=RuntimeError("boom")):
             a = self._collect()
         self._assert_parked_as_before(a)
-
-    def test_failing_switch_read_parks_as_before(self):
-        self._second_timeout_on_a_closed_md()
-        with mock.patch.object(sup, "enabled", side_effect=RuntimeError("boom")):
-            a = self._collect()
-        self._assert_parked_as_before(a)
-
-    def test_kill_switch_parks_as_before(self):
-        self._second_timeout_on_a_closed_md()
-        os.environ[sup.KILL_ENV] = "0"
-        self._assert_parked_as_before(self._collect())
-
-    def test_kill_switch_treats_a_reported_result_as_an_ordinary_success(self):
-        self._write_md("open")
-        self._row()
-        self._reply(m.RESULT, **{sup.RESULT_KEY: sup.REASON_MERGED}, review_required=False)
-        os.environ[sup.KILL_ENV] = "off"
-        a = self._collect()
-        self.assertEqual(a.state, A.DONE)
-        self.assertNotIn(sup.HISTORY_TYPE, self._history_types(a))
-        self.assertEqual(tasks.task_status(SLUG), "done")
-        self.assertNotIn("superseded", self.md.read_text(encoding="utf-8"))
 
     def test_a_failing_close_does_not_break_collect_or_alert(self):
         self._second_timeout_on_a_closed_md()

@@ -63,7 +63,6 @@ class WireFormatTest(unittest.TestCase):
         self.assertEqual(sup.HISTORY_UNCONFIRMED, "superseded-unconfirmed")
         self.assertEqual(sup.REASON_MD_CLOSED, "md-closed")
         self.assertEqual(sup.REASON_MERGED, "merged")
-        self.assertEqual(sup.KILL_ENV, "MACP_SUPERSEDED_CHECK")
 
     def test_module_imports_only_leaf_siblings(self):
         # `tasks` imports `orchestrator.orchestrator`, which would import this
@@ -78,19 +77,6 @@ class WireFormatTest(unittest.TestCase):
                 else:
                     relative.update(alias.name for alias in node.names)
         self.assertEqual(relative, {"repos", "statuses"})
-
-
-class EnabledTest(unittest.TestCase):
-    def test_on_by_default_and_off_by_the_switch(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(sup.KILL_ENV, None)
-            self.assertTrue(sup.enabled())
-            for off in ("0", "false", "no", "off", " OFF ", "False"):
-                os.environ[sup.KILL_ENV] = off
-                self.assertFalse(sup.enabled(), off)
-            for on in ("1", "true", "", "yes"):
-                os.environ[sup.KILL_ENV] = on
-                self.assertTrue(sup.enabled(), on)
 
 
 class JudgeTest(unittest.TestCase):
@@ -162,7 +148,6 @@ class ClassifyLandedTest(unittest.TestCase):
             self.assertTrue(sup.judge("done", None).superseded)
             self.assertEqual(sup.normalize_reason("merged"), sup.REASON_MERGED)
             self.assertIn("superseded", sup.note(sup.REASON_MERGED))
-            self.assertTrue(sup.enabled() in (True, False))
 
 
 class NormalizeReasonTest(unittest.TestCase):
@@ -608,10 +593,6 @@ class CheckRunTest(_GitFixture):
         self.md.parent.mkdir(parents=True)
         self.md.write_text(_md("open"), encoding="utf-8")
         self.payload = {"task_path": "Todo/items/t.md"}
-        patcher = mock.patch.dict(os.environ)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        os.environ.pop(sup.KILL_ENV, None)
 
     def _check(self, **kw):
         kw.setdefault("vault_root", self.vault)
@@ -658,23 +639,10 @@ class CheckRunTest(_GitFixture):
                           branch=BRANCH, probe_git=True)
         self.assertEqual(v, sup.Verdict(True, sup.REASON_MERGED))
 
-    def test_kill_switch_turns_both_signals_off(self):
-        self._branch_commit()
-        self._land_squash()
-        self.md.write_text(_md("done"), encoding="utf-8")
-        for off in ("0", "false", "no", "off"):
-            os.environ[sup.KILL_ENV] = off
-            with self.subTest(off=off):
-                self.assertEqual(
-                    self._check(repo_dir=self.clone, branch=BRANCH, probe_git=True),
-                    sup.NOT_SUPERSEDED)
-        os.environ[sup.KILL_ENV] = "1"
-        self.assertTrue(self._check().superseded)          # control: back on
-
     def test_any_internal_failure_is_not_superseded(self):
         self.md.write_text(_md("done"), encoding="utf-8")
         self.assertTrue(self._check().superseded)          # control
-        for target in ("md_closed_status", "enabled", "judge"):
+        for target in ("md_closed_status", "judge"):
             with self.subTest(target=target), \
                     mock.patch.object(sup, target, side_effect=RuntimeError("boom")):
                 self.assertEqual(self._check(), sup.NOT_SUPERSEDED)

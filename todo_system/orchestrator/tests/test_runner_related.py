@@ -186,13 +186,6 @@ class RunnerRelatedTest(unittest.TestCase):
         self.assertFalse((self._run_dir() / rc.RELATED_FILENAME).exists())
         self.assertFalse([ln for ln in lines if ln.startswith("related:")])
 
-    def test_the_kill_switch_leaves_no_file(self):
-        with mock.patch.dict("os.environ", {rc.KILL_ENV: "0"}):
-            out, _lines = self._run()
-
-        self.assertTrue(out.ok, out.summary)
-        self.assertFalse((self._run_dir() / rc.RELATED_FILENAME).exists())
-
 
 class RelatedIsAnInputNotAnArtifactTest(unittest.TestCase):
     """related.md must stay out of every required/inherited artifact list: the

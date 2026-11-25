@@ -69,7 +69,6 @@ CLEAN_TIMEOUT_S = 300          # one clone's `gradlew clean`
 # stage_timeout + stages.REAP_MARGIN window.
 BUDGET_S = 600
 GIT_TIMEOUT_S = 30             # each read-only git probe
-KILL_ENV = "MACP_DISK_GUARD"
 CLEAN_ARGV = ("./gradlew", "clean", "--no-daemon")   # the ONLY deleting act
 # Ledger states that mean a run holds (or is about to hold) its repo's clone.
 ACTIVE_STATES = frozenset({assignment.DISPATCHED, assignment.ACCEPTED,
@@ -93,13 +92,6 @@ _clock = time.monotonic
 
 class _Refused(Exception):
     """A git probe that could not answer; its message is the skip reason."""
-
-
-def enabled() -> bool:
-    """The kill switch: `MACP_DISK_GUARD=0` in the runner's env turns the guard
-    off entirely — not even the statvfs runs. Read at CALL time
-    (stages.usage_enabled's rule); only an explicit "0" disables it."""
-    return os.environ.get(KILL_ENV, "").strip() != "0"
 
 
 def measure(path: str | Path | None = None, *,
@@ -401,7 +393,7 @@ def ensure_free_space(*, exclude: Iterable = (),
     `exclude` is this run's own repo. Every other argument is a seam for tests
     and defaults to the module global of the same role, read now. Returns
     {triggered, free_before, free_after, threshold, target, cleaned, skipped}
-    (skipped = clone name → reason), plus `disabled`, `error`, `ledger` or
+    (skipped = clone name → reason), plus `error`, `ledger` or
     `elapsed_s` when they apply. Zero progress lines when nothing needed doing;
     exactly one when it acted, or when it could not look. Never raises."""
     lo = MIN_FREE_BYTES if min_free is None else min_free
@@ -410,9 +402,6 @@ def ensure_free_space(*, exclude: Iterable = (),
                  "target": max(lo, TARGET_FREE_BYTES if target_free is None else target_free),
                  "cleaned": [], "skipped": {}}
     try:
-        if not enabled():
-            res["disabled"] = True
-            return res
         root = Path(WORKER_ROOT if worker_root is None else worker_root)
         adir = ASSIGNMENTS_DIR if assignments_dir is None else assignments_dir
         jdir = JOBS_DIR if jobs_dir is None else jobs_dir
@@ -496,8 +485,6 @@ def main(argv: list[str] | None = None) -> int:
                    else "healthy — a run start stays silent")
         print(f"free space: {_gib(free)} of {_gib(total)} (trigger <{_gib(MIN_FREE_BYTES)}, "
               f"target {_gib(TARGET_FREE_BYTES)}) — {verdict}")
-    print(f"kill switch {KILL_ENV}: "
-          + ("off (guard enabled)" if enabled() else "ON — the guard is disabled"))
     print(f"ledger: {ASSIGNMENTS_DIR}")
     print(f"jobs: {JOBS_DIR}")
     held, problem = _holders(root, ASSIGNMENTS_DIR, JOBS_DIR)

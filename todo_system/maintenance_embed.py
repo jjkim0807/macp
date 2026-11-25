@@ -45,7 +45,6 @@ against that one.
 
 Environment (read at call time):
 
-  MACP_EMBED_TICK            "0" switches the step off entirely.
   MACP_EMBED_STATE_DIR       state dir; default ~/.local/share/macp/embed.
 
 Stdlib plus stdlib-only siblings — no top-level ``import sqlite_vec`` (it stays
@@ -69,7 +68,6 @@ from pathlib import Path
 
 from . import graph_memory as gm
 
-KILL_ENV = "MACP_EMBED_TICK"
 STATE_DIR_ENV = "MACP_EMBED_STATE_DIR"
 
 SKIP_NOTICE_COOLDOWN_S = 24 * 3600   # check_work_starvation's cadence
@@ -84,11 +82,6 @@ _now = time.time
 
 
 # -- config -------------------------------------------------------------------
-
-def enabled() -> bool:
-    """Only an explicit "0" disables the step (``maintenance_disk.enabled``'s rule)."""
-    return os.environ.get(KILL_ENV, "").strip() != "0"
-
 
 def vault_root() -> Path:
     """``gm.ROOT`` read as an ATTRIBUTE, so ``monkeypatch.setattr(gm, "ROOT", …)``
@@ -186,12 +179,10 @@ def _skip_notice(reason: str, now: float) -> str | None:
 # -- the step -----------------------------------------------------------------
 
 def embed_tick(*, now: float | None = None) -> str | None:
-    """The maintenance step. Returns the line to print, or None (disabled,
-    nothing changed, or a cooling skip notice). Never raises."""
+    """The maintenance step. Returns the line to print, or None (nothing
+    changed, or a cooling skip notice). Never raises."""
     con = None
     try:
-        if not enabled():
-            return None
         t = _now() if now is None else now
         con = gm.init_relations_db(db_path())
         # No sqlite-vec probe here: without the extension embed_vault falls back
@@ -246,8 +237,6 @@ def main(argv: list[str] | None = None) -> int:
     root, db = vault_root(), db_path()
     print(f"vault root: {root}")
     print(f"edge db:    {db}")
-    print(f"kill switch {KILL_ENV}: "
-          + ("off (embed enabled)" if enabled() else "ON — the embed is disabled"))
     if not db.is_file():
         print("edge db does not exist yet — the first tick creates it and embeds "
               "the whole corpus")

@@ -15,7 +15,6 @@ from pathlib import Path
 import pytest
 
 from todo_system import playbooks as pb
-from todo_system.orchestrator import related_context as rc
 
 REPO = "https://github.com/example/acme-app.git"
 OTHER = "https://github.com/example/other-svc.git"
@@ -169,7 +168,6 @@ def vault(tmp_path, monkeypatch):
     root = tmp_path / "vault"
     root.mkdir()
     monkeypatch.setattr(pb, "VAULT_ROOT", root)
-    monkeypatch.delenv(rc.KILL_ENV, raising=False)
     return root
 
 
@@ -469,14 +467,6 @@ def test_a_repo_with_nothing_left_to_say_loses_its_file(vault):
     assert pb.refresh(REPO, today=later, local_id="hq") == (
         "playbook: acme-app — nothing left to say, removed Memory/playbooks/acme-app.md")
     assert not (vault / "Memory/playbooks/acme-app.md").exists()
-
-
-def test_the_kill_switch_turns_refresh_and_the_section_off(vault, monkeypatch):
-    _seed(vault)
-    assert pb.refresh(REPO, today=TODAY, local_id="hq")
-    monkeypatch.setenv(rc.KILL_ENV, "0")
-    assert pb.prompt_section(REPO) == ""
-    assert pb.refresh(OTHER, today=TODAY, local_id="hq") is None
 
 
 def test_prompt_section_is_the_file_body_for_this_repo_only(vault):
