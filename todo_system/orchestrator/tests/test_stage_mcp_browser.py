@@ -136,20 +136,11 @@ class StageMcpWiringTest(unittest.TestCase):
     # AC1: configured → --mcp-config + rule + owner = run_id on the four stages.
     def test_browser_stages_get_mcp_config_rule_and_owner(self):
         for stage in _MCP_STAGES:
-            with self.subTest(stage=stage), \
-                    mock.patch.object(stages, "usage_enabled", return_value=True):
+            with self.subTest(stage=stage):
                 argv = _argv(stage, self.server)
                 self._assert_wired(argv)
                 self.assertLess(argv.index("--mcp-config"),
                                 argv.index(stages.SESSION_ID_FLAG))
-
-    def test_wired_without_session_id(self):
-        for stage in _MCP_STAGES:
-            with self.subTest(stage=stage), \
-                    mock.patch.object(stages, "usage_enabled", return_value=False):
-                argv = _argv(stage, self.server)
-                self.assertNotIn(stages.SESSION_ID_FLAG, argv)
-                self._assert_wired(argv)
 
     def test_task_allowed_tools_keep_mcp_rule(self):
         argv = _argv("implement", self.server, allowed_tools="Read,Edit,Bash(gcloud:*)")

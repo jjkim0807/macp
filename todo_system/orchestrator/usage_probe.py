@@ -4,8 +4,7 @@
 outside the Python stage loop that already records usage via
 `stages.record_stage_usage`. This module is the seam that gives those two the same
 Design-B instrumentation *without a second parser*: the caller adds a fresh
-`--session-id <sid>` per invocation (only when the `MACP_STAGE_USAGE` kill switch
-is not "0"), and after the CLI exits calls
+`--session-id <sid>` per invocation, and after the CLI exits calls
 
     <py> -m todo_system.orchestrator.usage_probe record \\
         --source <s> --dest <path.jsonl> --session-id <sid> --rc <int> \\
@@ -20,8 +19,7 @@ the vault-sync queue).
 
 Best-effort by contract: the record body never raises and the process always
 exits 0, so a token count can never fail the script that produced it. When the
-kill switch left no session id in the argv (`stage_usage` returns None), nothing
-is written — the same "record nothing" the stage loop takes on a switched-off run.
+argv carries no session id (`stage_usage` returns None), nothing is written.
 """
 from __future__ import annotations
 

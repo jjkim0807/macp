@@ -29,11 +29,10 @@ _EFFORT = "EFFORT-SENTINEL"
 @pytest.fixture
 def fixed(monkeypatch, tmp_path):
     """Pin the environment-dependent inputs of build_stage_argv (model/effort,
-    no browser mcp, usage on) and give a worker_root that exists."""
+    no browser mcp) and give a worker_root that exists."""
     monkeypatch.setattr(stages, "stage_model", lambda stage="implement", tier=None: _MODEL)
     monkeypatch.setattr(stages, "stage_effort", lambda stage="implement", tier=None: _EFFORT)
     monkeypatch.setattr(stages, "browser_mcp_server", lambda stage: None)
-    monkeypatch.setenv(stages.USAGE_ENV, "1")
     wr = tmp_path / "worker_root"
     wr.mkdir()
     return wr

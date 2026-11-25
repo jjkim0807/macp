@@ -4317,13 +4317,6 @@ class StageEnvWithGradleTest(unittest.TestCase):
         self.assertTrue(env["GRADLE_OPTS"].startswith(stages.WORKER_GRADLE_OPTS))
         self.assertIn(f"-Dorg.gradle.daemon.registry.base={base}", env["GRADLE_OPTS"])
 
-    def test_no_daemon_flag_folds_in_daemon_false(self):
-        # Open-Q #4: an explicit, default-off env flag → run gradle with no daemon.
-        with mock.patch.dict(os.environ, {"WORKER_GRADLE_NO_DAEMON": "1"}, clear=False):
-            env = stages.stage_env_with_gradle({}, repo_dir=Path("/x/Worker/r.wt/t"))
-        self.assertIn("-Dorg.gradle.daemon=false", env["GRADLE_OPTS"])
-        self.assertIn(stages.WORKER_GRADLE_OPTS, env["GRADLE_OPTS"])
-
 
 class StageEnvTest(unittest.TestCase):
     """`stage_env` = the Gradle limits + background tasks switched off, without
@@ -4526,9 +4519,8 @@ class TranscriptUsageParseTest(unittest.TestCase):
         self.assertIsNone(stages.transcript_usage([_cost(1.0)]))
 
 
-class UsageKillSwitchArgvTest(unittest.TestCase):
-    """MACP_STAGE_USAGE=0 gives back the pre-instrumentation argv exactly — the
-    switch an operator flips instead of reverting code."""
+class SessionIdArgvTest(unittest.TestCase):
+    """Every stage argv carries one fresh `--session-id`."""
 
     def setUp(self):
         self.worker_root = Path(tempfile.mkdtemp())
@@ -4543,47 +4535,19 @@ class UsageKillSwitchArgvTest(unittest.TestCase):
         mcp_patcher.start()
         self.addCleanup(mcp_patcher.stop)
 
-    def _argv(self, switch):
-        with mock.patch.dict(os.environ):
-            os.environ.pop(stages.USAGE_ENV, None)
-            if switch is not None:
-                os.environ[stages.USAGE_ENV] = switch
-            return stages.build_stage_argv(
-                "implement", task_id="t", run_id="r", run_dir=Path("/x"),
-                branch="b", worker_root=self.worker_root)
+    def _argv(self):
+        return stages.build_stage_argv(
+            "implement", task_id="t", run_id="r", run_dir=Path("/x"),
+            branch="b", worker_root=self.worker_root)
 
-    def test_off_is_the_pre_instrumentation_argv_exactly(self):
-        for switch in ("0", " 0 "):
-            argv = self._argv(switch)
-            self.assertEqual(argv[:2], ["claude", "-p"])
-            # the argv formula as it stood before instrumentation, spelled out
-            self.assertEqual(argv[3:], [
-                "--model", stages.stage_model("implement"),
-                "--effort", stages.stage_effort("implement"),
-                "--max-turns", "250",
-                "--allowed-tools", *stages._safe_tools("implement"),
-                "--add-dir", str(self.worker_root)], repr(switch))
-            self.assertIsNone(stages.argv_session_id(argv))
-
-    def test_on_by_default_adds_one_fresh_uuid_right_before_allowed_tools(self):
-        on = self._argv(None)
+    def test_adds_one_fresh_uuid_right_before_allowed_tools(self):
+        on = self._argv()
         i = on.index(stages.SESSION_ID_FLAG)
         self.assertEqual(on[i - 2:i], ["--max-turns", "250"])
         self.assertEqual(on[i + 2], "--allowed-tools")
         self.assertEqual(str(uuid.UUID(on[i + 1])), on[i + 1])
         self.assertEqual(stages.argv_session_id(on), on[i + 1])
-        # taking the pair back out gives the switched-off argv, prompt included
-        self.assertEqual(on[:i] + on[i + 2:], self._argv("0"))
-        self.assertNotEqual(stages.argv_session_id(self._argv(None)), on[i + 1])
-
-    def test_only_an_explicit_zero_turns_it_off(self):
-        for switch in ("1", "", "false", "no"):
-            self.assertIsNotNone(stages.argv_session_id(self._argv(switch)), repr(switch))
-
-    def test_switch_is_read_per_call_not_at_import(self):
-        self.assertIsNotNone(stages.argv_session_id(self._argv(None)))
-        self.assertIsNone(stages.argv_session_id(self._argv("0")))
-        self.assertIsNotNone(stages.argv_session_id(self._argv(None)))
+        self.assertNotEqual(stages.argv_session_id(self._argv()), on[i + 1])
 
     def test_argv_session_id_only_accepts_a_canonical_uuid(self):
         good = str(uuid.uuid4())

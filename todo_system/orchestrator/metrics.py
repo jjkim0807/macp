@@ -84,7 +84,7 @@ def _reverts_in_vault() -> int:
 # from the sample. Both Ns are reported so a reader never mistakes one for the
 # other. Real token/cost figures exist only for runs since 2026-09-19: the runner
 # now reads each stage's usage back from the CLI's transcript into stages.json
-# `usage` (see the comment above stages.USAGE_ENV). Older run_dirs carry none, so
+# `usage` (see the comment above stages.USAGE_KEYS). Older run_dirs carry none, so
 # artifact bytes stay the per-stage input-cost proxy across the whole sample and
 # `stage_usage` reports its own, smaller N. See Notes/macp-pipeline-cost-benefit.md.
 

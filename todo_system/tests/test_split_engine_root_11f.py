@@ -112,7 +112,7 @@ class _Harness:
 
     def run(self, script: Path, **env: str) -> subprocess.CompletedProcess:
         # From scratch: no inherited MACP_VAULT_ROOT / MAESTRO_VAULT_DIR /
-        # KAKAO_VAULT_DIR / MACP_STAGE_USAGE, so the SID/usage_probe branch runs.
+        # KAKAO_VAULT_DIR, so the SID/usage_probe branch runs.
         full = {
             "PATH": os.environ["PATH"],
             "HOME": str(self.home),

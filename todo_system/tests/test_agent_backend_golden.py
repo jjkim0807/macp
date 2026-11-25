@@ -8,12 +8,11 @@ through a ``mock(return_value=["true"])`` in ``test_claude_accounts_switch.py``,
 so a refactor could have silently reordered a flag or dropped ``--add-dir`` and
 every test would still have been green. This snapshot catches that.
 
-What it pins, for the representative stages and both the mcp-on/off and
-usage-on/off shapes:
+What it pins, for the representative stages and both the mcp-on/off shapes:
 
 * the flag **skeleton and order** —
   ``claude -p <prompt> --model <m> --effort <e> --max-turns <N>``
-  ``[--mcp-config <json> --strict-mcp-config]? [--session-id <uuid>]?``
+  ``[--mcp-config <json> --strict-mcp-config]? --session-id <uuid>``
   ``--allowed-tools <tools…> [--add-dir <wr>]?`` — with the environment-dependent
   values (model/effort, the session-id uuid, the mcp-config json) normalised to
   placeholders so the test pins *structure*, not a machine's resolved model;
@@ -28,8 +27,7 @@ the same argv as ``build_stage_argv`` — is in ``test_agent_backend.py``; this
 file is the independent snapshot the backend is compared against.
 
 No ``claude`` binary runs: ``build_stage_argv`` is pure. Volatile inputs
-(model/effort, worker_root existence, the mcp server path, the usage kill switch)
-are fixed per test. No personal identifier appears here (the engine tree is
+(model/effort, worker_root existence, the mcp server path) are fixed per test. No personal identifier appears here (the engine tree is
 scanned by the public-identifier gate).
 """
 
@@ -52,7 +50,7 @@ _MODEL = "MODEL-SENTINEL"
 _EFFORT = "EFFORT-SENTINEL"
 
 
-def _fix(monkeypatch, tmp_path, *, mcp: bool, usage: bool, wr_exists: bool) -> Path:
+def _fix(monkeypatch, tmp_path, *, mcp: bool, wr_exists: bool) -> Path:
     """Pin every environment-dependent input of build_stage_argv so its argv is
     deterministic, and return the worker_root to pass in."""
     monkeypatch.setattr(stages, "stage_model", lambda stage="implement", tier=None: _MODEL)
@@ -69,7 +67,6 @@ def _fix(monkeypatch, tmp_path, *, mcp: bool, usage: bool, wr_exists: bool) -> P
             lambda stage: server if stage in stages.BROWSER_MCP_STAGES else None)
     else:
         monkeypatch.setattr(stages, "browser_mcp_server", lambda stage: None)
-    monkeypatch.setenv(stages.USAGE_ENV, "1" if usage else "0")
     wr = tmp_path / "worker_root"
     if wr_exists:
         wr.mkdir()
@@ -97,7 +94,7 @@ def _normalise(argv: list[str]) -> list[str]:
     return out
 
 
-def _expected(stage: str, wr: Path, *, mcp: bool, usage: bool, wr_exists: bool) -> list[str]:
+def _expected(stage: str, wr: Path, *, mcp: bool, wr_exists: bool) -> list[str]:
     """The pinned skeleton, built from the module's own stable constants
     (max-turns, the tool list) but with the exact flag order spelled out here —
     the order is the invariant the refactor must not touch."""
@@ -106,8 +103,7 @@ def _expected(stage: str, wr: Path, *, mcp: bool, usage: bool, wr_exists: bool) 
            "--max-turns", str(stages.STAGE_MAX_TURNS[stage])]
     if mcp:
         exp += ["--mcp-config", "<MCP_CONFIG>", "--strict-mcp-config"]
-    if usage:
-        exp += [stages.SESSION_ID_FLAG, "<SID>"]
+    exp += [stages.SESSION_ID_FLAG, "<SID>"]
     exp += ["--allowed-tools", *stages._safe_tools(stage, None, browser_mcp=mcp)]
     if wr_exists:
         exp += ["--add-dir", str(wr)]
@@ -115,30 +111,29 @@ def _expected(stage: str, wr: Path, *, mcp: bool, usage: bool, wr_exists: bool) 
 
 
 # ---------------------------------------------------------------------------
-# Structural skeleton — every representative stage × mcp × usage.
+# Structural skeleton — every representative stage × mcp.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("stage", _STAGES)
 @pytest.mark.parametrize("mcp", [False, True], ids=["mcp_off", "mcp_on"])
-@pytest.mark.parametrize("usage", [True, False], ids=["usage_on", "usage_off"])
-def test_argv_skeleton_is_pinned(monkeypatch, tmp_path, stage, mcp, usage):
-    wr = _fix(monkeypatch, tmp_path, mcp=mcp, usage=usage, wr_exists=True)
+def test_argv_skeleton_is_pinned(monkeypatch, tmp_path, stage, mcp):
+    wr = _fix(monkeypatch, tmp_path, mcp=mcp, wr_exists=True)
     argv = _argv(stage, wr)
     # report is not a browser-mcp stage, so mcp flags never appear there
     # even when a server is "configured" — browser_mcp_server returns None for
     # it regardless of the monkeypatch, so the skeleton must reflect that.
     mcp_effective = mcp and stage in stages.BROWSER_MCP_STAGES
     assert _normalise(argv) == _expected(
-        stage, wr, mcp=mcp_effective, usage=usage, wr_exists=True)
+        stage, wr, mcp=mcp_effective, wr_exists=True)
 
 
 @pytest.mark.parametrize("stage", _STAGES)
 def test_add_dir_omitted_when_worker_root_absent(monkeypatch, tmp_path, stage):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=False)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=False)
     argv = _argv(stage, wr)
     assert "--add-dir" not in argv
     assert _normalise(argv) == _expected(
-        stage, wr, mcp=False, usage=True, wr_exists=False)
+        stage, wr, mcp=False, wr_exists=False)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +141,7 @@ def test_add_dir_omitted_when_worker_root_absent(monkeypatch, tmp_path, stage):
 # ---------------------------------------------------------------------------
 
 def test_literal_argv_report_mcp_off_usage_on(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     argv = _argv("report", wr)
     assert _normalise(argv) == [
         "claude", "-p", "<PROMPT>",
@@ -158,7 +153,7 @@ def test_literal_argv_report_mcp_off_usage_on(monkeypatch, tmp_path):
 
 
 def test_literal_argv_implement_mcp_on_usage_on(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=True, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=True, wr_exists=True)
     argv = _argv("implement", wr)
     assert _normalise(argv) == [
         "claude", "-p", "<PROMPT>",
@@ -183,7 +178,7 @@ def test_literal_argv_implement_mcp_on_usage_on(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_variadic_flag_order_mcp_before_session_before_allowed_tools(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=True, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=True, wr_exists=True)
     argv = _argv("implement", wr)
     i_mcp = argv.index("--mcp-config")
     i_strict = argv.index("--strict-mcp-config")
@@ -196,15 +191,8 @@ def test_variadic_flag_order_mcp_before_session_before_allowed_tools(monkeypatch
     assert i_add == len(argv) - 2  # --add-dir, <path>
 
 
-def test_session_id_absent_and_unparseable_when_usage_off(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=True, usage=False, wr_exists=True)
-    argv = _argv("implement", wr)
-    assert stages.SESSION_ID_FLAG not in argv
-    assert stages.argv_session_id(argv) is None
-
-
 def test_session_id_is_a_fresh_uuid_per_call(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     a = _argv("implement", wr)
     b = _argv("implement", wr)
     sid_a, sid_b = stages.argv_session_id(a), stages.argv_session_id(b)
@@ -218,7 +206,7 @@ def test_session_id_is_a_fresh_uuid_per_call(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("stage", _STAGES)
 def test_prompt_body_is_stage_prompt_plus_metadata(monkeypatch, tmp_path, stage):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     full = _argv(stage, wr)[2]
     assert full.startswith(stages.strip_frontmatter(stages.load_stage_prompt(stage)))
     assert "# Run metadata (injected by orchestrator)" in full
@@ -229,7 +217,7 @@ def test_prompt_body_is_stage_prompt_plus_metadata(monkeypatch, tmp_path, stage)
 
 
 def test_prompt_body_carries_external_repo_metadata(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     full = _argv("implement", wr, repo="https://example.test/x.git",
                  working_dir="/w/d")[2]
     assert "- repo: `https://example.test/x.git`" in full
@@ -238,7 +226,7 @@ def test_prompt_body_carries_external_repo_metadata(monkeypatch, tmp_path):
 
 
 def test_mcp_config_json_names_server_and_run_id_owner(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=True, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=True, wr_exists=True)
     argv = _argv("implement", wr)
     cfg = json.loads(argv[argv.index("--mcp-config") + 1])
     srv = cfg["mcpServers"][stages.BROWSER_MCP_SERVER_NAME]
@@ -262,7 +250,7 @@ _THREE_PHASE_PLAN = (
 def test_plan_prompt_split_example_is_what_the_engine_parses(monkeypatch, tmp_path):
     # The example the implement agent is shown is fed to the engine's own reader and
     # builder, so the prompt and the parser cannot drift apart.
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     full = _argv("implement", wr)[2]
     assert _SPLIT_MARK in full
     blocks = rescope.find_plan_split_blocks(full)
@@ -282,7 +270,7 @@ def test_plan_prompt_split_example_is_what_the_engine_parses(monkeypatch, tmp_pa
 
 
 def test_split_hint_names_every_key_the_builder_reads(monkeypatch, tmp_path):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     full = _argv("implement", wr)[2]
     hint = full[full.index(_SPLIT_MARK):]
     for key in ("declares_oversize: yes", "`rescope`", "`slug`", "`phases`",
@@ -294,7 +282,7 @@ def test_split_hint_names_every_key_the_builder_reads(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("stage", [s for s in _STAGES if s != "implement"])
 def test_split_hint_is_implement_only(monkeypatch, tmp_path, stage):
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     full = _argv(stage, wr)[2]
     assert _SPLIT_MARK not in full
     assert "```rescope" not in full
@@ -303,7 +291,7 @@ def test_split_hint_is_implement_only(monkeypatch, tmp_path, stage):
 def test_split_hint_sits_in_the_metadata_block(monkeypatch, tmp_path):
     # Appended to the run metadata: the stage prompt passes through verbatim, the
     # hint comes after it (so it outranks it) and before the project memory.
-    wr = _fix(monkeypatch, tmp_path, mcp=False, usage=True, wr_exists=True)
+    wr = _fix(monkeypatch, tmp_path, mcp=False, wr_exists=True)
     prompt = stages.strip_frontmatter(stages.load_stage_prompt("implement"))
     full = _argv("implement", wr, project_context="PROJECT-MEMORY-SENTINEL")[2]
     assert full.startswith(prompt)

@@ -363,30 +363,15 @@ def _touches_disjoint(a_globs: list[str], b_globs: list[str]) -> bool:
 # --- heavy-task routing ----------------------------------------------------
 # A heavy task (gradle build, emulator run, long job) goes to an online remote
 # that advertises the `heavy` capability, and comes back to its for_project
-# owner when that remote goes quiet. Both thresholds are read on every call so
-# an env change takes effect on the next tick without a restart.
-REMOTE_ONLINE_ENV = "MACP_REMOTE_ONLINE_S"            # liveness "online" bound
-REMOTE_ACCEPT_TIMEOUT_ENV = "MACP_REMOTE_ACCEPT_TIMEOUT_S"  # DISPATCHED -> ACCEPT bound
-DEFAULT_REMOTE_ONLINE_S = 900.0
-DEFAULT_REMOTE_ACCEPT_TIMEOUT_S = 600.0
+# owner when that remote goes quiet.
+REMOTE_ONLINE_S = 900.0            # liveness "online" bound
+REMOTE_ACCEPT_TIMEOUT_S = 600.0    # DISPATCHED -> ACCEPT bound
 
 # Ledger `rerouted_from.reason` values — shown in status/trace/api: wire format.
 REROUTE_ACCEPT_TIMEOUT = "accept-timeout"
 REROUTE_AGENT_STALE = "agent-stale"
 REROUTE_REJECTED = "rejected"
 REROUTE_PAUSED_GAME = "paused:game"      # the remote's owner switched it to game
-
-
-def _env_seconds(name: str, default: float) -> float:
-    """A positive number of seconds from env `name`; `default` when unset,
-    blank, unparseable or not positive."""
-    import os
-    raw = os.environ.get(name, "")
-    try:
-        v = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return v if v > 0 else default
 
 
 def _payload_bool(v) -> bool | None:
@@ -707,7 +692,7 @@ class Orchestrator:
         may announce 0 because its usage headroom is gone, and a bypass task is
         allowed to run then, one at a time. So is a long_job's start or poll
         (`long_job_phase(payload, job_state)`), which needs no usage headroom at
-        all. A worker that stopped announcing (MACP_REMOTE_ONLINE_S) has no slot
+        all. A worker that stopped announcing (REMOTE_ONLINE_S) has no slot
         for anything."""
         now = now if now is not None else dt.datetime.now().timestamp()
         used = (busy if busy is not None else self._busy_by_agent()).get(agent.id, 0)
@@ -716,7 +701,7 @@ class Orchestrator:
             rec = self.agent_slots().get(agent.id)
             if isinstance(rec, dict):
                 silent = now - _parse_ts(rec.get("ts"))
-                if silent >= self._remote_online_s():
+                if silent >= REMOTE_ONLINE_S:
                     return SlotGate(0, 0, used, silent)
                 cap, used = int(rec["max"]), max(used, int(rec.get("used") or 0))
         except Exception:  # noqa: BLE001 - an unreadable record = never announced
@@ -855,14 +840,6 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - unresolvable → not gradle-heavy
             return None
 
-    @staticmethod
-    def _remote_online_s() -> float:
-        return _env_seconds(REMOTE_ONLINE_ENV, DEFAULT_REMOTE_ONLINE_S)
-
-    @staticmethod
-    def _remote_accept_timeout_s() -> float:
-        return _env_seconds(REMOTE_ACCEPT_TIMEOUT_ENV, DEFAULT_REMOTE_ACCEPT_TIMEOUT_S)
-
     def _pick_heavy_remote(self, existing: Assignment | None = None,
                            now: float | None = None, *,
                            need_device: bool = False,
@@ -872,7 +849,7 @@ class Orchestrator:
         """The first heavy-capable remote (registry order) that is usable now.
 
         This is THE single "is this remote available?" check — online by
-        agent_liveness (MACP_REMOTE_ONLINE_S), not in `game` mode (a game agent
+        agent_liveness (REMOTE_ONLINE_S), not in `game` mode (a game agent
         counts as offline — agent_mode.py), with a free slot (_slot_gate, which
         reads `job_state` the way it reads `bypass_guard`),
         and not the agent that last REJECTED this very task (or that it was just
@@ -884,7 +861,7 @@ class Orchestrator:
         remotes = self.reg.heavy_remotes()
         if not remotes:
             return None
-        liveness = self.agent_liveness(stale_after_s=self._remote_online_s(), now=now)
+        liveness = self.agent_liveness(stale_after_s=REMOTE_ONLINE_S, now=now)
         modes = self.agent_modes()
         rr = (getattr(existing, "rerouted_from", None) or {}) if existing else {}
         refused = (rr.get("agent") if rr.get("reason") == REROUTE_REJECTED
@@ -2452,7 +2429,7 @@ class Orchestrator:
         at — a project-owned remote task is never moved. Four triggers:
         the remote was switched to game mode while the row was in flight
         (`paused:game` — agent_mode.py), no ACCEPT within
-        MACP_REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
+        REMOTE_ACCEPT_TIMEOUT_S (`accept-timeout`; the
         unacked envelope that exempts the row from reap_stale is exactly the
         offline-remote case), the remote stopped being online after it took the
         task (`agent-stale`), or it REJECTED the task (`rejected`). The row is
@@ -2470,9 +2447,8 @@ class Orchestrator:
                     and a.agent_id != a.fallback_agent]
             if not rows:
                 return moved
-            liveness = self.agent_liveness(stale_after_s=self._remote_online_s(),
-                                           now=now)
-            timeout = self._remote_accept_timeout_s()
+            liveness = self.agent_liveness(stale_after_s=REMOTE_ONLINE_S, now=now)
+            timeout = REMOTE_ACCEPT_TIMEOUT_S
             modes = self.agent_modes()
             tally = _SkipTally("reroute_remote")
             for a in rows:
@@ -3891,7 +3867,7 @@ def _check_divergence(root: Path, _run=None, *, threshold: int = 3) -> dict:
 
 def resolve_dispatch_limits() -> tuple:
     """(daily_run_budget, max_parallel_per_repo, max_parallel_gradle_builds) —
-    the raw profile→env values `_main` builds the dispatching Orchestrator with.
+    the raw profile values `_main` builds the dispatching Orchestrator with.
     Unfloored: callers apply max(1, …) / max(0, …) themselves. Shared with the
     dashboard's queue view so it judges with the same limits the tick uses."""
     # per-profile budget + per-repo concurrency cap from ~/.macp (the active
@@ -3912,26 +3888,6 @@ def resolve_dispatch_limits() -> tuple:
             gradle_cap = getattr(prof, "max_parallel_gradle_builds", 0)
     except Exception:
         pass
-    # env override — a per-host knob layered over the profile field; wrapped so a
-    # malformed value is ignored, never crashing the daemon, and still floored at
-    # 1 by max(1, ...) in _main (a host can set it to 1 to force serial-per-repo).
-    import os
-    env_cap = os.environ.get("MACP_MAX_PARALLEL_PER_REPO")
-    if env_cap:
-        try:
-            cap = int(env_cap)
-        except ValueError:
-            pass
-    # Global gradle-build cap — the cross-checkout memory guard. Same profile→env
-    # ladder as the per-repo cap; default 0 = unlimited (dormant), so an older
-    # profile without the field and today's behaviour are unaffected. A malformed
-    # value is ignored and it is floored at 0 by max(0, ...) in _main (never negative).
-    env_gradle = os.environ.get("MACP_MAX_PARALLEL_GRADLE_BUILDS")
-    if env_gradle:
-        try:
-            gradle_cap = int(env_gradle)
-        except ValueError:
-            pass
     return budget, cap, gradle_cap
 
 

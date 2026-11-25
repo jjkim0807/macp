@@ -2040,7 +2040,7 @@ class StageUsageLoopTest(unittest.TestCase):
         p.write_text("".join(f"{ln}\n" for ln in leg["transcript"]), encoding="utf-8")
 
     def _run(self, leg: dict | None = None, *, stage: str = "implement",
-             timeout_output: str | None = None, real_argv: bool = False,
+             timeout_output: str | None = None,
              patches: tuple = ()) -> dict:
         """One vault-task pass through StagedExecutor.execute. Its own RUNS_DIR
         each time: run ids have one-second resolution, so two passes would share
@@ -2063,10 +2063,9 @@ class StageUsageLoopTest(unittest.TestCase):
         msg = m.Envelope(to="w", type=m.TASK_ASSIGN, task_id="t",
                          payload={"auto_merge": False, "model_tier": "standard"})
         with contextlib.ExitStack() as stack:
-            if not real_argv:
-                stack.enter_context(mock.patch.object(
-                    stages, "build_stage_argv",
-                    return_value=["claude", "-p", "x", *leg["argv_tail"]]))
+            stack.enter_context(mock.patch.object(
+                stages, "build_stage_argv",
+                return_value=["claude", "-p", "x", *leg["argv_tail"]]))
             for p in (
                 mock.patch.object(stages, "restore_main"),
                 mock.patch.object(stages, "install_push_guard"),
@@ -2203,37 +2202,6 @@ class StageUsageLoopTest(unittest.TestCase):
             self._assert_reads_unchanged(str(recorded), got, ref)
             self.assertEqual(got["progress"].get("usage"),
                              None if recorded is None else {"implement": recorded})
-
-    def test_kill_switch_off_gives_the_old_argv_and_records_nothing(self):
-        """AC4 through the real build_stage_argv: MACP_STAGE_USAGE=0 and the argv
-        reaching subprocess.run has no session id, stages.json no `usage`."""
-        leg = _claude_fixture("success")["legs"]["text"]
-        with mock.patch.dict(os.environ, {stages.USAGE_ENV: "0"}):
-            off = self._run(leg, real_argv=True)
-        with mock.patch.dict(os.environ, {stages.USAGE_ENV: "1"}):
-            on = self._run(leg, real_argv=True)
-        self.assertNotIn(stages.SESSION_ID_FLAG, off["argv"])
-        self.assertNotIn("usage", off["progress"])
-        i = on["argv"].index(stages.SESSION_ID_FLAG)
-        # argv[2] is the prompt, which names each run's own run_id. So does the
-        # serialised --mcp-config (MACP_BROWSER_OWNER), which is NOT argv[2]: run
-        # ids have one-second resolution, so two passes that straddle a second
-        # boundary differed there and the comparison failed at random. Normalise
-        # each run's own id out of every arg rather than excluding one more index.
-        def _norm(args, run_id):
-            return [a.replace(run_id, "<run-id>") for a in args]
-
-        # Not a no-op: each run's own id really is inside one of those args, so a
-        # regression that stopped normalising would fail whenever the ids differ.
-        for got in (on, off):
-            self.assertTrue(any(got["run_id"] in a for a in got["argv"]),
-                            "no arg carries the run id — normalisation is vacuous")
-        self.assertEqual(_norm(on["argv"][3:i] + on["argv"][i + 2:], on["run_id"]),
-                         _norm(off["argv"][3:], off["run_id"]))
-        # a real, fresh id with no transcript behind it here
-        self.assertEqual(on["progress"]["usage"],
-                         {"implement": {"unavailable": "transcript not found"}})
-        self._assert_reads_unchanged("kill switch", on, off)
 
 
 class _GatedExecutor:
@@ -2373,14 +2341,10 @@ class RunnerParallelTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RUNNER_MAX_PARALLEL": "1"}):
             self.assertEqual(self.runner._max_parallel(), 1)
 
-    def test_per_account_max_env_else_registry(self):
+    def test_per_account_max_is_the_registry_concurrency(self):
         self.assertEqual(self.runner._per_account_max(), 1)   # _agent() concurrency
         self.runner.agent = _agent(concurrency=4)
-        self.assertEqual(self.runner._per_account_max(), 4)   # registry default
-        with mock.patch.dict(os.environ, {"RUNNER_MAX_PARALLEL_PER_ACCOUNT": "2"}):
-            self.assertEqual(self.runner._per_account_max(), 2)
-        with mock.patch.dict(os.environ, {"RUNNER_MAX_PARALLEL_PER_ACCOUNT": "x"}):
-            self.assertEqual(self.runner._per_account_max(), 4)   # bad env → registry
+        self.assertEqual(self.runner._per_account_max(), 4)
 
     def test_global_cap_only_when_env_set(self):
         os.environ.pop("RUNNER_MAX_PARALLEL", None)
@@ -2393,7 +2357,6 @@ class RunnerParallelTest(unittest.TestCase):
     def test_account_slots_passes_caps_and_fails_soft(self):
         self.runner.agent = _agent(concurrency=4)
         os.environ.pop("RUNNER_MAX_PARALLEL", None)
-        os.environ.pop("RUNNER_MAX_PARALLEL_PER_ACCOUNT", None)
         seen = {}
         cap = {"total": 6, "per_account": {"a": 3, "b": 3}, "slack": {},
                "order": ["a", "b"], "active": "a"}

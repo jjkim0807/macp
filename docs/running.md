@@ -241,8 +241,8 @@ is an **AI-local** agent is moved; a human-owned task, or one a remote owns by p
 (say a Windows-only project), keeps its owner.
 
 The dispatcher sends a heavy task to the first `heavy` remote, in registry order, that is
-**online** — it has sent any message within `MACP_REMOTE_ONLINE_S` seconds (default 900;
-`orchestrator agents` shows the same liveness) — and has fewer runs in flight than its
+**online** — it has sent any message within 900 seconds
+(`orchestrator agents` shows the same liveness) — and has fewer runs in flight than its
 `concurrency`. The envelope carries `requires: [heavy]`; the ledger payload does not, so a
 retry on the default agent is never refused for the capability. With no such remote the
 task goes to its owner exactly as before. `orchestrator status` marks a task sent this way
@@ -253,7 +253,7 @@ owner when its remote:
 
 | reason | when |
 | --- | --- |
-| `accept-timeout` | no ACCEPT within `MACP_REMOTE_ACCEPT_TIMEOUT_S` seconds (default 600) — the remote is off |
+| `accept-timeout` | no ACCEPT within 600 seconds — the remote is off |
 | `agent-stale` | it ACCEPTed, but is no longer online and sent no RESULT/FAIL |
 | `rejected` | it REJECTed the task; that remote is not picked for this task again |
 
@@ -274,13 +274,13 @@ already running when the CANCEL arrived cannot be stopped, so its PR may still o
 every 300 seconds, idle or busy. The orchestrator assigns only to a free slot (see
 [Concepts — free slots](concepts.md#choosing-resources)), so this message is what brings work to a
 runner. A remote runner also sends `HEARTBEAT {status: busy}` every
-`RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) from a separate thread while it is
+300 seconds from a separate thread while it is
 running something, because its serial loop is blocked for the whole run and a single
 stage can run for an hour without a progress message.
 
 With the git mailbox, messages and liveness arrive at the vault sync cadence (a few
-minutes). The 600 s / 900 s defaults leave room for that; do not set either below about
-twice your sync interval. `max_parallel_gradle_builds` (off by default) still counts
+minutes). The 600 s / 900 s bounds leave room for that.
+`max_parallel_gradle_builds` (off by default) still counts
 heavy runs that went to a remote.
 
 #### Game mode (pause a heavy remote)
