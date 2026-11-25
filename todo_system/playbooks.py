@@ -198,8 +198,10 @@ _EMPHASIS = re.compile(r"\*\*|__")
 
 
 def flat(text: str) -> str:
-    """One line: wikilinks to their target, bold markers dropped, whitespace collapsed."""
-    text = _EMPHASIS.sub("", _LINK.sub(r"\1", str(text)))
+    """One line: wikilinks to their target, bold markers and the YAML escape of
+    a quote (a frontmatter ``description: "… \\"x\\" …"``) dropped, whitespace
+    collapsed."""
+    text = _EMPHASIS.sub("", _LINK.sub(r"\1", str(text))).replace('\\"', '"')
     return _WS.sub(" ", text).strip()
 
 

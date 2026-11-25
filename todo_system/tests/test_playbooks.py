@@ -387,6 +387,11 @@ def test_clip_cuts_on_a_character_boundary():
     assert pb.clip("short", 50) == "short"
 
 
+def test_flat_unescapes_a_yaml_quote_and_flattens_links_and_bold():
+    assert pb.flat('shown as \\"network\\" — see [[some-note|alias]] **now**\n  ok') == (
+        'shown as "network" — see some-note now ok')
+
+
 # -- privacy (the related_context boundary) ----------------------------------------
 
 def test_scrub_takes_out_contact_codes_keys_queries_and_homes():
