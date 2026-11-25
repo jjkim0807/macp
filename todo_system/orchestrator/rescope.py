@@ -40,6 +40,13 @@ from pathlib import Path
 
 RESCOPE_SCHEMA_VERSION = 1
 RESCOPE_FILENAME = "rescope.json"
+# Size cap (bytes of the UTF-8 JSON form) on a split plan a remote runner carries
+# INLINE in its plan-park FAIL payload — the run dir lives on the remote host, so
+# HQ has no rescope.json file to read and the plan must ride in the message. Both
+# the runner's read (read_rescope_for_payload) and HQ's write (save_remote_rescope)
+# enforce it: a 2-5 subtask plan is a few KB, so this only ever drops a pathological
+# plan from bloating the git-tracked mailbox — fail-closed to today's ⛔.
+RESCOPE_MAX_BYTES = 64 * 1024
 
 # The framing collect() stamps on a parked row. Separate from `ALERT_BLOCKED`
 # (⛔) so only this row routes to the reconcile_rescope sweep. This is a benign
@@ -129,6 +136,64 @@ def find_latest_rescope(runs_dir, slug: str) -> tuple[Path, dict] | None:
         if plan is not None:
             return run_dir, plan
     return None
+
+
+# ---------------------------------------------------------------------------
+# Remote-park bridge — carry a split plan inline in a FAIL payload, restore it
+# on HQ. A plan-stage park on a remote runner (macbook·desktop-wsl) leaves its
+# rescope.json in THAT host's run dir; HQ has no file, so until now the park
+# reached a human as ⛔ even though a viable plan existed (#177 left this as the
+# "범위 밖" gap). The runner now reads the plan for the payload, and HQ writes it
+# into its own run dir so the ordinary load_rescope → can_auto_rescope →
+# execute_rescope path runs exactly as for an HQ run — no second code path.
+# ---------------------------------------------------------------------------
+
+
+def read_rescope_for_payload(run_dir, *, max_bytes: int = RESCOPE_MAX_BYTES) -> dict | None:
+    """Read `<run_dir>/rescope.json` for inlining into a remote runner's plan-park
+    FAIL payload. Returns the plan dict only when it is present AND its serialized
+    form is within `max_bytes` (so a pathological plan cannot bloat the git-tracked
+    mailbox); None otherwise. Never raises — None simply leaves today's park, which
+    HQ then routes to a human as before."""
+    plan = load_rescope(run_dir)
+    if not isinstance(plan, dict):
+        return None
+    try:
+        # Measure the indented form — that is what the envelope serializer and
+        # save_remote_rescope write, so a plan the runner carries is one HQ will
+        # also accept (no boundary case where the runner sends it but HQ drops it).
+        if len(json.dumps(plan, ensure_ascii=False, indent=2).encode("utf-8")) > max_bytes:
+            return None
+    except Exception:  # noqa: BLE001 — unserializable plan → carry nothing (fail-closed)
+        return None
+    return plan
+
+
+def save_remote_rescope(runs_dir, run_id: str, plan, *,
+                        max_bytes: int = RESCOPE_MAX_BYTES) -> Path | None:
+    """Persist a split plan a remote runner carried inline to HQ's
+    `<runs_dir>/<run_id>/rescope.json`, so the local reconcile path runs exactly as
+    for an HQ run. `run_id` is the run-dir basename (what collect() stores as
+    `last_run_dir`), never the remote absolute path. Returns the path written, or
+    None when nothing was: not a dict, over the cap, an empty id, or a file already
+    present — an HQ run's own rescope.json is NEVER overwritten, so the existing HQ
+    path is untouched. Never raises (fail-closed: no file → today's ⛔)."""
+    try:
+        name = str(run_id).strip()
+        if not isinstance(plan, dict) or not name:
+            return None
+        blob = json.dumps(plan, ensure_ascii=False, indent=2)
+        if len(blob.encode("utf-8")) > max_bytes:
+            return None
+        rd = Path(runs_dir) / name
+        dest = rd / RESCOPE_FILENAME
+        if dest.exists():
+            return None
+        rd.mkdir(parents=True, exist_ok=True)
+        _write_new_json(dest, plan)
+        return dest
+    except Exception:  # noqa: BLE001 — fail-closed: no file → today's ⛔ to a human
+        return None
 
 
 # ---------------------------------------------------------------------------

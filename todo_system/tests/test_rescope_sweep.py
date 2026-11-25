@@ -292,3 +292,141 @@ def test_collect_still_alerts_when_not_auto_viable(vault, monkeypatch):
     assert a.state == AWAITING_HUMAN
     assert a.last_alert_kind == ALERT_BLOCKED
     assert len(sent) == 1 and sent[0][0].splitlines()[0].startswith("⛔")
+
+
+# -- remote-park bridge: read_rescope_for_payload / save_remote_rescope ------
+# (the inline-plan helpers — a remote runner's run dir is on another host, so the
+#  plan rides in the FAIL payload and HQ restores it to its own run dir)
+
+
+def test_read_rescope_for_payload_reads_present_plan(tmp_path):
+    rd = tmp_path / "20261121T111528-x"
+    rd.mkdir()
+    plan = _plan("x")
+    (rd / rescope.RESCOPE_FILENAME).write_text(json.dumps(plan), encoding="utf-8")
+    assert rescope.read_rescope_for_payload(rd) == plan
+
+
+def test_read_rescope_for_payload_missing_is_none(tmp_path):
+    assert rescope.read_rescope_for_payload(tmp_path / "nope") is None
+
+
+def test_read_rescope_for_payload_over_cap_is_none(tmp_path):
+    rd = tmp_path / "20261121T111528-x"
+    rd.mkdir()
+    plan = _plan("x")
+    (rd / rescope.RESCOPE_FILENAME).write_text(json.dumps(plan), encoding="utf-8")
+    assert rescope.read_rescope_for_payload(rd, max_bytes=50) is None       # over cap -> drop
+    assert rescope.read_rescope_for_payload(rd, max_bytes=100_000) == plan  # under cap -> carry
+
+
+def test_save_remote_rescope_writes_when_absent(tmp_path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    plan = _plan("x")
+    dest = rescope.save_remote_rescope(runs, "20261121T111528-x", plan)
+    assert dest == runs / "20261121T111528-x" / rescope.RESCOPE_FILENAME
+    assert dest.exists() and json.loads(dest.read_text(encoding="utf-8")) == plan
+
+
+def test_save_remote_rescope_never_overwrites_hq_file(tmp_path):
+    runs = tmp_path / "runs"
+    rd = runs / "20261121T111528-x"
+    rd.mkdir(parents=True)
+    existing = _plan("hq-local")
+    (rd / rescope.RESCOPE_FILENAME).write_text(json.dumps(existing), encoding="utf-8")
+    assert rescope.save_remote_rescope(runs, "20261121T111528-x", _plan("remote")) is None
+    assert json.loads((rd / rescope.RESCOPE_FILENAME).read_text(encoding="utf-8")) == existing
+
+
+def test_save_remote_rescope_rejects_non_dict_empty_id_and_over_cap(tmp_path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    assert rescope.save_remote_rescope(runs, "r", ["not", "a", "dict"]) is None
+    assert rescope.save_remote_rescope(runs, "", _plan("x")) is None
+    assert rescope.save_remote_rescope(runs, "r", _plan("x"), max_bytes=50) is None
+    assert not list(runs.rglob(rescope.RESCOPE_FILENAME))     # nothing written
+
+
+# -- remote park -> HQ restore -> auto-split, through collect() + sweep ------
+# The 2026-11-21 incident: dripcoffee-dial-6 parked oversize on the macbook
+# runner, whose run_dir was a Mac path HQ could not read, so reconcile could not
+# find the plan and it reached a human. Here the FAIL carries the plan inline.
+
+# A remote runner's absolute run-dir prefix: not this host's runs dir, and its
+# basename is all HQ keeps (collect() stores Path(run_dir).name). Kept neutral —
+# no personal path — so the public-identifier gate stays green.
+_REMOTE_RUNS = "/remote-host/macp-worker/second-brain/Worker/runs"
+_PLAN_PARK_BLOCKED = "task exceeds a single Implement stage — needs re-scoping (plan)"
+
+
+def test_collect_restores_remote_inline_plan_and_auto_splits(vault, monkeypatch):
+    """A plan-stage park on a REMOTE runner: its run dir lives on the Mac, so HQ
+    has no rescope.json. The FAIL carries the split plan inline; collect() writes
+    it into HQ's own run dir, suppresses the ⛔, and execute_rescope then splits the
+    task into chained children exactly as for an HQ run — the whole 원격 파킹 →
+    자동 분할 path end to end."""
+    root, items, templates, runs, ledger = vault
+    monkeypatch.setattr(cli, "ITEMS_DIR", items)
+    slug = "big-refactor"
+    run_id = f"20261121T111528-{slug}"
+    remote_run_dir = f"{_REMOTE_RUNS}/{run_id}"              # a Mac path HQ cannot read
+    _write_parent(items, slug)
+    plan = _plan(slug)
+    assert not (runs / run_id / rescope.RESCOPE_FILENAME).exists()   # nothing on HQ yet
+    ledger.save(Assignment(task_id=slug, agent_id="worker-default", corr_id="c1",
+                           state=IN_PROGRESS, kind="ai-local"))
+    orch, mb, sent, routed = _orch(root, ledger)
+
+    mb.send(m.Envelope(to=m.ORCHESTRATOR, type=m.FAIL, frm="worker-default",
+                       task_id=slug, corr_id="c1",
+                       payload={"blocked_on": _PLAN_PARK_BLOCKED,
+                                "run_dir": remote_run_dir, "rescope": plan}))
+    orch.collect()
+
+    # collect(): restored to HQ's own run dir (basename only, never the Mac path),
+    # stamped pending, zero ⛔
+    a = ledger.load(slug)
+    assert a.state == AWAITING_HUMAN
+    assert a.last_alert_kind == ALERT_RESCOPE_PENDING
+    assert a.payload.get("last_run_dir") == run_id
+    restored = runs / run_id / rescope.RESCOPE_FILENAME
+    assert restored.exists()
+    assert json.loads(restored.read_text(encoding="utf-8")) == plan
+    assert sent == [] and routed == []
+
+    # the sweep splits it into three chained children, parent -> off bundle, one 🔀
+    notify, calls = _notifier()
+    done = rescope.execute_rescope(ledger, root, notify, items_dir=items, templates_dir=templates)
+    assert done == [slug]
+    assert all((items / f"{slug}-part-{i}.md").exists() for i in range(3))
+    row = ledger.load(slug)
+    assert row.state == DONE and row.blocked_on == ""
+    assert len(calls) == 1 and calls[0][0].splitlines()[0].startswith("🔀")
+
+
+def test_collect_remote_park_without_inline_plan_still_parks(vault, monkeypatch):
+    """The control: the same remote park with NO `rescope` field (an old runner, or
+    a park that wrote no viable plan). HQ has nothing to restore, so it reaches a
+    human with one ⛔ — exactly as today (the #177 '범위 밖' behaviour)."""
+    root, items, templates, runs, ledger = vault
+    monkeypatch.setattr(cli, "ITEMS_DIR", items)
+    slug = "big-refactor"
+    run_id = f"20261121T111528-{slug}"
+    remote_run_dir = f"{_REMOTE_RUNS}/{run_id}"
+    _write_parent(items, slug)
+    ledger.save(Assignment(task_id=slug, agent_id="worker-default", corr_id="c1",
+                           state=IN_PROGRESS, kind="ai-local"))
+    orch, mb, sent, routed = _orch(root, ledger)
+
+    mb.send(m.Envelope(to=m.ORCHESTRATOR, type=m.FAIL, frm="worker-default",
+                       task_id=slug, corr_id="c1",
+                       payload={"blocked_on": _PLAN_PARK_BLOCKED, "run_dir": remote_run_dir}))
+    orch.collect()
+
+    a = ledger.load(slug)
+    assert a.state == AWAITING_HUMAN
+    assert a.last_alert_kind == ALERT_BLOCKED
+    assert not (runs / run_id / rescope.RESCOPE_FILENAME).exists()   # nothing restored
+    assert len(sent) == 1 and sent[0][0].splitlines()[0].startswith("⛔")
+    assert not list(items.glob(f"{slug}-part-*.md"))

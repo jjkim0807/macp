@@ -1948,11 +1948,21 @@ class StagedExecutor(ClaudeCodeExecutor):
                     except Exception as e:      # noqa: BLE001 — never alter the park
                         split_note = f"skipped ({type(e).__name__})"
                     progress(f"plan split: {split_note}")
+                    park_payload = {"branch": branch, "run_dir": str(run_dir),
+                                    "verify": "FAIL", "stages": completed,
+                                    "blocked_on": blocked, "repo": repo_url}
+                    # On a remote runner (macbook·desktop-wsl) this run_dir lives on
+                    # that host, so HQ cannot read the rescope.json just written.
+                    # Carry it INLINE (capped) so HQ restores it to its own run dir
+                    # and auto-splits exactly as for an HQ run. Fail-closed: None
+                    # (no file written / over cap / unreadable) leaves the payload
+                    # unchanged → today's ⛔ at HQ. On an HQ run the field rides too
+                    # but HQ never overwrites its own file, so nothing changes there.
+                    inline_plan = rescope.read_rescope_for_payload(run_dir)
+                    if inline_plan is not None:
+                        park_payload["rescope"] = inline_plan
                     return ExecOutcome(
-                        False, f"blocked on {blocked} — not a defect",
-                        {"branch": branch, "run_dir": str(run_dir),
-                         "verify": "FAIL", "stages": completed,
-                         "blocked_on": blocked, "repo": repo_url})
+                        False, f"blocked on {blocked} — not a defect", park_payload)
                 if stage == "verify" and repo_url and repo is not None:
                     # App screen check (external app repos only): the verify stage
                     # has just written verify.md — capture the app's first screen on
