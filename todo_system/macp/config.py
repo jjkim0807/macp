@@ -102,6 +102,12 @@ class ProjectConfig:
     name: str = ""                     # canonical project id (default: dir basename)
     provides: str = ""                 # the interface/lib this project exposes, if any
     depends_on: list[str] = field(default_factory=list)   # upstream project names consumed
+    # The vault this project's tasks live in — the key `paths.vault_root()` already
+    # reads from a `.macp/config.toml` (`~` allowed). `macp init` (lite mode) sets
+    # it so commands run inside the repo find the vault instead of treating the
+    # repo as one. Appended last and written only when set, so an existing project
+    # file round-trips byte-identical.
+    vault_root: str = ""
 
 
 # ---- read -----------------------------------------------------------------
@@ -149,7 +155,8 @@ def load_project(project_root: Path) -> ProjectConfig | None:
                          account=d.get("account"),
                          name=d.get("name", ""),
                          provides=d.get("provides", ""),
-                         depends_on=list(d.get("depends_on", [])))
+                         depends_on=list(d.get("depends_on", [])),
+                         vault_root=str(d.get("vault_root", "") or ""))
 
 
 def list_profiles() -> list[str]:
@@ -241,6 +248,8 @@ def write_project(project_root: Path | str, cfg: ProjectConfig) -> Path:
         lines.append(f'provides = "{cfg.provides}"')
     if cfg.depends_on:
         lines.append(f'depends_on = {_arr(cfg.depends_on)}')
+    if cfg.vault_root:
+        lines.append(f'vault_root = "{cfg.vault_root}"')
     path = Path(project_root) / PROJECT_DIR / "config.toml"
     _write(path, "\n".join(lines))
     return path
