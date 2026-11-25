@@ -287,8 +287,7 @@ _TICK_STUBS = (
     "reconcile_rescope", "_dispatch_serial_per_checkout", "collect",
     "reconcile_split_parents",
     "reconcile_merged", "reconcile_closed", "reconcile_parents",
-    "reconcile_human_ready", "reconcile_queue", "_advote_bridge_tick",
-    "_beta_sweep_tick",
+    "reconcile_human_ready", "reconcile_queue", "_beta_sweep_tick",
 )
 _LIVE = ("collect", "reconcile_rescope")
 

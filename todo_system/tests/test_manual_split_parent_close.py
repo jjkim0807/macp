@@ -424,7 +424,7 @@ def test_tick_runs_the_sweep_before_reconcile_merged(vault, monkeypatch):
     monkeypatch.setattr(orch, "usage_hold", lambda: None)
     for name in ("collect", "reconcile_closed", "reconcile_queue", "reconcile_parents",
                  "reap_stale", "reconcile_resumes", "reconcile_rescope",
-                 "_advote_bridge_tick", "_beta_sweep_tick"):
+                 "_beta_sweep_tick"):
         monkeypatch.setattr(orch, name, lambda *a, **k: [])
     monkeypatch.setattr(orch, "reconcile_split_parents",
                         lambda: (order.append("split"), ["x"])[1])

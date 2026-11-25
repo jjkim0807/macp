@@ -51,7 +51,7 @@ _STUBBED = ("collect", "reconcile_merged", "reconcile_closed", "reconcile_queue"
             "reconcile_parents", "reap_stale",
             "reconcile_resumes", "reconcile_rescope", "reconcile_split_parents",
             "reconcile_human_ready", "requeue_unstarted",
-            "_advote_bridge_tick", "_beta_sweep_tick")
+            "_beta_sweep_tick")
 
 
 def _tick(orch, task_list, *, now=None, live=()):

@@ -792,7 +792,7 @@ class OrchestratorHookTest(VaultFixture):
             return real()
 
         stubs = ("collect", "reconcile_merged", "reconcile_closed", "reconcile_queue",
-                 "reconcile_parents", "reap_stale", "_advote_bridge_tick")
+                 "reconcile_parents", "reap_stale")
         with contextlib.ExitStack() as st:
             for name in stubs:
                 st.enter_context(mock.patch.object(self.orch, name, return_value=[]))
