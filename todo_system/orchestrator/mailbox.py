@@ -21,6 +21,7 @@ Stdlib-only. `Worker/agents/_state/` is gitignored runtime.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +35,11 @@ from .message import Envelope
 from .stages import GIT_TIMEOUT_RC, _git_stream
 
 DEFAULT_ROOT = "Worker/agents"
+
+# Set to "1" on a host whose vault checkout is only a mailbox relay (a remote
+# runner's clone): a pull that cannot be applied resets it to origin instead of
+# leaving it stuck. Never on HQ, whose live vault holds a person's work.
+CACHE_CLONE_ENV = "MACP_MAILBOX_CACHE_CLONE"
 
 # Every GitMailbox git call gets a wall-clock ceiling. An unbounded pull/push on a
 # wedged remote or a stalled credential helper never returns, and the orchestrator
@@ -344,6 +350,33 @@ class GitMailbox(Mailbox):
         # and the next receive() pulls again.
         if r.returncode != 0:
             self._git("rebase", "--abort")  # leave a clean tree, use local state
+        if os.environ.get(CACHE_CLONE_ENV) == "1" and (r.returncode != 0 or self._unmerged()):
+            self._reset_to_origin()
+
+    def _unmerged(self) -> bool:
+        """Unmerged index entries left behind (e.g. an autostash pop that
+        conflicted after a successful rebase): every later pull then fails with
+        "Exiting because of an unresolved conflict" until someone resolves them."""
+        r = self._git("diff", "--name-only", "--diff-filter=U")
+        return r.returncode == 0 and bool(r.stdout.strip())
+
+    def _reset_to_origin(self) -> None:
+        """CACHE_CLONE_ENV only: this checkout is a disposable relay copy (a remote
+        runner's vault clone), so a pull it cannot apply is resolved by taking
+        origin wholesale. Ignored files — the mailbox cursors under _state/ — are
+        untouched by reset/clean, so nothing is delivered twice. Unpushed local
+        commits (replies HQ never saw) are dropped; HQ's reroute covers that run.
+        2026-11-19: a desktop runner's clone sat in such a conflict for six days,
+        alive but silent, until a human reset it."""
+        self._git("rebase", "--abort")
+        self._git("merge", "--abort")
+        if self._git("fetch", "origin", self.branch).returncode != 0:
+            return
+        self._git("reset", "--hard", f"origin/{self.branch}")
+        self._git("clean", "-fd")
+        self._git("stash", "clear")   # autostash leftovers of the failed pulls
+        print(f"[mailbox] {self.repo_dir}: could not apply origin/{self.branch}; "
+              f"reset the cache clone to it", file=sys.stderr)
 
     def _commit_push(self, path: Path) -> None:
         # Resolve to survive symlinked roots (macOS /var -> /private/var):
