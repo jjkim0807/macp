@@ -52,7 +52,7 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `USAGE_GUARD_*` | pacing thresholds (below) |
 | `ANTHROPIC_ADMIN_KEY` | Anthropic Admin API key for the usage/cost CLI |
 
-Concurrency per repository and across Gradle builds are the profile fields
+The per-repository run cap and the global Gradle-build cap are the profile fields
 `max_parallel_per_repo` (default 2; `1` forces serial) and `max_parallel_gradle_builds`
 (default 0 = no cap).
 

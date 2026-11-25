@@ -21,6 +21,7 @@ related:
 > 엔진에서 삭제됐다. 철회 기록은 `docs/design/agent-backends.md`·`docs/design/state-store.md`에 있다.
 > 그 위에 선 부분(§1.1 ⑨·⑩, §2.3 (e)·(f), §2.4 ⑬~⑮, §2.5, §3.3 원격 업로드 경로, §6.1의 S4와 S6의
 > Gemini 어댑터)은 구현 전에 다시 설계해야 한다.
+> 킬스위치 본보기로 든 `MACP_STAGE_USAGE`·`usage_enabled()`도 2026-11-26 D14로 지워졌다.
 
 > **이 노트의 성격**: 분석·설계 전용. 이 태스크는 코드를 한 줄도 바꾸지 않는다 —
 > `docs/design/run-event-stream.md` 한 파일만 추가한다. 실제 구현은 §6 분할안의 후속 leaf 가,
