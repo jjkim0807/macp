@@ -36,6 +36,7 @@ def test_missing_vault_prints_fix_and_exits_2(capsys):
     assert rc == 2
     assert "cannot resolve the vault root" in err
     assert "MACP_VAULT_ROOT" in err and "vault-template" in err
+    assert "macp init" in err          # lite mode's one-command start
     assert "Traceback" not in err
 
 
