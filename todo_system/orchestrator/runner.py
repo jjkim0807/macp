@@ -1033,6 +1033,33 @@ class StagedExecutor(ClaudeCodeExecutor):
         except Exception as e:      # noqa: BLE001 — a screen check never flips verify
             progress(f"screen check skipped ({type(e).__name__})")
 
+    @staticmethod
+    def _move_off_diverged_remote(repo, branch: str, run_dir: Path,
+                                  progress: ProgressFn) -> str:
+        """The name this run's branch is pushed under from here on.
+
+        `stages.resolve_push_branch` renames the local branch to `<root>-rN` when
+        origin/<branch> is an older lineage this branch does not fast-forward
+        (no force-push, the old remote branch is left alone). Every later use of
+        the name — the next stages' metadata, the checkpoint push, the merge
+        check and the RESULT/FAIL payload's `branch`, which the orchestrator
+        adopts for reconcile_merged and retries — reads the returned value.
+        Never raises: on any surprise the name is kept, as before."""
+        try:
+            res = stages.resolve_push_branch(repo, branch)
+        except Exception as e:  # noqa: BLE001 - the helper never raises; belt
+            progress(f"push-branch check skipped ({type(e).__name__})")
+            return branch
+        if res.get("renamed_from"):
+            progress(f"branch: {res['note']}")
+            try:
+                with (run_dir / "run.log").open("a", encoding="utf-8") as f:
+                    f.write(f"\n=== branch moved ===\n{res['note']}\n")
+            except OSError:
+                pass
+            return res["branch"]
+        return branch
+
     def _superseded_exit(self, payload: dict, *, repo, repo_url, branch: str,
                          run_dir: Path, completed: list[str], progress: ProgressFn,
                          where: str) -> ExecOutcome | None:
@@ -1503,6 +1530,19 @@ class StagedExecutor(ClaudeCodeExecutor):
                 if out is not None:
                     superseded_reason = out.payload[superseded_mod.RESULT_KEY]
                     return out
+                if stage == "report" and repo_url and repo is not None:
+                    # Last look before the stage that pushes and opens the PR:
+                    # origin/<branch> may hold an older run's lineage this branch
+                    # does not continue (mulkko-171), and the pre-push guard will
+                    # refuse it. Move to `<branch>-rN` and put THAT on origin now,
+                    # so the Report agent's `gh pr create` has a pushed head and
+                    # the PR, the RESULT and the merge check all name it.
+                    moved = self._move_off_diverged_remote(repo, branch, run_dir, progress)
+                    if moved != branch:
+                        branch = moved
+                        pre = stages.checkpoint_push(repo, branch)
+                        if pre.get("note"):
+                            progress(f"pre-report push: {pre['note']}")
                 progress(f"stage {stage} …")
                 # Re-touch per stage. This is what justifies a stale cutoff of
                 # 90 minutes rather than one sized to a whole 5-stage pipeline:
@@ -1671,6 +1711,8 @@ class StagedExecutor(ClaudeCodeExecutor):
                                 cancelled = True
                                 progress("checkpoint skipped — cancelled")
                             else:
+                                branch = self._move_off_diverged_remote(
+                                    repo, branch, run_dir, progress)
                                 cp = stages.checkpoint_push(repo, branch)
                             if cp.get("note"):
                                 progress(f"timeout checkpoint: {cp['note']}")
@@ -1763,6 +1805,8 @@ class StagedExecutor(ClaudeCodeExecutor):
                             cancelled = True
                             progress("checkpoint skipped — cancelled")
                         else:
+                            branch = self._move_off_diverged_remote(
+                                repo, branch, run_dir, progress)
                             cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"capacity checkpoint: {cp['note']}")
@@ -1839,6 +1883,11 @@ class StagedExecutor(ClaudeCodeExecutor):
                             if out is not None:
                                 superseded_reason = out.payload[superseded_mod.RESULT_KEY]
                                 return out
+                            # Non-FF against an older run's origin/<branch>
+                            # (Implement rebased onto main): move to a `-rN`
+                            # name so the FF-only checkpoint below can land.
+                            branch = self._move_off_diverged_remote(
+                                repo, branch, run_dir, progress)
                             cp = stages.checkpoint_push(repo, branch)
                         if cp.get("note"):
                             progress(f"implement checkpoint: {cp['note']}")
