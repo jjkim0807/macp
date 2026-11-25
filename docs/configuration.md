@@ -157,8 +157,7 @@ session window and the weekly window before every dispatch:
   the window, new dispatch is held. The tick prints `USAGE-HOLD (weekly 57% ahead of
   pace (44% elapsed + 12pp allowance))`. Running stages are never interrupted.
 - **Hard cap.** Above the cap, dispatch waits for the window to reset.
-- **Slots.** A runner takes up to its `concurrency` while usage is allowed, one at a
-  time while the guard cannot read fresh numbers, and none during a hold.
+- **Slots.** Slack below the line buys extra parallel runs.
 
 | Variable | Default | Meaning |
 |---|---|---|

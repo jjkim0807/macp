@@ -437,12 +437,26 @@ def test_parallel_slots_wide_open_hits_the_ceiling():
     assert ug.parallel_slots(d, 3) == 3
 
 
-def test_parallel_slots_allowed_near_the_line_is_still_the_ceiling():
-    # weekly line = 57.1 + 12 = 69.1; util 66 is ~3pp under it but allowed: the
-    # pace line, the caps and the stage brake stop work, not a per-pp taper.
+def test_parallel_slots_tight_weekly_stays_serial():
+    # weekly line = 57.1 + 12 = 69.1; util 66 -> slack ~3pp < one 5pp step
     d = ug.evaluate(_usage(weekly_util=66.0), NOW)
     assert d["allowed"]
-    assert ug.parallel_slots(d, 3) == 3
+    assert ug.parallel_slots(d, 3) == 1
+
+
+def test_parallel_slots_one_step_of_weekly_slack_earns_two():
+    # slack ~7pp -> 1 + 1 step
+    d = ug.evaluate(_usage(weekly_util=62.0), NOW)
+    assert ug.parallel_slots(d, 3) == 2
+
+
+def test_parallel_slots_hard_cap_bounds_the_line():
+    # Late in the week elapsed + allowance exceeds the hard cap; the cap is the
+    # line, so utilization just under it earns no extra slot.
+    cap = ug._cfg()["weekly_hard_cap"]
+    d = ug.evaluate(_usage(weekly_util=cap - 2.0, weekly_reset_in=3600.0), NOW)
+    assert d["allowed"]
+    assert ug.parallel_slots(d, 3) == 1
 
 
 def test_parallel_slots_blocked_is_zero():
@@ -462,8 +476,14 @@ def test_parallel_slots_ceiling_of_one_is_serial():
     assert ug.parallel_slots(ug.evaluate(_usage(), NOW), 1) == 1
 
 
+def test_parallel_slots_step_env_override(monkeypatch):
+    monkeypatch.setenv("USAGE_GUARD_WEEKLY_PARALLEL_STEP", "100")
+    d = ug.evaluate(_usage(), NOW)
+    assert ug.parallel_slots(d, 3) == 1
+
+
 # ---------------------------------------------------------------------------
-# window_slack — shared headroom formula (planner_mode + account ranking)
+# window_slack — shared headroom formula (parallel_slots + planner_mode)
 # ---------------------------------------------------------------------------
 
 

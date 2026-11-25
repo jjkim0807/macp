@@ -11,8 +11,8 @@ passed (HQ host, PAUSED, usage guard block, daily run budget, queue depth), one
 of two modes:
 
   aggressive  usage decision allowed, fresh (not stale/carried), BOTH session
-              and weekly windows have slack >= a threshold (default 8pp
-              session, 5pp weekly), and the runner has a slot
+              and weekly windows have slack >= a threshold (default: one
+              `*_parallel_step` of usage_guard), and the runner has a slot
               that nothing will fill: queued + in-flight runs < the parallel
               slots the guard grants right now (`capacity`). With capacity 1
               that is the original rule — queue at or below
@@ -34,8 +34,8 @@ Knobs (env, read per call):
     MAESTRO_PLANNER_AGGRESSIVE_MAX_NEW_TASKS              (6)  clamped to depth room
     MAESTRO_PLANNER_AGGRESSIVE_DISCOVERY_INTERVAL_DAYS    (3)  never above normal
     MAESTRO_PLANNER_AGGRESSIVE_MAX_QUEUE                  (0)
-    MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_SESSION  (8)
-    MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_WEEKLY   (5)
+    MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_SESSION  (session_parallel_step)
+    MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_WEEKLY   (weekly_parallel_step)
 
 CLI (planner_tick.sh; always exits 0, any error prints MODE=normal):
     python -m todo_system.orchestrator.planner_mode decide --queue-depth N --depth-limit D
@@ -71,8 +71,6 @@ DEFAULT_BACKOFF_HOURS = 2
 DEFAULT_MAX_NEW_TASKS = 6
 DEFAULT_DISCOVERY_INTERVAL_DAYS = 3.0
 DEFAULT_MAX_QUEUE = 0
-# Slack (pp below the guard's line) a window needs for aggressive mode.
-DEFAULT_MIN_SLACK = {"session": 8.0, "weekly": 5.0}
 
 # A run in these states is consuming (or about to consume) the budget; an
 # awaiting_human / needs_input row is parked and counts as idle.
@@ -105,10 +103,11 @@ def _env_int(env: dict | None, name: str, default: int, *, minimum: int) -> int:
     return v if v >= minimum else default
 
 
-def min_slack(name: str, env: dict | None = None) -> float:
-    """Slack (pp) a window needs for aggressive mode (`DEFAULT_MIN_SLACK`)."""
+def min_slack(name: str, env: dict | None = None, cfg: dict | None = None) -> float:
+    """Slack (pp) a window needs for aggressive mode: one parallel step by default."""
+    cfg = cfg or usage_guard._cfg()
     return _env_float(env, f"MAESTRO_PLANNER_AGGRESSIVE_MIN_SLACK_{name.upper()}",
-                      DEFAULT_MIN_SLACK[name], minimum=0.0)
+                      cfg[f"{name}_parallel_step"], minimum=0.0)
 
 
 def planner_aggressiveness(decision: dict, queue_depth: int, running: int, *,
@@ -145,7 +144,7 @@ def planner_aggressiveness(decision: dict, queue_depth: int, running: int, *,
     if missing:
         return NORMAL, f"no usage data ({', '.join(missing)})"
     for name in ("session", "weekly"):
-        need = min_slack(name, env)
+        need = min_slack(name, env, cfg)
         if slack[name] < need:
             return NORMAL, f"{name} slack {slack[name]:.1f}pp < {need:g}pp"
     max_queue = _env_int(env, "MAESTRO_PLANNER_AGGRESSIVE_MAX_QUEUE",
