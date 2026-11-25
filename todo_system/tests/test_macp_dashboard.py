@@ -621,7 +621,7 @@ class InfoDietShell(unittest.TestCase):
         self.assertIn(".prj .main>div{white-space:nowrap", self.HTML)
 
     def test_status_card_three_counts_and_moved_metrics(self):
-        for label in ("<span>주의</span>", "<span>결정</span>", "<span>진행 중</span>"):
+        for label in ("<span>주의</span>", "<span>결정</span>", "<span>실행 중</span>"):
             self.assertIn(label, self.HTML, label)
         # the 3 action counts stay on the first screen (before 시스템 상세); runs today /
         # usage / slots moved into it (after d-sys).
@@ -1778,7 +1778,7 @@ class GroupFoldShell(unittest.TestCase):
     def test_section_counts_stay_task_based(self):
         # AC: header counts are task counts, not group counts — unchanged by folding.
         self.assertIn("$('cnt-attn').textContent=d.attention.length", self.HTML)
-        self.assertIn("$('cnt-active').textContent=d.active.length", self.HTML)
+        self.assertIn("$('cnt-active').textContent=run.length", self.HTML)
 
     def test_no_external_urls_in_fold_additions(self):
         self.assertNotIn("https://", self.HTML)
@@ -2456,7 +2456,8 @@ def _install_queue_fixture(tc: unittest.TestCase) -> Path:
               "Worker/_state"):
         (tmp / d).mkdir(parents=True)
     (tmp / "Worker/agents/registry.yaml").write_text(
-        "agents:\n  - id: w\n    kind: ai-local\n    projects: ['*']\n", encoding="utf-8")
+        "agents:\n  - id: w\n    kind: ai-local\n    projects: ['*']\n    concurrency: 4\n",
+        encoding="utf-8")
     items = tmp / "Todo" / "items"
 
     def md(slug, extra=""):
@@ -2574,14 +2575,67 @@ class QueueCollectTests(unittest.TestCase):
         for key in ("'queue'", "'queue-upcoming'", "'queue-blocked'"):
             self.assertIn(key, html)
         self.assertIn("'mdash.sec.'+s", html)
-        self.assertIn("fill('queue',q,queueRow,'큐 비어 있음')", html)   # no foldFill
+        self.assertIn("fill('queue',q,queueRow,'대기 중인 task 없음')", html)   # no foldFill
         self.assertNotIn("foldFill('queue'", html)
         self.assertIn('data-open="task:${esca(r.slug)}"', html)
         for w in ("next_tick", "checkout_busy", "gradle_cap", "usage_hold", "paused",
-                  "budget", "cooldown", "capacity"):
+                  "budget", "cooldown", "capacity", "no_slot", "assigned"):
             self.assertIn(w + ":[", html, w)                          # one badge per wait
         self.assertNotIn("https://", html)
         self.assertNotIn("http://", html)
+
+    # -- running / waiting (docs/dashboard-parity.md "Running and waiting") ----
+    def _ledger(self, slug, state, **extra):
+        (self.tmp / f"Worker/assignments/{slug}.json").write_text(json.dumps(
+            {"task_id": slug, "agent_id": "w", "corr_id": "c", "state": state,
+             "payload": {}, **extra}), encoding="utf-8")
+
+    def test_status_splits_running_from_waiting_with_a_reason(self):
+        self._ledger("qa-7-accepted", "accepted")
+        self._ledger("qa-8-assigned", "dispatched", updated_ts="2026-01-05T10:00:00")
+        d = M.collect_status()
+        # running = a worker is executing it: accepted + in_progress, never dispatched
+        self.assertEqual(sorted(r["task"] for r in d["running"]),
+                         ["qa-3-running", "qa-7-accepted"])
+        for r in d["running"]:
+            self.assertIn("agent_is_default", r)
+            self.assertIn("group", r)
+        # waiting = assigned-but-not-started first, then the queue in tick order
+        self.assertEqual([r["slug"] for r in d["waiting"]],
+                         ["qa-8-assigned", "qa-1-first", "qa-2-second"])
+        for r in d["waiting"]:
+            self.assertEqual(list(r), ["slug", "title", "project", "group", "wait",
+                                       "reason", "agent", "since"])
+            self.assertTrue(r["reason"])                  # one line, always
+        assigned, first, second = d["waiting"]
+        self.assertEqual((assigned["wait"], assigned["agent"]), ("assigned", "w"))
+        self.assertIn("`w`", assigned["reason"])
+        # `w` has 4 slots and 3 rows on it: one more goes out, its repo sibling waits
+        self.assertEqual((first["wait"], second["wait"]), ("next_tick", "checkout_busy"))
+        self.assertEqual(first["reason"], d["queue"][0]["wait_text"])
+        # the old keys keep their meaning for a client that predates the split
+        self.assertEqual(sorted(r["task"] for r in d["active"]),
+                         ["qa-3-running", "qa-8-assigned"])
+        self.assertEqual(len(d["queue"]), 2)
+
+    def test_waiting_says_no_slot_when_the_worker_is_full_and_follows_a_hold(self):
+        for i in range(3):                                # qa-3-running + 3 = `w` is full
+            self._ledger(f"qa-9-busy-{i}", "in_progress")
+        d = M.collect_status()
+        self.assertEqual([r["wait"] for r in d["waiting"]], ["no_slot", "no_slot"])
+        self.assertIn("`w` 빈 슬롯 없음 (4/4", d["waiting"][0]["reason"])
+        (self.tmp / "Worker/_state/PAUSED").write_text("", encoding="utf-8")
+        d = M.collect_status()
+        self.assertEqual({r["wait"] for r in d["waiting"]}, {"paused"})
+        self.assertTrue(all("PAUSED" in r["reason"] for r in d["waiting"]))
+
+    def test_web_page_draws_the_two_groups_from_the_new_fields(self):
+        html = M.HTML
+        self.assertIn("const run=d.running||d.active;", html)
+        self.assertIn("const q=d.waiting||d.queue||[]", html)
+        self.assertIn("r.reason||r.wait_text", html)
+        self.assertIn(">실행 중 <span class=\"cnt\" id=\"cnt-active\">", html)
+        self.assertIn("<summary>대기 중 <span class=\"cnt\" id=\"cnt-queue\">", html)
 
     def test_collect_queue_writes_nothing(self):
         def tree():
@@ -2932,8 +2986,14 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # (st.ans / st.amsg / st.adraft), the [data-dec] click line, the answer branch of the
 # keydown/input handlers and the instruction box's focus filter (two new i18n keys);
 # the rest of the page is byte-identical.
-_KO_HTML_SHA256 = "d4446fa82eca4ffaf392dc19c3b745d0df463809dd9f7b44e4e13ab3fab3182e"
-_KO_HTML_LEN = 55364
+# 2026-11-25: +566 bytes = running / waiting (macp-dispatch-only-to-free-slots): the
+# two card titles (진행 중 → 실행 중, 큐 → 대기 중) and the empty line of the second,
+# `const run=d.running||d.active` and its comment feeding the running card,
+# `d.waiting||d.queue` feeding the waiting list, queueRow reading `reason`, two QW
+# badges (assigned, no_slot — two new i18n keys) and `accepted` in the state badge map;
+# the rest of the page is byte-identical.
+_KO_HTML_SHA256 = "c2525f9477e2e530a0ed28133cf2e225356190d4529ca49e0e3c760165da6c46"
+_KO_HTML_LEN = 55930
 _HANGUL = re.compile("[가-힣]")
 
 

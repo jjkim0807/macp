@@ -277,9 +277,14 @@ reply. A run in progress stops at its next stage boundary: no checkpoint push, n
 stage (so no PR and no merge), no delegate publish, no reply. A report stage that was
 already running when the CANCEL arrived cannot be stopped, so its PR may still open.
 
-**Busy remotes stay online.** A remote runner sends `HEARTBEAT {status: busy}` every
-`RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) while it is running something, because a
-single stage can run for an hour without a progress message. Local runners do not.
+**Heartbeats carry slots.** Every runner sends a `HEARTBEAT` with
+`slots: {max, used}` when either number changes (at most once a minute) and at least
+every 300 seconds, idle or busy. The orchestrator assigns only to a free slot (see
+[Concepts — free slots](concepts.md#choosing-resources)), so this message is what brings work to a
+runner. A remote runner also sends `HEARTBEAT {status: busy}` every
+`RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) from a separate thread while it is
+running something, because its serial loop is blocked for the whole run and a single
+stage can run for an hour without a progress message.
 
 With the git mailbox, messages and liveness arrive at the vault sync cadence (a few
 minutes). The 600 s / 900 s defaults leave room for that; do not set either below about

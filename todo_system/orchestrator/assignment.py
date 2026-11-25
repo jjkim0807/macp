@@ -44,6 +44,29 @@ def _field(row, name: str):
 
 RESUMED_SCHEDULED = "resumed-scheduled"
 
+# History type of a row the orchestrator took back from a worker and put in the
+# queue again (Orchestrator._requeue): the assignment was not started in time, or
+# a retry / reroute found no free slot. Wire format (git-tracked ledger JSON).
+REQUEUED = "requeued"
+
+# How long an assignment may wait for its worker to start it. The orchestrator
+# only assigns to a worker with a free slot, so a row still `dispatched` after
+# this long was never started: it is taken back (CANCEL + queue), and a runner
+# that finds an envelope older than this does not start it.
+ASSIGN_TTL_S = 30 * 60.0
+
+
+def is_requeued(row) -> bool:
+    """True for a FAILED row whose last history entry is `requeued`: it is back
+    in the queue, waiting for a free slot. Not a failure — nothing ran."""
+    if _field(row, "state") != FAILED:
+        return False
+    history = _field(row, "history")
+    if not isinstance(history, list) or not history:
+        return False
+    last = history[-1]
+    return isinstance(last, dict) and last.get("type") == REQUEUED
+
 
 def is_resume_pending(row) -> bool:
     """True for a FAILED row that a scheduled resume (resume.py) has just put
@@ -64,11 +87,12 @@ def is_resume_pending(row) -> bool:
 def is_deferred(row) -> bool:
     """True for a ledger row (Assignment or its JSON dict) that is only WAITING:
     stored FAILED but flagged `checkout_busy` or `job_running`, or queued again
-    by a scheduled resume. Only FAILED — a REJECTED row is a real refusal, and
-    the runner never sets these flags on a REJECT."""
+    by a scheduled resume or by the orchestrator taking an unstarted assignment
+    back. Only FAILED — a REJECTED row is a real refusal, and the runner never
+    sets these flags on a REJECT."""
     return (_field(row, "state") == FAILED
             and bool(_field(row, "checkout_busy") or _field(row, "job_running")
-                     or is_resume_pending(row)))
+                     or is_resume_pending(row) or is_requeued(row)))
 
 
 def display_state(row) -> str:

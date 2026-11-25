@@ -21,5 +21,6 @@ agents:
     mailbox: file://Worker/agents
     repo: null            # per task, from the task file's `repo:` field
     wake: claude
-    concurrency: 1        # parallel runs; the usage guard may lower it further
+    concurrency: 1        # slots: tasks are assigned only while one is free; the
+                          # runner announces fewer when usage headroom or memory is short
     capabilities: [general]

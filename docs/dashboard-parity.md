@@ -8,6 +8,82 @@ operator vault keeps its own `docs/dashboard-parity.md`, and for these sections
 that copy points here. The older contracts that code comments cite (the theme
 tokens, the human `why` table, the queue) are still in the vault's copy.
 
+## Running and waiting
+
+A task used to show as "in progress" from the moment the orchestrator pushed it
+into a worker's mailbox, although nothing ran until that worker took it out —
+sometimes days later. The orchestrator now assigns a task only to a worker with
+a free slot, and the page shows two groups: what a worker is executing, and
+what is waiting, with the one line that says why.
+
+### 1. The `running` and `waiting` fields in `/api/status`
+
+Both are top-level lists and **additive**. An older server sends neither; a
+client then falls back to `active` (for running) and `queue` (for waiting), as
+the web page does. `active` and `queue` keep their old meaning.
+
+```json
+"running": [
+  {"task": "demo-3-api", "title": "API", "project": "demo", "group": "demo",
+   "state": "in_progress", "agent": "worker-default", "agent_is_default": true,
+   "age": "12m", "updated": "2026-11-25T17:25:51+09:00"}
+],
+"waiting": [
+  {"slug": "demo-4-ui", "title": "UI", "project": "demo", "group": "demo",
+   "wait": "assigned", "reason": "`worker-default`에 배정됨 — 곧 시작",
+   "agent": "worker-default", "since": "2026-11-25T17:30:02+09:00"},
+  {"slug": "demo-5-docs", "title": "Docs", "project": "demo", "group": "demo",
+   "wait": "no_slot", "reason": "`worker-default` 빈 슬롯 없음 (2/2 사용 중)",
+   "agent": "", "since": "2026-11-24"}
+]
+```
+
+`running` holds the ledger rows whose state is `accepted` or `in_progress`: a
+worker took the task and its stages are executing. A row has the same keys as a
+row of `active` (`task`, `title`, `project`, `group`, `state`, `agent`,
+`agent_is_default`, `age`, `updated`, …). A `dispatched` row is **not** running.
+
+`waiting` holds every task that is not executing yet, in the order it will
+start: first the tasks already assigned to a worker (ledger `dispatched`: handed
+to a free slot, about to start), then the queue in the orchestrator's tick
+order.
+
+| key | type | render as |
+|---|---|---|
+| `slug`, `title`, `project`, `group` | string | The row's label, as in `queue`. |
+| `wait` | string | Do not branch the layout on it. A stable id for a badge: `assigned`, or one of the queue's verdicts (`next_tick`, `no_slot`, `checkout_busy`, `gradle_cap`, `usage_hold`, `paused`, `budget`, `cooldown`, `capacity`). The list can grow, so handle an unknown value like any other. |
+| `reason` | string | One line: why the task is not running yet. Always present. |
+| `agent` | string | The worker an `assigned` row was given to; `""` for a queued row (it goes to whichever worker has room). |
+| `since` | string | When the wait began (ISO date or date-time), or `""`. |
+
+`no_slot` is new: the task's worker has no free slot. The reason names the
+worker and its slots (`used/max`), or says its slot heartbeat stopped.
+
+Every sentence is already in the server's UI language. A client never
+translates or rewords it, and never works out a reason by itself.
+
+### 2. Client rules (web and app alike)
+
+1. Two groups: 「실행 중」 from `running`, 「대기 중」 from `waiting`. The first-screen
+   count is `running.length`.
+2. Draw `waiting` in the order received, with no sorting and no folding by
+   project: the order is the information. Show `reason` under the title.
+3. `queue_upcoming` (start date ahead) and `queue_blocked` (waiting on other
+   tasks) stay as they were, under the waiting group.
+4. Both lists are read-only: no buttons, no request of their own.
+5. At a 390 px width there is no horizontal scroll.
+
+### 3. Where each side lives
+
+- The slot gate and the wait verdicts: `todo_system/orchestrator/orchestrator.py`
+  (`_slot_gate`, `queue_snapshot`).
+- Server wiring: `scripts/macp_dashboard.py`, where `collect_status` builds
+  `running` and calls `collect_waiting` for `waiting`.
+- Web client: `update` reads `d.running` and `d.waiting`; `queueRow` draws a
+  waiting row.
+- Android app: `macp-dashboard-android` renders the same two fields, tracked as
+  a follow-up task.
+
 ## Triage cards
 
 The attention list used to show only a slug and a short note. To find out why a

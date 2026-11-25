@@ -137,7 +137,8 @@ class SerialHoldNoteTest(_LedgerCase):
         super().setUp()
         self.orch = Orchestrator(FileMailbox(self.tmp / "agents"),
                                  Registry([Agent(id="w", kind="ai-local",
-                                                 projects=["*"], repo="~/x")]),
+                                                 projects=["*"], repo="~/x",
+                                                 concurrency=8)]),
                                  self.led, notify=lambda *a, **k: None)
         self.led.save(_row("edge-to-edge-insets-mulkko", A.IN_PROGRESS,
                            payload={"repo": self.REPO}))

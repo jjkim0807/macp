@@ -39,7 +39,9 @@ class QueueSnapshotTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mb = FileMailbox(self.tmp / "agents")
         self.ledger = Ledger(self.tmp / "assignments")
-        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x")])
+        # concurrency: the worker has room, so every wait below is the gate it names
+        self.reg = Registry([Agent(id="w", kind="ai-local", projects=["*"], repo="~/x",
+                                   concurrency=8)])
         self.orch = self._make()
 
     def tearDown(self):
@@ -170,7 +172,21 @@ class QueueSnapshotTest(unittest.TestCase):
         self.assertIsNone(hold_wait({}, paused=False, usage_hold=None, budget_exceeded=False))
         self.assertEqual(sorted(WAIT_RANK), sorted([
             "next_tick", "checkout_busy", "gradle_cap", "usage_hold", "paused",
-            "budget", "cooldown", "capacity"]))
+            "budget", "cooldown", "capacity", "no_slot"]))
+
+    def test_no_slot_names_the_worker_and_its_slots(self):
+        self.reg.get("w").concurrency = 1
+        self._save("beta", A.IN_PROGRESS, {"repo": OTHER})
+        r = self._one([Task("alpha", {"repo": REPO})], "alpha")
+        self.assertEqual(r["wait"], "no_slot")
+        self.assertIn("`w` 빈 슬롯 없음 (1/1", r["wait_text"])
+        self.assertEqual(r["holder"], "")
+
+    def test_checkout_busy_beats_no_slot(self):
+        self.reg.get("w").concurrency = 1
+        self._save("beta", A.IN_PROGRESS, {"repo": REPO})
+        r = self._one([Task("alpha", {"repo": REPO})], "alpha")
+        self.assertEqual((r["wait"], r["holder"]), ("checkout_busy", "beta"))
 
     # -- exclusions / order -----------------------------------------------
     def test_in_flight_parked_done_and_unroutable_are_left_out(self):
