@@ -167,7 +167,7 @@ def read_rescope_for_payload(run_dir, *, max_bytes: int = RESCOPE_MAX_BYTES) -> 
 
 
 def save_remote_rescope(runs_dir, run_id: str, plan, *,
-                        max_bytes: int = RESCOPE_MAX_BYTES) -> "Path | None":
+                        max_bytes: int = RESCOPE_MAX_BYTES) -> Path | None:
     """Persist a split plan a remote runner carried inline to HQ's
     `<runs_dir>/<run_id>/rescope.json`, so the local reconcile path runs exactly as
     for an HQ run. `run_id` is the run-dir basename (what collect() stores as
