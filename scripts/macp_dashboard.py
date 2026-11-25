@@ -97,6 +97,10 @@ AGENT_MODE = _agent_mode.state_path(VAULT / "Worker")
 RELATIONS_DB = VAULT / "Memory" / "relations.sqlite"
 
 ACTIVE = ("dispatched", "in_progress")
+# A worker took the task and its stages are executing — /api/status `running`.
+# `dispatched` is NOT running: the task is assigned to a free slot and about to
+# start, so it is the head of `waiting` (docs/dashboard-parity.md).
+RUNNING = ("accepted", "in_progress")
 # The default runner identity (systemd unit runs `--agent worker-default`). The
 # server decides `active[].agent_is_default` from it so the web/app can drop the
 # noisy "agent …" row line unless a non-default agent is running the task.
@@ -1752,6 +1756,25 @@ def collect_queue(*, db: Path | None = None, assign: Path | None = None,
         return {k: [] for k in QUEUE_KEYS}
 
 
+def collect_waiting(assigned: list[dict], queue: list[dict]) -> list[dict]:
+    """/api/status `waiting` — every task that is not executing yet, each with the
+    one line that says why. First the rows already assigned to a worker (ledger
+    `dispatched`: handed to a free slot, about to start), then the queue in tick
+    order with the orchestrator's own wait verdict. One row shape for both, so a
+    client draws one list and never judges anything."""
+    rows = [{"slug": r["task"], "title": r.get("title") or "",
+             "project": r.get("project") or "", "group": _group_of(r),
+             "wait": "assigned",
+             "reason": i18n.t("dash.waiting.assigned", agent=r.get("agent") or "?"),
+             "agent": r.get("agent") or "", "since": r.get("updated") or ""}
+            for r in assigned]
+    rows += [{"slug": q["slug"], "title": q["title"], "project": q["project"],
+              "group": q["group"], "wait": q["wait"], "reason": q["wait_text"],
+              "agent": "", "since": q["since"]}
+             for q in queue]
+    return rows
+
+
 def _registry_or_none():
     """The agent registry, or None when it cannot be read (triage then skips the
     human-glob lookup instead of failing)."""
@@ -1864,7 +1887,10 @@ def collect_status() -> dict:
     # active/attention, so those objects may end up carrying `group` too; harmless,
     # it is a field addition and no consumer removes or renames anything.
     active = [r for r in a if r["state"] in ACTIVE]
-    for r in active:                               # additive: the server decides whether
+    # The two groups the page shows: `running` (a worker is executing it) and
+    # `waiting` (assigned-but-not-started, then the queue — built below).
+    running_rows = [r for r in a if r["state"] in RUNNING]
+    for r in (*active, *running_rows):             # additive: the server decides whether
         # the runner is the default one, so the client can hide the "agent …" line
         # unless a non-default agent is running the task. (recent shares these dict
         # objects per the note above; the extra bool riding along is harmless.)
@@ -1891,7 +1917,7 @@ def collect_status() -> dict:
     # Additive: an answerable decision row of `human` gains `decision`
     # {question, options}, is urgent and leads the list. Fail-soft per row.
     _attach_decisions(human)
-    for r in (*active, *attention, *human, *human_later):
+    for r in (*active, *running_rows, *attention, *human, *human_later):
         # a decision is never folded into its project group: it is the thing to answer
         r["group"] = "" if "decision" in r else _group_of(r)
 
@@ -1935,6 +1961,7 @@ def collect_status() -> dict:
         budget=budget,
         cap=cap,
     )
+    queue = collect_queue(usage=usage)
 
     return {
         "now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1958,7 +1985,13 @@ def collect_status() -> dict:
         # object is attached HERE (not folded into it): /api/status.account.slots.
         "account": {**collect_account_runtime(collect_account()),
                     "slots": collect_account_slots()},
-        **collect_queue(usage=usage),
+        **queue,
+        # Running / waiting — SoT: docs/dashboard-parity.md "Running and waiting".
+        # Additive: `active` and `queue` above keep their old meaning for a
+        # client that predates the split.
+        "running": running_rows,
+        "waiting": collect_waiting([r for r in a if r["state"] == "dispatched"],
+                                   queue.get("queue") or []),
         # Usage vs results — SoT: todo_system/usage_value.py docstring. Additive:
         # one key, left out when its build fails.
         **collect_usage_value(),
@@ -2280,7 +2313,7 @@ border-radius:8px;padding:10px;font-size:13px;margin-top:6px}
 const $=id=>document.getElementById(id);
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const esca=s=>(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',in_progress:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(s)}</span>`};
+const badge=s=>{const m={done:'b-done',failed:'b-fail',deferred:'b-def',in_progress:'b-run',accepted:'b-run',dispatched:'b-run',awaiting_human:'b-wait'};return `<span class="badge ${m[s]||'b-gray'}">${esc(s)}</span>`};
 function pcolor(s){let h=0;for(const c of(s||''))h=(h*31+c.charCodeAt(0))>>>0;return h%360}
 function copyBtn(id){return `<button class="cp" data-cp="${esca(id)}" title="@@dash.js.copy_id@@ ${esca(id)}">⧉ id</button>`}
 function pchip(p){if(!p)return '';const h=pcolor(p);return `<span class="pchip" style="color:hsl(${h},65%,74%);border-color:hsl(${h},35%,44%)" title="@@dash.js.project@@ ${esca(p)}">${esc(p)}</span>`}
@@ -2399,9 +2432,10 @@ function decClick(btn){
 
 // @@dash.html.queue@@ (docs/dashboard-parity.md "@@dash.html.queue@@"): the server judges `wait`; rows render in the
 // order received (tick order). Existing badge classes only — no new colours.
-const QW={next_tick:['@@dash.js.qw_next_tick@@','b-run'],checkout_busy:['@@dash.js.qw_checkout_busy@@','b-def'],gradle_cap:['@@dash.js.qw_gradle_cap@@','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['@@dash.js.qw_budget@@','b-wait'],cooldown:['@@dash.js.qw_retry@@','b-gray'],capacity:['@@dash.js.qw_retry@@','b-gray']};
+const QW={assigned:['@@dash.js.qw_assigned@@','b-run'],next_tick:['@@dash.js.qw_next_tick@@','b-run'],no_slot:['@@dash.js.qw_no_slot@@','b-def'],checkout_busy:['@@dash.js.qw_checkout_busy@@','b-def'],gradle_cap:['@@dash.js.qw_gradle_cap@@','b-def'],usage_hold:['HOLD','b-wait'],paused:['PAUSED','b-wait'],budget:['@@dash.js.qw_budget@@','b-wait'],cooldown:['@@dash.js.qw_retry@@','b-gray'],capacity:['@@dash.js.qw_retry@@','b-gray']};
 const qwBadge=w=>{const m=QW[w]||[w||'?','b-gray'];return `<span class="badge ${m[1]}">${esc(m[0])}</span>`};
-const queueRow=(r,i)=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(r.wait_text),r.holder&&!(r.wait_text||'').includes(r.holder)?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'@@dash.js.from@@':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`;
+// One row of `waiting` (server-worded `reason`); an older server's `queue` row carries wait_text/holder instead.
+const queueRow=(r,i)=>{const why=r.reason||r.wait_text||'';return `<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div><span class="age mono">${i+1}</span> ${tlabel(r.slug,r.title,r.project)}</div><div class="note">${[esc(why),r.holder&&!why.includes(r.holder)?'← '+esc(r.holder):'',r.since?esc(md(String(r.since).slice(0,16)))+'@@dash.js.from@@':''].filter(Boolean).join(' · ')||'—'}</div></div><div class="rmeta">${qwBadge(r.wait)}</div></div>`};
 const upcomingRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta"><span class="age">${esc(md(r.not_before))}@@dash.js.from@@</span></div></div>`;
 const blockedRow=r=>`<div class="row clk" data-open="task:${esca(r.slug)}"><div class="main"><div>${tlabel(r.slug,r.title,r.project)}</div></div><div class="rmeta qd"><span class="age qdeps">${(r.waiting_on||[]).length?'← '+r.waiting_on.map(esc).join(', '):'@@dash.js.deps_done@@'}</span></div></div>`;
 // Open/closed of the queue <details> survives reloads under the contract keys
@@ -2564,8 +2598,11 @@ function update(d){
   setState(d);
   $('clock').textContent=(d.now||'').split(' ')[1]||d.now||'';
   $('upd').textContent='@@dash.js.last_update@@ '+(d.now||'');
+  // Running = a worker is executing it (accepted/in_progress). `running` is the server's
+  // list; an older server only sends `active` (which also holds assigned-but-unstarted rows).
+  const run=d.running||d.active;
   $('mv-runs').textContent=d.runs_today;
-  $('mv-active').textContent=d.active.length;
+  $('mv-active').textContent=run.length;
   $('mv-queue').textContent=(d.todo&&d.todo.dispatchable)||0;
   $('mv-attn').textContent=d.attention.length;
   const urgent=d.human.filter(r=>r.urgent),rest=d.human.filter(r=>!r.urgent),later=d.human_later||[];
@@ -2612,14 +2649,15 @@ function update(d){
 
   // @@dash.html.in_progress@@: top ACTLIM on the first screen (folded by project), rest behind @@dash.html.more@@.
   // cnt-active stays the full count; foldFill keeps its grouping on the shown slice.
-  $('cnt-active').textContent=d.active.length;
-  const shownA=showAll.active?d.active:d.active.slice(0,ACTLIM);
+  $('cnt-active').textContent=run.length;
+  const shownA=showAll.active?run:run.slice(0,ACTLIM);
   foldFill('active','active',shownA,activeRow,'@@dash.js.no_active@@');
   const abtn=document.querySelector('.more[data-sec="active"]');
-  if(abtn){if(d.active.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'@@dash.js.less@@':`@@dash.html.more@@ (+${d.active.length-ACTLIM})`}else abtn.hidden=true}
+  if(abtn){if(run.length>ACTLIM){abtn.hidden=false;abtn.textContent=showAll.active?'@@dash.js.less@@':`@@dash.html.more@@ (+${run.length-ACTLIM})`}else abtn.hidden=true}
 
-  // @@dash.html.queue@@: server order as-is, no group folding (the order is the information).
-  const q=d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
+  // @@dash.html.queue@@: assigned-but-not-started rows first, then the queue — server order as-is,
+  // no group folding (the order is the information). `waiting` falls back to an older server's `queue`.
+  const q=d.waiting||d.queue||[],qu=d.queue_upcoming||[],qb=d.queue_blocked||[];
   $('cnt-queue').textContent=q.length;
   fill('queue',q,queueRow,'@@dash.js.queue_empty@@');
   $('cnt-queue-upcoming').textContent=qu.length;
