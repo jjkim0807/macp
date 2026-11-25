@@ -3,6 +3,15 @@
 This guide takes you from a fresh clone to a real task that a coding agent finishes
 and turns into a pull request. Part 1 needs no accounts; part 2 does.
 
+> **The short way.** If you only want to see a worker finish one task in a repository
+> of yours, the README's [Try it in five minutes](../README.md#try-it-in-five-minutes)
+> does it with three commands: `macp init`, `macp add "<one sentence>"`,
+> `macp up --once` (after `uv tool install git+https://github.com/jjkim0807/macp`).
+> They make the vault at `~/.macp/vault`, write and validate the task file, and run one
+> pass of the orchestrator and the runner for you. This guide does the same by hand,
+> piece by piece, and is the setup to follow for a separate vault repository and the
+> 24/7 units.
+
 - [Part 1 — the loop, without an agent](#part-1--the-loop-without-an-agent)
 - [Part 2 — a real run on one of your repositories](#part-2--a-real-run-on-one-of-your-repositories)
 - [Where to go next](#where-to-go-next)

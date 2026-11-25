@@ -430,3 +430,31 @@ def test_three_commands_take_a_fresh_repo_to_a_worker_branch(tmp_path):
     assert _git(vault, "status", "--porcelain") == ""
     assert _git(vault, "log", "-1", "--format=%s") in (f"macp add: {slug}",
                                                        "macp up: task state")
+
+
+# --- the same three commands from the installed wheel (`uv tool install` layout) -----
+
+
+def test_wheel_ships_the_vault_template_and_the_add_prompt(installed_wheel):
+    names = set(installed_wheel.names)
+    assert "todo_system/_engine/vault-template/Todo/items/.gitkeep" in names
+    assert "todo_system/_engine/vault-template/CLAUDE.md" in names
+    assert "todo_system/_engine/vault-template/Worker/agents/registry.yaml" in names
+    assert {"todo_system/prompts/lite-add.md", "todo_system/prompts/lite-task-template.md",
+            "todo_system/lite.py"} <= names
+
+
+def test_three_commands_from_the_installed_console_script(installed_wheel, tmp_path):
+    """The wheel's own `macp` (no checkout on sys.path): the vault skeleton comes
+    from site-packages/todo_system/_engine/vault-template."""
+    env, home = _clean_env(tmp_path)
+    del env["PYTHONPATH"]
+    macp = str(installed_wheel.venv / "bin" / "macp")
+    repo = _user_repo(tmp_path / "proj")
+    for args in (["init"], ["add", "Add an install line to the README"], ["up", "--once"]):
+        r = subprocess.run([macp, *args], cwd=repo, env=env, capture_output=True, text=True,
+                           timeout=900)
+        assert r.returncode == 0, f"macp {' '.join(args)}\n{r.stdout}\n{r.stderr}"
+    assert (home / ".macp" / "vault" / "CLAUDE.md").is_file()
+    assert _git(repo, "log", "--format=%s", "main..worker/readme-install-line") == \
+        "chore(worker): readme-install-line — add an install line"
