@@ -62,10 +62,12 @@ routed to you are parked in your inbox, not executed.
    - the usage guard
    - per-repository concurrency
    - the `touches` overlap
-   Then it routes each remaining task through `registry.yaml` and writes an assignment
-   to the ledger.
+   Then it routes each remaining task through `registry.yaml` and, **only when that
+   worker has a free slot**, writes an assignment to the ledger. A task whose worker
+   is full stays in the queue, so `dispatched` means "about to start".
 3. The **runner** receives the `TASK_ASSIGN`, prepares a git worktree, and runs the
-   pipeline. Each stage writes its artifact into `Worker/runs/<run_id>/`.
+   pipeline. It starts what it is given: usage was judged when the task was assigned.
+   Each stage writes its artifact into `Worker/runs/<run_id>/`.
 4. The **report** stage pushes the branch and opens a PR. With `auto_merge: true` it
    also squash-merges the PR once verify has passed. A device check (the post-verify
    screen check, an emulator run) is never a merge condition: one that could not run
@@ -153,6 +155,15 @@ declare `touches` lists that do not overlap. Global caps are
 utilization. It holds new dispatch (`USAGE-HOLD`) when automation runs ahead of the
 elapsed share of the window, and above a hard cap. Slack below the line buys extra
 parallel slots. A single task can pass a pacing hold with `bypass_guard: true`.
+
+**Free slots.** Every runner tells the orchestrator how many runs it can hold right
+now and how many it holds (`slots: {max, used}` in each `HEARTBEAT`). `max` is the
+registry `concurrency`, narrowed by usage headroom and free memory, and 0 while the
+runner drains for a restart. The orchestrator assigns a task only to a worker with
+`max − used > 0`, so nothing waits in a mailbox. A worker that has never announced is
+given its registry `concurrency`; one whose heartbeat stopped (15 minutes) is given
+nothing. An assignment no worker started within 30 minutes is taken back: the
+orchestrator cancels it and puts the task in the queue again, with no failure counted.
 
 **Splitting.** When implement finds a task too big for one stage, the worker parks it
 with a split proposal. `rescope` then writes 2–5 dependent subtasks

@@ -20,6 +20,10 @@ Check these in order:
 6. **Same-repo serialization.** "deferred — checkout … is busy" means another run holds
    the repository. Declare disjoint `touches` lists on both tasks to let them run side
    by side.
+7. **No free slot.** "N task(s) wait in the queue — `worker` 빈 슬롯 없음 (2/2 사용 중)"
+   means the worker is full; the task goes out when a run ends. "슬롯 하트비트 없음"
+   means that runner stopped announcing: check that its process is up
+   (`orchestrator agents`). The dashboard's waiting list shows the same line per task.
 
 `orchestrator trace <slug>` shows what the system currently believes about one task.
 
