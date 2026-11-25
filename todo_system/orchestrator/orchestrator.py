@@ -4069,11 +4069,9 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
 
     budget, cap, gradle_cap = resolve_dispatch_limits()
-    # Route the mailbox + ledger through the configured backend at default args:
-    # in git mode open_state_store(base).mailbox()/.ledger() are byte-identical to
-    # open_mailbox(default uri, base) / Ledger(base/DEFAULT_LEDGER); external mode
-    # hands back the SQLite mailbox/ledger. A non-default --uri/--ledger keeps the
-    # direct construction (and never builds the external store).
+    # At default args open_state_store(base).mailbox()/.ledger() are byte-identical
+    # to open_mailbox(default uri, base) / Ledger(base/DEFAULT_LEDGER). A
+    # non-default --uri/--ledger keeps the direct construction.
     if args.uri == f"git://{DEFAULT_ROOT}" and args.ledger == DEFAULT_LEDGER:
         store = open_state_store(base)
         mailbox = store.mailbox()

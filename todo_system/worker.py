@@ -2209,9 +2209,7 @@ def check_dispatch_silence(now: float | None = None,
         from .orchestrator import tasks as _tasks
         from .orchestrator.state_store import open_state_store
 
-        # Route the ledger read through the configured backend. In git mode (the
-        # default) open_state_store(ROOT).ledger() is Ledger(ROOT/Worker/assignments),
-        # byte-identical to before; external mode reads the SQLite ledger instead.
+        # open_state_store(ROOT).ledger() is Ledger(ROOT/Worker/assignments).
         assignments = list(open_state_store(ROOT).ledger().all())
         parked = {a.task_id for a in assignments if a.state == "awaiting_human"}
         # load_dispatchable() is a TODO-level view: status open + worker_mode auto.
@@ -2308,8 +2306,6 @@ def check_work_starvation(now: float | None = None) -> str | None:
         from .orchestrator.orchestrator import _parse_ts
         from .orchestrator.state_store import open_state_store
 
-        # Route through the configured backend (see check_dispatch_silence): git
-        # mode is byte-identical, external mode reads the SQLite ledger.
         assignments = list(open_state_store(ROOT).ledger().all())
         parked = {a.task_id for a in assignments if a.state == "awaiting_human"}
         runnable = [t for t in _tasks.load_dispatchable() if t.slug not in parked]

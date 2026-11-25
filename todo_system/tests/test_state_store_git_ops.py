@@ -41,8 +41,6 @@ from todo_system.orchestrator.state_store import GitStateStore
 
 @pytest.fixture
 def vault(tmp_path):
-    # tmp_path/"vault" so tmp_path/"state.sqlite" below is a *sibling*, i.e.
-    # OUTSIDE the vault working tree — the whole point of the external backend.
     return tmp_path / "vault"
 
 
