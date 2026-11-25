@@ -353,7 +353,10 @@ def test_save_remote_rescope_rejects_non_dict_empty_id_and_over_cap(tmp_path):
 # runner, whose run_dir was a Mac path HQ could not read, so reconcile could not
 # find the plan and it reached a human. Here the FAIL carries the plan inline.
 
-_REMOTE_RUNS = "/Users/jjkim/macp-worker/second-brain/Worker/runs"
+# A remote runner's absolute run-dir prefix: not this host's runs dir, and its
+# basename is all HQ keeps (collect() stores Path(run_dir).name). Kept neutral —
+# no personal path — so the public-identifier gate stays green.
+_REMOTE_RUNS = "/remote-host/macp-worker/second-brain/Worker/runs"
 _PLAN_PARK_BLOCKED = "task exceeds a single Implement stage — needs re-scoping (plan)"
 
 
