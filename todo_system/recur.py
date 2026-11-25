@@ -9,6 +9,8 @@
 A repeating task is a *series* of ordinary task files, one per round:
 ``<series>.md`` (a first round written without a date) and
 ``<series>-<YYYYMMDD>.md``. Nothing else marks a series — the slug is the key.
+The undated file is a round only while it carries ``recur`` itself, so an
+umbrella task that shares the series' name is left out of it.
 
 When the **newest round** of a series reaches its ``not_before`` (a round
 without one counts as reached), the orchestrator tick writes the next round as
@@ -25,7 +27,8 @@ one line. That is the only moment a round is created:
 
 What moves in the copy: the slug date and ``not_before`` become the new time,
 and the dates in ``due`` and ``scheduled`` move by the same number of days (a
-``HH:MM~HH:MM`` block keeps its clock times, hence its length).
+``HH:MM~HH:MM`` block keeps its clock times, hence its length). What one round
+owns alone does not travel: ``completed`` and the external-tracker link.
 
 The time the next round is counted from is the current round's ``not_before``;
 a round without one falls back to its ``scheduled`` date, then the date in its
@@ -78,6 +81,12 @@ _H2_RE = re.compile(r"^## ", re.M)
 # up for this tick. A slot is only ever taken when a round's `not_before` was
 # hand-edited away from its slug date, so this is a bound, not a tuning knob.
 _MAX_TAKEN_SLOTS = 400
+
+# Frontmatter that belongs to one round and must not ride into its copy: the
+# calendar's stamp of when that round was closed, and its link to an external
+# tracker issue (two task files naming one issue make `tracker pull` update
+# whichever it finds first, and `tracker push` report the same issue twice).
+_ROUND_ONLY_KEYS = ("completed", "external_ref", "external_updated_at")
 
 
 @dataclass(frozen=True)
@@ -208,12 +217,14 @@ def _frontmatter(text: str) -> tuple[list[str], str] | None:
 
 def _value(lines: list[str], key: str) -> str | None:
     """A top-level scalar as the line parsers read it — trimmed, surrounding
-    quotes stripped. None when the key is absent."""
+    quotes stripped, and the last one when the key is written twice. None when
+    the key is absent."""
     prefix = f"{key}:"
+    found = None
     for line in lines:
         if line.startswith(prefix):
-            return line[len(prefix):].strip().strip('"').strip("'")
-    return None
+            found = line[len(prefix):].strip().strip('"').strip("'")
+    return found
 
 
 def _is_list_item(line: str) -> bool:
@@ -221,9 +232,11 @@ def _is_list_item(line: str) -> bool:
 
 
 def _replace(lines: list[str], key: str, rendered: str | None) -> list[str]:
-    """`lines` with the top-level `key:` line (and a block list under it) set
-    to `key: rendered`, appended when the key is absent — or, with `rendered`
-    None, removed."""
+    """`lines` with the top-level `key` set to `rendered`: written where the key
+    first stood (appended when it is absent), and every other line of that key —
+    a block list under it, a second definition further down — dropped, so the
+    readers that take the last definition see this one. `rendered` None removes
+    the key."""
     prefix = f"{key}:"
     out: list[str] = []
     done = False
@@ -231,12 +244,12 @@ def _replace(lines: list[str], key: str, rendered: str | None) -> list[str]:
     while i < len(lines):
         line = lines[i]
         i += 1
-        if done or not line.startswith(prefix):
+        if not line.startswith(prefix):
             out.append(line)
             continue
-        done = True
-        if rendered is not None:
+        if not done and rendered is not None:
             out.append(f"{key}: {rendered}")
+        done = True
         while i < len(lines) and _is_list_item(lines[i]):
             i += 1
     if not done and rendered is not None:
@@ -249,18 +262,16 @@ def _shift_date(lines: list[str], key: str, days: int) -> list[str]:
     the line — quotes, a `HH:MM~HH:MM` block — stays as written, and a value
     without a date (`-`, a bare time block) is left alone."""
     prefix = f"{key}:"
-    out = list(lines)
-    for i, line in enumerate(out):
-        if not line.startswith(prefix):
-            continue
-        m = _DATE_RE.search(line, len(prefix))
+    out: list[str] = []
+    for line in lines:
+        m = _DATE_RE.search(line, len(prefix)) if line.startswith(prefix) else None
         if m:
             try:
                 moved = dt.date.fromisoformat(m.group(0)) + dt.timedelta(days=days)
+                line = line[:m.start()] + moved.isoformat() + line[m.end():]
             except (ValueError, OverflowError):
-                break
-            out[i] = line[:m.start()] + moved.isoformat() + line[m.end():]
-        break
+                pass                # not a real date: leave the line as written
+        out.append(line)
     return out
 
 
@@ -318,8 +329,8 @@ def build_next_round(text: str, *, prev_slug: str, new_slug: str,
     lines = _shift_date(lines, "due", shift)
     lines = _shift_date(lines, "scheduled", shift)
     lines = _replace(lines, "updated", today.isoformat())
-    # `completed:` is the calendar's stamp of when the copied round was closed.
-    lines = _replace(lines, "completed", None)
+    for key in _ROUND_ONLY_KEYS:
+        lines = _replace(lines, key, None)
     if _value(lines, "worker_branch") == f"worker/{prev_slug}":
         lines = _replace(lines, "worker_branch", f'"worker/{new_slug}"')
     log_line = i18n.t("recur.md.created", today=today.isoformat(), prev=prev_slug)
@@ -331,14 +342,25 @@ def build_next_round(text: str, *, prev_slug: str, new_slug: str,
 # ---------------------------------------------------------------------------
 
 
-def _is_open(path: Path) -> bool:
-    """Whether a round is still open. An unreadable file counts as open: the
-    sweep then creates nothing, which is the side that cannot duplicate a round."""
+def _holds_back(path: Path, *, undated: bool) -> bool:
+    """Whether an older round keeps the next one from being written: it is
+    still open.
+
+    The undated `<series>.md` counts only when it carries `recur` itself. A
+    first round does; an umbrella task that merely shares the series' name
+    (`parent:` of the rounds, say) does not, and must not stall the series for
+    as long as it stays open. A dated file is always a round.
+
+    An unreadable file counts as open: the sweep then creates nothing, which is
+    the side that cannot duplicate a round."""
     try:
         parsed = _frontmatter(path.read_text(encoding="utf-8"))
     except OSError:
         return True
-    return not is_closed(_value(parsed[0], "status") if parsed else None)
+    lines = parsed[0] if parsed else []
+    if undated and _value(lines, "recur") is None:
+        return False
+    return not is_closed(_value(lines, "status"))
 
 
 def _next_round(items: Path, series: str, rounds: list[tuple[dt.date, str]],
@@ -358,8 +380,10 @@ def _next_round(items: Path, series: str, rounds: list[tuple[dt.date, str]],
     not_before = _value(lines, "not_before")
     if _nb.is_deferred(not_before, now):
         return None
-    if any(_is_open(items / f"{slug}.md") for _date, slug in rounds[:-1]):
-        return None
+    # Newest first: the round still open is nearly always the one just before.
+    for date, slug in reversed(rounds[:-1]):
+        if _holds_back(items / f"{slug}.md", undated=date == dt.date.min):
+            return None
     anchor = (_nb.parse_not_before(not_before)
               or _midnight(_leading_date(_value(lines, "scheduled")))
               or _midnight(latest_date if latest_date != dt.date.min else None)
@@ -376,10 +400,17 @@ def _next_round(items: Path, series: str, rounds: list[tuple[dt.date, str]],
                                 anchor=anchor, when=when, today=now.date())
     try:
         # "x": a file that appeared since the check above is never overwritten.
-        with open(dest, "x", encoding="utf-8") as fh:
-            fh.write(markdown)
+        fh = open(dest, "x", encoding="utf-8")
     except FileExistsError:
         return None
+    try:
+        with fh:
+            fh.write(markdown)
+    except OSError:
+        # No half-written round (a full disk): it would be imported as a task and
+        # would read as a taken slot. The next tick tries this slot again.
+        dest.unlink(missing_ok=True)
+        raise
     return Created(dest.stem, latest, _nb.display_not_before(when))
 
 

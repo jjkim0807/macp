@@ -290,6 +290,18 @@ def test_a_date_only_scheduled_moves_too():
     assert "\nscheduled: 2026-12-04\n" in _build(text)
 
 
+def test_what_one_round_owns_alone_does_not_travel():
+    # A second file naming the same tracker issue would be updated, and reported
+    # done, in place of the first.
+    text = ("---\nstatus: done\nexternal_ref: jira:PROJ-123\n"
+            "external_updated_at: 2026-11-20T10:00:00Z\n"
+            'completed: "2026-11-27 10:40"\nrecur: weekly\n---\nbody\n')
+    out = _build(text)
+    for key in ("external_ref", "external_updated_at", "completed"):
+        assert f"\n{key}:" not in out
+    assert out.startswith("---\nstatus: open\nrecur: weekly\nnot_before: ")
+
+
 def test_a_worker_branch_of_another_name_is_kept():
     text = '---\nstatus: open\nworker_branch: "worker/custom"\nrecur: weekly\n---\nbody\n'
     assert '\nworker_branch: "worker/custom"\n' in _build(text)
@@ -303,6 +315,23 @@ def test_only_top_level_keys_are_rewritten():
     assert "\n    status: pending\n    due: 2026-11-29\n" in out
 
 
+def test_a_key_written_twice_ends_up_defined_once():
+    # The engine's line parsers take the LAST definition: a copy that rewrote only
+    # the first `status:` would be born `done`.
+    text = ("---\nstatus: open\nrecur: weekly\nstatus: done\n"
+            "due: 2026-11-29\ndue: 2026-11-30\n---\nbody\n")
+    out = _build(text)
+    assert out.count("\nstatus:") == 1
+    assert W.parse_frontmatter(out)[0]["status"] == "open"
+    assert W.parse_frontmatter(out)[0]["due"] == "2026-12-07"
+    assert "\ndue: 2026-12-06\ndue: 2026-12-07\n" in out
+
+
+def test_a_date_that_is_not_one_is_left_as_written():
+    text = "---\nstatus: open\ndue: 2026-13-45\nrecur: weekly\n---\nbody\n"
+    assert "\ndue: 2026-13-45\n" in _build(text)
+
+
 def test_a_file_without_frontmatter_is_refused():
     with pytest.raises(ValueError):
         _build("# no frontmatter\n")
@@ -313,6 +342,7 @@ def test_a_file_without_frontmatter_is_refused():
     '---\nstatus: open\nrecur: "every 3d"\n---\n',
     "---\nrecur: off\nstatus: open\n---\nbody\n",
     "---\nrecur:   daily   \n---\n",
+    "---\nrecur: daily\nstatus: open\nrecur: weekly\n---\n",      # written twice: the last one
 ])
 def test_the_sweep_reads_recur_exactly_as_validate_does(text):
     lines, _body = recur._frontmatter(text)
@@ -410,6 +440,30 @@ def test_the_series_resumes_once_the_open_round_closes(tmp_path):
     assert [c.slug for c in made] == ["weekly-audit-20261211"]
 
 
+def test_an_open_dated_round_holds_back_even_without_recur_of_its_own(tmp_path):
+    # e.g. a round written by hand before the series got `recur`
+    _write(tmp_path, "weekly-audit-20261120", recur_value=None, not_before='"2026-11-20 10:00"')
+    _write(tmp_path, "weekly-audit-20261127")
+    assert recur.generate_due(tmp_path, now=NOW) == []
+
+
+def test_an_open_first_round_without_a_date_holds_the_series_back(tmp_path):
+    first = _write(tmp_path, "weekly-audit", not_before='"2026-11-20 10:00"')
+    _write(tmp_path, "weekly-audit-20261127")
+    assert recur.generate_due(tmp_path, now=NOW) == []
+    first.write_text(first.read_text(encoding="utf-8").replace("status: open", "status: done"),
+                     encoding="utf-8")
+    assert [c.slug for c in recur.generate_due(tmp_path, now=NOW)] == ["weekly-audit-20261204"]
+
+
+def test_an_umbrella_task_named_like_the_series_does_not_hold_it_back(tmp_path):
+    # An open task that only shares the series' name (the rounds' `parent`, say)
+    # carries no `recur`, so it is not a round and must not stall the series.
+    _write(tmp_path, "weekly-audit", recur_value=None, not_before=None, extra="is_parent: true")
+    _write(tmp_path, "weekly-audit-20261127", extra='parent: "[[weekly-audit]]"')
+    assert [c.slug for c in recur.generate_due(tmp_path, now=NOW)] == ["weekly-audit-20261204"]
+
+
 @pytest.mark.parametrize("status", ["done", "cancelled", "canceled"])
 def test_closing_the_newest_round_early_does_not_end_the_series(tmp_path, status):
     _write(tmp_path, "weekly-audit-20261127", status=status)
@@ -490,6 +544,39 @@ def test_one_broken_series_does_not_stop_the_others(tmp_path):
     made = recur.generate_due(tmp_path, now=NOW, warn=warned.append)
     assert [c.slug for c in made] == ["weekly-audit-20261204"]
     assert len(warned) == 1 and warned[0].startswith("broken-series: ")
+
+
+def test_a_failed_write_leaves_no_half_written_round(tmp_path, monkeypatch):
+    _write(tmp_path, "weekly-audit-20261127")
+    dest = tmp_path / "weekly-audit-20261204.md"
+    real_open = open
+
+    class FullDisk:
+        """The real file, whose write fails after a few bytes reached the disk."""
+
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._fh.close()
+            return False
+
+        def write(self, _text):
+            self._fh.write("---\nstatus: op")
+            raise OSError(28, "No space left on device")
+
+    warned = []
+    with monkeypatch.context() as m:
+        m.setattr(recur, "open", lambda *a, **k: FullDisk(real_open(*a, **k)), raising=False)
+        assert recur.generate_due(tmp_path, now=NOW, warn=warned.append) == []
+    assert len(warned) == 1 and "No space left on device" in warned[0]
+    assert not dest.exists()
+    # the slot is free again, so the next tick writes the same round whole
+    assert [c.slug for c in recur.generate_due(tmp_path, now=NOW)] == ["weekly-audit-20261204"]
+    assert dest.read_text(encoding="utf-8").endswith("에서 recur\n")
 
 
 def test_a_missing_directory_is_an_empty_sweep(tmp_path):

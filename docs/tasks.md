@@ -160,7 +160,9 @@ recur: weekly
 
 - **Rounds are files.** A series is `<series>.md` (a first round written without a
   date) plus `<series>-<YYYYMMDD>.md`. The slug is all that ties them together, so do
-  not give an unrelated task the same name with a date on the end.
+  not give an unrelated task the same name with a date on the end. An undated
+  `<series>.md` with no `recur` of its own, such as an umbrella task the rounds name
+  as their `parent`, is not part of the series.
 - **When.** On the first tick after the newest round's `not_before` has passed (at
   once, if it has none) the orchestrator writes the next round. Nothing is written
   while another round of the series is still open; close it and the series picks up
@@ -170,7 +172,8 @@ recur: weekly
   number of days (a `HH:MM~HH:MM` block keeps its times), `status` is `open`, every
   checkbox is cleared and the Progress Log starts over. Everything else is copied as
   written, so edit a round that has not started yet and the rounds after it inherit
-  the change.
+  the change. Prose is not rewritten either: word the title, `outcome` and steps
+  without the round's own date ("this week's report", not "the 2026-11-27 report").
 - **From when.** The next time is counted from this round's `not_before`. Without
   one it is counted from its `scheduled` date, then the date in its slug, then today.
   Periods that went by unnoticed are skipped: you get one round, at the next time
