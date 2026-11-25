@@ -88,6 +88,19 @@ macp up --once                              # 디스패치 → 워커 → 결과
 이 문서들이 말하는 `macp`는 위 설치 줄로 설치한 명령입니다. 개발 체크아웃의 `scripts/macp`
 래퍼는 다른 프로그램(프로젝트/프로필 CLI)입니다.
 
+### 이미 Claude Code를 쓰고 있다면
+
+위 설치 줄로 macp를 설치했다면, 아무 Claude Code 세션 안에서 한 번만 추가합니다:
+
+    /plugin marketplace add jjkim0807/macp
+    /plugin install macp@macp
+
+그다음부터는 모든 세션에서 같은 명령을 슬래시 명령으로 씁니다: `/macp init`,
+`/macp add "<한 문장>"`, `/macp up --once`, `/macp status`. 플러그인에는 자체 코드가
+없습니다. 슬래시 명령은 `macp` 명령을 실행하고 그 출력을 보여 주며, `/macp up`은 세션의
+백그라운드에서 실행됩니다. 이 저장소처럼 다른 `/macp` 명령이 이미 있는 곳에서는
+`/macp:macp`로 부르세요. 자세한 내용은 [plugins/macp](plugins/macp/README.md)에 있습니다.
+
 ## 누구에게 맞는가
 
 여러 저장소에서 코딩 에이전트를 상시로 돌리려는 개인이나 소규모 운영자에게 맞습니다.

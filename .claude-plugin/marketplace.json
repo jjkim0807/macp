@@ -1,0 +1,16 @@
+{
+  "name": "macp",
+  "description": "macp — queue a task in one sentence and let a Claude Code worker finish it on its own branch",
+  "owner": {
+    "name": "The macp authors",
+    "url": "https://github.com/jjkim0807/macp"
+  },
+  "plugins": [
+    {
+      "name": "macp",
+      "source": "./plugins/macp",
+      "description": "Run the macp CLI from any Claude Code session: /macp init, /macp add \"<sentence>\", /macp up --once, /macp status",
+      "category": "development"
+    }
+  ]
+}

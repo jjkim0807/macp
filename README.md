@@ -115,6 +115,20 @@ any of them or the result above changes.
 `macp` from the install line above is the command these docs mean. A development
 checkout's `scripts/macp` wrapper is a different program (the project/profile CLI).
 
+### Already using Claude Code?
+
+With macp installed by the line above, add it to Claude Code once, inside any session:
+
+    /plugin marketplace add jjkim0807/macp
+    /plugin install macp@macp
+
+Then the same commands are slash commands in every session: `/macp init`,
+`/macp add "<one sentence>"`, `/macp up --once`, `/macp status`. The plugin has no code
+of its own: each slash command runs the `macp` command and shows what it prints, and
+`/macp up` runs in the background of the session. Where another `/macp` command
+already exists, as in this repository, type `/macp:macp` instead.
+[plugins/macp](plugins/macp/README.md) has the details.
+
 ## Who it's for
 
 macp fits an individual or a small operator who wants coding agents working on several
