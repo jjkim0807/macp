@@ -10,6 +10,7 @@ into it, for example `status: done` and Progress Log lines.
 - [Worker modes](#worker-modes)
 - [Field reference](#field-reference)
 - [Ordering and gating](#ordering-and-gating)
+- [Repeating tasks](#repeating-tasks)
 - [Writing a good task](#writing-a-good-task)
 - [Rules the parser enforces](#rules-the-parser-enforces)
 
@@ -133,10 +134,53 @@ A task with no `worker_mode` belongs to you.
 | `auto_activate` | `false` opts out of the automatic flip |
 | `human_gate` | `true` means a person must look first, even with every dependency done. It also stops the automatic split of a task that is too big for one stage |
 | `not_before` | earliest start, `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` |
+| `recur` | `daily` · `weekly` · `every Nd` · `weekly <day> HH:MM` · `off`. The task repeats: when a round's `not_before` comes, the next round is written as `<series>-<YYYYMMDD>.md`. See [Repeating tasks](#repeating-tasks) |
 | `parent` | `"[[parent-slug]]"`. When every child is done, the parent closes |
 
 To chain work, write the children as `worker_mode: blocked` with `depends_on` pointing
 at the previous child. Each one starts as soon as its predecessor merges.
+
+## Repeating tasks
+
+Add `recur` to a task and it becomes the first round of a series. It works for a
+worker task and for a task of your own alike.
+
+```yaml
+not_before: "2026-11-27 10:00"
+recur: weekly
+```
+
+| Value | The next round is |
+|---|---|
+| `daily` | one day after this one |
+| `weekly` | seven days after this one |
+| `every Nd` | N days after this one, for example `every 3d` |
+| `weekly <day> HH:MM` | the next `<day>` at that time, for example `weekly fri 09:00` (`mon`…`sun`, the full names and 월…일 all work) |
+| `off` | not written: the series stops here |
+
+- **Rounds are files.** A series is `<series>.md` (a first round written without a
+  date) plus `<series>-<YYYYMMDD>.md`. The slug is all that ties them together, so do
+  not give an unrelated task the same name with a date on the end. An undated
+  `<series>.md` with no `recur` of its own, such as an umbrella task the rounds name
+  as their `parent`, is not part of the series.
+- **When.** On the first tick after the newest round's `not_before` has passed (at
+  once, if it has none) the orchestrator writes the next round. Nothing is written
+  while another round of the series is still open; close it and the series picks up
+  again.
+- **What.** The next round is a copy of the newest one: `not_before` and the date in
+  the slug become the next time, the dates in `due` and `scheduled` move by the same
+  number of days (a `HH:MM~HH:MM` block keeps its times), `status` is `open`, every
+  checkbox is cleared and the Progress Log starts over. Everything else is copied as
+  written, so edit a round that has not started yet and the rounds after it inherit
+  the change. Prose is not rewritten either: word the title, `outcome` and steps
+  without the round's own date ("this week's report", not "the 2026-11-27 report").
+- **From when.** The next time is counted from this round's `not_before`. Without
+  one it is counted from its `scheduled` date, then the date in its slug, then today.
+  Periods that went by unnoticed are skipped: you get one round, at the next time
+  still ahead.
+- **Stopping.** Closing or cancelling a round does not stop the series; the next
+  round still appears when the closed one's time comes. To stop, delete `recur` from
+  the newest round or set `recur: off`.
 
 ## Writing a good task
 
@@ -160,5 +204,8 @@ at the previous child. Each one starts as soon as its predecessor merges.
 - **Tool rules contain no spaces.** `Bash(uv run:*)` matches nothing, because the
   allowlist is split on spaces. Use `Bash(uv:*)`.
 - **Dates are absolute.** "tomorrow" is not parsed.
+- **`recur` takes exactly the values in [Repeating tasks](#repeating-tasks).** Anything
+  else (`monthly`, `weekly fri` without a time) is an error, and the task does not
+  repeat.
 
 `cli validate <slug>` reports all of these before the worker ever sees the file.

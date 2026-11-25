@@ -303,6 +303,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.md.answer": "- {today}: 결정(대시보드): {text}",
         # the next_action an answered decision task is left with
         "triage.md.answer_next": "결정 반영 — {text}",
+        # the one Progress Log line a `recur:` round starts with (recur.py)
+        "recur.md.created": "- {today}: 생성 — {prev}에서 recur",
         # usage vs results (usage_value.py): the dashboard card and the brief table
         "usage_value.title": "사용량 대비 결과",
         "usage_value.basis": (
@@ -634,6 +636,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
         "triage.md.answer": "- {today}: decision (dashboard): {text}",
         "triage.md.answer_next": "Carry out the decision — {text}",
+        "recur.md.created": "- {today}: created — recur from {prev}",
         "usage_value.title": "Usage vs results",
         "usage_value.basis": (
             "Counted from this host's run dirs — remote-runner runs and pruned run dirs are "

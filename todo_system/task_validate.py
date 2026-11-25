@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 from functools import lru_cache
 
+from . import recur as _recur
 from . import worker as _worker
 from .ownership import HUMAN_OVERRIDE_WORKER_MODES
 
@@ -448,6 +449,14 @@ def validate_frontmatter(fm: dict, body: str = "") -> list[Issue]:
                     f"{', '.join(TIERS)}.",
                 )
             )
+
+    # `recur` is read by the orchestrator tick (recur.generate_due), which skips
+    # a value it does not know without a word: the series just never gets its
+    # next round. Judged by the tick's own parser, so the two cannot disagree
+    # about what a value means. Absent and `off` are fine.
+    recur_problem = _recur.recur_error(fm.get("recur"))
+    if recur_problem is not None:
+        issues.append(Issue(ERROR, "recur", recur_problem))
 
     criteria = fm.get("acceptance_criteria")
     if criteria is not None and not isinstance(criteria, list):
