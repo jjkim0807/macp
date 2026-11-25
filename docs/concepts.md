@@ -259,4 +259,5 @@ workers.
 | `.claude/commands/` | interactive skills (`/brief`, `/todo`, …) |
 | `scripts/` | daemons, the dashboard, unit installers and integrations — see [scripts/README.md](../scripts/README.md) |
 | `vault-template/` | the vault skeleton |
+| `.claude-plugin/`, `plugins/macp/` | the Claude Code plugin: `/macp …` runs the `macp` CLI ([plugins/macp](../plugins/macp/README.md)) |
 | `docs/design/` | design notes |
