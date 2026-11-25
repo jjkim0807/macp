@@ -310,7 +310,7 @@ command line; they appear in no run log, no note, no result JSON and no exceptio
 
 ## Notifications and other integrations
 
-KakaoTalk/Slack notifications, an app-beta publishing sweep and an `advote` bridge
+KakaoTalk/Slack notifications and an app-beta publishing sweep
 ship in the tree, but each turns on only when its config file or token exists in the
 vault. With none present they stay silent: no network calls, at most one warning per
 process. [scripts/NOTIFICATIONS.md](../scripts/NOTIFICATIONS.md) lists the exact

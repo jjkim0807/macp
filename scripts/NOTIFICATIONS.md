@@ -1,6 +1,6 @@
 # Author-only integrations are opt-in
 
-Three integrations ship in this tree but are meaningful only on the author's
+Two integrations ship in this tree but are meaningful only on the author's
 home base. Each one is switched on **by the presence of a config file or token
 in the vault** — never by a new config key. On a checkout without those files
 every one is a *silent* no-op: no progress line, no network call, no per-tick
@@ -38,15 +38,3 @@ When that file is missing or its `repos` map is empty, the sweep returns before
 any progress line or state write — a checkout with no apps to publish prints
 nothing each tick. With a non-empty config the sweep runs as before (min-poll,
 HEAD-on-main and already-running gates follow).
-
-## 3. advote bridge
-
-`todo_system.advote_bridge.run_once` bridges advote user suggestions into the
-pipeline. It is gated on:
-
-- `<vault>/.secrets/advote.json` — endpoint + per-tenant admin keys.
-
-Absent, `run_once` returns `None` before any poll, notify, or state write, and
-the orchestrator's `_advote_bridge_tick` returns before even importing the
-module — a bare checkout's tick does no work at all. With the secret present the
-bridge polls and reverse-reports as before.

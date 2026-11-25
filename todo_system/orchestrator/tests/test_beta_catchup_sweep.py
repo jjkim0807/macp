@@ -447,7 +447,7 @@ def _orch(tmp_path):
 
 
 def test_beta_sweep_tick_is_fail_open(tmp_path, monkeypatch):
-    """A sweep-gate error must never break a tick (the _advote_bridge_tick rule)."""
+    """A sweep-gate error must never break a tick (fail-open)."""
     def boom(**_kw):
         raise RuntimeError("state file is garbage")
 

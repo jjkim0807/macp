@@ -123,6 +123,40 @@ class UsageHoldReasonTest(unittest.TestCase):
         self.assertIsNone(M.usage_hold_reason(self._log("some unrelated log line")))
 
 
+class OrchLogTest(unittest.TestCase):
+    """The monitor reads the log the tick's service manager writes. The tick no
+    longer tees a copy into logs/orchestrator.out.log, so on a systemd host that
+    file stops at its last line and must not be the one read."""
+
+    def _logs(self, **files: str) -> Path:
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        for name, line in files.items():
+            (d / f"{name.replace('_', '-')}.out.log").write_text(line + "\n")
+        return d
+
+    def test_systemd_unit_log_wins_over_the_stale_copy(self):
+        d = self._logs(macp_orchestrator=UNHELD_LINE, orchestrator=UNHELD_LINE)
+        self.assertEqual(M.orch_log(d), d / "macp-orchestrator.out.log")
+
+    def test_launchd_log_when_there_is_no_unit_log(self):
+        d = self._logs(orchestrator=UNHELD_LINE)
+        self.assertEqual(M.orch_log(d), d / "orchestrator.out.log")
+
+    def test_scan_readers_follow_the_unit_log(self):
+        # The stale copy ends on a hold; the live unit log has moved on. Both
+        # readers that scan() calls must see the live one.
+        from unittest import mock
+        noop = "candidates=3 dispatched=0 updated=0 reaped=0 reconciled=0"
+        d = self._logs(orchestrator=REAL_HOLD_LINE)
+        (d / "macp-orchestrator.out.log").write_text("\n".join([noop] * 6) + "\n")
+        findings: list = []
+        with mock.patch.object(M, "LOG_DIR", d):
+            self.assertIsNone(M.usage_hold_reason())
+            M.check_orchestrator_noop(findings, {})
+        self.assertEqual([f["fingerprint"] for f in findings], ["orchestrator-noop-dispatch"])
+
+
 class StalePendingDemotionTest(unittest.TestCase):
     """check_stale_pending called directly — never via scan()."""
 

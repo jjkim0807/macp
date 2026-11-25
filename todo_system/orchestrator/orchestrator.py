@@ -3372,30 +3372,6 @@ class Orchestrator:
             pass
         return None
 
-    def _advote_bridge_tick(self) -> None:
-        """Bridge advote user suggestions into the pipeline (promote a ticket + drop
-        a blocked task) and reverse-report macp run state back to advote. Fully
-        self-contained and fail-open: no secrets, network down, or any error is
-        swallowed here so a feedback bridge can never stall a tick. The min-poll
-        interval and the HEAD==main guard live inside run_once. The bridge is an
-        author-only opt-in: with no <vault>/.secrets/advote.json we return before
-        even importing the module, so a bare checkout's tick does no work at all.
-        See todo_system.advote_bridge."""
-        try:
-            # ledger.root is Worker/assignments -> the vault root is two up.
-            vault_root = Path(self.ledger.root).parent.parent
-            if not (vault_root / ".secrets" / "advote.json").exists():
-                return                            # opt-in off → silent, no import per tick
-            from .. import advote_bridge
-            from ..kakao_format import LEVEL_DIGEST
-            advote_bridge.run_once(
-                vault_root=vault_root,
-                notify=lambda msg: self._notify_routed(
-                    msg, None, level=LEVEL_DIGEST, event_key="advote-bridge"),
-            )
-        except Exception as e:
-            print(f"[orchestrator] advote bridge tick skipped (fail-open): {e}")
-
     def _beta_sweep_tick(self) -> None:
         """Start the beta catch-up sweep when it is due — publish a main that the
         merge-time publisher missed (DanceMirror 35cdd60, 2026-09-25).
@@ -3404,8 +3380,8 @@ class Orchestrator:
         DETACHED process, because a sweep contains a gradle build that would
         otherwise freeze dispatch for up to 30 minutes. The min-poll interval,
         the HEAD==main guard and the "already running" check all live inside
-        spawn_sweep_if_due. Fail-open like the advote bridge above — a publisher
-        problem must never stall a tick. See todo_system.orchestrator.beta_publish.
+        spawn_sweep_if_due. Fail-open — a publisher problem must never stall a
+        tick. See todo_system.orchestrator.beta_publish.
         """
         try:
             from . import beta_publish
@@ -3467,7 +3443,7 @@ class Orchestrator:
         ever retuned. `state=FAILED` is in TERMINAL, so reap_stale cannot mistake
         the back-dated timestamp for a stalled run.
 
-        Fail-open like the bridge above: `consume` already swallows per-record and
+        Fail-open like the beta sweep above: `consume` already swallows per-record and
         sweep-level errors, and this wrapper catches whatever is left (the import,
         `ledger.root`) so a reservation file can never stall dispatch.
         """
@@ -4093,11 +4069,9 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
 
     budget, cap, gradle_cap = resolve_dispatch_limits()
-    # Route the mailbox + ledger through the configured backend at default args:
-    # in git mode open_state_store(base).mailbox()/.ledger() are byte-identical to
-    # open_mailbox(default uri, base) / Ledger(base/DEFAULT_LEDGER); external mode
-    # hands back the SQLite mailbox/ledger. A non-default --uri/--ledger keeps the
-    # direct construction (and never builds the external store).
+    # At default args open_state_store(base).mailbox()/.ledger() are byte-identical
+    # to open_mailbox(default uri, base) / Ledger(base/DEFAULT_LEDGER). A
+    # non-default --uri/--ledger keeps the direct construction.
     if args.uri == f"git://{DEFAULT_ROOT}" and args.ledger == DEFAULT_LEDGER:
         store = open_state_store(base)
         mailbox = store.mailbox()

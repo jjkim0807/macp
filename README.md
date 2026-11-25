@@ -123,7 +123,7 @@ personal-scale system, published as-is:
 - Workers execute code on your machine and can push to GitHub. **Read
   [SECURITY.md](SECURITY.md) before the first live run.**
 - Some integrations are shaped around the author's setup: KakaoTalk/Slack
-  notifications, an app-beta publishing sweep, and an `advote` bridge. They stay
+  notifications and an app-beta publishing sweep. They stay
   silent unless their config file exists; see
   [scripts/NOTIFICATIONS.md](scripts/NOTIFICATIONS.md).
 - Parts of the worker prompts (`todo_system/prompts/`), code comments and log messages

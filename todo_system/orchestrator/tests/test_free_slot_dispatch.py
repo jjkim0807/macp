@@ -41,7 +41,7 @@ REMOTE = "desktop-runner"
 _STUBBED = ("reconcile_merged", "reconcile_closed", "reconcile_queue",
             "reconcile_parents", "reconcile_resumes", "reconcile_rescope",
             "reconcile_split_parents", "reconcile_human_ready",
-            "_advote_bridge_tick", "_beta_sweep_tick", "_server_deploy_watch_tick")
+            "_beta_sweep_tick", "_server_deploy_watch_tick")
 
 
 def _ago(seconds: float) -> str:

@@ -2533,10 +2533,8 @@ class Runner:
             if not msg.task_id:
                 return None
             ledger_root, vault_root = self._vault_layout()
-            # Route through the configured backend when no explicit ledger dir was
-            # set: in git mode open_state_store(vault_root).ledger() is
-            # Ledger(vault_root/Worker/assignments) == Ledger(ledger_root), so this
-            # is byte-identical; external mode reads the SQLite ledger instead. An
+            # With no explicit ledger dir, open_state_store(vault_root).ledger() is
+            # Ledger(vault_root/Worker/assignments) == Ledger(ledger_root). An
             # explicit ledger_root keeps the direct Ledger construction.
             if self.ledger_root is None:
                 row = open_state_store(vault_root).ledger().load(msg.task_id)
@@ -3222,9 +3220,8 @@ def _main(argv: list[str] | None = None) -> int:
         if not ok:
             print(f"hq-host guard: {reason}")
             return 3
-    # Route the mailbox through the configured backend at the default URI: git
-    # mode is byte-identical to open_mailbox(default uri, base), external mode
-    # hands back the SQLite mailbox. A non-default --uri keeps open_mailbox.
+    # At the default URI open_state_store(base).mailbox() is byte-identical to
+    # open_mailbox(default uri, base). A non-default --uri keeps open_mailbox.
     if args.uri == f"git://{DEFAULT_ROOT}":
         mailbox = open_state_store(base).mailbox()
     else:

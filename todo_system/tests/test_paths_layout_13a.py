@@ -290,7 +290,6 @@ _MODULE_ROOTS = (
     ("todo_system.session_end", "ROOT"),
     ("todo_system.usage_guard", "ROOT"),
     ("todo_system.task_export", "DEFAULT_VAULT_ROOT"),
-    ("todo_system.advote_bridge", "_VAULT_ROOT"),
 )
 # Source files whose vault anchor used to be the engine (parents[N] / _INSTALL_DIR).
 _ANCHORED_SOURCES = (
@@ -321,7 +320,6 @@ _ANCHORED_SOURCES = (
     # claude_remote_control_watchdog.py and claude_upgrade.py were here until the
     # 2026-10-19 engine split moved both to the vault's ops/ — they are no longer
     # part of this tree, so there is nothing here left to ratchet.
-    "todo_system/advote_bridge.py",
 )
 # Scripts that looked config keys up at the engine instead of the vault.
 _CONFIG_KEY_SOURCES = (
