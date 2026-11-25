@@ -21,6 +21,7 @@ related:
 > 비-Claude 백엔드(Solar 루프·Gemini CLI)는 사용 0회로 엔진에서 삭제됐다. 철회 기록은
 > `docs/design/state-store.md`·`docs/design/agent-backends.md`에 있다. 그 위에 선 부분(§3.7의
 > Solar·Gemini 서술, §4.5 원격 러너 경로, §6.1의 A7 leaf)은 구현 전에 다시 설계해야 한다.
+> 킬스위치 본보기로 든 `stages.usage_enabled()`(`MACP_STAGE_USAGE`)도 2026-11-26 D14로 지워졌다.
 
 > **이 노트의 성격**: 분석·설계 전용. 코드를 한 줄도 바꾸지 않고 `docs/design/inflight-approvals.md` 한 파일만
 > 추가한다. 실제 구현은 §6 분할안의 leaf 가, 설계 머지 뒤 **사람이 게이트를 풀 때** 맡는다. 본문의 `파일:줄`

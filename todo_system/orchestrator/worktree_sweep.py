@@ -15,8 +15,8 @@ its Gradle daemons register under `stages.GRADLE_REGISTRY_DIR / <slug>`.
 worktree is removed only when ALL of these hold, and any rung that cannot be
 answered holds it:
 
-1. idle past the retention window (RETENTION_DAYS_DEFAULT, env
-   RETENTION_ENV): the age is measured from the LATEST of the ledger row's
+1. idle past the retention window (RETENTION_DAYS): the age is measured
+   from the LATEST of the ledger row's
    `updated_ts` and the mtimes of the worktree's git admin files (HEAD, index,
    logs/HEAD). Unparseable timestamp → treated as now; no admin file → hold;
 2. not `locked`;
@@ -64,8 +64,7 @@ from pathlib import Path
 
 from . import disk_guard, stages
 
-RETENTION_DAYS_DEFAULT = 7
-RETENTION_ENV = "MACP_PARKED_WORKTREE_RETENTION_DAYS"
+RETENTION_DAYS = 7
 MAX_ACTIONS = 5            # removals per tick, per kind (worktrees / orphan registries)
 BUDGET_S = 30              # read on loop entry, like worker.STALE_WORKTREE_BUDGET_S
 GIT_TIMEOUT_S = 10
@@ -84,17 +83,6 @@ _monotonic = time.monotonic
 
 class _Unreadable(Exception):
     """The ledger or a job file could not be read; message = the reason."""
-
-
-def _retention_s() -> int:
-    raw = os.environ.get(RETENTION_ENV, "").strip()
-    try:
-        days = int(raw)
-    except ValueError:
-        days = RETENTION_DAYS_DEFAULT
-    if days < 1:
-        days = RETENTION_DAYS_DEFAULT
-    return days * DAY_S
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -341,7 +329,7 @@ def reclaim_parked_worktrees(now: float | None = None) -> list[str]:
         if not root.is_dir():
             return []
         now = time.time() if now is None else now
-        window = _retention_s()
+        window = RETENTION_DAYS * DAY_S
         deadline = _monotonic() + BUDGET_S
 
         # Pass 1, ledger-free: which worktrees / registry dirs are past the

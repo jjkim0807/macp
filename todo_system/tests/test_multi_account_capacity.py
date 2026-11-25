@@ -54,8 +54,7 @@ def env(tmp_path, monkeypatch):
     for name in list(os.environ):
         if name.startswith("USAGE_GUARD_") and name != "USAGE_GUARD_STATE_DIR":
             monkeypatch.delenv(name, raising=False)
-    for name in ("RUNNER_MAX_PARALLEL", "RUNNER_MAX_PARALLEL_PER_ACCOUNT",
-                 "RUNNER_SLOTS_STATE"):
+    for name in ("RUNNER_MAX_PARALLEL", "RUNNER_SLOTS_STATE"):
         monkeypatch.delenv(name, raising=False)
     return SimpleNamespace(tmp=tmp_path, accounts=tmp_path / "accounts")
 

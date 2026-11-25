@@ -79,11 +79,6 @@ from pathlib import Path
 from . import repos
 from .statuses import is_closed
 
-# "0" / "false" / "no" / "off" switches the whole feature off. Read at call time
-# by both the runner's boundary check and the orchestrator's collect() gate.
-KILL_ENV = "MACP_SUPERSEDED_CHECK"
-_OFF = frozenset({"0", "false", "no", "off"})
-
 # Wire format: RESULT_KEY rides the runner's RESULT payload (its value is one of
 # the REASON_* strings); the HISTORY_* strings and the reasons land in the
 # git-tracked assignment JSON. Never re-spell any of them.
@@ -117,11 +112,6 @@ NOT_SUPERSEDED = Verdict(False)
 
 
 # -- pure -------------------------------------------------------------------
-
-def enabled() -> bool:
-    """False when KILL_ENV switches the check off. Read on every call."""
-    return os.environ.get(KILL_ENV, "1").strip().lower() not in _OFF
-
 
 def judge(md_status: object, landed: bool | None) -> Verdict:
     """The verdict from already-collected inputs.
@@ -343,8 +333,6 @@ def check_run(payload: dict | None, *, vault_root: Path | str | None,
     when the runner sets it. Never raises: any failure is NOT_SUPERSEDED.
     """
     try:
-        if not enabled():
-            return NOT_SUPERSEDED
         status = md_closed_status(payload, vault_root)
         if status:
             return judge(status, None)

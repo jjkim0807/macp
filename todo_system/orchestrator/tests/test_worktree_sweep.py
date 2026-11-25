@@ -88,7 +88,6 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ws, "REGISTRY_DIR", e.reg)
     monkeypatch.setattr(ws, "_pgrep_free", lambda p: True)
     monkeypatch.setattr(ws, "_proc_cwds", lambda: [])
-    monkeypatch.delenv(ws.RETENTION_ENV, raising=False)
     return e
 
 
@@ -299,19 +298,6 @@ def test_empty_root_is_silent(env, monkeypatch, tmp_path):
     empty.mkdir()
     monkeypatch.setattr(disk_guard, "WORKER_ROOT", empty)
     assert ws.reclaim_parked_worktrees(now=_past()) == []
-
-
-def test_retention_env_override(env, monkeypatch):
-    wt = env.add("s1")
-    later = time.time() + 2 * DAY
-    monkeypatch.setenv(ws.RETENTION_ENV, "abc")
-    assert ws.reclaim_parked_worktrees(now=later) == []
-    assert wt.is_dir()
-    monkeypatch.setenv(ws.RETENTION_ENV, "0")
-    assert ws.reclaim_parked_worktrees(now=later) == []
-    monkeypatch.setenv(ws.RETENTION_ENV, "1")
-    out = ws.reclaim_parked_worktrees(now=later)
-    assert _done(out, wt) and not wt.exists()
 
 
 def test_per_tick_cap(env):

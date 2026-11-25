@@ -159,18 +159,17 @@ echo "[$NOW_TS] brief.sh: invoking claude -p (max-turns=30)"
 # - Write/Edit: required to write the brief file
 # - Bash(git log:*): for "yesterday → today" diffing
 # Token usage instrumentation (Design B, best-effort — same scheme the stage loop
-# uses). Fresh --session-id per call ONLY when the kill switch is not "0"; after
+# uses). Fresh --session-id per call; after
 # the CLI exits, usage_probe reads that session's usage back (reusing
 # stages.stage_usage, no new parser) into an untracked JSONL (Worker/_state/).
-# The else branch is the pre-instrumentation call byte-for-byte. This script runs
+# Without python3 (no SID) the else branch is the plain call. This script runs
 # under `set -euo pipefail`, whose pre-existing semantic is: a claude crash aborts
 # with claude's rc BEFORE the artifact check below. `if PIPELINE` stops set -e from
 # firing on the pipe so we can read claude's rc from $pipestatus[1] (a trailing
 # `|| true` would reset pipestatus to the rc of `true`), record it best-effort,
 # then reproduce that abort with `exit "$rc"` — so exit codes never change.
 _t0=$(date +%s)
-SID=""
-[[ "${MACP_STAGE_USAGE:-}" != "0" ]] && SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
+SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
 if [[ -n "$SID" ]]; then
   if claude -p "$FULL_PROMPT" \
        --max-turns 30 \

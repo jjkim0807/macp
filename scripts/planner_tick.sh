@@ -344,14 +344,13 @@ WORKER_TIPS_BEFORE="$(_worker_tips)"
 
 # Token usage instrumentation (Design B, best-effort — same scheme the stage loop
 # uses, todo_system/orchestrator/stages.py "Stage token usage"). Attach a fresh
-# --session-id per call ONLY when the kill switch is not "0"; after the CLI exits,
+# --session-id per call; after the CLI exits,
 # read that session's usage back via usage_probe (which reuses stages.stage_usage,
-# no new parser) into an untracked JSONL (Worker/_state/, git-ignored). Kill switch
-# off ⇒ the else branch is the pre-instrumentation call byte-for-byte and no probe
+# no new parser) into an untracked JSONL (Worker/_state/, git-ignored). Without
+# python3 (no SID) the else branch is the plain call and no probe
 # runs. Recording is best-effort (|| true): a token count never fails the tick.
 _t0=$(date +%s)
-SID=""
-[ "${MACP_STAGE_USAGE:-}" != "0" ] && SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
+SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
 if [ -n "$SID" ]; then
   claude -p "$PROMPT" \
     --model "$MODEL" --effort high --max-turns 30 \

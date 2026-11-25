@@ -54,7 +54,6 @@ tools carry no gcloud/ssh/scp); it is a runtime concern bounded by ``cap_s``.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -65,11 +64,8 @@ from . import launch_extras
 from . import lease
 
 # Default per-run node-uptime cap: 20 minutes, in seconds. A task overrides it
-# with the ``screen_check_cap_min`` frontmatter key (minutes); the env seam
-# ``MACP_SCREEN_CHECK_CAP_S`` wins over both and exists only so the unit suite can
-# pin a tiny cap without a frontmatter round-trip.
+# with the ``screen_check_cap_min`` frontmatter key (minutes).
 _DEFAULT_CAP_S = 1200
-_CAP_ENV = "MACP_SCREEN_CHECK_CAP_S"
 # Lock TTL headroom over the cap: the holder is this process for the whole node
 # round-trip, so the TTL is only the backstop for a holder that dies without
 # releasing (the lease's same-host dead-PID reclaim clears it sooner).
@@ -225,18 +221,10 @@ def is_app_repo(repo: Path | str) -> bool:
 def cap_seconds(payload: dict) -> int:
     """The per-run node-uptime cap in seconds.
 
-    Priority: env ``MACP_SCREEN_CHECK_CAP_S`` (test seam) > frontmatter
+    Priority: frontmatter
     ``screen_check_cap_min`` (minutes) > ``_DEFAULT_CAP_S`` (20 min). Mirrors
     ``stages.stage_timeout_for``'s override parsing: a non-positive or
-    unparseable value falls through to the next source rather than raising."""
-    env_raw = os.environ.get(_CAP_ENV)
-    if env_raw is not None:
-        try:
-            s = int(env_raw)
-            if s > 0:
-                return s
-        except (TypeError, ValueError):
-            pass
+    unparseable value falls through to the default rather than raising."""
     raw = (payload or {}).get("screen_check_cap_min")
     if raw is not None:
         try:

@@ -84,7 +84,7 @@ class Profile:
     # builds on a small host). 0 = unlimited (dormant). Until 2026-10-18 the
     # orchestrator read this off the profile with getattr(..., 0) but the field
     # did not exist here, so `max_parallel_gradle_builds = N` in config.toml was
-    # silently ignored and only the MACP_MAX_PARALLEL_GRADLE_BUILDS env worked.
+    # silently ignored.
     # Appended last: the schema test pins existing field order.
     max_parallel_gradle_builds: int = 0
 

@@ -519,7 +519,6 @@ def _safe_tools(stage: str, task_tools: str | None = None, *,
 # have read different text than before — and what the stage loop reads is the
 # one thing this must not change. The session id changes none of it: rc, stdout
 # and stderr came out byte-identical in the same capture.
-USAGE_ENV = "MACP_STAGE_USAGE"
 # A record's keys, in this order. Nothing else from the CLI (prompt, tool
 # output, thinking) is ever copied into stages.json.
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
@@ -529,18 +528,10 @@ USAGE_TOKEN_KEYS = USAGE_KEYS[:4]
 SESSION_ID_FLAG = "--session-id"
 
 
-def usage_enabled() -> bool:
-    """The kill switch: `MACP_STAGE_USAGE=0` in the runner's env turns usage off
-    entirely — no flag, no transcript read, no stages.json write — so argv is
-    byte-for-byte what it was before instrumentation. Read at CALL time, like
-    usage_guard._cfg; only an explicit "0" disables it."""
-    return os.environ.get(USAGE_ENV, "").strip() != "0"
-
-
 def argv_session_id(argv) -> str | None:
-    """The `--session-id` build_stage_argv put in `argv`, or None — kill switch
-    off, or a caller's stub argv. Only a canonical UUID counts, because the value
-    ends up in a filesystem glob."""
+    """The `--session-id` build_stage_argv put in `argv`, or None — a caller's
+    stub argv. Only a canonical UUID counts, because the value ends up in a
+    filesystem glob."""
     try:
         args = list(argv)
         value = str(args[args.index(SESSION_ID_FLAG) + 1])
@@ -676,7 +667,7 @@ PLAYBOOK_STAGES = ("implement", "verify")
 
 def playbook_section(repo: str | None) -> str:
     """`<vault>/Memory/playbooks/<repo>.md` as a prompt section (≤ 2 KB), or ""
-    — no repo, no file, the related-context kill switch. Never raises: the
+    — no repo, no file. Never raises: the
     prompt builder must not acquire a way to fail."""
     try:
         from .. import playbooks
@@ -915,11 +906,10 @@ def build_stage_argv(stage: str, *, task_id: str, run_id: str, run_dir: Path,
         # it; --strict-mcp-config is that flag (why strict: BROWSER_MCP_SERVER_NAME).
         argv += ["--mcp-config", browser_mcp_config(mcp_server, run_id),
                  "--strict-mcp-config"]
-    if usage_enabled():
-        # Names the transcript stage_usage reads the usage back from — fresh per
-        # invocation, so one id is one stage run. Ahead of --allowed-tools, which
-        # is variadic: nothing should depend on where its list ends.
-        argv += [SESSION_ID_FLAG, str(uuid.uuid4())]
+    # Names the transcript stage_usage reads the usage back from — fresh per
+    # invocation, so one id is one stage run. Ahead of --allowed-tools, which
+    # is variadic: nothing should depend on where its list ends.
+    argv += [SESSION_ID_FLAG, str(uuid.uuid4())]
     argv += ["--allowed-tools", *_safe_tools(stage, allowed_tools, browser_mcp=mcp_on)]
     wr = Path(worker_root) if worker_root else paths.worker_root()
     if wr.exists():
@@ -2453,8 +2443,8 @@ def usage_shows_no_api_work(rec: dict | None) -> bool:
     `invalidate_model_cache_if_unavailable`): a green stage that did real API work
     — even one that merely *quotes* a capacity marker, e.g. this file's own
     `_CAPACITY_MARKERS` — carries a real usage dict with token counts and no
-    "unavailable" key, so it returns False and is never mis-deferred. `None` (the
-    `MACP_STAGE_USAGE` kill switch off, or a stub argv), `{"unavailable":
+    "unavailable" key, so it returns False and is never mis-deferred. `None` (a
+    stub argv), `{"unavailable":
     "timeout"}`, a CLI-crash `"...transcript not found"`, and every other
     "unavailable" reason also return False: only the exact "no usage in
     transcript" prefix — a session that ran but logged nothing — counts."""
@@ -2606,7 +2596,7 @@ def record_playbook(repo: str | None) -> str | None:
     and verify read it as of this run's start (`playbook_section`).
 
     Returns the one progress line when the file changed, else None (unchanged,
-    nothing to say, not the HQ host, kill switch). Best-effort like every
+    nothing to say, not the HQ host). Best-effort like every
     `record_*`: a run never fails over a hint."""
     if not repo:
         return None
@@ -2734,7 +2724,7 @@ def stage_usage(argv, *, env: dict | None = None, returncode: int | None = None,
                 duration_ms: int | None = None, timed_out: bool = False) -> dict | None:
     """One stage invocation's stages.json record: the USAGE_KEYS, or
     {"unavailable": "<why>"}. None — record nothing — when `argv` carries no
-    session id (kill switch off, or a stub argv). `duration_ms` is the runner's
+    session id (a stub argv). `duration_ms` is the runner's
     own wall clock for the subprocess."""
     sid = argv_session_id(argv)
     if sid is None:
@@ -2783,8 +2773,8 @@ def record_stage_usage(run_dir: Path, stage: str, argv, *, env: dict | None = No
                        returncode: int | None = None, duration_ms: int | None = None,
                        timed_out: bool = False) -> dict | None:
     """The runner's one call per stage invocation: stage_usage(), then
-    record_usage(). Returns what was recorded — None when nothing was, which is
-    always the case with the kill switch off. Never raises: a reader that does is
+    record_usage(). Returns what was recorded — None when nothing was (a stub
+    argv with no session id). Never raises: a reader that does is
     recorded as unavailable instead, because the stage's outcome must not depend
     on whether its tokens could be counted."""
     try:
@@ -3415,17 +3405,12 @@ def _worker_gradle_opts(repo_dir: Path | str | None = None) -> str:
     `WORKER_GRADLE_OPTS` always leads (and stays a CONTIGUOUS substring, so callers
     that pin it by `assertIn` keep matching). When the run's checkout `repo_dir` is
     known, a per-run `-Dorg.gradle.daemon.registry.base` follows it (AC a — the
-    stage build and `cleanup_build_daemons`' `--stop` then share one registry). The
-    explicit, default-off `WORKER_GRADLE_NO_DAEMON` env flag appends
-    `-Dorg.gradle.daemon=false` so a flaky daemon can't wedge a stage — no
-    auto-detection, the default path is the per-run registry base. With
-    `repo_dir=None` and the flag unset this is byte-identical to `WORKER_GRADLE_OPTS`
+    stage build and `cleanup_build_daemons`' `--stop` then share one registry).
+    With `repo_dir=None` this is byte-identical to `WORKER_GRADLE_OPTS`
     (the cap-1 / pre-this-leaf path, AC6 bit-for-bit)."""
     parts = [WORKER_GRADLE_OPTS]
     if repo_dir is not None:
         parts.append(f"-Dorg.gradle.daemon.registry.base={gradle_registry_base(repo_dir)}")
-    if os.environ.get("WORKER_GRADLE_NO_DAEMON"):
-        parts.append("-Dorg.gradle.daemon=false")
     return " ".join(parts)
 
 

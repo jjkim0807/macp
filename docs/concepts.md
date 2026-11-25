@@ -146,13 +146,13 @@ line, run lessons older than 60 days drop out, and every source passes the same 
 filter as `related.md`. Only the HQ host writes the file. The weekly usage table in the
 brief ends with one line that counts same-cause FAIL repeats per week, which is how to tell
 whether the playbooks earn their keep; `python -m todo_system.playbooks recurrence` prints
-the full table. `MACP_RELATED_CONTEXT=0` turns playbooks off together with `related.md`.
+the full table.
 
 **Isolation and concurrency.** Every run gets its own git worktree on
 `worker/<slug>` — a vault task too, so the vault you work in stays on its default
 branch while it runs ([where a run works](running.md#where-a-run-works)). Two tasks on the same repository run at the same time only when both
-declare `touches` lists that do not overlap. Global caps are
-`MACP_MAX_PARALLEL_PER_REPO` (default 2) and `MACP_MAX_PARALLEL_GRADLE_BUILDS`.
+declare `touches` lists that do not overlap. Global caps are the profile fields
+`max_parallel_per_repo` (default 2) and `max_parallel_gradle_builds`.
 
 **Usage pacing.** The usage guard reads your Claude subscription's 5-hour and weekly
 utilization. It holds new dispatch (`USAGE-HOLD`) when automation runs ahead of the

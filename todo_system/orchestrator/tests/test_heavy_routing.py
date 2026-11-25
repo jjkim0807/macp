@@ -29,8 +29,6 @@ from todo_system.orchestrator import runner as runner_mod
 from todo_system.orchestrator.assignment import Assignment, Ledger
 from todo_system.orchestrator.mailbox import FileMailbox
 from todo_system.orchestrator.orchestrator import (
-    REMOTE_ACCEPT_TIMEOUT_ENV,
-    REMOTE_ONLINE_ENV,
     Orchestrator,
     Task,
     is_heavy,
@@ -95,8 +93,6 @@ class _Base(unittest.TestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for k in (REMOTE_ONLINE_ENV, REMOTE_ACCEPT_TIMEOUT_ENV):
-            os.environ.pop(k, None)
 
     # -- fixtures -------------------------------------------------------------
     def seen(self, agent_id: str, age_s: float | None) -> None:
@@ -226,12 +222,6 @@ class TickRoutingTest(_Base):
         _tick(self.orch, [self.heavy_task()])
         self._assert_default()
 
-    def test_online_threshold_comes_from_env(self):
-        self.seen(REMOTE, 60)
-        os.environ[REMOTE_ONLINE_ENV] = "30"
-        _tick(self.orch, [self.heavy_task()])
-        self._assert_default()
-
     def test_non_heavy_task_routing_is_unchanged(self):
         self.seen(REMOTE, 60)
         (self.clone / "gradlew").unlink()                 # no gradle → not heavy
@@ -332,12 +322,6 @@ class TickRerouteTest(_Base):
         res = _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 601)
         self.assertEqual([a.task_id for a in res["rerouted"]], ["app-build"])
         self.assertEqual(res["dispatched"], [])          # same tick: row is busy
-        self._assert_rerouted(row, "accept-timeout")
-
-    def test_accept_timeout_comes_from_env(self):
-        os.environ[REMOTE_ACCEPT_TIMEOUT_ENV] = "60"
-        row = self._dispatch_remote()
-        _tick(self.orch, [self.heavy_task()], now=dt.datetime.now().timestamp() + 61)
         self._assert_rerouted(row, "accept-timeout")
 
     def test_stale_after_accept_reroutes(self):
@@ -568,9 +552,9 @@ class RunnerCancelTest(unittest.TestCase):
         hb2 = mock.patch("todo_system.worker.runner_heartbeat_clear")
         hb2.start()
         self.addCleanup(hb2.stop)
-        env = mock.patch.dict(os.environ, {"RUNNER_BUSY_HEARTBEAT_S": "3600"})
-        env.start()
-        self.addCleanup(env.stop)
+        beat = mock.patch.object(runner_mod, "BUSY_HEARTBEAT_S", 3600.0)
+        beat.start()
+        self.addCleanup(beat.stop)
 
     def _assign(self) -> m.Envelope:
         msg = m.Envelope(to=REMOTE, type=m.TASK_ASSIGN, task_id="app-build",
@@ -770,9 +754,9 @@ class BusyHeartbeatTest(unittest.TestCase):
             p = mock.patch(target)
             p.start()
             self.addCleanup(p.stop)
-        env = mock.patch.dict(os.environ, {"RUNNER_BUSY_HEARTBEAT_S": "0.05"})
-        env.start()
-        self.addCleanup(env.stop)
+        beat = mock.patch.object(runner_mod, "BUSY_HEARTBEAT_S", 0.05)
+        beat.start()
+        self.addCleanup(beat.stop)
 
     def _beats(self):
         return [r for r in self.mb.receive(m.ORCHESTRATOR)

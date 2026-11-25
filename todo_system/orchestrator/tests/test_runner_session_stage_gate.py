@@ -92,15 +92,11 @@ def test_bounded_by_the_window_reset_and_the_cap():
     assert c2.t - 1_000_000.0 <= runner_mod.STAGE_GATE_MAX_S + 60
 
 
-def test_bypass_guard_and_switch_never_wait(monkeypatch):
+def test_bypass_guard_never_waits():
     c = _Clock()
     gate = _gate_seq(("x", c.t + 3600))
     assert runner_mod._wait_for_session_headroom("verify", {"bypass_guard": True},
                                                  lambda _n: None, gate=gate,
-                                                 sleep=c.sleep, clock=c)
-    assert gate.calls == []
-    monkeypatch.setenv(runner_mod.STAGE_GATE_ENV, "0")
-    assert runner_mod._wait_for_session_headroom("verify", {}, lambda _n: None, gate=gate,
                                                  sleep=c.sleep, clock=c)
     assert gate.calls == []
 

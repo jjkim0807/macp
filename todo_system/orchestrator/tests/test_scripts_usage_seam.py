@@ -1,10 +1,10 @@
 """Shell-seam invariants for scripts/planner_tick.sh (bash, `set -uo pipefail`)
 and scripts/brief.sh (zsh, `set -euo pipefail`).
 
-Each script wraps its `claude -p` call in an if/else seam: kill switch off ⇒ the
-original call byte-for-byte (no `--session-id`, no probe); on ⇒ one fresh
-`--session-id` before `--allowed-tools` + a best-effort usage_probe after. These
-tests pin what must not change — argv parity under the kill switch, `| tail` /
+Each script wraps its `claude -p` call in an if/else seam: one fresh
+`--session-id` before `--allowed-tools` + a best-effort usage_probe after (the
+else branch, taken only without python3, is the plain call). These
+tests pin what must not change — `| tail` /
 `| tee` passing stdout through, per-shell rc capture, and (brief) the pre-existing
 `set -e` crash-abort-before-artifact-check exit code.
 
@@ -78,8 +78,7 @@ MODEL="test-model"
 PROMPT="hello"
 RC=""
 _t0=$(date +%s)
-SID=""
-[ "${MACP_STAGE_USAGE:-}" != "0" ] && SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
+SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
 if [ -n "$SID" ]; then
   claude -p "$PROMPT" \
     --model "$MODEL" --effort high --max-turns 30 \
@@ -106,8 +105,7 @@ set -euo pipefail
 FULL_PROMPT="hello"
 rc=""
 _t0=$(date +%s)
-SID=""
-[[ "${MACP_STAGE_USAGE:-}" != "0" ]] && SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
+SID=$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || true)
 if [[ -n "$SID" ]]; then
   if claude -p "$FULL_PROMPT" \
        --max-turns 30 \
@@ -146,7 +144,7 @@ class _SeamBase(unittest.TestCase):
         fake.write_text(FAKE_CLAUDE, encoding="utf-8")
         fake.chmod(0o755)
 
-    def _run(self, *, shell, seam, switch, rc, shape, stdout, extra_env):
+    def _run(self, *, shell, seam, rc, shape, stdout, extra_env):
         argv_out = self.tmp / f"argv_{uuid.uuid4().hex}.json"
         env = dict(os.environ)
         env.update(
@@ -158,9 +156,6 @@ class _SeamBase(unittest.TestCase):
             FAKE_CLAUDE_TRANSCRIPT=shape,
             FAKE_CLAUDE_STDOUT=stdout,
         )
-        env.pop("MACP_STAGE_USAGE", None)
-        if switch is not None:
-            env["MACP_STAGE_USAGE"] = switch
         env.update(extra_env)
         result = subprocess.run([shell, "-c", seam], cwd=str(ROOT), env=env,
                                 capture_output=True, text=True)
@@ -188,39 +183,29 @@ class PlannerSeamTest(_SeamBase):
         super().setUp()
         self.dest = self.tmp / "state" / "planner_usage.jsonl"
 
-    def _planner(self, *, switch, rc=0, shape="success", stdout="ok\n"):
-        return self._run(shell="bash", seam=PLANNER_SEAM, switch=switch, rc=rc,
+    def _planner(self, *, rc=0, shape="success", stdout="ok\n"):
+        return self._run(shell="bash", seam=PLANNER_SEAM, rc=rc,
                          shape=shape, stdout=stdout, extra_env={"DEST": str(self.dest)})
 
-    def test_kill_switch_off_argv_has_no_session_id_and_no_probe(self):
-        result, argv = self._planner(switch="0")
-        self.assertNotIn("--session-id", argv)
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("POST_SEAM_REACHED", result.stderr)
-        self.assertFalse(self.dest.exists())
-
-    def test_kill_switch_on_inserts_one_canonical_uuid_before_allowed_tools(self):
-        result_on, argv_on = self._planner(switch=None)
+    def test_inserts_one_canonical_uuid_before_allowed_tools(self):
+        result_on, argv_on = self._planner()
         self.assertEqual(argv_on.count("--session-id"), 1)
         i = argv_on.index("--session-id")
         self.assertEqual(str(uuid.UUID(argv_on[i + 1])), argv_on[i + 1])
         self.assertEqual(argv_on[i + 2], "--allowed-tools")
-        _, argv_off = self._planner(switch="0")
-        # taking the pair back out reproduces the switched-off argv exactly
-        self.assertEqual(argv_on[:i] + argv_on[i + 2:], argv_off)
 
     def test_tail_passes_claude_stdout_through_byte_for_byte(self):
         payload = "line one\nline two\nnot valid json {oops\n"
-        result, _ = self._planner(switch=None, stdout=payload)
+        result, _ = self._planner(stdout=payload)
         self.assertEqual(result.stdout, payload)
 
     def test_pipestatus_captures_claude_rc_and_planner_does_not_abort(self):
-        result, _ = self._planner(switch=None, rc=7)
+        result, _ = self._planner(rc=7)
         self.assertEqual(self._rc(result), "7")             # claude's rc, not tail's 0
         self.assertIn("POST_SEAM_REACHED", result.stderr)   # no set -e: continues
 
     def test_success_records_usage_from_the_transcript(self):
-        result, argv = self._planner(switch=None, shape="success")
+        result, argv = self._planner(shape="success")
         sid = argv[argv.index("--session-id") + 1]
         rows = self._rows(self.dest)
         self.assertEqual(len(rows), 1)
@@ -229,20 +214,20 @@ class PlannerSeamTest(_SeamBase):
         self.assertEqual(rows[0]["input_tokens"], 3)
 
     def test_error_max_turns_records_multi_turn_usage(self):
-        self._planner(switch=None, rc=1, shape="max_turns")
+        self._planner(rc=1, shape="max_turns")
         rows = self._rows(self.dest)
         self.assertEqual(len(rows), 1)
         self.assertNotIn("unavailable", rows[0])
         self.assertEqual(rows[0]["num_turns"], 2)
 
     def test_non_json_stdout_still_records_from_transcript(self):
-        self._planner(switch=None, shape="success", stdout="prose, definitely not json\n")
+        self._planner(shape="success", stdout="prose, definitely not json\n")
         rows = self._rows(self.dest)
         self.assertEqual(len(rows), 1)
         self.assertNotIn("unavailable", rows[0])
 
     def test_cli_crash_records_unavailable(self):
-        self._planner(switch=None, rc=2, shape="none")
+        self._planner(rc=2, shape="none")
         rows = self._rows(self.dest)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["unavailable"], "cli crash (rc=2): transcript not found")
@@ -257,35 +242,26 @@ class BriefSeamTest(_SeamBase):
         self.logdir.mkdir()
         self.brief_dest = self.vaultdir / "Worker" / "_state" / "brief_usage.jsonl"
 
-    def _brief(self, *, switch, rc=0, shape="success", stdout="ok\n"):
-        return self._run(shell="zsh", seam=BRIEF_SEAM, switch=switch, rc=rc,
+    def _brief(self, *, rc=0, shape="success", stdout="ok\n"):
+        return self._run(shell="zsh", seam=BRIEF_SEAM, rc=rc,
                          shape=shape, stdout=stdout,
                          extra_env={"VAULT_DIR": str(self.vaultdir),
                                     "LOG_DIR": str(self.logdir)})
 
-    def test_kill_switch_off_argv_has_no_session_id_and_no_probe(self):
-        result, argv = self._brief(switch="0")
-        self.assertNotIn("--session-id", argv)
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("POST_SEAM_REACHED", result.stderr)
-        self.assertFalse(self.brief_dest.exists())
-
-    def test_kill_switch_on_inserts_one_uuid_before_allowed_tools(self):
-        result_on, argv_on = self._brief(switch=None)
+    def test_inserts_one_uuid_before_allowed_tools(self):
+        result_on, argv_on = self._brief()
         self.assertEqual(argv_on.count("--session-id"), 1)
         i = argv_on.index("--session-id")
         self.assertEqual(str(uuid.UUID(argv_on[i + 1])), argv_on[i + 1])
         self.assertEqual(argv_on[i + 2], "--allowed-tools")
-        _, argv_off = self._brief(switch="0")
-        self.assertEqual(argv_on[:i] + argv_on[i + 2:], argv_off)
 
     def test_tee_passes_claude_stdout_through(self):
         payload = "alpha\nbeta\n"
-        result, _ = self._brief(switch=None, stdout=payload)
+        result, _ = self._brief(stdout=payload)
         self.assertEqual(result.stdout, payload)
 
     def test_success_continues_past_seam_and_records(self):
-        result, _ = self._brief(switch=None, rc=0, shape="success")
+        result, _ = self._brief(rc=0, shape="success")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self._rc(result), "0")
         self.assertIn("POST_SEAM_REACHED", result.stderr)
@@ -296,7 +272,7 @@ class BriefSeamTest(_SeamBase):
     def test_crash_aborts_with_claude_rc_before_artifact_check(self):
         # The buggy `| tee … || true; rc=$pipestatus[1]` would read `true`'s 0,
         # skip the exit, and reach POST_SEAM. Correct capture makes zsh exit 7.
-        result, _ = self._brief(switch=None, rc=7, shape="none", stdout="boom\n")
+        result, _ = self._brief(rc=7, shape="none", stdout="boom\n")
         self.assertEqual(result.returncode, 7)
         self.assertNotIn("POST_SEAM_REACHED", result.stderr)
         rows = self._rows(self.brief_dest)          # still recorded — best-effort
@@ -310,7 +286,6 @@ class ScriptWiringStructureTest(unittest.TestCase):
 
     def test_planner_tick_is_wired_to_the_seam(self):
         t = PLANNER.read_text(encoding="utf-8")
-        self.assertIn("MACP_STAGE_USAGE", t)
         self.assertIn('--session-id "$SID"', t)
         self.assertIn("${PIPESTATUS[0]}", t)
         self.assertIn("usage_probe record", t)
@@ -320,7 +295,6 @@ class ScriptWiringStructureTest(unittest.TestCase):
 
     def test_brief_is_wired_to_the_seam(self):
         t = BRIEF.read_text(encoding="utf-8")
-        self.assertIn("MACP_STAGE_USAGE", t)
         self.assertIn('--session-id "$SID"', t)
         self.assertIn("$pipestatus[1]", t)
         self.assertIn("usage_probe record", t)

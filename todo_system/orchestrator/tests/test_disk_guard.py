@@ -125,13 +125,9 @@ class FakeRun:
 
 
 class _GuardCase(unittest.TestCase):
-    """A tmp worker root, ledger and jobs dir, with the kill switch lifted."""
+    """A tmp worker root, ledger and jobs dir."""
 
     def setUp(self):
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop(dg.KILL_ENV, None)   # the conftest set it to "0"
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.root = self.tmp / "Worker"
@@ -207,7 +203,6 @@ class ThresholdTest(_GuardCase):
         self.assertEqual(dg.MIN_FREE_BYTES, 3 * 1024 ** 3)
         self.assertEqual(dg.TARGET_FREE_BYTES, 5 * 1024 ** 3)
         self.assertLess(dg.MIN_FREE_BYTES, dg.TARGET_FREE_BYTES)   # the hysteresis gap
-        self.assertEqual(dg.KILL_ENV, "MACP_DISK_GUARD")
 
 
 class IdleClassificationTest(_GuardCase):
@@ -437,25 +432,6 @@ class FailuresAreSkipsTest(_GuardCase):
 
 
 class NeverRaisesTest(_GuardCase):
-    def test_kill_switch_skips_even_the_measurement(self):
-        # (h)
-        self.clone("idle")
-        for value in ("0", " 0 "):
-            os.environ[dg.KILL_ENV] = value
-            disk = mock.Mock(side_effect=AssertionError("measured"))
-            run = FakeRun(FakeDisk(1 * G))
-            res = self.guard(disk, run)
-            self.assertTrue(res["disabled"])
-            self.assertFalse(res["triggered"])
-            disk.assert_not_called()
-            self.assertEqual(run.calls, [])
-        self.assertEqual(self.lines, [])
-
-    def test_only_an_explicit_zero_disables(self):
-        for value in ("", "1", "no", "false"):
-            os.environ[dg.KILL_ENV] = value
-            self.assertTrue(dg.enabled(), value)
-
     def test_unreadable_disk_is_one_line_and_no_clean(self):
         # (i) a disk_usage error
         self.clone("idle")
@@ -630,11 +606,7 @@ class ImportWeightTest(unittest.TestCase):
 class SuiteIsolationTest(unittest.TestCase):
     """(n) todo_system/conftest.py's `_disk_guard_isolated` is live. Without it,
     any _execute test on a host below the trigger would walk the real ~/Worker
-    (the HQ host had 2.2G free the day this was written). No env pop here."""
-
-    def test_the_kill_switch_is_set_for_every_test(self):
-        self.assertEqual(os.environ.get(dg.KILL_ENV), "0")
-        self.assertFalse(dg.enabled())
+    (the HQ host had 2.2G free the day this was written)."""
 
     def test_every_path_seam_points_into_a_tmp_dir(self):
         real = {"WORKER_ROOT": paths.worker_root(),
@@ -646,11 +618,10 @@ class SuiteIsolationTest(unittest.TestCase):
             self.assertIn("disk-guard", str(value), attr)
 
     def test_an_uninjected_call_does_nothing_at_all(self):
-        disk = mock.Mock(side_effect=AssertionError("measured"))
         lines: list[str] = []
-        res = dg.ensure_free_space(progress=lines.append, disk_usage=disk)
-        self.assertTrue(res["disabled"])
-        disk.assert_not_called()
+        res = dg.ensure_free_space(progress=lines.append,
+                                   run=mock.Mock(side_effect=AssertionError("ran")))
+        self.assertFalse(res["triggered"])
         self.assertEqual(lines, [])
 
 

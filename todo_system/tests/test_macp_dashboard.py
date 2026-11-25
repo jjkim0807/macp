@@ -2907,8 +2907,8 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
             srv.serve_forever = fake_forever
             return srv
 
-        env = {"MACP_DASHBOARD_STATUS_REFRESH_S": refresh}
-        with mock.patch.dict(os.environ, env), \
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(M, "STATUS_REFRESH_S", float(refresh)), \
                 mock.patch.object(M, "serve", side_effect=fake_serve), \
                 mock.patch.object(M.os, "chdir"), \
                 mock.patch.object(M, "collect_status", return_value={"ok": True}), \
@@ -2940,14 +2940,6 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
         self.assertIn("r.status===401", t)
         self.assertNotIn("catch(e){const hs=$('hstate')", t)
         self.assertIn("tick();setInterval(tick,3000);", t)
-
-    def test_status_refresh_env_parsing(self):
-        with mock.patch.dict(os.environ, {}):
-            os.environ.pop("MACP_DASHBOARD_STATUS_REFRESH_S", None)
-            self.assertEqual(M._status_refresh_s(), 5.0)
-        for raw, want in (("", 5.0), ("abc", 5.0), ("2.5", 2.5), ("0", 0.0)):
-            with mock.patch.dict(os.environ, {"MACP_DASHBOARD_STATUS_REFRESH_S": raw}):
-                self.assertEqual(M._status_refresh_s(), want, raw)
 
 
 # ---- UI language (macp-ui-language-2-dashboard) -----------------------------

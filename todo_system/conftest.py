@@ -73,10 +73,10 @@ The ~/Worker clones — ``StagedExecutor._execute`` calls the run-start disk gua
 (``orchestrator/disk_guard.py``) on every run, and below its 3 GiB trigger the
 guard runs git probes and ``./gradlew clean`` in the clones under ~/Worker. That
 is not hypothetical: the HQ host had 2.2–2.6G free on 2026-09-19, so every
-unisolated ``_execute`` test would have fired it. ``_disk_guard_isolated`` sets
-the guard's kill switch (``MACP_DISK_GUARD=0``) and points ``WORKER_ROOT``,
+unisolated ``_execute`` test would have fired it. ``_disk_guard_isolated`` gives
+the guard a healthy disk (``_disk_usage``) and points ``WORKER_ROOT``,
 ``ASSIGNMENTS_DIR`` and ``JOBS_DIR`` into a tmp dir for every test. The guard's own
-tests lift the switch and inject a fake for every seam; the tmp paths stay behind
+tests inject a fake for every seam; the tmp paths stay behind
 them as a second belt, so a forgotten seam finds an empty worker root, not a clone.
 The parked-worktree sweep (``orchestrator/worktree_sweep.py``, reached by every
 scan_queue and runner test) reads those same three seams plus its own
@@ -88,10 +88,10 @@ The maintenance cache prune (``todo_system/maintenance_disk.py``) is a step of
 it runs ``uv cache prune`` and deletes old Gradle caches under the real
 ``~/.gradle`` — and the HQ host had 6.4G free the day it was written, so every
 unisolated ``cmd_maintenance`` test would have fired it. ``_disk_prune_isolated``
-sets its kill switch (``MACP_DISK_PRUNE=0``) and points ``HOME_DIR``,
+gives it a healthy disk (``_disk_usage``) and points ``HOME_DIR``,
 ``GRADLE_HOME_DIR``, ``STATE_DIR``, ``VAULT_ROOT`` and ``PROC_DIR`` into a tmp
-dir that is never created. The module's own tests lift the switch and build a
-fake home there.
+dir that is never created. The module's own tests inject their own disk and
+build a fake home there.
 
 The maintenance vault embedding (``todo_system/maintenance_embed.py``) is the
 other new step of ``worker.cmd_maintenance``, and a worse offender than the
@@ -99,10 +99,10 @@ prune: it has no threshold to sit behind. Every unisolated ``cmd_maintenance``
 test would walk the REAL vault's ~4,000-doc corpus and write vectors into the
 real ``Memory/relations.sqlite`` (or, under the gate command's
 ``MACP_VAULT_ROOT=vault-template``, into the template's).
-``_embed_tick_isolated`` sets its kill switch (``MACP_EMBED_TICK=0``) and points
+``_embed_tick_isolated`` stubs ``embed_tick`` out and points
 ``VAULT_ROOT``, ``DB_PATH`` and ``STATE_DIR`` into a tmp dir that is never
 created, so a forgotten seam finds an empty vault rather than the live one. The
-module's own tests lift the switch and build a tmp vault there.
+module's own tests restore the real step and build a tmp vault there.
 
 The repo playbooks (``todo_system/playbooks.py``) — every external-repo
 ``StagedExecutor._execute`` rebuilds ``Memory/playbooks/<repo>.md`` under the vault
@@ -543,13 +543,16 @@ def _runtime_paths_isolated(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(mailbox.Mailbox, "__init__", _redirected_init)
 
 
+_AMPLE_DISK = types.SimpleNamespace(total=2 ** 50, used=0, free=2 ** 50)
+
+
 @pytest.fixture(autouse=True)
 def _disk_guard_isolated(tmp_path_factory, monkeypatch):
-    # Switched off AND pointed at a tmp dir (see the module docstring). The dirs
-    # are never created: a guard test that forgets a seam then measures /tmp and
-    # finds no clones to walk, instead of walking the real ~/Worker.
+    # A healthy disk AND a tmp dir (see the module docstring). The dirs are never
+    # created: a guard test that forgets a seam finds no clones to walk, instead
+    # of walking the real ~/Worker.
     base = tmp_path_factory.mktemp("disk-guard")
-    monkeypatch.setenv(disk_guard.KILL_ENV, "0")
+    monkeypatch.setattr(disk_guard, "_disk_usage", lambda _p: _AMPLE_DISK)
     monkeypatch.setattr(disk_guard, "WORKER_ROOT", base / "Worker")
     monkeypatch.setattr(disk_guard, "ASSIGNMENTS_DIR", base / "assignments")
     monkeypatch.setattr(disk_guard, "JOBS_DIR", base / "jobs")
@@ -558,10 +561,10 @@ def _disk_guard_isolated(tmp_path_factory, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _disk_prune_isolated(tmp_path_factory, monkeypatch):
-    # Switched off AND pointed at a tmp dir (see the module docstring). The dirs
-    # are never created, so a prune test that forgets a seam finds no caches.
+    # A healthy disk AND a tmp dir (see the module docstring). The dirs are never
+    # created, so a prune test that forgets a seam finds no caches.
     base = tmp_path_factory.mktemp("disk-prune")
-    monkeypatch.setenv(maintenance_disk.KILL_ENV, "0")
+    monkeypatch.setattr(maintenance_disk, "_disk_usage", lambda _p: _AMPLE_DISK)
     monkeypatch.setenv(maintenance_disk.STATE_DIR_ENV, str(base / "state"))
     monkeypatch.setattr(maintenance_disk, "HOME_DIR", base / "home")
     monkeypatch.setattr(maintenance_disk, "GRADLE_HOME_DIR", base / "home" / ".gradle")
@@ -584,10 +587,10 @@ def _ops_alerts_isolated(tmp_path_factory, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _embed_tick_isolated(tmp_path_factory, monkeypatch):
-    # Switched off AND pointed at a tmp dir (see the module docstring). The dirs
+    # Stubbed out AND pointed at a tmp dir (see the module docstring). The dirs
     # are never created, so an embed test that forgets a seam finds no corpus.
     base = tmp_path_factory.mktemp("embed-tick")
-    monkeypatch.setenv(maintenance_embed.KILL_ENV, "0")
+    monkeypatch.setattr(maintenance_embed, "embed_tick", lambda **_k: None)
     monkeypatch.setenv(maintenance_embed.STATE_DIR_ENV, str(base / "state"))
     monkeypatch.setattr(maintenance_embed, "VAULT_ROOT", base / "vault")
     monkeypatch.setattr(maintenance_embed, "DB_PATH",

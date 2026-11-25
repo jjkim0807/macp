@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
 import re
 import subprocess
 import time
@@ -57,12 +56,10 @@ from . import launch_extras
 from . import lease
 from . import remote_gate
 
-# Per-run node-uptime cap: 30 min (task default). Override: env
-# ``MACP_BETA_SMOKE_CAP_S`` (test seam) > repo ``smoke.cap_min`` (minutes) >
-# this default. Independent of remote_gate's 120-min TTL — a smoke run is a
-# minutes-long build+scenario, not a heavy test suite.
+# Per-run node-uptime cap: 30 min (task default). Override: repo
+# ``smoke.cap_min`` (minutes) > this default. Independent of remote_gate's
+# 120-min TTL — a smoke run is a minutes-long build+scenario, not a heavy test suite.
 _DEFAULT_CAP_S = 1800
-_CAP_ENV = "MACP_BETA_SMOKE_CAP_S"
 _GIT_TIMEOUT = 60
 # One throttled alert per (repo, kind) in this window, mirroring
 # remote_gate.note_budget_alert's per-key flag and the beta sweep's alerted_sha.
@@ -484,18 +481,10 @@ def smoke_skippable(repo_dir: Path | str, base: str | None, merge_sha: str, *,
 # ---------------------------------------------------------------------------
 
 def cap_seconds(smoke_cfg: dict | None) -> int:
-    """Per-run node-uptime cap in seconds. Priority: env ``MACP_BETA_SMOKE_CAP_S``
-    (test seam) > ``smoke.cap_min`` (minutes) > ``_DEFAULT_CAP_S`` (30 min). A
+    """Per-run node-uptime cap in seconds. Priority: ``smoke.cap_min``
+    (minutes) > ``_DEFAULT_CAP_S`` (30 min). A
     non-positive / unparseable value falls through rather than raising (mirrors
     ``screen_check.cap_seconds``)."""
-    env_raw = os.environ.get(_CAP_ENV)
-    if env_raw is not None:
-        try:
-            s = int(env_raw)
-            if s > 0:
-                return s
-        except (TypeError, ValueError):
-            pass
     raw = (smoke_cfg or {}).get("cap_min")
     if raw is not None:
         try:

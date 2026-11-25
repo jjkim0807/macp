@@ -51,13 +51,12 @@ account is usable again (window reset, re-login, `macp account use`).
 Fail policy: **fail-open, but with memory.** If usage cannot be fetched (expired
 token, offline, 429) the guard allows work — a guard outage must not stall the
 whole control plane (cf. the dirty-vault stall class of incidents). The last
-good snapshot is honored up to `USAGE_GUARD_STALE_OK_S`; beyond that the guard
+good snapshot is honored up to `stale_ok_s` (3h); beyond that the guard
 reports `no-data`. Crucially it does NOT thereby forget a block it had already
 decided: while the previous decision's `blocked_until` is still in the future
 the hold stands (`carried: True`). Without that, the endpoint's 429 — which
 arrives precisely when utilization is high — reopened the gate exactly when the
-hard cap was supposed to hold. Set `USAGE_GUARD_FAIL_CLOSED=1` to block on
-no-data outright.
+hard cap was supposed to hold.
 
 State: `Worker/_state/usage_guard/latest.json` (git-ignored) holds the last
 snapshot + the last decision, for the dashboard and macp_monitor to read.
@@ -105,8 +104,9 @@ EXIT_BLOCKED = 3
 
 
 def _cfg() -> dict:
-    """Thresholds, env-overridable (read per call so a resident daemon picks up
-    changes without a restart — see the stages.py import-time-constant lesson).
+    """Thresholds. Caps, allowances and parallel steps are env-overridable (read
+    per call so a resident daemon picks up changes without a restart — see the
+    stages.py import-time-constant lesson); the fetch timings are fixed.
 
     - hard_cap: block outright above this utilization %, until the window
       resets. Weekly defaults lower than session because a blown weekly locks
@@ -135,20 +135,19 @@ def _cfg() -> dict:
         "weekly_hard_cap": f("USAGE_GUARD_WEEKLY_HARD_CAP", 90.0),
         "session_allowance": f("USAGE_GUARD_SESSION_ALLOWANCE", 30.0),
         "weekly_allowance": f("USAGE_GUARD_WEEKLY_ALLOWANCE", 12.0),
-        "fetch_ttl_s": f("USAGE_GUARD_TTL_S", 240.0),
+        "fetch_ttl_s": 240.0,
         # 2026-09-27: 1h -> 3h. The endpoint's rate limit is shared with every
         # Claude CLI on the account (the CLI polls /api/oauth/usage itself), so
         # 429s with Retry-After ~1h are routine; at 1h the guard spent those
         # stretches in no-data and the planner's aggressive mode never fired.
-        "stale_ok_s": f("USAGE_GUARD_STALE_OK_S", 10800.0),
+        "stale_ok_s": 10800.0,
         # Failure backoff: after a failed fetch, wait before re-probing. Grows
         # exponentially per consecutive failure from base, capped at max, unless
         # the response carried a Retry-After (then that wins). The endpoint 429s
         # exactly while utilization is high, so re-probing every tick amplifies
         # the very outage it is reacting to.
-        "backoff_base_s": f("USAGE_GUARD_BACKOFF_BASE_S", 60.0),
-        "backoff_max_s": f("USAGE_GUARD_BACKOFF_MAX_S", 1800.0),
-        "fail_closed": os.environ.get("USAGE_GUARD_FAIL_CLOSED") == "1",
+        "backoff_base_s": 60.0,
+        "backoff_max_s": 1800.0,
         # Parallel pacing (see parallel_slots): each full `step` of slack below a
         # window's gate line buys one more concurrent run. Weekly is the scarce
         # window, so its step is the finest. Session was 15pp, which held the
@@ -681,7 +680,7 @@ def hold_kind(decision: dict | None) -> str | None:
 
     - None: not a hold (allowed, or the guard is disabled).
     - "paused": every account unavailable (`_paused_decision`).
-    - "no_data": a carried no-data hold, or a fail-closed one with no windows.
+    - "no_data": a carried no-data hold, or any hold with no windows.
     - "hard_cap": some blocked window is at/over its hard cap.
     - "pace": blocked windows exist and none is at its hard cap.
     - "unknown": anything else (e.g. a hand-built `{"allowed": False}`).
@@ -837,9 +836,8 @@ def _no_data_decision(state: dict, cfg: dict, now: float) -> dict:
             "age_s": age_s, "last_error": last_error, "next_retry_at": next_retry_at,
         }
     return {
-        "allowed": not cfg["fail_closed"],
-        "reason": f"no usage data ({err}) — "
-                  + ("fail-closed" if cfg["fail_closed"] else "fail-open"),
+        "allowed": True,
+        "reason": f"no usage data ({err}) — fail-open",
         "blocked_until": None, "release_eta": None, "windows": [], "checked_at": now,
         "stale": True,
         "age_s": age_s, "last_error": last_error, "next_retry_at": next_retry_at,

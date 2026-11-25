@@ -124,7 +124,7 @@ def _wrapper(checkout: Path, version: str) -> None:
 
 
 class _Case(unittest.TestCase):
-    """A fake home at 6 GiB free (trigger 8, target 10), kill switch lifted."""
+    """A fake home at 6 GiB free (trigger 8, target 10)."""
 
     BASE_FREE = 6 * G
 
@@ -132,8 +132,7 @@ class _Case(unittest.TestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for name in (md.KILL_ENV, md.MIN_FREE_ENV, md.TARGET_ENV, md.MAX_AGE_ENV,
-                     md.UV_BIN_ENV, "UV", "GRADLE_USER_HOME"):
+        for name in (md.UV_BIN_ENV, "UV", "GRADLE_USER_HOME"):
             os.environ.pop(name, None)
         os.environ[md.UV_BIN_ENV] = UV
         self.tmp = Path(os.path.realpath(tempfile.mkdtemp()))
@@ -231,13 +230,6 @@ class ThresholdTest(_Case):
         self.assertEqual(md.min_free_bytes(), 8 * G)
         self.assertEqual(md.target_bytes(), 10 * G)
         self.assertEqual(md.max_age_days(), 30)
-        self.assertEqual(md.KILL_ENV, "MACP_DISK_PRUNE")
-        os.environ[md.MIN_FREE_ENV] = "12"
-        self.assertEqual(md.target_bytes(), 14 * G)
-        os.environ[md.TARGET_ENV] = "5"            # never below the trigger
-        self.assertEqual(md.target_bytes(), 12 * G)
-        os.environ[md.MIN_FREE_ENV] = "junk"
-        self.assertEqual(md.min_free_bytes(), 8 * G)
 
 
 class AllowlistTest(_Case):
@@ -389,14 +381,9 @@ class CandidateTest(_Case):
         got = md.build_cache_candidates(self.gh, 30 * DAY, self.now)
         self.assertEqual(got, [self.old1, self.old2])
 
-    def test_max_age_is_configurable_and_bad_values_fall_back(self):
-        os.environ[md.MAX_AGE_ENV] = "0.5"
-        self.assertEqual(md.max_age_days(), 0.5)
-        got = md.build_cache_candidates(self.gh, md.max_age_days() * DAY, self.now)
+    def test_a_shorter_max_age_takes_the_recent_entry_too(self):
+        got = md.build_cache_candidates(self.gh, 0.5 * DAY, self.now)
         self.assertEqual(got, [self.old1, self.old2, self.recent])
-        for bad in ("junk", "0", "-3"):
-            os.environ[md.MAX_AGE_ENV] = bad
-            self.assertEqual(md.max_age_days(), 30)
 
 
 def _daemon_cmdline(version: str | None) -> bytes:
@@ -690,8 +677,8 @@ class StopTest(_Case):
     def test_stops_at_the_target(self):
         # (g) 7.5 → 8.5 after 8.5 goes: target 8.5 reached, the rest stays
         self.disk.base = int(7.5 * G)
-        os.environ[md.TARGET_ENV] = "8.5"
-        line = self.prune()
+        with mock.patch.object(md, "TARGET_GAP_GIB", 0.5):
+            line = self.prune()
         self.assertFalse((self.caches / "8.5").exists())
         self.assertTrue((self.caches / "8.7").exists())
         self.assertTrue(self.old1.exists())
@@ -851,19 +838,7 @@ class CoolingNeverNotifiedTest(unittest.TestCase):
         self.assertTrue(md._cooling(now=100.0, last=50.0, window=600.0))
 
 
-class KillSwitchAndFailOpenTest(_Case):
-    def test_kill_switch_skips_even_the_measurement(self):
-        # (k)
-        for value in ("0", " 0 "):
-            os.environ[md.KILL_ENV] = value
-            with mock.patch.object(md, "_disk_usage", mock.Mock(side_effect=AssertionError)) as d:
-                self.assertIsNone(self.prune())
-                d.assert_not_called()
-        self.assertEqual(self.run.calls, [])
-        for value in ("", "1", "no"):
-            os.environ[md.KILL_ENV] = value
-            self.assertTrue(md.enabled(), value)
-
+class FailOpenTest(_Case):
     def test_unreadable_disk_is_one_line_and_no_delete(self):
         # (l)
         with mock.patch.object(md, "_disk_usage", mock.Mock(side_effect=OSError(5, "EIO"))):
@@ -920,11 +895,7 @@ class ImportWeightTest(unittest.TestCase):
 
 
 class SuiteIsolationTest(unittest.TestCase):
-    """(o) todo_system/conftest.py's `_disk_prune_isolated` is live. No env pop."""
-
-    def test_the_kill_switch_is_set_for_every_test(self):
-        self.assertEqual(os.environ.get(md.KILL_ENV), "0")
-        self.assertFalse(md.enabled())
+    """(o) todo_system/conftest.py's `_disk_prune_isolated` is live."""
 
     def test_every_path_seam_points_into_a_tmp_dir(self):
         real_home = Path.home()
@@ -935,9 +906,9 @@ class SuiteIsolationTest(unittest.TestCase):
             self.assertNotEqual(value, real_home / ".gradle", attr)
 
     def test_an_uninjected_call_does_nothing_at_all(self):
-        with mock.patch.object(md, "_disk_usage", mock.Mock(side_effect=AssertionError)) as d:
+        with mock.patch.object(md, "_run", mock.Mock(side_effect=AssertionError)) as run:
             self.assertIsNone(md.check_and_prune())
-        d.assert_not_called()
+        run.assert_not_called()
 
 
 def _quiet_other_steps(monkeypatch):

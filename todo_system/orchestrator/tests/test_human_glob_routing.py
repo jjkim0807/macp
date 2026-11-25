@@ -14,7 +14,6 @@ real `Orchestrator.tick()`.
 
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
 import unittest
@@ -27,8 +26,6 @@ from todo_system.orchestrator import repos, tasks
 from todo_system.orchestrator.assignment import Ledger
 from todo_system.orchestrator.mailbox import FileMailbox
 from todo_system.orchestrator.orchestrator import (
-    REMOTE_ACCEPT_TIMEOUT_ENV,
-    REMOTE_ONLINE_ENV,
     Orchestrator,
     _worker_mode_beats_human_glob,
 )
@@ -59,11 +56,6 @@ class _Base(unittest.TestCase):
         self.ledger = Ledger(self.tmp / "assignments")
         self.notes: list = []
         self.orch = self._orch(self.human_projects)
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        for k in (REMOTE_ONLINE_ENV, REMOTE_ACCEPT_TIMEOUT_ENV):
-            os.environ.pop(k, None)
 
     def _reg(self, human_projects, *, with_default=True) -> Registry:
         agents = [Agent(id=HUMAN, kind="human", projects=list(human_projects),

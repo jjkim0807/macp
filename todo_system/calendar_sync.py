@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import os
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -422,31 +421,11 @@ def _write_scheduled(source_path: str, value: str, note: str | None = None) -> N
 # block moves to the earliest free working slot of the same length; the move is
 # written to the md and pushed on the next sync. Runs AFTER the upserts so a
 # block the person dragged in the calendar is pulled into the md first and is
-# never overridden. Opt out per task with `reschedule: false`, or for the whole
-# host with MACP_RESCHEDULE_OVERDUE=0.
+# never overridden. Opt out per task with `reschedule: false`.
 
 RESCHEDULE_GRACE = dt.timedelta(minutes=30)   # a block ending this long ago is overdue
 RESCHEDULE_HORIZON_DAYS = 21
 _SLOT_STEP = dt.timedelta(minutes=15)
-
-
-def _reschedule_hours() -> tuple[int, int]:
-    """Working window `MACP_RESCHEDULE_HOURS=10-18` (local hours), default 10–18."""
-    raw = os.environ.get("MACP_RESCHEDULE_HOURS", "10-18")
-    try:
-        a, b = (int(x) for x in raw.split("-", 1))
-        if 0 <= a < b <= 24:
-            return a, b
-    except ValueError:
-        pass
-    return 10, 18
-
-
-def _reschedule_weekdays() -> set[int]:
-    """`MACP_RESCHEDULE_WEEKENDS=1` allows Sat/Sun; default Mon–Fri."""
-    if os.environ.get("MACP_RESCHEDULE_WEEKENDS", "") in ("1", "true", "yes"):
-        return set(range(7))
-    return set(range(5))
 
 
 def _block_bounds(sched_date: str, start: str, end: str) -> tuple[dt.datetime, dt.datetime]:
@@ -596,8 +575,6 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
 
     A decision task (:func:`_is_decision_task`) is skipped whole: its block is
     neither moved nor counted as busy, because it is not on the calendar."""
-    if os.environ.get("MACP_RESCHEDULE_OVERDUE", "1") in ("0", "false", "no", "off"):
-        return []
     try:
         tzinfo = _event_tzinfo()
         now = now or dt.datetime.now(tzinfo).replace(tzinfo=None)
@@ -626,8 +603,7 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
             return []
         busy += _freebusy(service, calendars, now,
                           now + dt.timedelta(days=RESCHEDULE_HORIZON_DAYS + 1))
-        moves = plan_overdue_moves(blocks, busy, now, hours=_reschedule_hours(),
-                                   weekdays=_reschedule_weekdays())
+        moves = plan_overdue_moves(blocks, busy, now)
         for slug, old, new in moves:
             _write_scheduled(paths_by_slug[slug], new,
                              note=f"지난 블록 {old}이 끝났는데 열려 있어 {new}로 자동 재배치")
@@ -648,14 +624,14 @@ def reschedule_overdue_blocks(service, rows, calendars: Sequence[str],
 # (:func:`record_completion_transition`) and the sync re-shapes the event to
 # end at that time, titles it `✅ …`, and swaps its private `todo_slug` for
 # `todo_done_slug` — so the cleanup, the calendar→md pull and the overdue mover
-# all leave it alone. Done events are deleted `MACP_CALENDAR_DONE_KEEP_DAYS`
-# (default 30) after completion.
+# all leave it alone. Done events are deleted `DONE_KEEP_DAYS` (30) after
+# completion.
 #
 # A done task that is reopened keeps its ✅ event as history until it ages
 # out; the reopened task simply gets a fresh `todo_slug` event beside it.
 
 DONE_MIN = dt.timedelta(minutes=15)
-DONE_KEEP_DAYS_DEFAULT = 30
+DONE_KEEP_DAYS = 30
 _DONE_MARK = "✅"
 
 
@@ -708,15 +684,6 @@ def done_block_window(start: dt.datetime, end: dt.datetime,
 def _done_title(title: str) -> str:
     """`✅ <title>` with exactly one mark, whatever the title already had."""
     return f"{_DONE_MARK} " + re.sub(rf"^(?:\s|{_DONE_MARK})+", "", title or "")
-
-
-def _done_keep_days() -> int:
-    """`MACP_CALENDAR_DONE_KEEP_DAYS` (default 30; junk or < 1 → 30)."""
-    try:
-        n = int(os.environ.get("MACP_CALENDAR_DONE_KEEP_DAYS", "").strip())
-    except ValueError:
-        return DONE_KEEP_DAYS_DEFAULT
-    return n if n >= 1 else DONE_KEEP_DAYS_DEFAULT
 
 
 def _timed_when(t: dt.datetime) -> dict[str, str]:
@@ -948,7 +915,7 @@ def sync_due_tasks_to_calendar(
     Done human tasks with a timed block and a `completed:` stamp (written by
     :func:`record_completion_transition`) keep their event as a `✅` record
     trimmed to the completion time (:func:`_finalize_done_event`); done events
-    are deleted ``MACP_CALENDAR_DONE_KEEP_DAYS`` (default 30) after completion.
+    are deleted ``DONE_KEEP_DAYS`` (30) after completion.
     A done task without `completed:` (done before 2026-11-19) loses its event
     as before. A reopened task's ✅ event stays as history until it ages out.
 
@@ -1032,7 +999,7 @@ def sync_due_tasks_to_calendar(
     # cleanup: a task that just went done still has its live `todo_slug` event,
     # which the cleanup would otherwise delete before it can be trimmed.
     now_local = _now_local()
-    keep_days = _done_keep_days()
+    keep_days = DONE_KEEP_DAYS
     done_targets: list[tuple[sqlite3.Row, str, tuple[dt.datetime, dt.datetime], dt.datetime]] = []
     try:
         done_rows = con.execute(
@@ -1071,7 +1038,7 @@ def sync_due_tasks_to_calendar(
     # calendar from the md, so edits made to the old event in the calendar app
     # are dropped). A just-done task's `todo_slug` event is kept for
     # _finalize_done_event below. Done events (`todo_done_slug`, no
-    # `todo_slug`) are kept until MACP_CALENDAR_DONE_KEEP_DAYS after
+    # `todo_slug`) are kept until DONE_KEEP_DAYS after
     # completion. Events with neither key are never touched.
     # Lookback is generous: an event only gets deleted if it carries a
     # todo_slug we no longer sync here, and events drift out of a narrow window

@@ -3088,22 +3088,10 @@ def wait_ingest_alerts(timeout: float = 5.0) -> bool:
     return not any(t.is_alive() for t in pending)
 
 
-STATUS_TTL_S = float(os.environ.get("MACP_DASHBOARD_STATUS_TTL", "2.0") or 2.0)
+STATUS_TTL_S = 2.0
 # main() precomputes the /api/status body every N seconds in a background thread
 # (see _StatusCache). <= 0 turns that off (plain TTL single-flight, as serve()).
-DEFAULT_STATUS_REFRESH_S = 5.0
-
-
-def _status_refresh_s() -> float:
-    """MACP_DASHBOARD_STATUS_REFRESH_S, read at call time. Empty or unparseable
-    falls back to DEFAULT_STATUS_REFRESH_S; <= 0 means background refresh is off."""
-    raw = os.environ.get("MACP_DASHBOARD_STATUS_REFRESH_S", "").strip()
-    if not raw:
-        return DEFAULT_STATUS_REFRESH_S
-    try:
-        return float(raw)
-    except ValueError:
-        return DEFAULT_STATUS_REFRESH_S
+STATUS_REFRESH_S = 5.0
 
 
 def _compute_status_body() -> bytes:
@@ -3836,7 +3824,7 @@ def main() -> int:
     srv = serve(args.host, args.port,
                 os.environ.get("MACP_DASHBOARD_TOKEN", "").strip(),
                 public_exposure=public)
-    refresh_s = _status_refresh_s()
+    refresh_s = STATUS_REFRESH_S
     if start_status_refresh(srv, refresh_s):
         logger.info("status background refresh interval_s=%s", refresh_s)
     else:

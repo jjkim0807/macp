@@ -1607,14 +1607,14 @@ class StagedExecutor(ClaudeCodeExecutor):
                              "timeout_stage": stage, "checkpoint_sha": cp.get("tip"),
                              "repo": repo_url})
                     # Token usage → stages.json `usage.<stage>`, via the backend. The
-                    # argv (carrying a fresh --session-id unless MACP_STAGE_USAGE=0) is
+                    # argv (carrying a fresh --session-id) is
                     # on r.args; report_usage reads that session's transcript back once
                     # the process is gone — ahead of every early return below, so a
                     # failed stage still gets its row. It never raises and changes
                     # nothing this loop reads: r.returncode/r.stdout/r.stderr reach
                     # run.log, the model-cache hook, the capacity check and the artifact
                     # check exactly as before (why not --output-format json: the comment
-                    # above stages.USAGE_ENV).
+                    # above stages.USAGE_KEYS).
                     usage_rec = backend.report_usage(
                         stage, run_dir, r.args, env=stage_env, returncode=r.returncode,
                         duration_ms=int((time.monotonic() - stage_started) * 1000))
@@ -1650,8 +1650,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                 # <synthetic> notice), so usage_shows_no_api_work is True; a green
                 # stage that merely quotes a marker (e.g. this very task's edits to
                 # stages._CAPACITY_MARKERS) did real API work → real usage dict →
-                # False, so it is never mis-deferred. With MACP_STAGE_USAGE off
-                # usage_rec is None and the rc=0 arm is inert (default is on).
+                # False, so it is never mis-deferred.
                 # is_capacity_limit is ANDed LAST so the common green stage (rc 0,
                 # real usage) short-circuits on the cheap rc/usage check before the
                 # stdout scan — and so the rc != 0 arm stays byte-for-byte (usage is
@@ -2194,8 +2193,7 @@ _CANCEL = threading.local()
 # holds it). The orchestrator reroutes a heavy task whose remote stops looking
 # online; without this a remote mid-stage (a stage can run for an hour with no
 # PROGRESS) would look dead and its task would run twice.
-BUSY_HEARTBEAT_ENV = "RUNNER_BUSY_HEARTBEAT_S"
-DEFAULT_BUSY_HEARTBEAT_S = 300.0
+BUSY_HEARTBEAT_S = 300.0
 # At most one slots announcement per this many seconds from the poll loop. The
 # orchestrator reads them once per tick (minutes), so a minute loses nothing.
 ANNOUNCE_MIN_GAP_S = 60.0
@@ -2217,7 +2215,6 @@ def _cancel_requested_now() -> bool:
 # stage, wait while the 5h session window is at/over the stage cap
 # (usage_guard.stage_gate). The admission gates only stop NEW runs; runs already
 # in flight used to ride the window to 100%.
-STAGE_GATE_ENV = "RUNNER_STAGE_USAGE_GATE"          # "0" disables
 STAGE_GATE_POLL_S = 60.0
 STAGE_GATE_PROGRESS_S = 600.0                        # < the stale-reap bound
 STAGE_GATE_MAX_S = 5.5 * 3600                        # one 5h window + slack
@@ -2228,12 +2225,10 @@ def _wait_for_session_headroom(stage: str, payload: dict, progress, *, gate=None
     """Block before `stage` while the session window is at its stage cap.
     Returns False when the orchestrator cancelled the run during the wait (the
     caller stops at this boundary), else True (go). `bypass_guard: true` tasks
-    and RUNNER_STAGE_USAGE_GATE=0 never wait. Emits a PROGRESS line every
+    never wait. Emits a PROGRESS line every
     STAGE_GATE_PROGRESS_S so the waiting run is not reaped as stale. Bounded by
     STAGE_GATE_MAX_S and by the window's own reset; never raises."""
     try:
-        if os.environ.get(STAGE_GATE_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
-            return True
         if (payload or {}).get("bypass_guard"):
             return True
         if gate is None:
@@ -2266,15 +2261,6 @@ def _wait_for_session_headroom(stage: str, payload: dict, progress, *, gate=None
             sleep(STAGE_GATE_POLL_S)
     except Exception:
         return True
-
-
-def _busy_heartbeat_interval() -> float:
-    raw = os.environ.get(BUSY_HEARTBEAT_ENV, "")
-    try:
-        v = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return DEFAULT_BUSY_HEARTBEAT_S
-    return v if v > 0 else DEFAULT_BUSY_HEARTBEAT_S
 
 
 def _account_named(start: str, name: str):
@@ -2794,7 +2780,7 @@ class Runner:
         run holds this runner, so the orchestrator's liveness view does not read
         a long stage as a dead remote and reroute its task. A thread, so it
         beats even while serial poll_once is blocked inside handle()."""
-        interval = _busy_heartbeat_interval()
+        interval = BUSY_HEARTBEAT_S
         stop = threading.Event()
         try:
             while True:
@@ -2967,10 +2953,7 @@ class Runner:
         at ~3.4GB each and have OOM-killed the whole runner unit on the 8GB HQ
         (2026-09-13), so an extra run waits until MemAvailable clears the floor.
         Unreadable meminfo (non-Linux) fails open."""
-        try:
-            floor = float(os.environ.get("RUNNER_PARALLEL_MIN_AVAIL_MB", 3000))
-        except ValueError:
-            floor = 3000.0
+        floor = 3000.0
         avail = _mem_available_mb()
         ok = avail is None or avail >= floor
         if not ok and not self._mem_hold_logged:
@@ -3033,15 +3016,9 @@ class Runner:
         return max(1, n)
 
     def _per_account_max(self) -> int:
-        """Per-account concurrency ceiling: `RUNNER_MAX_PARALLEL_PER_ACCOUNT`,
-        else the registry's `concurrency` (the historical single-account ceiling).
-        >= 1."""
-        raw = os.environ.get("RUNNER_MAX_PARALLEL_PER_ACCOUNT")
-        try:
-            n = int(raw) if raw else int(getattr(self.agent, "concurrency", 1) or 1)
-        except ValueError:
-            n = int(getattr(self.agent, "concurrency", 1) or 1)
-        return max(1, n)
+        """Per-account concurrency ceiling: the registry's `concurrency` (the
+        historical single-account ceiling). >= 1."""
+        return max(1, int(getattr(self.agent, "concurrency", 1) or 1))
 
     def _global_cap(self) -> int | None:
         """The GLOBAL sum ceiling — `RUNNER_MAX_PARALLEL` *when it is set*, else

@@ -47,18 +47,14 @@ report one, the event carries no zone and Google applies the calendar's own.
 | `MACP_WORKER_ROOT` | where external repositories are cloned (key `worker_root`; default `~/Worker`) |
 | `MACP_LANGUAGE` | UI language for engine log/CLI text, `en` or `ko` (key `language`; default `en`; other values read as `en`) |
 | `MACP_BROWSER_MCP_SERVER` | macp-browser MCP server script for the browser stages (key `browser_mcp_server`; default unset = no MCP wiring; `MACP_BROWSER_NODE` picks the node binary, default `node`). See [Browser MCP server](#browser-mcp-server) |
-| `MACP_MAX_PARALLEL_PER_REPO` | concurrent runs per repository (default 2; `1` forces serial) |
-| `MACP_MAX_PARALLEL_GRADLE_BUILDS` | global cap on concurrent Gradle builds (default 0 = no cap) |
-| `MACP_REMOTE_ONLINE_S` | heavy routing: a `heavy` remote counts as online if it sent any message within this many seconds (default 900). See [Heavy tasks](#heavy-tasks) |
-| `MACP_REMOTE_ACCEPT_TIMEOUT_S` | heavy routing: a task sent to a remote comes back to its owner when no ACCEPT arrives within this many seconds (default 600) |
-| `RUNNER_BUSY_HEARTBEAT_S` | remote runners only: seconds between `HEARTBEAT {status: busy}` while a run is going (default 300) |
 | `MACP_DASHBOARD_TOKEN`, `MACP_PUBLIC_EXPOSURE` | dashboard exposure (see [Running 24/7](running.md#the-dashboard)) |
 | `USAGE_GUARD_DISABLE` | `1` turns usage pacing off |
 | `USAGE_GUARD_*` | pacing thresholds (below) |
 | `ANTHROPIC_ADMIN_KEY` | Anthropic Admin API key for the usage/cost CLI |
 
-The three heavy-routing variables are read on every tick, so a change takes effect
-without a restart. Blank, non-numeric or non-positive values fall back to the default.
+The per-repository run cap and the global Gradle-build cap are the profile fields
+`max_parallel_per_repo` (default 2; `1` forces serial) and `max_parallel_gradle_builds`
+(default 0 = no cap).
 
 ### Heavy tasks
 
@@ -169,7 +165,6 @@ session window and the weekly window before every dispatch:
 | `USAGE_GUARD_WEEKLY_ALLOWANCE` | 12 | percentage points the weekly window may run ahead of pace |
 | `USAGE_GUARD_SESSION_ALLOWANCE` | 30 | the same for the 5-hour window |
 | `USAGE_GUARD_WEEKLY_HARD_CAP`, `USAGE_GUARD_SESSION_HARD_CAP` | 90 | block outright above this % |
-| `USAGE_GUARD_FAIL_CLOSED` | unset | `1` = hold when usage cannot be read (the default lets work through) |
 
 A single task can pass a pacing hold with `bypass_guard: true` in its frontmatter.
 

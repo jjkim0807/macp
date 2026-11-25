@@ -122,7 +122,6 @@ stay silent while there is enough free space.
 | When | once per run, before branch prep | every maintenance tick (~5 min) |
 | Trigger → target | < 3 GiB → 5 GiB free | < 8 GiB → 10 GiB free |
 | What it frees | `./gradlew clean --no-daemon` in idle `~/Worker` clones | caches that Gradle and uv download again on demand |
-| Kill switch | `MACP_DISK_GUARD=0` | `MACP_DISK_PRUNE=0` |
 
 ### What the cache prune removes
 
@@ -132,12 +131,12 @@ Below the trigger, the prune runs one pass, at most once every 30 minutes:
 2. `<gradle home>/caches/<version>/` directories for a Gradle version that is in
    use by neither a `~/Worker` wrapper (`gradle/wrapper/gradle-wrapper.properties`,
    linked worktrees included) nor a live Gradle daemon, or that is but nothing below
-   has touched for N days. Active runs no longer block this — only the version set
+   has touched for 30 days. Active runs no longer block this — only the version set
    actually in use is protected. If the protected set can't be read (an unparseable
    wrapper, a Gradle daemon whose version can't be parsed, or no `/proc`), every
    version directory is kept.
 3. Regular hex-named files directly in `<gradle home>/caches/build-cache-1/` that
-   haven't changed for N days, oldest first. These prune even while runs are active:
+   haven't changed for 30 days, oldest first. These prune even while runs are active:
    each is deleted as one atomic file.
 
 It stops once free space reaches the target. Every deletion goes through one function
@@ -174,10 +173,6 @@ Environment (read at call time):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MACP_DISK_PRUNE` | on | `0` switches the step off |
-| `MACP_DISK_PRUNE_MIN_FREE_GIB` | 8 | trigger and alert threshold |
-| `MACP_DISK_PRUNE_TARGET_GIB` | trigger + 2 | stop deleting at this much free space |
-| `MACP_DISK_PRUNE_MAX_AGE_DAYS` | 30 | N in "unchanged for N days" |
 | `MACP_DISK_PRUNE_STATE_DIR` | `~/.local/share/macp/disk` | throttle state |
 | `MACP_UV_BIN` | `$UV`, then `PATH`, then `~/.local/bin/uv` | uv binary |
 | `GRADLE_USER_HOME` | `~/.gradle` | Gradle home |
@@ -241,8 +236,8 @@ is an **AI-local** agent is moved; a human-owned task, or one a remote owns by p
 (say a Windows-only project), keeps its owner.
 
 The dispatcher sends a heavy task to the first `heavy` remote, in registry order, that is
-**online** — it has sent any message within `MACP_REMOTE_ONLINE_S` seconds (default 900;
-`orchestrator agents` shows the same liveness) — and has fewer runs in flight than its
+**online** — it has sent any message within 900 seconds
+(`orchestrator agents` shows the same liveness) — and has fewer runs in flight than its
 `concurrency`. The envelope carries `requires: [heavy]`; the ledger payload does not, so a
 retry on the default agent is never refused for the capability. With no such remote the
 task goes to its owner exactly as before. `orchestrator status` marks a task sent this way
@@ -253,7 +248,7 @@ owner when its remote:
 
 | reason | when |
 | --- | --- |
-| `accept-timeout` | no ACCEPT within `MACP_REMOTE_ACCEPT_TIMEOUT_S` seconds (default 600) — the remote is off |
+| `accept-timeout` | no ACCEPT within 600 seconds — the remote is off |
 | `agent-stale` | it ACCEPTed, but is no longer online and sent no RESULT/FAIL |
 | `rejected` | it REJECTed the task; that remote is not picked for this task again |
 
@@ -274,13 +269,13 @@ already running when the CANCEL arrived cannot be stopped, so its PR may still o
 every 300 seconds, idle or busy. The orchestrator assigns only to a free slot (see
 [Concepts — free slots](concepts.md#choosing-resources)), so this message is what brings work to a
 runner. A remote runner also sends `HEARTBEAT {status: busy}` every
-`RUNNER_BUSY_HEARTBEAT_S` seconds (default 300) from a separate thread while it is
+300 seconds from a separate thread while it is
 running something, because its serial loop is blocked for the whole run and a single
 stage can run for an hour without a progress message.
 
 With the git mailbox, messages and liveness arrive at the vault sync cadence (a few
-minutes). The 600 s / 900 s defaults leave room for that; do not set either below about
-twice your sync interval. `max_parallel_gradle_builds` (off by default) still counts
+minutes). The 600 s / 900 s bounds leave room for that.
+`max_parallel_gradle_builds` (off by default) still counts
 heavy runs that went to a remote.
 
 #### Game mode (pause a heavy remote)

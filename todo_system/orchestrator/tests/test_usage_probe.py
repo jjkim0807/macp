@@ -10,7 +10,6 @@ import datetime
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import unittest
 import uuid
@@ -203,25 +202,6 @@ class UsageProbeRecordTest(unittest.TestCase):
                 self.assertEqual(self._run(rc="0"), 0)
         m.assert_not_called()                       # the reader was never reached
         self.assertFalse(self.dest.exists())        # …but the import failed first
-
-    def test_kill_switch_agrees_with_stage_loop_on_contract_values(self):
-        """The scripts gate the probe with the shell test
-        `[ "${MACP_STAGE_USAGE:-}" != "0" ]`; the stage loop gates with
-        stages.usage_enabled(). They must agree on the AC contract — exactly "0"
-        disables, everything else (unset / "" / "1" / …) enables — so the one env
-        var means the same thing in both worlds and the probe fires precisely when
-        the argv carried a session id."""
-        for val in (None, "", "0", "1", "false", "no", "00"):
-            with mock.patch.dict(os.environ):
-                os.environ.pop(stages.USAGE_ENV, None)
-                if val is not None:
-                    os.environ[stages.USAGE_ENV] = val
-                py_enabled = stages.usage_enabled()
-                shell_enabled = subprocess.run(
-                    ["bash", "-c", 'test "${MACP_STAGE_USAGE:-}" != "0"'],
-                    env=dict(os.environ)).returncode == 0
-                self.assertEqual(py_enabled, shell_enabled, repr(val))
-                self.assertEqual(shell_enabled, val != "0", repr(val))
 
 
 # --- reader seam: argv/kwargs handed to stages.stage_usage ----------------

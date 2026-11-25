@@ -16,7 +16,7 @@ Design notes
   store lives outside the vault: `$MACP_SMS_DIR` or `~/.local/share/macp/sms/`,
   dir 0700, file 0600.
 - **Short retention.** Every append drops entries older than
-  `$MACP_SMS_RETENTION_DAYS` (default 7).
+  `RETENTION_DAYS` (7).
 - **Idempotent.** The phone retries until it gets a 2xx, so a message carrying
   the same `id` twice is stored once.
 - **Ingest-failure alert throttle.** The dashboard alerts when it rejects the
@@ -49,7 +49,7 @@ import threading
 import time
 from pathlib import Path
 
-DEFAULT_RETENTION_DAYS = 7
+RETENTION_DAYS = 7
 MAX_BODY = 4000
 
 
@@ -60,13 +60,6 @@ def store_dir() -> Path:
 
 def inbox_path() -> Path:
     return store_dir() / "inbox.jsonl"
-
-
-def retention_days() -> float:
-    try:
-        return float(os.environ.get("MACP_SMS_RETENTION_DAYS", DEFAULT_RETENTION_DAYS))
-    except ValueError:
-        return DEFAULT_RETENTION_DAYS
 
 
 def _now() -> dt.datetime:
@@ -229,7 +222,7 @@ def normalize(raw: dict) -> dict:
 def append(messages: list[dict], now: dt.datetime | None = None) -> int:
     """Store normalized messages, drop expired ones. Returns how many were new."""
     now = now or _now()
-    cutoff = now - dt.timedelta(days=retention_days())
+    cutoff = now - dt.timedelta(days=RETENTION_DAYS)
     with _locked():
         records = [r for r in _read_all()
                    if (_parse_ts(r.get("received_at", "")) or now) >= cutoff]
