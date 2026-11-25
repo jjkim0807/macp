@@ -12,6 +12,7 @@ import datetime as dt
 import pytest
 
 from todo_system import recur
+from todo_system import task_validate as tv
 from todo_system import worker as W
 
 D = dt.datetime
@@ -502,3 +503,54 @@ def test_the_default_clock_is_not_before_s(tmp_path, monkeypatch):
     assert recur.generate_due(tmp_path) == []
     monkeypatch.setattr(nb, "_now", lambda: NOW)
     assert [c.slug for c in recur.generate_due(tmp_path)] == ["weekly-audit-20261204"]
+
+
+# --- validate ------------------------------------------------------------------
+
+
+def _levels(issues, field):
+    return [i.level for i in issues if i.field == field]
+
+
+@pytest.mark.parametrize("value", ["daily", "weekly", "every 3d", "weekly fri 09:00", "off"])
+def test_validate_accepts_every_documented_value(value):
+    assert tv.validate_frontmatter({"recur": value}) == []
+
+
+@pytest.mark.parametrize("value", ["monthly", "every 0d", "weekly fri", "weekly  # note", ["weekly"]])
+def test_validate_flags_a_bad_value_as_an_error(value):
+    issues = tv.validate_frontmatter({"recur": value})
+    assert _levels(issues, "recur") == [tv.ERROR]
+    assert recur.EXPECTED in issues[0].message
+
+
+def test_validate_says_nothing_about_a_task_without_recur():
+    assert tv.validate_frontmatter({"status": "open", "tags": ["todo"]}) == []
+
+
+def test_validate_file_reads_the_value_the_sweep_reads(tmp_path):
+    """One file, both readers: what validate flags is exactly what the tick skips."""
+    bad = _write(tmp_path, "weekly-audit-20261127", recur_value="every friday")
+    assert _levels(tv.validate_file(bad), "recur") == [tv.ERROR]
+    assert recur.generate_due(tmp_path, now=NOW) == []
+
+    good = _write(tmp_path, "weekly-review-20261127", recur_value='"weekly fri 10:00"')
+    assert _levels(tv.validate_file(good), "recur") == []
+    assert [c.slug for c in recur.generate_due(tmp_path, now=NOW)] == ["weekly-review-20261204"]
+
+
+def test_cli_validate_exits_nonzero_on_a_bad_recur(tmp_path, monkeypatch, capsys):
+    """The real `cli validate <slug>` path: argv -> cmd_validate -> validate_file."""
+    from todo_system import cli
+
+    _write(tmp_path, "weekly-audit-20261127", recur_value="every friday")
+    _write(tmp_path, "weekly-review", recur_value="weekly fri 09:00")
+    monkeypatch.setattr(cli, "ITEMS_DIR", tmp_path)
+
+    assert cli.cmd_validate(cli.build_parser().parse_args(["validate", "weekly-audit-20261127"])) == 1
+    out = capsys.readouterr().out
+    assert "[error] weekly-audit-20261127: recur — " in out
+    assert "1 error(s)" in out
+
+    assert cli.cmd_validate(cli.build_parser().parse_args(["validate", "weekly-review"])) == 0
+    assert "worker contract OK" in capsys.readouterr().out
