@@ -305,8 +305,7 @@ class StagedExecutor(ClaudeCodeExecutor):
         never leaks into another account's stages. (None, None) = no account
         configured → the stage inherits the process env, exactly as before.
         `msg` stays in the signature for the callers and their mocks; the
-        per-task round-robin it fed (`account_for`) is gone — one active account
-        at a time.
+        per-task round-robin it once fed is gone — one active account at a time.
 
         `assigned` (multi-account capacity): the account the runner's
         `poll_parallel` picked for this run to balance fan-out across accounts.

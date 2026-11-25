@@ -585,25 +585,6 @@ def test_profile_schema_roundtrip_and_default_output_unchanged(roots):
     assert old.active_account == "" and old.accounts[0].priority == 100
     assert old.accounts[0].claude_config_dir == ACC.LEGACY_CONFIG_DIR
 
-    # account_for: pin → round-robin, as before (priority/active_account have no consumer here)
-    assert C.account_for(q, C.ProjectConfig(profile="q", account="school")).name == "school"
-    rr = C.account_for(q, C.ProjectConfig(profile="q"), "task-1")
-    assert rr in q.accounts
-    assert C.account_for(q, C.ProjectConfig(profile="q"), "task-1") is rr    # stable per task_id
-    assert C.account_for(q, None) is q.accounts[0]                            # no task_id → first
-    assert C.account_for(C.Profile(name="e"), None) is None
-
-    # build_invocation: the legacy default dir → no override; any other dir → set
-    _, env = C.build_invocation(C.Account(name="x"), "hi")
-    assert "CLAUDE_CONFIG_DIR" not in env
-    _, env = C.build_invocation(C.Account(name="y", claude_config_dir=str(roots.home / ".claude")), "hi")
-    assert "CLAUDE_CONFIG_DIR" not in env
-    other = roots.accounts / "dev"
-    argv, env = C.build_invocation(C.Account(name="dev", claude_config_dir=str(other), priority=10),
-                                   "hi", ["--model", "m"])
-    assert argv == ["claude", "-p", "hi", "--model", "m"]
-    assert env["CLAUDE_CONFIG_DIR"] == str(other)
-
 
 # ---- AC1: leaf module, stdlib only, literal confined ------------------------
 

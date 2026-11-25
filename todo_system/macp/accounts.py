@@ -792,8 +792,7 @@ def claude_env_for(acct, base: dict | None = None) -> dict:
 
     * config dir — ``CLAUDE_CONFIG_DIR=<acct dir>``, **unless** the dir is the
       legacy single dir, which is left unset (forcing it makes the CLI ignore its
-      normal auth store, e.g. the macOS Keychain — the rule
-      ``config.build_invocation`` always applied).
+      normal auth store, e.g. the macOS Keychain).
     * token — when ``ANTHROPIC_API_KEY`` is set the token layer is not touched
       (the caller chose the API-billing path; the ``claude_auth.claude_env``
       rule). Otherwise ``<acct dir>/automation-token`` is read with

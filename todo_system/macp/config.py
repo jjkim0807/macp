@@ -42,8 +42,7 @@ class Account:
     remaining fields are a declarative schema kept for a future non-Claude backend.
       - agent: backend id ('claude' default).
       - claude_config_dir: auth isolation for Claude (CLAUDE_CONFIG_DIR).
-      - command: invocation template for a non-Claude CLI agent; '{prompt}' is
-        substituted (appended if absent).
+      - command: invocation template for a non-Claude CLI agent.
       - env: extra environment (config dirs, non-secret settings) for this
         account. **Never an API key**: `write_profile` serializes this verbatim
         into the profile TOML and `account list` prints `command`, so a secret
@@ -96,7 +95,7 @@ class ProjectConfig:
     worker_mode: str = "auto"
     capabilities: list[str] = field(default_factory=list)
     # Pin one of the profile's accounts; without a pin the profile's active_account /
-    # lowest priority decides (current_account). account_for() keeps its round-robin.
+    # lowest priority decides (current_account).
     account: str | None = None
     # --- cross-project links: some projects (e.g. advote's feedback SDK) are
     #     consumed by others, so a change upstream must fan out to downstream. ---
@@ -190,31 +189,6 @@ def resolve(start: Path | str | None = None) -> dict:
             "profile": load_profile(prof_name)}
 
 
-def account_for(profile: Profile, project: ProjectConfig | None, task_id: str = "",
-                agent: str | None = "claude") -> Account | None:
-    """Pick the account to run with: the project's pinned account if set, else
-    round-robin the profile's accounts (stable per task_id for reproducibility).
-
-    Only accounts of ``agent`` are candidates (default ``claude``, as in
-    ``accounts.pick_account``; ``agent=None`` considers every account). The
-    filter keeps the round-robin stable: the index is
-    ``hash(task_id) % len(candidates)``, so a profile that gains a non-claude
-    account does not re-shuffle every existing task's claude mapping.
-    """
-    if not profile or not profile.accounts:
-        return None
-    cands = [a for a in profile.accounts
-             if agent is None or getattr(a, "agent", "claude") == agent]
-    if not cands:
-        return None
-    if project and project.account:
-        for a in cands:
-            if a.name == project.account:
-                return a
-    idx = (hash(task_id) % len(cands)) if task_id else 0
-    return cands[idx]
-
-
 def current_account(start: Path | str | None = None) -> tuple[Account | None, str]:
     """The claude account work at ``start`` (default: cwd) runs as, with the rule
     that chose it — ``resolve(start)`` fed to ``accounts.resolve_active`` (project
@@ -242,32 +216,6 @@ def active_token_file(start: Path | str | None = None) -> Path:
 def active_credentials_file(start: Path | str | None = None) -> Path:
     """``.credentials.json`` of :func:`current_account` (the legacy dir when none)."""
     return credentials_file_for(current_account(start)[0])
-
-
-def build_invocation(account: Account, prompt: str,
-                     extra_args: list[str] | None = None) -> tuple[list[str], dict]:
-    """(argv, env) to run `prompt` with this account's agent.
-    - claude (default / no command): `claude -p <prompt> [extra_args]` + CLAUDE_CONFIG_DIR.
-    - other agent: account.command with '{prompt}' substituted (appended if no
-      placeholder), plus account.env. `extra_args` (claude-specific flags) are
-      ignored for a non-claude agent.
-
-    The returned env is the caller's to pass to a subprocess.
-    """
-    import shlex
-    env = dict(account.env or {})
-    if account.agent == "claude" or not account.command:
-        argv = ["claude", "-p", prompt, *(extra_args or [])]
-        cfg = os.path.expanduser(account.claude_config_dir or "")
-        # only override for a non-default config dir (forcing the legacy default dir
-        # makes claude ignore its normal auth store, e.g. the macOS keychain)
-        if cfg and cfg != os.path.expanduser(LEGACY_CONFIG_DIR):
-            env["CLAUDE_CONFIG_DIR"] = cfg
-        return argv, env
-    argv = [p.replace("{prompt}", prompt) for p in shlex.split(account.command)]
-    if "{prompt}" not in account.command:
-        argv.append(prompt)
-    return argv, env
 
 
 # ---- write (minimal TOML for our fixed schema) ----------------------------
