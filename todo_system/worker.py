@@ -38,6 +38,7 @@ from . import kakao_format
 from . import maintenance_disk
 from . import maintenance_embed
 from . import not_before as nb_gate
+from . import ops_alerts
 from . import paths
 from .frontmatter_lists import parse_inline_list
 from .kakao_format import compose_alert
@@ -816,11 +817,83 @@ def _engine_sync_marker(vault: Path) -> Path:
     return vault / "Worker" / "_state" / _ENGINE_SYNC_MARKER_NAME
 
 
+# Consecutive skipped engine pulls (HEAD off main, a modified tracked file, or an
+# untracked file an incoming commit would overwrite). A skip is silent by design,
+# which is how the HQ engine sat 11 merged PRs behind for over a day (2026-11-26)
+# with nothing turning red. The count lives beside the sync marker (vault
+# Worker/_state, gitignored); the Nth consecutive skip opens one dashboard ops
+# task, and the next pull that goes through clears the count and the task.
+ENGINE_PULL_SKIP_ALERT_AFTER = 3
+_ENGINE_PULL_SKIPS_NAME = "engine-pull-skips"
+ENGINE_PULL_ALERT_KEY = "engine-pull-stalled"
+
+
+def _engine_pull_skips_path(vault: Path) -> Path:
+    return vault / "Worker" / "_state" / _ENGINE_PULL_SKIPS_NAME
+
+
+def _engine_pull_skipped(vault: Path, engine: Path, why: str, alert_after: int) -> None:
+    """Record one skipped pull; on exactly the ``alert_after``-th in a row, open
+    the dashboard ops task. Never raises (a state-file error prints one line)."""
+    print(f"engine-pull: skip — {why}")
+    path = _engine_pull_skips_path(vault)
+    try:
+        count = int(path.read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        count = 0
+    count += 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{count} {why}\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"engine-pull: 건너뜀 카운터 기록 실패 — {exc}")
+    if count != alert_after:
+        return
+    print(f"engine-pull: {count}회 연속 건너뜀 — 대시보드 경보")
+    ops_alerts.open_alert(
+        ENGINE_PULL_ALERT_KEY,
+        f"엔진 자동 갱신이 {count}회 연속 건너뛰어짐 ({why})",
+        [
+            f"엔진 체크아웃({engine})에서 `git status`·`git branch --show-current`로 원인을 확인한다",
+            "main이 아니면 main으로 돌리고, 수정된 추적 파일·겹치는 추적 안 되는 파일을 치운다",
+            "다음 maintenance 틱에서 `engine-pull: pulled …`가 찍히면 이 태스크가 자동으로 닫힌다",
+        ],
+    )
+
+
+def _engine_pull_went_through(vault: Path) -> None:
+    """A pull succeeded: drop the skip count and close the ops task if one was
+    opened. A no-op stat when nothing was skipped. Never raises."""
+    path = _engine_pull_skips_path(vault)
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        print(f"engine-pull: 건너뜀 카운터 삭제 실패 — {exc}")
+    ops_alerts.resolve_alert(ENGINE_PULL_ALERT_KEY, "엔진 자동 갱신 재개")
+
+
+def _untracked_overlap(untracked: list[str], incoming: list[str]) -> list[str]:
+    """Untracked paths an incoming change would write over: the same path, or one
+    is a directory prefix of the other (an incoming file where an untracked
+    directory sits, or the reverse)."""
+    hits = []
+    for u in untracked:
+        u_dir = u.rstrip("/")
+        for i in incoming:
+            if i == u_dir or i.startswith(u_dir + "/") or u_dir.startswith(i + "/"):
+                hits.append(u)
+                break
+    return hits
+
+
 def pull_engine_checkout(
     *,
     engine: Path | None = None,
     vault: Path | None = None,
     run: Callable = subprocess.run,
+    skip_alert_after: int = ENGINE_PULL_SKIP_ALERT_AFTER,
 ) -> list[str]:
     """Best-effort ff-only pull of a *separate* engine checkout, inside the tick.
 
@@ -832,10 +905,20 @@ def pull_engine_checkout(
     :func:`restart_stale_daemons`: new code lands in the checkout and the same
     tick kickstarts the daemons onto it.
 
-    Safety mirrors the ops script: no pull when HEAD is not ``main`` or the tree
-    is dirty (excluding ``Worker/`` scratch), and ``--ff-only`` so a local commit
-    fails loudly and retries next tick rather than merging/rebasing. A dependency
-    change (``pyproject.toml`` / ``uv.lock``) triggers ``uv sync``.
+    Safety mirrors the ops script: no pull when HEAD is not ``main`` or a
+    *tracked* file is modified (excluding ``Worker/`` scratch), and
+    ``--ff-only`` so a local commit fails loudly and retries next tick rather
+    than merging/rebasing. A dependency change (``pyproject.toml`` /
+    ``uv.lock``) triggers ``uv sync``.
+
+    Untracked files do not make the checkout dirty (``--untracked-files=no``): a
+    fast-forward never touches them, and counting them let one stray runtime log
+    (``logs/kakao_*``) stall every pull for over a day (2026-11-26). The one case
+    they matter — an incoming commit adds a path an untracked file occupies, which
+    ``git pull`` would refuse — is checked after the fetch and skipped like a
+    dirty tree. Every skip is counted; ``skip_alert_after`` consecutive skips
+    (default :data:`ENGINE_PULL_SKIP_ALERT_AFTER`) open one dashboard ops task
+    (:mod:`todo_system.ops_alerts`), and the next pull that goes through closes it.
 
     A ``uv sync`` that exits non-zero, times out or finds no ``uv`` leaves a
     "sync pending" marker (``vault/Worker/_state/engine-uv-sync-pending``).
@@ -875,17 +958,32 @@ def pull_engine_checkout(
         )
 
     if _git("branch", "--show-current").stdout.strip() != "main":
-        print("engine-pull: skip — HEAD가 main이 아님")
+        _engine_pull_skipped(vault, engine, "HEAD가 main이 아님", skip_alert_after)
         return []
-    if _git("status", "--porcelain", "--", ".", ":!Worker").stdout.strip():
-        print("engine-pull: skip — 체크아웃 dirty")
+    if _git("status", "--porcelain", "--untracked-files=no",
+            "--", ".", ":!Worker").stdout.strip():
+        _engine_pull_skipped(vault, engine, "체크아웃 dirty (추적 파일 수정)", skip_alert_after)
         return []
 
     before = _git("rev-parse", "--short", "HEAD").stdout.strip()
     if _git("fetch", "origin", "main").returncode != 0:
         return ["engine-pull: fetch 실패"]
+    untracked = _git("ls-files", "--others", "--exclude-standard", "--directory",
+                     "--", ".", ":!Worker").stdout.split("\n")
+    untracked = [u for u in untracked if u.strip()]
+    if untracked:
+        incoming = _git("diff", "--name-only", "HEAD", "FETCH_HEAD")
+        if incoming.returncode == 0:
+            hits = _untracked_overlap(untracked, [p for p in incoming.stdout.split("\n") if p])
+            if hits:
+                shown = ", ".join(hits[:3]) + (" …" if len(hits) > 3 else "")
+                _engine_pull_skipped(
+                    vault, engine, f"추적 안 되는 파일이 들어올 커밋과 겹침 ({shown})",
+                    skip_alert_after)
+                return []
     if _git("pull", "--ff-only", "origin", "main").returncode != 0:
         return ["engine-pull: ff-only pull 실패 (로컬 커밋?)"]
+    _engine_pull_went_through(vault)
     after = _git("rev-parse", "--short", "HEAD").stdout.strip()
     marker = _engine_sync_marker(vault)
     pending = marker.exists()

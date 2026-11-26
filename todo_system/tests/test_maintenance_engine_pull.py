@@ -10,7 +10,11 @@ throwaway tmp dir with (or without) a fake `.git`.
 Contract under test:
   * no-op (empty list, zero subprocess calls) for the combined layout
     (engine == vault) or any non-checkout (no engine/.git),
-  * skip (empty list, no fetch/pull) when HEAD != main or the tree is dirty,
+  * skip (empty list, no fetch/pull) when HEAD != main or a *tracked* file is
+    modified; untracked files alone never block (checked against a real local
+    origin too), unless an incoming commit writes a path one occupies,
+  * three consecutive skips open one dashboard ops task; a pull that goes
+    through clears the count and closes it,
   * fetch + ff-only pull on a clean, behind checkout, and `uv sync` *only* when
     pyproject.toml / uv.lock changed,
   * a git/uv returncode != 0 is reported as a non-empty reason list (so the
@@ -24,6 +28,8 @@ Contract under test:
 from __future__ import annotations
 
 import subprocess
+
+import pytest
 
 from todo_system import worker
 
@@ -114,7 +120,7 @@ def test_clean_behind_pulls(tmp_path):
 
 def test_dirty_skips(tmp_path, capsys):
     engine, vault = _checkout(tmp_path)
-    fake = FakeRun({"branch": cp(0, "main\n"), "status": cp(0, "?? scratch\n")})
+    fake = FakeRun({"branch": cp(0, "main\n"), "status": cp(0, " M todo_system/x.py\n")})
 
     reasons = worker.pull_engine_checkout(engine=engine, vault=vault, run=fake)
 
@@ -122,6 +128,206 @@ def test_dirty_skips(tmp_path, capsys):
     assert "fetch" not in fake.keys
     assert "pull" not in fake.keys
     assert "dirty" in capsys.readouterr().out
+
+
+def test_dirty_check_ignores_untracked_files(tmp_path):
+    """The dirty probe asks git for tracked changes only — an untracked runtime
+    log must not count (2026-11-26: logs/kakao_* stalled every pull)."""
+    engine, vault = _checkout(tmp_path)
+    fake = FakeRun(_clean_behind_responses())
+
+    worker.pull_engine_checkout(engine=engine, vault=vault, run=fake)
+
+    status_argv = next(argv for argv, _ in fake.calls if argv[3] == "status")
+    assert "--untracked-files=no" in status_argv
+
+
+def test_untracked_overlapping_incoming_skips(tmp_path, capsys):
+    engine, vault = _checkout(tmp_path)
+    responses = _clean_behind_responses()
+    responses["ls-files"] = cp(0, "logs/\nnotes.txt\n")
+    responses["diff"] = cp(0, "logs/new.log\ntodo_system/x.py\n")
+    fake = FakeRun(responses)
+
+    reasons = worker.pull_engine_checkout(engine=engine, vault=vault, run=fake)
+
+    assert reasons == []
+    assert "fetch" in fake.keys
+    assert "pull" not in fake.keys
+    assert "겹침" in capsys.readouterr().out
+
+
+def test_untracked_not_overlapping_pulls(tmp_path):
+    engine, vault = _checkout(tmp_path)
+    responses = _clean_behind_responses()
+    responses["ls-files"] = cp(0, "logs/\n")
+    responses["diff"] = [cp(0, "todo_system/x.py\n"), cp(0, "")]  # overlap probe, deps probe
+    fake = FakeRun(responses)
+
+    reasons = worker.pull_engine_checkout(engine=engine, vault=vault, run=fake)
+
+    assert reasons == []
+    assert "pull" in fake.keys
+
+
+def test_untracked_overlap_matches_dir_prefix_both_ways():
+    assert worker._untracked_overlap(["logs/"], ["logs/a.log"]) == ["logs/"]
+    assert worker._untracked_overlap(["tools"], ["tools/x.py"]) == ["tools"]
+    assert worker._untracked_overlap(["a/b.txt"], ["a"]) == ["a/b.txt"]
+    assert worker._untracked_overlap(["logs/"], ["logsx/a", "todo_system/x.py"]) == []
+
+
+# --- consecutive skips → one dashboard alert ---------------------------------
+
+
+def _ops_task(name="engine-pull-stalled"):
+    from todo_system import ops_alerts
+    return ops_alerts.vault_root() / "Todo" / "items" / f"ops-{name}.md"
+
+
+def test_three_consecutive_skips_open_one_alert(tmp_path, monkeypatch):
+    engine, vault = _checkout(tmp_path)
+    opened = []
+    from todo_system import ops_alerts
+    real_open = ops_alerts.open_alert
+    monkeypatch.setattr(ops_alerts, "open_alert",
+                        lambda *a, **kw: (opened.append(a[0]), real_open(*a, **kw)))
+
+    def dirty_tick():
+        fake = FakeRun({"branch": cp(0, "main\n"), "status": cp(0, " M x.py\n")})
+        assert worker.pull_engine_checkout(engine=engine, vault=vault, run=fake) == []
+
+    dirty_tick()
+    dirty_tick()
+    assert opened == []                       # two skips: still quiet
+    dirty_tick()
+    assert opened == ["engine-pull-stalled"]  # third: exactly one alert
+    assert "status: open" in _ops_task().read_text(encoding="utf-8")
+    dirty_tick()
+    dirty_tick()
+    assert opened == ["engine-pull-stalled"]  # no repeat while it keeps skipping
+
+    # The next pull that goes through clears the count and closes the task.
+    worker.pull_engine_checkout(engine=engine, vault=vault, run=FakeRun(_clean_behind_responses()))
+    assert not (vault / "Worker" / "_state" / "engine-pull-skips").exists()
+    assert "status: done" in _ops_task().read_text(encoding="utf-8")
+
+    # A fresh streak counts from zero again.
+    dirty_tick()
+    dirty_tick()
+    assert opened == ["engine-pull-stalled"]
+
+
+def test_mixed_skip_kinds_share_one_streak(tmp_path):
+    engine, vault = _checkout(tmp_path)
+    worker.pull_engine_checkout(engine=engine, vault=vault,
+                                run=FakeRun({"branch": cp(0, "worker/x\n")}))
+    worker.pull_engine_checkout(engine=engine, vault=vault,
+                                run=FakeRun({"branch": cp(0, "main\n"), "status": cp(0, " M x\n")}))
+    assert not _ops_task().exists()
+    responses = _clean_behind_responses()
+    responses["ls-files"] = cp(0, "logs/\n")
+    responses["diff"] = cp(0, "logs/a.log\n")
+    worker.pull_engine_checkout(engine=engine, vault=vault, run=FakeRun(responses))
+    assert _ops_task().exists()
+
+
+def test_fetch_failure_does_not_reset_streak(tmp_path):
+    engine, vault = _checkout(tmp_path)
+    counter = vault / "Worker" / "_state" / "engine-pull-skips"
+    worker.pull_engine_checkout(engine=engine, vault=vault,
+                                run=FakeRun({"branch": cp(0, "worker/x\n")}))
+    assert counter.read_text(encoding="utf-8").startswith("1 ")
+    responses = _clean_behind_responses()
+    responses["fetch"] = cp(1, "")
+    worker.pull_engine_checkout(engine=engine, vault=vault, run=FakeRun(responses))
+    assert counter.read_text(encoding="utf-8").startswith("1 ")
+
+
+# --- real git: a local origin, no network ------------------------------------
+
+
+def _g(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, check=True)
+
+
+@pytest.fixture
+def real_checkout(tmp_path):
+    """(engine clone on main, an upstream clone to push new commits from, vault)."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    upstream = tmp_path / "upstream"
+    subprocess.run(["git", "clone", "-q", str(origin), str(upstream)], check=True)
+    _g(upstream, "checkout", "-q", "-b", "main")
+    (upstream / "README.md").write_text("v1\n")
+    _g(upstream, "add", "README.md")
+    _g(upstream, "commit", "-q", "-m", "v1")
+    _g(upstream, "push", "-q", "origin", "main")
+    engine = tmp_path / "engine"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(origin), str(engine)], check=True)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    return engine, upstream, vault
+
+
+def _push_change(upstream, rel="README.md", text="v2\n"):
+    path = upstream / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    _g(upstream, "add", rel)
+    _g(upstream, "commit", "-q", "-m", f"change {rel}")
+    _g(upstream, "push", "-q", "origin", "main")
+    return _g(upstream, "rev-parse", "HEAD").stdout.strip()
+
+
+def _head(repo):
+    return _g(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_real_git_untracked_logs_still_fast_forwards(real_checkout):
+    engine, upstream, vault = real_checkout
+    (engine / "logs").mkdir()
+    (engine / "logs" / "kakao_digest.jsonl").write_text("{}\n")
+    (engine / "logs" / "kakao_route.log").write_text("x\n")
+    new = _push_change(upstream)
+
+    reasons = worker.pull_engine_checkout(engine=engine, vault=vault)
+
+    assert reasons == []
+    assert _head(engine) == new
+    assert (engine / "logs" / "kakao_route.log").exists()  # untouched
+    assert not (vault / "Worker" / "_state" / "engine-pull-skips").exists()
+
+
+def test_real_git_modified_tracked_file_skips(real_checkout, capsys):
+    engine, upstream, vault = real_checkout
+    before = _head(engine)
+    (engine / "README.md").write_text("local edit\n")
+    _push_change(upstream, "other.txt", "o\n")
+
+    reasons = worker.pull_engine_checkout(engine=engine, vault=vault)
+
+    assert reasons == []
+    assert _head(engine) == before
+    assert "dirty" in capsys.readouterr().out
+
+
+def test_real_git_untracked_file_in_incoming_path_skips(real_checkout, capsys):
+    engine, upstream, vault = real_checkout
+    before = _head(engine)
+    (engine / "logs").mkdir()
+    (engine / "logs" / "a.log").write_text("mine\n")
+    _push_change(upstream, "logs/a.log", "theirs\n")
+
+    reasons = worker.pull_engine_checkout(engine=engine, vault=vault)
+
+    assert reasons == []  # a skip, not a failed pull
+    assert _head(engine) == before
+    assert (engine / "logs" / "a.log").read_text() == "mine\n"
+    assert "겹침" in capsys.readouterr().out
 
 
 def test_head_not_main_skips(tmp_path, capsys):
