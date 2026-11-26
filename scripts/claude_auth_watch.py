@@ -63,7 +63,7 @@ from todo_system import ops_alerts  # noqa: E402
 from todo_system import paths  # noqa: E402
 # Single source of the length budget + self-limiting composer. Leaf module,
 # stdlib-only, so it stays safe under launchd's bare /usr/bin/python3 (no venv).
-from todo_system.kakao_format import compose_alert  # noqa: E402
+from todo_system.kakao_format import compose_alert, sender_env  # noqa: E402
 # Engine root through the resolver: dev checkout -> repo root (same value as the
 # bootstrap above); wheel install -> todo_system/_engine, where scripts/ and
 # .claude/commands ship in repo layout. The bootstrap only puts the engine on
@@ -147,7 +147,9 @@ def notify(title: str, message: str, link: str | None = None,
             args = [str(KAKAO_SCRIPT), _compose_kakao_text(title, message)]
             if link:
                 args.append(link)
-            env = dict(os.environ)
+            # The vault this module resolved, so kakao_send.sh never falls back
+            # to the engine checkout as its data root (logs/ written there).
+            env = sender_env(VAULT)
             if level:
                 env["KAKAO_LEVEL"] = level
             subprocess.run(args, capture_output=True, timeout=30, env=env)

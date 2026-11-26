@@ -108,7 +108,8 @@ def kakao_notifier(text: str, link: str | None = None, *,
     args = [str(KAKAO_SCRIPT), text] + ([link] if link else [])
     try:
         subprocess.run(args, cwd=str(_ENGINE_ROOT), capture_output=True,
-                       text=True, encoding="utf-8", errors="replace", timeout=30)
+                       text=True, encoding="utf-8", errors="replace", timeout=30,
+                       env=_kakao_format.sender_env(_VAULT_DATA_ROOT))
     except Exception:
         pass
 

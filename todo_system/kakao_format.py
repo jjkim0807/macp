@@ -146,9 +146,44 @@ def _vault_root() -> Path:
     on; in an installed wheel the anchor is None and the cwd-upward search runs
     instead of a site-packages anchor."""
     env = _os.environ.get("KAKAO_VAULT_DIR")
-    if env:
-        return Path(env)
-    return paths.vault_root(start=paths.vault_search_start())
+    root = Path(env) if env else paths.vault_root(start=paths.vault_search_start())
+    if _is_bare_engine_tree(root):
+        # kakao_send.sh falls back to its own engine checkout as the data root
+        # when the caller sets neither KAKAO_VAULT_DIR nor MACP_VAULT_ROOT, and
+        # hands that to kakao_route.py as KAKAO_VAULT_DIR. Writing routing state
+        # there left untracked logs/kakao_digest.jsonl + kakao_route.log in the
+        # HQ engine checkout, which stalled its auto-pull for a day (2026-11-26).
+        # Refuse: route() degrades to an immediate send, losing nothing.
+        raise paths.VaultRootError(
+            f"refusing to keep alert state in the engine checkout {root}: set "
+            "MACP_VAULT_ROOT to the vault root")
+    return root
+
+
+def _is_bare_engine_tree(root: Path) -> bool:
+    """True for an engine source tree that is not also a vault: it ships this
+    module but carries no ``.macp/config.toml`` marker. A combined layout (engine
+    checkout == vault) always has the marker, so it is never refused."""
+    try:
+        return ((root / "todo_system" / "kakao_format.py").is_file()
+                and not (root / ".macp" / "config.toml").is_file())
+    except OSError:
+        return False
+
+
+def sender_env(vault: Path | str | None, base: dict | None = None) -> dict[str, str]:
+    """Environment for spawning ``scripts/kakao_send.sh`` from Python.
+
+    The script resolves its data root as KAKAO_VAULT_DIR → MACP_VAULT_ROOT → its
+    own engine checkout. A caller that already resolved the vault passes it here
+    so the last fallback (alert state and logs written into the engine tree) can
+    never be reached from the engine's own senders. An inherited KAKAO_VAULT_DIR /
+    MACP_VAULT_ROOT is left alone, so the test seam and an explicit split install
+    keep their precedence."""
+    env = dict(_os.environ if base is None else base)
+    if vault and not env.get("KAKAO_VAULT_DIR") and not env.get("MACP_VAULT_ROOT"):
+        env["MACP_VAULT_ROOT"] = str(vault)
+    return env
 
 
 def _locked_append(path: Path, text: str) -> None:
@@ -198,7 +233,7 @@ def route(
     """
     try:
         now = _time.time() if now is None else float(now)
-        root = _vault_root()
+        root = None if (digest_path and dedup_path and log_path) else _vault_root()
         digest_p = Path(digest_path) if digest_path else root / "logs" / "kakao_digest.jsonl"
         dedup_p = Path(dedup_path) if dedup_path else root / "logs" / "kakao_dedup.json"
         log_p = Path(log_path) if log_path else root / "logs" / "kakao_route.log"
