@@ -667,6 +667,7 @@ def kakao_notify(message: str, link: str | None = None, *,
             timeout=15,
             check=False,
             capture_output=True,
+            env=kakao_format.sender_env(ROOT),
         )
     except (OSError, subprocess.SubprocessError):
         pass
