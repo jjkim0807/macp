@@ -17,6 +17,9 @@ Lite mode (``docs/design/lite-mode.md``) adds two things in front of that:
 * When nothing resolves a vault — exactly the case that exits 2 — and the lite
   default vault (:func:`default_vault`) exists, that vault is used. With no
   default vault the quick start now says ``macp init``.
+
+``macp -h`` / ``macp --help`` prints the lite verbs first (:func:`verb_summary`),
+then the todo CLI's own help when a vault resolves, and exits 0 either way.
 """
 
 from __future__ import annotations
@@ -40,6 +43,14 @@ def default_vault() -> Path:
     return Path(os.environ.get("MACP_HOME") or (Path.home() / ".macp")) / "vault"
 
 
+def verb_summary() -> str:
+    """The lite verbs with one line each — the commands the README teaches."""
+    from todo_system.i18n import t
+    lines = [t("lite.help.usage")]
+    lines += [f"  {verb:<10} {t('lite.help.' + verb)}" for verb in LITE_VERBS]
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in LITE_VERBS:
@@ -55,11 +66,26 @@ def main(argv: list[str] | None = None) -> int:
             fallback = default_vault()
             if (fallback / "Todo" / "items").is_dir():
                 os.environ["MACP_VAULT_ROOT"] = str(fallback)
+    wants_help = bool(args) and args[0] in ("-h", "--help")
+    if wants_help:
+        # `macp --help` is the first thing a new user types: show the README's
+        # verbs and exit 0 whether or not a vault exists yet.
+        sys.stdout.write(verb_summary())
     try:
         from todo_system import cli
     except paths.VaultRootError as exc:
+        if wants_help:
+            from todo_system.i18n import t
+            sys.stdout.write(f"\n{t('lite.help.no_vault')}\n")
+            return 0
         sys.stderr.write(f"macp: {exc}\n\n{QUICK_START}")
         return 2
+    if wants_help:
+        from todo_system.i18n import t
+        parser = cli.build_parser()
+        parser.prog = "macp"
+        sys.stdout.write(f"\n{t('lite.help.task_cli')}\n\n{parser.format_help()}")
+        return 0
     return cli.main()
 
 
