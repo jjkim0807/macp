@@ -76,6 +76,26 @@ usual cause. Name the exact local command in `acceptance_criteria`.
 - Never edit `Worker/assignments/*.json` by hand. The orchestrator owns the ledger, and
   a hand edit races the next tick.
 
+## A vault task's PR conflicts on files the run never touched
+
+A vault task works inside the vault repository, so while `worker/<slug>` is checked
+out the vault's own daemons can commit onto it (`chore: sync vault state`,
+`chore: planner`, `chore: beta watermark`, `chore(mailbox):`, …). `main` gets the
+same state under other commits, and the PR reads CONFLICTING on
+`Worker/assignments/*.json`, `Memory/index.md` and the like.
+
+For an `auto_merge: true` **delegate** task the engine handles this itself
+(`orchestrator/vault_pr_rebuild.py`). When the squash merge is refused for a conflict
+it replays only the run's own commits onto `origin/main` (the engine's commits are
+dropped, and a commit `main` already has is skipped), pushes the result to the same
+`worker/<slug>` as a fast-forward, and merges again. It never uses `--admin`,
+`--auto`, a force push or a push to `main`. If one of the run's own commits really
+conflicts, nothing is pushed: the task parks in `awaiting_human` and the note names
+the conflicting files. Resolve those by hand.
+
+The engine list of commit subjects is `ENGINE_COMMIT_PREFIXES` in that module. A code
+repository's PR never takes this path. Its conflicts are real ones.
+
 ## Builds fail with "No space left on device"
 
 Look for `disk-prune:` and `disk guard:` lines in the maintenance and runner logs.
