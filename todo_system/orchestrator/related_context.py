@@ -4,8 +4,8 @@ Why this module exists: the three consumers that most need "which past records
 relate to this task" are the three that **cannot run a command to find out**.
 
 * The research stage's whitelist is ``STAGE_TOOLS["research"] = "Read Write"``
-  (``orchestrator/stages.py``) — no Bash at all. ``TASK_TOOLS_STAGES =
-  ("implement",)`` means a task's own ``allowed_tools`` cannot widen it either,
+  (``orchestrator/stages.py``) — no Bash at all. ``TASK_TOOLS_STAGES`` names no
+  read-only stage, so a task's own ``allowed_tools`` cannot widen it either,
   so "run this query yourself" is a dead instruction there however it is worded.
 * ``scripts/brief.sh`` passes ``Read Write Edit Bash(git log:*) Bash(git diff:*)
   Bash(git status:*)`` — same conclusion.

@@ -59,10 +59,11 @@ no_homebrew_cli = pytest.mark.skipif(
 
 # --- half 1: the permission surfaces, asserted verbatim -------------------------
 
-def test_a_task_can_widen_only_the_implement_stage():
-    """`allowed_tools` in a task's frontmatter reaches implement only, so no task
-    can hand verify/report/discover a tool this wiring would then depend on."""
-    assert stages.TASK_TOOLS_STAGES == ("implement",)
+def test_a_task_can_widen_only_the_write_stages():
+    """`allowed_tools` in a task's frontmatter reaches implement, quick and
+    delegate only (quick/delegate since 2026-11-28), so no task can hand
+    verify/report/discover a tool this wiring would then depend on."""
+    assert stages.TASK_TOOLS_STAGES == ("implement", "quick", "delegate")
 
 
 def _allowed_tools_lines(script: str) -> list[str]:
