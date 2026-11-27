@@ -1824,6 +1824,9 @@ def _attach_decisions(human: list[dict]) -> None:
     docstring of todo_system/orchestrator/triage.py, "Decision cards". Only
     `why` owned / parked rows are asked; a row that gets a card also becomes
     `urgent`, so a decision never waits behind a due date or a time block.
+    A parked row with no md card may carry the question its run asked
+    (triage.run_decision_card, "Decision cards of a parked run"); its
+    `action` then becomes that question.
     The sort is stable: rows with a card first, every other row in the order
     collect_human gave it. Local md reads only (mtime-cached), no gh/git/
     network. Fail-soft per row: an error leaves that row untouched and logs
@@ -1833,12 +1836,24 @@ def _attach_decisions(human: list[dict]) -> None:
     except Exception as e:
         logger.warning("decision cards unavailable err=%s", type(e).__name__)
         return
+    reg, latest = None, None                    # read once, only if a parked row needs them
     for r in human:
         if r.get("why") not in ("owned", "parked"):
             continue
         slug = str(r.get("slug") or "")
         try:
             card = _tri.decision_card(slug, items_dir=ITEMS)
+            if card is None and r.get("why") == "parked":
+                # the question a parked run asked (same docstring, "Decision cards
+                # of a parked run"); its row note becomes that question, so the
+                # raw blocker is shown nowhere but the card's folded details
+                if latest is None:
+                    reg, latest = _registry_or_none(), _tri.latest_runs(RUNS)
+                card = _tri.run_decision_card(_tri.gather(
+                    slug, assign_dir=ASSIGN, items_dir=ITEMS, runs_dir=RUNS, vault_root=VAULT,
+                    registry=reg, latest_run=latest.get(slug, "")))
+                if card is not None:
+                    r["action"] = card["question"]
         except Exception as e:
             logger.warning("decision card failed task=%s err=%s", slug, type(e).__name__)
             continue
@@ -2149,6 +2164,10 @@ border-radius:6px;font:inherit;font-size:13px;padding:3px 8px}
 .tmsg.ok{color:var(--grn)}.tmsg.err{color:var(--red)}
 /* Decision card: the same box as a triage card; an option is a sentence, so its button wraps. */
 .dec .tbtn{white-space:normal;text-align:left;overflow-wrap:anywhere}
+/* An option with a consequence takes its own line; the raw worker text stays folded. */
+.dopt{display:flex;flex-direction:column;gap:2px;min-width:0}.dopt.full{flex-basis:100%}
+.tlink{background:none;border:0;color:var(--blu);cursor:pointer;font-size:12px;padding:0;margin-top:6px}
+.ddet{overflow-wrap:anywhere;margin-top:2px}
 .empty{color:var(--mut);font-size:13px;padding:5px 0}
 .mut{color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
@@ -2414,18 +2433,26 @@ const depRow=r=>`<div class="row"><div class="main"><div class="ttl mono">${esc(
 // A click posts {task, action:'answer', option} (option = 1-based position) or {task, action:'answer',
 // text} to /api/action and shows the reply message as-is. No confirm dialog. An answer only records:
 // the server writes the choice down and runs nothing, whatever the option says.
+// A parked run's card adds optional keys, drawn when present: background lines, what each option
+// leads to (under its button), the recommended option and why, and the worker's raw text, folded
+// behind a toggle (st.dopen survives the poll). Missing keys draw the card exactly as before.
 function decBlock(slug,d){
   if(!d)return '';
   const st=ts(slug),s=esca(slug),dis=st.busy?' disabled':'';
-  const opts=(d.options||[]).map((o,i)=>`<button class="tbtn" data-dec="opt" data-n="${i+1}" data-slug="${s}"${dis}>${esc(o)}</button>`).join('');
+  const cons=d.consequences||[],rec=d.recommended||0;
+  const bg=(d.background||[]).map(b=>`<div class="note">${esc(b)}</div>`).join('');
+  const opts=(d.options||[]).map((o,i)=>`<div class="dopt${cons[i]?' full':''}"><button class="tbtn" data-dec="opt" data-n="${i+1}" data-slug="${s}"${dis}>${esc(o)}${rec===i+1?` <span class="badge b-pur">@@dash.js.dec_recommended@@</span>`:''}</button>${cons[i]?`<div class="note">→ ${esc(cons[i])}</div>`:''}</div>`).join('');
+  const why=rec&&d.reason?`<div class="tadv">@@dash.js.dec_reason@@: ${esc(d.reason)}</div>`:'';
+  const det=d.detail?`<button class="tlink" data-dec="detail" data-slug="${s}">@@dash.js.dec_detail@@ ${st.dopen?'▾':'▸'}</button>${st.dopen?`<div class="note mono ddet">${esc(d.detail)}</div>`:''}`:'';
   const msg=(st.busy&&st.ans)?'<div class="tmsg">@@dash.js.tri_sending@@</div>':(st.amsg?`<div class="tmsg err">${esc(st.amsg)}</div>`:'');
-  return `<div class="tri dec">${d.question?`<div class="treason">${esc(d.question)}</div>`:''}${opts?`<div class="tacts">${opts}</div>`:''}<div class="tin"><input class="tri-in" data-kind="answer" data-slug="${s}" maxlength="500" placeholder="@@dash.js.dec_placeholder@@" value="${esca(st.adraft)}"><button class="tbtn" data-dec="send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>${msg}</div>`;
+  return `<div class="tri dec">${d.question?`<div class="treason">${esc(d.question)}</div>`:''}${bg}${opts?`<div class="tacts">${opts}</div>`:''}${why}<div class="tin"><input class="tri-in" data-kind="answer" data-slug="${s}" maxlength="500" placeholder="@@dash.js.dec_placeholder@@" value="${esca(st.adraft)}"><button class="tbtn" data-dec="send" data-slug="${s}"${dis}>@@dash.js.tri_send@@</button></div>${det}${msg}</div>`;
 }
 function decSend(slug){const st=ts(slug),v=(st.adraft||'').trim();
   if(!v){st.amsg='@@dash.js.dec_need_text@@';if(last)update(last);return}
   triAct(slug,'answer',v)}
 function decClick(btn){
   const slug=btn.dataset.slug||'';
+  if(btn.dataset.dec==='detail'){const st=ts(slug);st.dopen=!st.dopen;if(last)update(last);return}
   if(btn.dataset.dec==='send'){decSend(slug);return}
   triAct(slug,'answer',null,Number(btn.dataset.n));
 }
@@ -3657,7 +3684,13 @@ class Handler(BaseHTTPRequestHandler):
 
         The answer only records (triage_actions._answer): one md commit and, for
         a waiting human assignment, one reply to the orchestrator. Nothing is
-        closed, merged, resumed or dispatched here, whatever the choice says."""
+        closed, merged, resumed or dispatched here, whatever the choice says.
+
+        With no md decision card, the question a parked run asked is judged the
+        same way (triage.run_decision_card over fresh facts). Its answer is the
+        one that carries the task on: the choice and the question are committed
+        to the md and a resume is reserved after that commit
+        (triage_actions._answer_run, instruct's path), which takes the card away."""
         from todo_system.orchestrator import triage as _tri
         from todo_system.orchestrator import triage_actions as _acts
 
@@ -3679,8 +3712,15 @@ class Handler(BaseHTTPRequestHandler):
         if not (ITEMS / f"{slug}.md").is_file():
             refuse(404, "unknown_task")
             return
+        facts, run_card = None, None
         try:
             card = _tri.decision_card(slug, items_dir=ITEMS)
+            if card is None:
+                # a parked run's question: judged again from fresh facts, and its
+                # answer records then resumes (triage_actions._answer_run)
+                facts = _tri.gather(slug, assign_dir=ASSIGN, items_dir=ITEMS, runs_dir=RUNS,
+                                    vault_root=VAULT, registry=_registry_or_none())
+                card = run_card = _tri.run_decision_card(facts)
         except Exception as e:
             logger.warning("dashboard action answer: card failed task=%s err=%s", slug,
                            type(e).__name__)
@@ -3699,16 +3739,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             choice = " ".join(text.split())
         try:
-            ok, message = _acts.run_action("answer", slug, None, vault_root=VAULT,
+            ok, message = _acts.run_action("answer", slug, facts, vault_root=VAULT,
                                            items_dir=ITEMS, text=choice, run=_ACTION_RUN,
-                                           assign_dir=ASSIGN)
+                                           assign_dir=ASSIGN, run_card=run_card)
         except Exception as e:
             logger.warning("dashboard action crashed task=%s action=answer err=%s", slug,
                            type(e).__name__)
             ok, message = False, i18n.t("triage.result.internal")
         # the answer itself stays out of the log (length only), like an instruction
-        logger.info("dashboard action task=%s action=answer rule=decision ok=%s text_len=%d",
-                    slug, ok, len(choice))
+        logger.info("dashboard action task=%s action=answer rule=%s ok=%s text_len=%d",
+                    slug, "decision" if run_card is None else "run_decision", ok, len(choice))
         self._status_cache.invalidate()
         self._reply_json(200, {"ok": ok, "message": message}, extra)
 

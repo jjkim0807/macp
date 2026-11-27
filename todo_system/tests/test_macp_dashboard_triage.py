@@ -1018,7 +1018,9 @@ class DecisionCardShell(unittest.TestCase):
         b = self.render()
         self.assertIn("dis=st.busy?' disabled':''", b)
         self.assertEqual(b.count("${dis}>"), 2)                  # each option, and send
-        self.assertEqual(b.count("<button"), 2)
+        # + the details toggle, which only folds text and posts nothing
+        self.assertEqual(b.count("<button"), 3)
+        self.assertEqual(b.count('data-dec="detail"'), 1)
 
     def test_answers_go_to_the_action_route_as_option_or_text(self):
         h = self.handlers()
@@ -1071,6 +1073,304 @@ class DecisionCardShell(unittest.TestCase):
         self.assertIsNone(_HANGUL_RE.search(en))
         for s in ("직접 답 한 줄 (500자 이하)", "답을 한 줄 적어 주세요"):
             self.assertIn(s, ko)
+
+    def test_a_run_cards_extra_keys_render_when_present(self):
+        b = self.render()
+        for tok in ("d.background||[]", "d.consequences||[]", "d.recommended||0", "d.reason",
+                    "d.detail", "${esc(cons[i])}", "${esc(d.reason)}", "${esc(d.detail)}",
+                    "rec===i+1", "@@dash.js.dec_recommended@@", "@@dash.js.dec_reason@@",
+                    "@@dash.js.dec_detail@@"):
+            self.assertIn(tok, b)
+        # the raw worker text is drawn only behind the toggle
+        self.assertIn("st.dopen?`<div class=\"note mono ddet\">${esc(d.detail)}</div>`:''", b)
+        self.assertEqual(b.count("esc(d.detail)"), 1)
+        click = self.handlers()[self.handlers().index("function decClick"):]
+        self.assertIn("btn.dataset.dec==='detail'", click)
+        # the toggle returns before anything is posted
+        self.assertLess(click.index("btn.dataset.dec==='detail'"), click.index("triAct("))
+        for s, lang in (("자세히", "ko"), ("권장 이유", "ko"), ("Details", "en"),
+                        ("Why recommended", "en")):
+            self.assertIn(s, M.render_html(lang))
+
+
+# --- the question a parked run asks (acceptance criteria 1-3) -------------------------
+# The 2026-11-27 park (decision_cases/visit_store_park.json, anonymised): the card
+# showed Verify's English blocker with its file and class names and three buttons
+# that said nothing about the choice.
+
+_DCASE = _REPO / "todo_system" / "orchestrator" / "tests" / "decision_cases" / "visit_store_park.json"
+
+
+def _dcase() -> dict:
+    return json.loads(_DCASE.read_text(encoding="utf-8"))
+
+
+def _with_block(text: str, req: dict) -> str:
+    return text + "\n```decision\n" + json.dumps(req, ensure_ascii=False) + "\n```\n"
+
+
+class _RunDecisionVault(_GitTriageVault):
+    """_GitTriageVault plus the 11-27 park, committed on main by install()."""
+
+    def setUp(self):
+        super().setUp()
+        self.case = _dcase()
+        self.slug = self.case["slug"]
+        self.raw = self.case["ledger"]["blocked_on"]
+        self.question = self.case["decision_block"]["question"]
+
+    def install(self, *, block: bool = True, run: bool = True, ledger: dict | None = None,
+                md: str | None = None) -> None:
+        case = json.loads(json.dumps(self.case))
+        if block:
+            case["run"]["files"]["verify.md"] = _with_block(case["run"]["files"]["verify.md"],
+                                                            case["decision_block"])
+        if not run:
+            case.pop("run")
+        case["ledger"].update(ledger or {})
+        if md is not None:
+            case["task_md"] = md
+        self._install_case(case)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "park")
+        self.commits = int(self.git("rev-list", "--count", "HEAD").strip())
+
+    def parked(self) -> dict | None:
+        rows = {r["slug"]: r for r in self.status(self.port)["human"] if r["why"] == "parked"}
+        return rows.get(self.slug)
+
+    def assertNoRawText(self, row: dict):
+        shown = json.loads(json.dumps(row))
+        detail = shown["decision"].pop("detail")
+        self.assertEqual(detail, self.raw)               # whole, but only behind the toggle
+        body = json.dumps(shown, ensure_ascii=False)
+        for token in self.case["raw_tokens"]:
+            self.assertNotIn(token, body)
+
+
+class RunDecisionStatus(_RunDecisionVault):
+    def test_the_parked_row_asks_the_question_in_plain_words(self):
+        self.install()
+        row = self.parked()
+        d = row["decision"]
+        self.assertEqual(sorted(d), ["background", "consequences", "detail", "options",
+                                     "question", "reason", "recommended", "source"])
+        self.assertEqual(d["question"], "지난 진료일 저장을 계획과 다른 이름(visit-date)·400일 제한으로 "
+                                        "만든 PR #50을 그대로 받을까요?")
+        self.assertEqual(d["background"], self.case["decision_block"]["background"])
+        self.assertEqual(d["options"], ["PR #50을 그대로 받기", "계획대로 이름·기간을 다시 만들기"])
+        self.assertEqual(d["consequences"],
+                         [o["consequence"] for o in self.case["decision_block"]["options"]])
+        self.assertEqual((d["recommended"], d["reason"], d["source"]),
+                         (1, self.case["decision_block"]["reason"], "run"))
+        # the row: its note is the question, it leads the list, it is never folded
+        self.assertEqual(row["action"], self.question)
+        self.assertIs(row["urgent"], True)
+        self.assertEqual(row["group"], "")
+        self.assertEqual(self.status(self.port)["human"][0]["slug"], self.slug)
+        # the triage card beside it: [취소] only — the card's options answer
+        self.assertEqual(row["triage"]["rule"], "decision")
+        self.assertEqual([a["id"] for a in row["triage"]["actions"]], ["cancel"])
+        self.assertNoRawText(row)
+
+    def test_the_old_verify_md_gets_the_could_not_ask_card(self):
+        self.install(block=False)                        # the 11-27 verify.md as it was
+        row = self.parked()
+        d = row["decision"]
+        self.assertIn("질문을 만들지 못했어요", d["question"])
+        self.assertEqual((d["options"], d["background"], d["consequences"]), ([], [], []))
+        self.assertEqual(row["action"], d["question"])
+        self.assertEqual(row["triage"]["rule"], "blocked")
+        self.assertNoRawText(row)
+
+    def test_the_ledger_copy_asks_without_a_run_dir(self):
+        from todo_system.orchestrator import stages
+        # a remote runner's park: its run dir is on another machine
+        self.install(block=False, run=False,
+                     ledger={"decision": stages.normalize_decision(self.case["decision_block"])})
+        d = self.parked()["decision"]
+        self.assertEqual(d["question"], self.question)
+        self.assertEqual(d["recommended"], 1)
+
+    def test_rows_another_rule_explains_get_no_run_card(self):
+        self.install()
+        parked = {r["slug"]: r for r in self.status(self.port)["human"] if r["why"] == "parked"}
+        for slug in (self.REVIEW, self.ORPHAN):
+            self.assertNotIn("decision", parked[slug])
+            self.assertIn("triage", parked[slug])
+
+    def test_the_status_path_runs_no_subprocess(self):
+        self.install()
+        rows = [{"slug": self.slug, "why": "parked", "action": "x"}]
+        with mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("no subprocess")):
+            M._attach_decisions(rows)
+        self.assertEqual(rows[0]["decision"]["source"], "run")
+
+
+class RunDecisionAnswer(_RunDecisionVault):
+    def test_option_1_records_the_choice_with_its_question_and_resumes(self):
+        self.install()
+        self.assertIn("decision", self.parked())
+        with self.assertLogs("macp.dashboard", level="INFO") as logs:
+            code, res = self.post({"task": self.slug, "action": "answer", "option": 1})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertIn("PR #50을 그대로 받기", res["message"])
+        md = (self.items / f"{self.slug}.md").read_text(encoding="utf-8")
+        self.assertRegex(md, r"\n- \d{4}-\d{2}-\d{2}: 결정\(대시보드\): PR #50을 그대로 받기 — 질문: "
+                             + re.escape(self.question) + r"\n$")
+        self.assertIn("\nstatus: open\n", md)
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.slug}.md"])
+        record = json.loads(resume.record_path(self.root, self.slug).read_text(encoding="utf-8"))
+        self.assertEqual(record["after_commit"], self.git("rev-parse", "HEAD").strip())
+        self.assertEqual(record["note"], "dashboard: decision")
+        self.assertEqual(self.gh_calls, [])
+        self.assertTrue(any(f"dashboard action task={self.slug} action=answer rule=run_decision "
+                            "ok=True" in line for line in logs.output), logs.output)
+        # answered: the card is gone on the next poll, and a second click is refused
+        self.assertNotIn("decision", self.parked())
+        code, res = self.post({"task": self.slug, "action": "answer", "option": 2})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+
+    def test_a_text_answer_and_the_refusals(self):
+        self.install()
+        for body, code in (({"option": 3}, 400), ({"option": 0}, 400), ({"option": True}, 400),
+                           ({"option": 1, "text": "x"}, 400), ({}, 400),
+                           ({"text": "a\nb"}, 400)):
+            with self.subTest(body=body):
+                c, res = self.post({"task": self.slug, "action": "answer", **body})
+                self.assertEqual(c, code)
+                self.assertSentence(res, ok=False)
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD").strip()), self.commits)
+        self.assertFalse(resume.record_path(self.root, self.slug).exists())
+        code, res = self.post({"task": self.slug, "action": "answer",
+                               "text": "  이름은 그대로 두고 계획 문서만 고쳐  "})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        md = (self.items / f"{self.slug}.md").read_text(encoding="utf-8")
+        self.assertIn("결정(대시보드): 이름은 그대로 두고 계획 문서만 고쳐 — 질문: ", md)
+
+    def test_the_could_not_ask_card_takes_a_text_answer(self):
+        self.install(block=False)
+        code, _res = self.post({"task": self.slug, "action": "answer", "option": 1})
+        self.assertEqual(code, 400)                      # no options on this card
+        code, res = self.post({"task": self.slug, "action": "answer", "text": "그대로 다시 해"})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        self.assertTrue(resume.record_path(self.root, self.slug).exists())
+
+    def test_a_task_a_person_took_over_has_no_card_to_answer(self):
+        md = self.case["task_md"].replace("worker_mode: auto", "worker_mode: manual")
+        self.install(md=md)
+        self.assertNotIn("decision", self.parked())
+        code, res = self.post({"task": self.slug, "action": "answer", "option": 1})
+        self.assertEqual(code, 409)
+        self.assertSentence(res, ok=False)
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD").strip()), self.commits)
+
+
+class RunDecisionPath(_RunDecisionVault):
+    """Acceptance criterion 3, end to end: a real Verify result (the runner's
+    `_execute` over the stub stages of test_runner_full_verify_path) → the FAIL
+    envelope the runner sends → a real Orchestrator.collect() on this vault →
+    `GET /api/status` → `POST /api/action` answer → the md commit and the resume."""
+
+    TASK = "light-task"          # the slug test_runner_full_verify_path's sandbox runs
+
+    def setUp(self):
+        super().setUp()
+        import pytest
+
+        from todo_system import cli
+        from todo_system.orchestrator.tests.test_runner_full_verify_path import _Sandbox
+        mp = pytest.MonkeyPatch()
+        self.addCleanup(mp.undo)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.box = _Sandbox(tmp, mp)
+        mp.setattr(cli, "ITEMS_DIR", self.items)
+        self._md(self.TASK, "---\ntags:\n  - todo\nstatus: open\nworker_mode: auto\n"
+                            "auto_merge: true\n---\n\n# light task\n\n## Progress Log\n\n"
+                            "- 2026-11-27: created\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "light task")
+
+    def run_verify(self, req: dict) -> dict:
+        """One dispatch whose Verify FAILs on a blocker with `req` as its block;
+        the FAIL envelope's payload exactly as runner._send builds it."""
+        self.box.artifacts["verify"] = _with_block(
+            "---\nstage: verify\noverall_status: fail\nconfidence: high\n"
+            f"blocked_on: {json.dumps(self.raw)}\n---\n\n# verify\n", req)
+        out = self.box.execute()
+        self.assertFalse(out.ok)
+        return {"reason": out.summary, **out.payload}
+
+    def collect(self, payload: dict):
+        from todo_system.orchestrator import message as msg_mod
+        from todo_system.orchestrator.assignment import IN_PROGRESS, Assignment, Ledger
+        from todo_system.orchestrator.mailbox import FileMailbox
+        from todo_system.orchestrator.orchestrator import Orchestrator
+        from todo_system.orchestrator.registry import Agent, Registry
+        ledger = Ledger(self.assign)
+        ledger.save(Assignment(task_id=self.TASK, agent_id="worker-default", corr_id="C",
+                               kind="ai-local", state=IN_PROGRESS,
+                               created_ts="2026-11-27T00:00:00+09:00",
+                               payload={"worker_mode": "auto", "auto_merge": True}))
+        mb = FileMailbox(self.root / "Worker" / "agents")
+        mb.send(msg_mod.Envelope(to=msg_mod.ORCHESTRATOR, type=msg_mod.FAIL, frm="worker-default",
+                                 task_id=self.TASK, corr_id="C", payload=payload))
+        self.alerts: list = []                 # what reached a person (notify)
+        Orchestrator(mb, Registry([Agent(id="worker-default", kind="ai-local", projects=["*"])]),
+                     ledger, notify=lambda text, link=None: self.alerts.append(text),
+                     alert_route=lambda text, **kw: ("send", text)).collect()
+        return ledger.load(self.TASK)
+
+    def test_an_irreversible_question_reaches_the_card_and_the_answer_resumes(self):
+        from todo_system.orchestrator.assignment import AWAITING_HUMAN
+        req = {"question": "만든 공개 페이지를 지금 공개로 바꿀까요?",
+               "background": ["페이지는 다 만들었고, 공개하면 검색에 잡혀요."],
+               "options": [{"label": "지금 공개", "consequence": "바로 누구나 볼 수 있어요."},
+                           {"label": "비공개로 두기", "consequence": "링크를 아는 사람만 봐요."}],
+               "recommended": 2, "reason": "공개는 되돌려도 이미 퍼진 건 못 거둬요.", "gate": "public"}
+        payload = self.run_verify(req)
+        self.assertEqual(payload["blocked_on"], self.raw)
+        a = self.collect(payload)
+        self.assertEqual(a.state, AWAITING_HUMAN)
+        self.assertEqual(a.decision["question"], req["question"])
+        self.assertEqual(len(self.alerts), 1)              # the park pages once, as before
+        # the dashboard: run dirs here hold nothing for this task, so the card is the
+        # ledger copy the park carried
+        rows = {r["slug"]: r for r in self.status(self.port)["human"] if r["why"] == "parked"}
+        d = rows[self.TASK]["decision"]
+        self.assertEqual((d["question"], d["background"], d["options"], d["recommended"]),
+                         (req["question"], req["background"], ["지금 공개", "비공개로 두기"], 2))
+        self.assertEqual(d["consequences"], ["바로 누구나 볼 수 있어요.", "링크를 아는 사람만 봐요."])
+        self.assertEqual(d["detail"], self.raw)
+        # the button = the option: record it, then carry the task on
+        code, res = self.post({"task": self.TASK, "action": "answer", "option": 2})
+        self.assertEqual(code, 200)
+        self.assertSentence(res, ok=True)
+        md = (self.items / f"{self.TASK}.md").read_text(encoding="utf-8")
+        self.assertIn(f"결정(대시보드): 비공개로 두기 — 질문: {req['question']}\n", md)
+        self.assertEqual(self.head_files(), [f"Todo/items/{self.TASK}.md"])
+        record = json.loads(resume.record_path(self.root, self.TASK).read_text(encoding="utf-8"))
+        self.assertEqual(record["after_commit"], self.git("rev-parse", "HEAD").strip())
+
+    def test_a_reversible_choice_never_reaches_a_person(self):
+        from todo_system.orchestrator.assignment import AWAITING_HUMAN
+        payload = self.run_verify(self.case["decision_block"])     # the 11-27 case
+        self.assertNotIn("blocked_on", payload)
+        a = self.collect(payload)
+        self.assertNotEqual(a.state, AWAITING_HUMAN)
+        self.assertEqual(self.alerts, [])
+        md = (self.items / f"{self.TASK}.md").read_text(encoding="utf-8")
+        self.assertIn("워커 결정(되돌릴 수 있는 선택이라 묻지 않음): PR #50을 그대로 받기", md)
+        d = self.status(self.port)
+        self.assertNotIn(self.TASK, {r["slug"] for r in d["human"]})
+        for r in d["attention"]:
+            self.assertNotIn("decision", r)
 
 
 if __name__ == "__main__":
