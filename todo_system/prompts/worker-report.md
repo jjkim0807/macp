@@ -89,7 +89,22 @@ Keep them when you re-Write the file for `pr_url` / `merged`. -->
 > alerts and carry follow-ups. Copy the headings exactly; write the prose under them in
 > the vault's language.
 
-If a next step is only a choice a person has to make, do not leave it as prose under `## 다음 단계`: raise it as a decision task — on the human-owned task that carries the choice, or a new `worker_mode: manual` task under `<vault_root>/Todo/items/` — with `needs_decision: true`, `decision_options:` (one option per line, at most 6), the question in `next_action` and no `scheduled:`, and name that task in the bullet.
+#### Choices: make the reversible ones, ask only the irreversible ones
+
+Decision 2026-11-20: a person is asked only about the five irreversible gates of
+`worker-verify.md` Step 8d — `money`, `send`, `public`, `delete`, `identity`. Any other
+choice the run met (a name, a bound, a file name that differs from the plan, an equivalent
+already merged, a UX default) is the worker's: it is made, not asked.
+
+- If verify.md carries a ```decision block, copy it into report.md unchanged (one block,
+  the same strict JSON). With `"gate": "none"` the engine writes its recommended option
+  into the task's Progress Log as the worker's decision when the run ends; say in one line
+  under `사람이 검토해야 할 부분` which option was taken and why. If you made such a choice
+  yourself in this stage, write the block the same way.
+- Never hold a merge (`worker_mode_recommendation: review`) for a reversible choice — merge
+  and record it. A hold for an irreversible step adds the block with that `gate`, so the
+  dashboard asks it as a question with one button per option instead of showing your prose.
+- If a next step is only an irreversible choice a person has to make, do not leave it as prose under `## 다음 단계`: raise it as a decision task — on the human-owned task that carries the choice, or a new `worker_mode: manual` task under `<vault_root>/Todo/items/` — with `needs_decision: true`, `decision_options:` (one option per line, at most 6), the question in `next_action` and no `scheduled:`, and name that task in the bullet. Write the question and options in the vault's language, in plain words (no file or class names).
 
 #### `merged: no` requires a reason, and there are two kinds
 
@@ -108,7 +123,9 @@ frontmatter (the runner reads the first match, so write only the one that applie
                                          # command error. Retrying may fix it.
     worker_mode_recommendation: review   # I chose not to merge. The task's own
                                          # guardrails, a live experiment, a
-                                         # finance gate, an out-of-repo decision.
+                                         # finance gate, an irreversible
+                                         # out-of-repo step (never a reversible
+                                         # choice — see "Choices" above).
 
 `review` makes the runner report a deliberate hold instead of a failure, and stops
 it burning a retry on something that is not broken. Explain the reason in

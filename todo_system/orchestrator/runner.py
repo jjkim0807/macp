@@ -1859,11 +1859,32 @@ class StagedExecutor(ClaudeCodeExecutor):
                         # the same unmet precondition. Surface it instead.
                         blocker = stages.parse_blocked_on(text)
                         if blocker:
+                            # A ```decision block beside the blocker says what the
+                            # person is asked. Decision 2026-11-20: only an
+                            # irreversible step (the block names its gate) is a
+                            # person's decision. Any other choice is the worker's —
+                            # record the recommended option and retry like any
+                            # FAIL instead of parking (no blocked_on in the
+                            # payload); the orchestrator writes the pick into the
+                            # task's Progress Log so the retry carries it on.
+                            request = stages.parse_decision_request(text)
+                            decided = stages.decision_record(request)
+                            if decided is not None:
+                                progress(f"reversible choice, not a park: {decided['choice']}")
+                                return ExecOutcome(
+                                    False, f"{stage} FAIL — reversible choice, the worker "
+                                           f"picked: {decided['choice']}",
+                                    {"branch": branch, "run_dir": str(run_dir),
+                                     "verify": "FAIL", "stages": completed,
+                                     "decided": decided})
                             progress(f"blocked on {blocker}")
+                            park = {"branch": branch, "run_dir": str(run_dir),
+                                    "verify": "FAIL", "stages": completed,
+                                    "blocked_on": blocker}
+                            if request is not None:
+                                park["decision"] = request   # ledger → dashboard question
                             return ExecOutcome(False, f"blocked on {blocker} — not a defect",
-                                               {"branch": branch, "run_dir": str(run_dir),
-                                                "verify": "FAIL", "stages": completed,
-                                                "blocked_on": blocker})
+                                               park)
                         return ExecOutcome(False, f"{stage} FAIL — not merged",
                                            {"branch": branch, "run_dir": str(run_dir),
                                             "verify": "FAIL", "stages": completed})
@@ -1964,6 +1985,22 @@ class StagedExecutor(ClaudeCodeExecutor):
                 extra["account"] = acct     # the claude account this run spent on
             if pr_url:
                 extra["pr_url"] = pr_url
+            # A choice the run settled or left (```decision block, report.md
+            # first, then verify.md): a reversible pick rides as `decided` so the
+            # orchestrator writes it into the Progress Log; a request that names
+            # an irreversible gate rides as `decision`, the question a held
+            # review asks on the dashboard.
+            verify_art = run_dir / stages.STAGE_ARTIFACT["verify"]
+            request = stages.parse_decision_request(report_txt) or (
+                stages.parse_decision_request(
+                    verify_art.read_text(encoding="utf-8", errors="replace"))
+                if verify_art.exists() else None)
+            if request is not None:
+                decided = stages.decision_record(request)
+                if decided is not None:
+                    extra["decided"] = decided
+                elif request["gate"]:
+                    extra["decision"] = request
             if stages.parse_verify_verdict(report_txt) == "FAIL":
                 return ExecOutcome(False, f"report declared the run failed{merge_note}",
                                    extra)

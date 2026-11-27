@@ -623,5 +623,78 @@ class AnswerTests(_GitVault):
         self.assertFalse(self.inbox.exists())
 
 
+# --- answer to a parked run's question: record, then carry on -------------------------
+
+RUN_CARD = {"question": "지난 진료일 저장을 계획과 다른 이름(visit-date)·400일 제한으로 만든 "
+                        "PR #50을 그대로 받을까요?",
+            "options": ["PR #50을 그대로 받기", "계획대로 이름·기간을 다시 만들기"],
+            "source": "run"}
+
+
+class AnswerRunTests(_GitVault):
+    """The answer to a run's question is instruct's path: one committed
+    「결정(대시보드)」 line naming the question, then a resume after that commit."""
+
+    def answer(self, text, **kw):
+        return self.act("answer", text=text, run_card=RUN_CARD, **kw)
+
+    def test_the_choice_and_its_question_are_committed_then_resumed(self):
+        ok, msg = self.answer("PR #50을 그대로 받기")
+        self.assertTrue(ok, msg)
+        self.assertIn("「PR #50을 그대로 받기」로 기록하고 다시 진행", msg)
+        self.assertSentence(msg)
+        text = self.md.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith(
+            f"- {TODAY}: 결정(대시보드): PR #50을 그대로 받기 — 질문: {RUN_CARD['question']}\n"))
+        self.assertIn(f"\nupdated: {TODAY}\n", text)
+        self.assertIn("\nstatus: open\n", text)                  # nothing closed
+        self.assertEqual(self.head_files(), [f"Todo/items/{SLUG}.md"])
+        self.assertEqual(self.git("log", "-1", "--format=%s").strip(),
+                         f"chore: record decision for {SLUG} (dashboard)")
+        record = json.loads(resume.record_path(self.root, SLUG).read_text(encoding="utf-8"))
+        self.assertEqual(record["after_commit"], self.git("rev-parse", "HEAD").strip())
+        self.assertEqual(record["note"], "dashboard: decision")
+
+    def test_no_marker_is_needed_and_none_is_written(self):
+        # a worker task md has no needs_decision; the answer adds none and drops nothing
+        ok, _msg = self.answer("계획대로 이름·기간을 다시 만들기")
+        self.assertTrue(ok)
+        text = self.md.read_text(encoding="utf-8")
+        self.assertNotIn("needs_decision", text)
+        self.assertIn("worker_mode: auto", text)
+        self.assertIn("- todo", text)
+
+    def test_a_failed_resume_is_said_and_the_record_stays(self):
+        def refuse(*a, **k):
+            raise resume.ResumeError("no ledger row")
+
+        with self.assertLogs("macp.dashboard", level="WARNING"):
+            ok, msg = self.answer("PR #50을 그대로 받기", schedule=refuse)
+        self.assertFalse(ok)
+        self.assertIn("재개 예약을 못 했어요", msg)
+        self.assertSentence(msg)
+        self.assertIn("결정(대시보드): PR #50을 그대로 받기", self.md.read_text(encoding="utf-8"))
+
+    def test_a_blank_answer_is_refused_before_any_write(self):
+        ok, msg = self.answer("  ")
+        self.assertFalse(ok)
+        self.assertIn("한 줄", msg)
+        self.assertEqual(self.md.read_text(encoding="utf-8"), MD)
+        self.assertFalse(resume.record_path(self.root, SLUG).exists())
+
+    def test_refused_off_main_writes_and_reserves_nothing(self):
+        self.git("checkout", "-q", "-b", "worker/other")
+        ok, msg = self.answer("PR #50을 그대로 받기")
+        self.assertFalse(ok)
+        self.assertIn("main이 아니라", msg)
+        self.assertEqual(self.md.read_text(encoding="utf-8"), MD)
+        self.assertFalse(resume.record_path(self.root, SLUG).exists())
+
+    def test_a_missing_question_still_records_the_choice(self):
+        ok, _msg = self.act("answer", text="그대로", run_card={"options": []})
+        self.assertTrue(ok)
+        self.assertIn("결정(대시보드): 그대로 — 질문: -", self.md.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

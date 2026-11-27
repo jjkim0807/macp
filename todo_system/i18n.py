@@ -298,10 +298,27 @@ MESSAGES: dict[str, dict[str, str]] = {
             "결정은 커밋했지만 오케스트레이터 회신은 보내지 못했어요 — 대시보드 로그를 확인하세요"),
         "triage.result.bad_option": "없는 선택지예요 — 화면을 새로고침하세요",
         "triage.result.bad_answer": "답은 한 줄, 500자 이하로 적어 주세요",
+        # answering the question a parked run asked: record, then carry on
+        "triage.result.answered_resume": (
+            "「{choice}」로 기록하고 다시 진행하도록 예약했어요 — 다음 틱(5분 안)에 이어서 돌아요"),
+        "triage.result.answered_no_resume": (
+            "답은 기록했지만 재개 예약을 못 했어요 — 잠시 뒤 다시 눌러 주세요"),
+        # the decision card of a parked run (triage.run_decision_card)
+        "triage.decision.reason": "사람이 정해야 할 것이 있어 멈췄어요",
+        "triage.decision.advice": "위 질문에서 고르면 기록되고 다시 진행돼요 — 그만두려면 [취소]",
+        "triage.decision.unparsed": (
+            "무엇을 정해야 하는지 질문을 만들지 못했어요 — 워커가 남긴 원문은 '자세히'에 있어요"),
+        "triage.blocked.advice_decision": (
+            "위 칸에 답을 적으면 기록되고 다시 진행돼요 — 그대로 다시 돌리려면 [재개]"),
         # Progress Log lines a click writes into the task md
         "triage.md.cancel": "- {today}: 대시보드에서 취소(사용자)",
         "triage.md.instruction": "- {today}: 사용자 지시(대시보드): {text}",
         "triage.md.answer": "- {today}: 결정(대시보드): {text}",
+        "triage.md.answer_run": "- {today}: 결정(대시보드): {text} — 질문: {question}",
+        # the line the orchestrator writes for a reversible choice a run made itself
+        "triage.md.worker_decided": (
+            "- {today}: 워커 결정(되돌릴 수 있는 선택이라 묻지 않음): {choice} — 질문: {question}{reason}"),
+        "triage.md.worker_decided_reason": " · 이유: {reason}",
         # the next_action an answered decision task is left with
         "triage.md.answer_next": "결정 반영 — {text}",
         # the one Progress Log line a `recur:` round starts with (recur.py)
@@ -711,9 +728,27 @@ MESSAGES: dict[str, dict[str, str]] = {
             "check the dashboard log"),
         "triage.result.bad_option": "That option does not exist — refresh the page",
         "triage.result.bad_answer": "Write the answer as one line of at most 500 characters",
+        "triage.result.answered_resume": (
+            "Recorded: {choice} — the task is scheduled to carry on at the next tick "
+            "(within 5 minutes)"),
+        "triage.result.answered_no_resume": (
+            "The answer is recorded, but the resume could not be scheduled — try again in a moment"),
+        "triage.decision.reason": "Stopped on a choice a person has to make",
+        "triage.decision.advice": (
+            "Pick an answer above: it is recorded and the task carries on — [Cancel] to drop it"),
+        "triage.decision.unparsed": (
+            "Could not turn this into a question — the worker's own words are under Details"),
+        "triage.blocked.advice_decision": (
+            "Write an answer above: it is recorded and the task carries on — "
+            "[Resume] to run it again as it is"),
         "triage.md.cancel": "- {today}: cancelled from the dashboard (user)",
         "triage.md.instruction": "- {today}: user instruction (dashboard): {text}",
         "triage.md.answer": "- {today}: decision (dashboard): {text}",
+        "triage.md.answer_run": "- {today}: decision (dashboard): {text} — question: {question}",
+        "triage.md.worker_decided": (
+            "- {today}: worker decision (a reversible choice, so nobody was asked): {choice} — "
+            "question: {question}{reason}"),
+        "triage.md.worker_decided_reason": " · why: {reason}",
         "triage.md.answer_next": "Carry out the decision — {text}",
         "recur.md.created": "- {today}: created — recur from {prev}",
         "usage_value.title": "Usage vs results",
@@ -896,6 +931,9 @@ DASHBOARD: dict[str, dict[str, str]] = {
         # decision card (human rows): question and options come from the server
         "dash.js.dec_placeholder": "직접 답 한 줄 (500자 이하)",
         "dash.js.dec_need_text": "답을 한 줄 적어 주세요",
+        "dash.js.dec_recommended": "권장",
+        "dash.js.dec_reason": "권장 이유",
+        "dash.js.dec_detail": "자세히",
         "dash.js.done": " 완료",
         "dash.js.qw_next_tick": "다음 틱",
         "dash.js.qw_checkout_busy": "리포 사용중",
@@ -1049,6 +1087,9 @@ DASHBOARD: dict[str, dict[str, str]] = {
         "dash.js.tri_need_text": "Write a one-line instruction first",
         "dash.js.dec_placeholder": "One-line answer (max 500 chars)",
         "dash.js.dec_need_text": "Write a one-line answer first",
+        "dash.js.dec_recommended": "recommended",
+        "dash.js.dec_reason": "Why recommended",
+        "dash.js.dec_detail": "Details",
         "dash.js.done": " done",
         "dash.js.qw_next_tick": "next tick",
         "dash.js.qw_checkout_busy": "repo busy",

@@ -2984,8 +2984,13 @@ class StatusBackgroundRefreshTests(unittest.TestCase):
 # `d.waiting||d.queue` feeding the waiting list, queueRow reading `reason`, two QW
 # badges (assigned, no_slot — two new i18n keys) and `accepted` in the state badge map;
 # the rest of the page is byte-identical.
-_KO_HTML_SHA256 = "c2525f9477e2e530a0ed28133cf2e225356190d4529ca49e0e3c760165da6c46"
-_KO_HTML_LEN = 55930
+# 2026-11-27: +1317 bytes = a parked run's decision card (macp-decision-card-plain-
+# question): decBlock draws the optional background / consequences / recommended /
+# reason keys and the folded `detail` behind a toggle (three new i18n keys), its comment,
+# decClick's toggle branch and three CSS rules (.dopt, .tlink, .ddet); the rest of the
+# page is byte-identical.
+_KO_HTML_SHA256 = "8434902701bd852bece721356b87d65abac804d8100f4ca6674cbdf2e941fb52"
+_KO_HTML_LEN = 57247
 _HANGUL = re.compile("[가-힣]")
 
 

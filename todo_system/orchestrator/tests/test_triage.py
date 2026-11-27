@@ -237,8 +237,8 @@ class RuleOrderKo(_Lang):
         self.assertEqual(triage.RULES, (
             "merged_blocked", "orphan_redelivery", "workflow_scope", "nonff_push",
             "remote_no_pr", "human_misroute", "reaped_off", "ui_merge_hold",
-            "device_unverified", "review_pr", "rescope_pending", "timeout_park", "blocked",
-            "result_no_pr", "fallback"))
+            "device_unverified", "review_pr", "rescope_pending", "timeout_park", "decision",
+            "blocked", "result_no_pr", "fallback"))
 
 
 class MergeConditionKo(_Lang):
@@ -525,7 +525,8 @@ class GatherKo(_TmpVault):
             "agent_is_human", "human_pattern", "last_note", "last_alert_kind", "blocked_on",
             "timeout_streak", "refail_count", "history_types", "merged_park",
             "resume_reserved", "run", "verdict", "verify_blocked_on", "pr_url", "merged",
-            "recommendation", "rebase_conflict", "result_text", "log_tail"})
+            "recommendation", "rebase_conflict", "result_text", "log_tail", "decision_request"})
+        self.assertIsNone(f["decision_request"])
 
     def test_cache_rereads_a_changed_file(self):
         case = _load_case("orphan_redelivery.json")
@@ -794,6 +795,174 @@ class DecisionCardKo(_TmpVault):
                           want, front)
         self.assertFalse(triage.md_decision({}))
         self.assertFalse(triage.md_decision({"tags": None, "needs_decision": None}))
+
+
+# --- the decision card of a parked run (triage.run_decision_card) -------------------
+# The 2026-11-27 park (decision_cases/visit_store_park.json, anonymised): Verify
+# parked a task with an English blocker that listed file and class names, and the
+# card showed it as is, with [재개]·[지시 추가]·[취소] that said nothing about the
+# choice. Acceptance criterion 1: the card is a plain question with background,
+# options with what each leads to, and a recommendation; the raw text only folded.
+
+_DECISION_CASE = Path(__file__).resolve().parent / "decision_cases" / "visit_store_park.json"
+_BODY_KEYS = ("question", "background", "options", "consequences", "reason")
+
+
+def _decision_case() -> dict:
+    return json.loads(_DECISION_CASE.read_text(encoding="utf-8"))
+
+
+def _with_block(verify_md: str, req: dict) -> str:
+    return verify_md + "\n```decision\n" + json.dumps(req, ensure_ascii=False) + "\n```\n"
+
+
+class RunDecisionCardKo(_TmpVault):
+    def setUp(self):
+        super().setUp()
+        self.case = _decision_case()
+        self.raw = self.case["ledger"]["blocked_on"]
+
+    def body(self, card: dict) -> str:
+        return json.dumps({k: card[k] for k in _BODY_KEYS}, ensure_ascii=False)
+
+    def assertNoRawText(self, card: dict):
+        body = self.body(card)
+        for token in self.case["raw_tokens"]:
+            self.assertNotIn(token, body)
+        self.assertEqual(card["detail"], self.raw)          # folded, whole
+
+    def install_with(self, verify_md: str | None = None, **ledger) -> str:
+        case = json.loads(json.dumps(self.case))
+        if verify_md is not None:
+            case["run"]["files"]["verify.md"] = verify_md
+        case["ledger"].update(ledger)
+        return self.install(case)
+
+    def test_case_11_27_with_a_block_is_a_plain_question(self):
+        verify = _with_block(self.case["run"]["files"]["verify.md"], self.case["decision_block"])
+        f = self.gather(self.install_with(verify))
+        card = triage.run_decision_card(f)
+        want = self.case["decision_block"]
+        self.assertEqual(card["question"],
+                         "지난 진료일 저장을 계획과 다른 이름(visit-date)·400일 제한으로 만든 "
+                         "PR #50을 그대로 받을까요?")
+        self.assertEqual(card["background"], want["background"])
+        self.assertEqual(card["options"], ["PR #50을 그대로 받기", "계획대로 이름·기간을 다시 만들기"])
+        self.assertEqual(card["consequences"], [o["consequence"] for o in want["options"]])
+        self.assertEqual((card["recommended"], card["reason"]), (1, want["reason"]))
+        self.assertEqual(card["source"], "run")
+        self.assertNoRawText(card)
+        for key in ("question", "reason"):
+            self.assertTrue(_HANGUL.search(card[key]), key)
+        # the triage card beside it: no raw blocker, and the answer is the card's
+        t = triage.diagnose(f)
+        self.assertCard(t, "decision", ["cancel"], reason_has=["사람이 정해야"],
+                        advice_has=["고르면 기록되고"])
+        self.assertFalse(any(token in e for e in t["evidence"] for token in self.case["raw_tokens"]),
+                         t["evidence"])
+
+    def test_case_11_27_as_it_was_folds_the_raw_text(self):
+        # the real verify.md: an English blocker, no block → no question is invented
+        f = self.gather(self.install_with())
+        card = triage.run_decision_card(f)
+        self.assertEqual(card["question"], i18n.t("triage.decision.unparsed"))
+        self.assertIn("질문을 만들지 못했어요", card["question"])
+        self.assertEqual((card["options"], card["background"], card["consequences"]), ([], [], []))
+        self.assertEqual((card["recommended"], card["reason"]), (0, ""))
+        self.assertNoRawText(card)
+        t = triage.diagnose(f)
+        self.assertCard(t, "blocked", ["resume", "instruct", "cancel"],
+                        advice_has=["답을 적으면 기록되고"])
+        self.assertNotIn(i18n.t("triage.ev.blocked_on", blocked_on=triage._clip(self.raw)),
+                         t["evidence"])
+
+    def test_the_ledger_copy_wins_and_needs_no_run_dir(self):
+        # a remote runner's park: the run dir is on another machine
+        case = json.loads(json.dumps(self.case))
+        case.pop("run")
+        from todo_system.orchestrator import stages
+        case["ledger"]["decision"] = stages.normalize_decision(case["decision_block"])
+        slug = self.install(case)
+        card = triage.run_decision_card(self.gather(slug))
+        self.assertEqual(card["options"][0], "PR #50을 그대로 받기")
+        self.assertEqual(card["detail"], self.raw)
+        # ...and over a run dir that says something else
+        other = dict(case["decision_block"], question="다른 질문인가요?")
+        case["run"] = {"name": self.case["run"]["name"],
+                       "files": {"verify.md": _with_block("---\n---\n", other)}}
+        shutil.rmtree(self.root / "Worker/runs")
+        (self.root / "Worker/runs").mkdir()
+        self.install(case)
+        self.assertEqual(triage.run_decision_card(self.gather(slug))["question"],
+                         self.case["decision_block"]["question"])
+
+    def test_a_report_block_counts_when_verify_has_none(self):
+        verify = self.case["run"]["files"]["verify.md"]
+        case = json.loads(json.dumps(self.case))
+        case["run"]["files"]["verify.md"] = verify
+        case["run"]["files"]["report.md"] = _with_block("---\nstage: report\n---\n",
+                                                        self.case["decision_block"])
+        f = self.gather(self.install(case))
+        self.assertEqual(triage.run_decision_card(f)["recommended"], 1)
+
+    def test_rows_that_get_no_run_card(self):
+        verify = _with_block(self.case["run"]["files"]["verify.md"], self.case["decision_block"])
+        slug = self.install_with(verify)
+        base = self.gather(slug)
+        self.assertIsNotNone(triage.run_decision_card(base))
+        for name, change in (("failed row", {"state": "failed"}),
+                             ("deferred", {"deferred": True}),
+                             ("closed md", {"todo_status": "done"}),
+                             ("no md", {"md_exists": False}),
+                             ("manual md", {"md_worker_mode": "manual"}),
+                             ("human gate", {"human_gate": True}),
+                             ("merged park", {"merged_park": True}),
+                             ("answered: resume reserved", {"resume_reserved": True})):
+            with self.subTest(name):
+                self.assertIsNone(triage.run_decision_card(dict(base, **change)))
+        self.assertIsNone(triage.run_decision_card(None))
+
+    def test_a_blocker_another_rule_explains_gets_no_fallback_card(self):
+        f = _facts(blocked_on="AC 8 emulator check needs a human with adb",
+                   last_alert_kind="blocked")
+        self.assertEqual(triage.diagnose(f)["rule"], "device_unverified")
+        self.assertIsNone(triage.run_decision_card(f))
+        self.assertIsNone(triage.run_decision_card(_facts()))     # no blocker at all
+
+    def test_the_decision_rule_needs_a_card_target(self):
+        req = {"question": "?", "background": [], "options": [{"label": "a", "consequence": ""},
+                                                             {"label": "b", "consequence": ""}],
+               "recommended": 0, "reason": "", "gate": "send"}
+        f = _facts(blocked_on="x", decision_request=req)
+        self.assertEqual(triage.diagnose(f)["rule"], "decision")
+        # no card can sit on a manual md, so the generic rule explains it instead
+        self.assertEqual(triage.diagnose(dict(f, md_worker_mode="manual"))["rule"], "blocked")
+
+    def test_an_answered_row_shows_the_raw_blocker_again_until_it_redispatches(self):
+        f = _facts(blocked_on="needs an API key", resume_reserved=True)
+        self.assertIsNone(triage.run_decision_card(f))
+        t = triage.diagnose(f)
+        self.assertIn(i18n.t("triage.ev.blocked_on", blocked_on="needs an API key"), t["evidence"])
+
+
+class RunDecisionCardEn(RunDecisionCardKo):
+    LANG = "en"
+
+    def test_case_11_27_as_it_was_folds_the_raw_text(self):
+        f = self.gather(self.install_with())
+        card = triage.run_decision_card(f)
+        self.assertEqual(card["question"], i18n.t("triage.decision.unparsed"))
+        self.assertFalse(_HANGUL.search(card["question"]))
+        self.assertEqual(card["detail"], self.raw)
+        self.assertFalse(_HANGUL.search(triage.diagnose(f)["advice"]))
+
+    def test_case_11_27_with_a_block_is_a_plain_question(self):
+        verify = _with_block(self.case["run"]["files"]["verify.md"], self.case["decision_block"])
+        f = self.gather(self.install_with(verify))
+        t = triage.diagnose(f)
+        self.assertEqual(t["rule"], "decision")
+        for text in (t["reason"], t["advice"], *(a["label"] for a in t["actions"])):
+            self.assertFalse(_HANGUL.search(text), text)
 
 
 if __name__ == "__main__":
