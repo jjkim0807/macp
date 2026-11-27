@@ -175,7 +175,7 @@ acceptance_criteria:
 ```
 
 Describe the work in the body under `## Spec`: the goal, what is in and out of scope,
-and pointers. The research stage reads the body first.
+and pointers. The implement stage reads the body first.
 
 Keep `auto_merge: false` for the first runs. The report stage then opens the PR and
 stops, and you merge it yourself.

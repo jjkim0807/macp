@@ -58,22 +58,22 @@ name under the worker root. Keys that start with `_`, such as `_readme`, are ign
 An entry with a missing field or a wrong type, such as a string `tag_cmd`, is
 skipped with one printed line. Repos with no entry are ignored.
 
-### Worked example: mindchat
+### Worked example: myapp
 
-mindchat's server lives under `server/`. Production runs on Cloud Run with the
+myapp's server lives under `server/`. Production runs on Cloud Run with the
 image tagged by the 7-character short sha, and the owner deploys with
-`~/.config/mindchat/deploy.sh <sha>`.
+`~/.config/myapp/deploy.sh <sha>`.
 
 ```json
 {
   "_readme": "Server deploy watch — see docs/server-deploy-watch.md in the engine repo.",
   "repos": {
-    "mindchat": {
+    "myapp": {
       "server_paths": ["server/**"],
       "tag_cmd": ["gcloud", "run", "services", "describe", "<service>",
                   "--region", "<region>", "--project", "<gcp-project>",
                   "--format", "value(spec.template.spec.containers[0].image)"],
-      "deploy_cmd": "~/.config/mindchat/deploy.sh <sha>",
+      "deploy_cmd": "~/.config/myapp/deploy.sh <sha>",
       "grace_minutes": 30
     }
   }
@@ -81,7 +81,7 @@ image tagged by the 7-character short sha, and the owner deploys with
 ```
 
 The `gcloud run services describe` command only reads. It prints the full image
-ref, `<registry>/mindchat/server:<short sha>`, and the engine keeps the part after
+ref, `<registry>/myapp/server:<short sha>`, and the engine keeps the part after
 the last `:`. Replace `<service>`, `<region>` and `<gcp-project>` with the real
 values in the vault copy only. Don't put them in the engine repo.
 
@@ -93,9 +93,9 @@ session adds it after the merge.
 - **Behind**: one alert per repo and per newest undeployed commit, for example:
 
   ```text
-  🚨 [서버 미배포] mindchat — main의 서버 변경 2건이 30분 넘게 운영에 반영되지 않았어요
+  🚨 [서버 미배포] myapp — main의 서버 변경 2건이 30분 넘게 운영에 반영되지 않았어요
   운영 태그: 1a2b3c4
-  배포 명령: ~/.config/mindchat/deploy.sh 9f8e7d6
+  배포 명령: ~/.config/myapp/deploy.sh 9f8e7d6
   9f8e7d6 server: fix crash
   5c6d7e8 server: add endpoint
   ```

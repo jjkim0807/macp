@@ -75,7 +75,11 @@ you a pull request — or a local branch, if the repository has no GitHub remote
 Nothing is merged for you.
 
 You need Linux or macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`, and
-the [Claude Code](https://code.claude.com) CLI, logged in. Install macp once:
+the [Claude Code](https://code.claude.com) CLI, logged in. If the repository's remote is
+on GitHub, the pull request also needs the [`gh`](https://cli.github.com) CLI, logged in,
+with permission to push to that remote. Without `gh` the result is the branch
+`worker/<slug>` pushed to the remote, with no pull request and no pull request link.
+Install macp once:
 
     uv tool install git+https://github.com/jjkim0807/macp
 
@@ -90,7 +94,9 @@ macp up --once                              # dispatch → worker → result, th
 - `macp init` creates your vault (tasks, run records, memory) under `~/.macp/` and
   marks this repository as managed. There are no environment variables to set and no
   vault repository to create. It changes `.macp/` (and `CLAUDE.md` / `AGENTS.md`) in
-  your repository and commits nothing.
+  your repository and commits nothing. Commit those changes and the worker reads the
+  project memory too; if you don't, `macp add` only prints an "uncommitted changes" note
+  and carries on.
 - `macp add` turns the sentence into a validated task file. You never edit frontmatter.
   The worker sees committed work only — pushed work, when the repository has a remote.
 - `macp up --once` runs one pass of the same orchestrator and runner the 24/7 setup

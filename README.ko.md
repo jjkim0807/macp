@@ -51,7 +51,10 @@ macp는 **특정 코딩 에이전트에 묶이지 않는 운영 계층**을 지�
 저장소에 GitHub 원격이 없으면 로컬 브랜치를 남깁니다. 머지는 하지 않습니다.
 
 Linux 또는 macOS, Python ≥ 3.12, [`uv`](https://docs.astral.sh/uv/), `git`, 그리고
-로그인된 [Claude Code](https://code.claude.com) CLI가 필요합니다. macp는 한 번만 설치합니다:
+로그인된 [Claude Code](https://code.claude.com) CLI가 필요합니다. 저장소 원격이 GitHub이면
+풀 리퀘스트를 열기 위해 로그인된 [`gh`](https://cli.github.com) CLI와 그 원격에 push할 권한도
+필요합니다. `gh`가 없으면 결과는 원격에 push된 `worker/<slug>` 브랜치이고, 풀 리퀘스트와
+그 링크는 없습니다. macp는 한 번만 설치합니다:
 
     uv tool install git+https://github.com/jjkim0807/macp
 
@@ -66,6 +69,8 @@ macp up --once                              # 디스패치 → 워커 → 결과
 - `macp init`은 `~/.macp/` 아래에 볼트(태스크·실행 기록·메모리)를 만들고 이 저장소를
   관리 대상으로 표시합니다. 설정할 환경변수도, 따로 만들 볼트 저장소도 없습니다.
   저장소의 `.macp/`(그리고 `CLAUDE.md`·`AGENTS.md`)만 바꾸고 아무것도 커밋하지 않습니다.
+  이 변경을 커밋하면 워커가 프로젝트 메모리도 읽습니다. 커밋하지 않아도 `macp add`는
+  '커밋하지 않은 변경' 안내만 찍고 진행합니다.
 - `macp add`는 문장을 검증된 태스크 파일로 바꿉니다. frontmatter를 손으로 쓰지 않습니다.
   워커는 커밋된 것만 봅니다. 원격이 있는 저장소라면 push된 것만 봅니다.
 - `macp up --once`는 24시간 운영과 같은 오케스트레이터와 러너를 한 번 돌립니다. 워커는
