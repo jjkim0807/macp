@@ -140,7 +140,7 @@ For each acceptance criterion, the exact command or check Verify should run **lo
 
 ## Open questions
 
-- A choice only a person can make: `결정 필요: <question> — 선택지: <a> / <b>`. "없음" if none.
+- A choice only a person can make — one of the five irreversible gates of `worker-verify.md` Step 8d (`money`, `send`, `public`, `delete`, `identity`): `결정 필요: <question> — 선택지: <a> / <b>`. Any other choice (a name, a bound, a plan-literal difference) you make yourself: `결정함: <choice> — <why>`, picking the option easiest to undo. "없음" if none.
 ```
 
 How many phases, and how much detail, is your call: a small change is one phase. If what you learn while building changes the plan, update the file so it matches what you did.

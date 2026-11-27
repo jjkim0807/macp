@@ -114,3 +114,12 @@ def test_a_finished_run_without_a_block_carries_neither(box):
     out = box.execute()
     assert out.ok, out.summary
     assert "decided" not in out.payload and "decision" not in out.payload
+
+
+def test_the_rendered_stage_prompts_carry_the_rule(box):
+    # the prompts the real build_stage_argv hands each stage, not just the files
+    box.execute()
+    assert "Step 8d: A choice the plan did not settle" in box.prompts["verify"]
+    assert "```decision" in box.prompts["verify"]
+    assert "Choices: make the reversible ones, ask only the irreversible ones" in box.prompts["report"]
+    assert "결정함:" in box.prompts["implement"]

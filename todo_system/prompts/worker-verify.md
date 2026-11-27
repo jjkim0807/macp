@@ -63,7 +63,9 @@ This ensures artifacts land in the vault even when you `cd` to an external repo 
 
 1. `<vault_root>/Worker/runs/<run-id>/implementation_plan.md` — written by the Implement stage; especially the "Verification strategy" section. If it is missing, build the check list from the acceptance criteria and the project's standard checks, and say so in verify.md.
 2. `<vault_root>/Worker/runs/<run-id>/run.log` — to know what was changed and which branch.
-3. The task frontmatter (path in Run metadata) — to confirm `acceptance_criteria` verbatim.
+3. The task frontmatter (path in Run metadata) — to confirm `acceptance_criteria` verbatim — and
+   its `## Progress Log`: a `결정(대시보드)` or `워커 결정` line there is a choice already made,
+   and it overrides the plan's literal wording (Step 8d).
 4. The project's own definition of "healthy" (Step 2).
 
 ## Allowed tools
@@ -323,6 +325,60 @@ exists at `<vault_root>/Worker/runs/<run-id>/rescope.json` (schema in
   second split of the same lineage, or on an `auto_merge: false` / real-account /
   guardrail task, and hands those to a human as before.
 
+### Step 8d: A choice the plan did not settle — make it yourself unless it is irreversible
+
+Sometimes the work is sound but differs from what the plan or the task spelled out: another
+name, another bound or limit, another file name, an equivalent already merged under other
+names, a UX default nobody fixed. That is a choice, and decision 2026-11-20 fixes who makes it:
+
+- **Reversible** — anything a revert, a rename, a follow-up task, an earlier beta or an
+  earlier server revision can undo. **It is yours.** Do not FAIL for it and do not write
+  `blocked_on` for it. Pick the option that is easiest to undo (usually: keep what already
+  works and is already used), judge the criterion on substance against that pick, write the
+  block below with `"gate": "none"` and `recommended` = your pick, and add one line under
+  `concerns`. The engine writes your pick into the task's Progress Log, where the person can
+  overturn it later. (If you FAIL anyway with such a block, the engine records the pick and
+  retries instead of asking anyone — the FAIL only costs a run.)
+- **Irreversible** — only these five gates: `money` (a real-account order, deploy or state
+  change; a payment; creating a paid resource), `send` (an external submission or message:
+  an application, an email, a store or policy submission, a public post), `public` (making a
+  repo, an app or a document public), `delete` (deleting data, a repo, a branch or a cloud
+  resource that cannot be restored, including a migration that can lose data), `identity` (an
+  act in the user's name: a login, linking a credential, a consent, a signature). Then:
+  `overall_status: fail`, `blocked_on: "<one plain sentence in the vault's language>"`, and
+  the block with that `gate`. The dashboard asks it as a question with one button per option;
+  the person's answer is recorded in the task md and the task resumes.
+
+The block: exactly one, strict JSON (double quotes, no comments, no trailing commas), written
+for a person who has not read the code:
+
+```decision
+{"question": "<one sentence: what should the person decide?>",
+ "background": ["<what differs from the plan, in plain words>", "<why it matters>"],
+ "options": [{"label": "<short button text>", "consequence": "<what happens if this is chosen>"},
+             {"label": "<short button text>", "consequence": "<what happens if this is chosen>"}],
+ "recommended": 1,
+ "reason": "<why that option>",
+ "gate": "none"}
+```
+
+- `question`, `background` (1–3 lines), every `label` and `consequence`, and `reason` are in
+  the vault's language (Korean in this vault) and in plain words: no file names, class names,
+  paths or routes in them, and at most the one short name a person needs to recognise the
+  thing (like `visit-date` below). The identifiers stay in the prose of verify.md; the
+  dashboard folds the raw `blocked_on` under "자세히" and never shows it unfolded.
+- 2–3 options, each with its consequence. `recommended` is the 1-based number of the option
+  you recommend (0 only when you truly cannot tell).
+- `gate` is `none` or exactly one of `money`, `send`, `public`, `delete`, `identity`. If you
+  cannot name the gate, the choice is reversible.
+- A real case that should not have parked (2026-11-27): Verify found the store merged
+  earlier as `visit-date` with a 400-day bound where the plan said `visit` and 366 days, and
+  parked it as a "human decision" in an English `blocked_on` that listed class and file
+  names. Both work and a rename is a follow-up task — reversible. The right verdict: judge
+  the phase met by the equivalent, write the block with `"gate": "none"`, question 「지난 진료일
+  저장을 계획과 다른 이름(visit-date)·400일 제한으로 만든 PR #50을 그대로 받을까요?」,
+  recommended 「PR #50을 그대로 받기」, and PASS if everything else holds.
+
 ## Output
 
 Write exactly one file: `<vault_root>/Worker/runs/<run-id>/verify.md`:
@@ -338,6 +394,7 @@ overall_status: pass | fail | skip
 confidence: high | medium | low
 verified_by: local | actions     # `actions` only under the `ci: actions` opt-in
 blocked_on: "<what>"             # only on a FAIL caused by the environment or a human-only step
+                                 # (an irreversible choice: one plain sentence + the Step 8d block)
 ---
 
 # Verification — <task title>
@@ -430,6 +487,12 @@ the same thing — the checks were run locally.
   - OR the task exceeds a single stage and must be re-scoped (Step 8c) — FAIL with
     `blocked_on: "needs re-scope into N sub-tasks"`; leave/complete `rescope.json` so
     the orchestrator can auto-split a safe plan instead of paging a human
+  - OR an open choice guards one of the five irreversible gates (Step 8d) — FAIL with a
+    plain `blocked_on` sentence and the ```decision block naming that gate
+- A difference from the plan's literal wording that is a reversible choice (a name, a
+  bound, a file name, an equivalent already merged) is never a FAIL by itself: make the
+  choice, record it in the ```decision block with `"gate": "none"` (Step 8d), and judge the
+  rest
 - Set `overall_status: skip` ONLY if:
   - the project defines nothing executable for this change (no test, lint or build
     at all) AND no acceptance criterion is an executable claim — then judge by the diff

@@ -135,9 +135,11 @@ translates, rewords or completes it.
 
 `rule` is one of `merged_blocked`, `orphan_redelivery`, `workflow_scope`,
 `nonff_push`, `remote_no_pr`, `human_misroute`, `reaped_off`, `ui_merge_hold`,
-`device_unverified`, `review_pr`, `rescope_pending`, `timeout_park`, `blocked`,
-`result_no_pr` or `fallback`. The list can grow, so handle an unknown value like
-any other.
+`device_unverified`, `review_pr`, `rescope_pending`, `timeout_park`, `decision`,
+`blocked`, `result_no_pr` or `fallback`. The list can grow, so handle an unknown
+value like any other. `decision` is a park that asked a question: the row's
+decision card carries it (see [A parked run's question](#6-a-parked-runs-question)),
+so this card offers only [취소].
 
 ### 2. `POST /api/action`
 
@@ -249,6 +251,9 @@ The field appears on a row of `human` when both hold:
 - the task md raises a decision that can be answered now: it has
   `needs_decision: true` or the `decision` tag, its status is not closed, its
   `worker_mode` is not `blocked`, and its `not_before` is not still ahead.
+
+A `parked` row whose task file raises no decision can instead carry the
+question its run asked, with a few more keys (§6).
 
 Rows with `why: "blocked"` and rows of `human_later` never have it (it is not
 that person's turn yet), and no other list carries it. The field is
@@ -403,12 +408,85 @@ decision_options:
 - The stage prompts tell agents to raise a leftover choice this way instead of
   burying the options in the Progress Log.
 
-### 6. Where each side lives
+### 6. A parked run's question
+
+A worker run can park a task on a choice too. It used to show the Verify
+stage's own English `blocked_on`, file and class names included, above
+[재개]·[지시 추가]·[취소], which said nothing about what was being asked. Now:
+
+- **Only an irreversible step reaches a person** (decision 2026-11-20). A
+  stage that meets a choice the plan did not settle writes one ```decision
+  block (`worker-verify.md` Step 8d). Its `gate` names the irreversible step it
+  guards: `money`, `send`, `public`, `delete` or `identity`. Any other choice
+  is reversible: the worker takes the recommended option, the orchestrator
+  writes it into the task's Progress Log (`- <date>: 워커 결정(되돌릴 수 있는
+  선택이라 묻지 않음): …`) and the run carries on. Nobody is asked, and nothing
+  appears on the dashboard.
+- **An irreversible choice parks the task** and the server attaches its
+  question to the `human` row (`why: "parked"`) as the same `decision` field,
+  with more keys:
+
+```json
+"decision": {
+  "question": "만든 페이지를 지금 공개로 바꿀까요?",
+  "options": ["지금 공개", "비공개로 두기"],
+  "background": ["페이지는 다 만들었고, 공개하면 검색에 잡혀요."],
+  "consequences": ["바로 누구나 볼 수 있어요.", "링크를 아는 사람만 봐요."],
+  "recommended": 2,
+  "reason": "공개는 되돌려도 이미 퍼진 건 못 거둬요.",
+  "detail": "<the stage's raw blocked_on, up to 600 characters>",
+  "source": "run"
+}
+```
+
+| key | type | render as |
+|---|---|---|
+| `question`, `options` | as in §1 | The same: the question in bold, one button per option. |
+| `background` | string[] (0–3) | Muted lines under the question. |
+| `consequences` | string[] | One per option, in the same order: a muted line under that option's button (`→ …`). An empty string means none. |
+| `recommended` | integer | The 1-based option the worker recommends: mark its button (web: a 「권장」 badge). `0` = no recommendation. |
+| `reason` | string | When `recommended` is set: one line, why (web: 「권장 이유: …」). May be empty. |
+| `detail` | string | The worker's raw text. **Folded**: show it only after the person opens a 「자세히」 toggle, never unfolded. May be empty. |
+| `source` | string | `"run"` for this card. A task-file card (§1) has no `source` key. |
+
+  Every key but `detail` is plain text in the vault's language; a client never
+  rewords, translates or shortens any of them. A client that does not know the
+  new keys still draws a correct card from `question` and `options`.
+
+- **When the block is missing or unusable** (an older run, a stage that wrote
+  only prose) and the generic `blocked` rule explains the park, the card says
+  so instead of guessing: `question` is the fixed sentence 「무엇을 정해야 하는지
+  질문을 만들지 못했어요 — 워커가 남긴 원문은 '자세히'에 있어요」, `options` is
+  empty, and the raw text is in `detail`. No language model rewrites it. Parks
+  another rule explains (a device check, a review PR, a re-scope, time-outs, a
+  merged PR) get no such card.
+- **The rest of the row.** The row's `action` (its note line) is the card's
+  `question`, and the triage card on a row with a run card quotes no raw
+  blocker. With a block the triage rule is `decision` and offers only
+  [취소]; without one it stays `blocked` and its advice points at the card.
+- **Answering** uses §2 unchanged (`option` or `text`). Unlike a task-file
+  card, this answer carries the task on: the server commits one Progress Log
+  line `- <date>: 결정(대시보드): <the choice> — 질문: <the question>`, then
+  reserves a resume after that commit (the [지시 추가] path). The reserved
+  resume takes the card away on the next poll, and the resumed run reads the
+  choice from the task file. The choice is still only words: the resumed run
+  acts on it under the same gates as any run.
+- The ledger row keeps the request (`decision` in `Worker/assignments/<slug>.json`)
+  so a remote runner's park, whose run directory is on another machine, is
+  asked the same way.
+
+### 7. Where each side lives
 
 - The card and the marker: `todo_system/orchestrator/triage.py`
-  (`decision_card`, `md_decision`).
+  (`decision_card`, `md_decision`; a parked run's card: `run_decision_card`).
+- The block a stage writes: `todo_system/orchestrator/stages.py`
+  (`parse_decision_request`, `normalize_decision`, `decision_record`,
+  `DECISION_GATES`); the park or the recorded pick: `runner.py`
+  (`StagedExecutor._execute`) and `orchestrator.py`
+  (`Orchestrator._record_worker_decision`).
 - The record and the reply: `todo_system/orchestrator/triage_actions.py`
-  (`_answer`, reached through `run_action("answer", …)`).
+  (`_answer`, reached through `run_action("answer", …)`; a parked run's
+  answer: `_answer_run`, reached with `run_card=`).
 - Server wiring: `scripts/macp_dashboard.py`, where `_attach_decisions` (called
   by `collect_status`) adds the field and orders the rows, and
   `Handler._post_answer` (called by `Handler._post_action`) serves the POST.
@@ -416,7 +494,8 @@ decision_options:
   from `humanRow`; they post through `triAct`.
 - Calendar: `todo_system/calendar_sync.py` (`_is_decision_task`).
 - Android app: `macp-dashboard-android` renders the same field, tracked as a
-  follow-up task.
+  follow-up task (the run card's extra keys: a follow-up of
+  macp-decision-card-plain-question).
 
 ## Usage vs results
 

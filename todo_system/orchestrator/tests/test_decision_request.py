@@ -167,5 +167,36 @@ class Judgment(unittest.TestCase):
         self.assertIsNone(stages.decision_record({"question": "?", "options": []}))
 
 
+class StagePromptsTeachTheBlock(unittest.TestCase):
+    """The prompts teach exactly the block the engine reads."""
+
+    def prompt(self, stage: str) -> str:
+        return (stages.COMMANDS_DIR / f"worker-{stage}.md").read_text(encoding="utf-8")
+
+    def test_the_verify_prompt_example_is_a_block_the_engine_reads(self):
+        text = self.prompt("verify")
+        req = stages.parse_decision_request(text)
+        self.assertIsNotNone(req)
+        self.assertEqual(len(req["options"]), 2)
+        self.assertEqual((req["recommended"], req["gate"]), (1, ""))
+        self.assertIn("Step 8d", text)
+        for gate in stages.DECISION_GATES:
+            self.assertIn(f"`{gate}`", text)
+        # the 11-27 case is taught as the reversible example
+        self.assertIn("PR #50을 그대로 받기", text)
+        self.assertIn('"gate": "none"', text)
+
+    def test_the_report_and_implement_prompts_route_the_same_way(self):
+        report = self.prompt("report")
+        self.assertIn("```decision", report)
+        self.assertIn("Never hold a merge (`worker_mode_recommendation: review`) for a "
+                      "reversible choice", report)
+        implement = self.prompt("implement")
+        self.assertIn("결정함:", implement)
+        for text in (report, implement):
+            for gate in stages.DECISION_GATES:
+                self.assertIn(f"`{gate}`", text)
+
+
 if __name__ == "__main__":
     unittest.main()
