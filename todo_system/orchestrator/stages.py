@@ -972,6 +972,119 @@ def parse_blocked_on(verify_md_text: str) -> str | None:
     return v or None
 
 
+# --- decision requests (a choice a stage leaves for the engine to route) -------------
+#
+# A stage that meets a choice the plan did not settle writes ONE fenced block
+# whose info string is `decision` into verify.md or report.md, strict JSON:
+#
+#   ```decision
+#   {"question": "<one sentence in the vault's language>",
+#    "background": ["<what changed from the plan, plain words>", "..."],
+#    "options": [{"label": "<button text>", "consequence": "<what happens then>"}, ...],
+#    "recommended": 1, "reason": "<why that one>", "gate": "none"}
+#   ```
+#
+# `gate` names which irreversible step of decision 2026-11-20 the choice guards:
+# money (real-account orders, payments, paid resources), send (an external
+# submission or message), public (making something public), delete (a deletion
+# that cannot be restored), identity (an act in the user's name). Only those make
+# it a person's decision. Anything else — "none", a missing or an unknown value —
+# is a reversible choice: the worker picks `recommended`, the engine records it in
+# the task's Progress Log and the run carries on (runner._execute). The reading is
+# deterministic and never calls an LLM; a block that does not parse is None, and
+# the dashboard then folds the raw `blocked_on` under "details" (triage.py).
+
+DECISION_FENCE = "decision"
+DECISION_GATES = ("money", "send", "public", "delete", "identity")
+DECISION_OPTIONS_MIN = 2
+DECISION_OPTIONS_MAX = 6
+DECISION_BACKGROUND_MAX = 3
+DECISION_QUESTION_CHARS = 200
+DECISION_LABEL_CHARS = 80
+DECISION_LINE_CHARS = 200
+_DECISION_BLOCK_RE = re.compile(r"^[ \t]*```[ \t]*decision[ \t]*\n(.*?)^[ \t]*```[ \t]*$",
+                                re.M | re.S)
+
+
+def _decision_line(value, limit: int) -> str:
+    """`value` as one trimmed line of at most `limit` chars ("" for a non-string)."""
+    if not isinstance(value, str):
+        return ""
+    s = " ".join(value.split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def normalize_decision(obj) -> dict | None:
+    """A decision request (the parsed JSON object, or a ledger copy of one) in
+    its one normalized shape, or None when it is not a usable request.
+
+    Shape: {"question": str, "background": [str] (0..3), "options": [{"label":
+    str, "consequence": str}] (2..6), "recommended": int (1-based, 0 = none),
+    "reason": str, "gate": str (one of DECISION_GATES, "" = reversible)}.
+    Usable = a non-empty question and at least two options with a label; an
+    option may be a bare string (a label with no consequence). Every text is
+    one line, clipped."""
+    if not isinstance(obj, dict):
+        return None
+    question = _decision_line(obj.get("question"), DECISION_QUESTION_CHARS)
+    options = []
+    raw_opts = obj.get("options")
+    for o in raw_opts if isinstance(raw_opts, list) else ():
+        if isinstance(o, str):
+            o = {"label": o}
+        if not isinstance(o, dict):
+            continue
+        label = _decision_line(o.get("label"), DECISION_LABEL_CHARS)
+        if label:
+            options.append({"label": label,
+                            "consequence": _decision_line(o.get("consequence"),
+                                                          DECISION_LINE_CHARS)})
+    options = options[:DECISION_OPTIONS_MAX]
+    if not question or len(options) < DECISION_OPTIONS_MIN:
+        return None
+    bg = obj.get("background")
+    bg = [bg] if isinstance(bg, str) else bg if isinstance(bg, list) else []
+    background = [b for b in (_decision_line(x, DECISION_LINE_CHARS) for x in bg) if b]
+    rec = obj.get("recommended")
+    if isinstance(rec, bool) or not isinstance(rec, int) or not 1 <= rec <= len(options):
+        rec = 0
+    gate = obj.get("gate")
+    gate = gate.strip().lower() if isinstance(gate, str) else ""
+    return {"question": question,
+            "background": background[:DECISION_BACKGROUND_MAX],
+            "options": options,
+            "recommended": rec,
+            "reason": _decision_line(obj.get("reason"), DECISION_LINE_CHARS),
+            "gate": gate if gate in DECISION_GATES else ""}
+
+
+def parse_decision_request(text: str) -> dict | None:
+    """The first ```decision block of a stage artifact, normalized
+    (normalize_decision), or None: no block, JSON that does not parse, or a
+    request that is not usable. Never raises."""
+    m = _DECISION_BLOCK_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(1))
+    except ValueError:
+        return None
+    return normalize_decision(obj)
+
+
+def decision_record(req: dict | None) -> dict | None:
+    """What the engine writes down for a reversible choice the worker made:
+    {"question", "choice" (the recommended option's label), "reason"}. None when
+    the request needs a person (it names a gate) or recommends nothing — then
+    there is no pick to record and the choice stays a person's."""
+    req = normalize_decision(req)
+    if req is None or req["gate"] or not req["recommended"]:
+        return None
+    return {"question": req["question"],
+            "choice": req["options"][req["recommended"] - 1]["label"],
+            "reason": req["reason"]}
+
+
 def parse_report_pr_url(report_md_text: str) -> str | None:
     """report.md declares `pr_url:` — the PR it opened, or null when it opened
     none. The review notification asserted a PR existed without ever reading
