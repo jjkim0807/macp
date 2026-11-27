@@ -45,6 +45,7 @@ from . import screen_check
 from . import agent_backend
 from . import stages
 from . import superseded as superseded_mod
+from . import vault_pr_rebuild
 from . import worktree_sweep
 from .assignment import ASSIGN_TTL_S, DONE, Ledger
 from .mailbox import DEFAULT_ROOT, Mailbox, open_mailbox
@@ -616,6 +617,22 @@ class StagedExecutor(ClaudeCodeExecutor):
             return (r.stdout or "").strip() if getattr(r, "returncode", 1) == 0 else ""
         except Exception:       # noqa: BLE001 — a watch that cannot read watches nothing
             return ""
+
+    @staticmethod
+    def _vault_pr_rebuild_applies(repo_url, live_wt: bool, merge_note) -> bool:
+        """Whether a refused delegate merge goes through vault_pr_rebuild.
+
+        Vault tasks only (no `repo_url`): only the vault repo is a working tree
+        the engine's daemons commit into, so only there does a worker branch
+        carry commits main holds under other shas. An external code repo's PR
+        conflict is real and parks as before. Also needs a live worktree to run
+        git in, and a refusal that reads as a conflict (a permission or a
+        missing `gh` is not something a rebuild fixes). Never raises."""
+        try:
+            return (not repo_url and bool(live_wt)
+                    and vault_pr_rebuild.looks_like_conflict(merge_note))
+        except Exception:       # noqa: BLE001
+            return False
 
     @staticmethod
     def _origin_repo_arg(checkout) -> str | None:
@@ -2096,6 +2113,22 @@ class StagedExecutor(ClaudeCodeExecutor):
                             merged = True
                             progress("merge: gh exited non-zero but the PR is "
                                      "MERGED — treated as merged")
+                        park_reason = mp.get("note") or "merge not confirmed"
+                        if not merged and self._vault_pr_rebuild_applies(
+                                repo_url, live_wt, mp.get("note")):
+                            # The vault daemons committed onto this branch while
+                            # it was checked out and main holds the same content
+                            # under other shas — the conflict is theirs, not the
+                            # run's. Replay only the run's own commits onto
+                            # origin/main (fast-forward push to worker/<slug>) and
+                            # merge again; a conflict in the run's own commits
+                            # still parks below, naming the files.
+                            rb = vault_pr_rebuild.rebuild_and_merge(
+                                vault_wt, branch, repo=gh_repo, progress=progress)
+                            if rb.get("note"):
+                                progress(f"rebuild: {rb['note']}")
+                            merged = bool(rb.get("merged"))
+                            park_reason = rb.get("note") or park_reason
                         if not merged:
                             # Not confirmed merged (md-only conflict, perm, no gh).
                             # Park — closing `done` on a still-open PR is the very
@@ -2106,7 +2139,7 @@ class StagedExecutor(ClaudeCodeExecutor):
                             sink["review_note"] = (
                                 f"delegate PR 미머지 — 검토 대기: "
                                 f"{pub.get('pr_url') or branch} "
-                                f"({mp.get('note') or 'merge not confirmed'})")[:200]
+                                f"({park_reason})")[:200]
                 except Exception as e:      # noqa: BLE001 — courtesy step, fail open
                     progress(f"publish: skipped ({type(e).__name__})")
             # The runner no longer moves the live vault's HEAD, so on a healthy run
