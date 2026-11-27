@@ -1451,6 +1451,11 @@ class Orchestrator:
             if a and (not a.corr_id or a.corr_id == msg.corr_id):
                 if a.apply_reply(msg):
                     self._adopt_renamed_branch(a, msg)
+                    # Before the outcome is routed: a FAIL that carries a pick
+                    # retries below and a RESULT closes, and both need the line
+                    # already in the md (the retry reads it; a close samples the
+                    # md's fingerprint first).
+                    self._record_worker_decision(a, msg)
                     orphaned = (msg.payload or {}).get("orphaned_commits")
                     orphaned = orphaned if isinstance(orphaned, dict) else None
                     if msg.type == m.FAIL and orphaned:
@@ -1597,6 +1602,45 @@ class Orchestrator:
                           f"(expected {a.corr_id}, got {msg.corr_id})")
             self.mb.ack(m.ORCHESTRATOR, msg)
         return updated
+
+    @staticmethod
+    def _record_worker_decision(a: Assignment, msg: m.Envelope) -> None:
+        """Write a reversible choice the run made into the task's Progress Log.
+
+        Decision 2026-11-20: a choice that guards no irreversible step is the
+        worker's to make, not a person's. The runner reads the stage's
+        ```decision block (stages.decision_record) and sends the pick as
+        `decided` — on a FAIL instead of a park (the retry then reads the line
+        and carries on), or on a RESULT the run finished with. The line is the
+        record a person reads later and may overturn; nobody is alerted.
+
+        md only, never git: the todo-sync daemon commits Todo/items/ like every
+        other orchestrator md write. The same line twice is written once. Never
+        raises: a missing md or a write that keeps racing leaves a log line."""
+        decided = (msg.payload or {}).get("decided")
+        if msg.type not in (m.FAIL, m.RESULT) or not isinstance(decided, dict):
+            return
+        try:
+            from . import tasks
+
+            def line(key: str, limit: int = 200) -> str:
+                return " ".join(str(decided.get(key) or "").split())[:limit]
+
+            choice, question, reason = line("choice", 120), line("question"), line("reason")
+            if not choice:
+                return
+            entry = i18n.t("triage.md.worker_decided", today=dt.date.today().isoformat(),
+                           choice=choice, question=question or "-",
+                           reason=i18n.t("triage.md.worker_decided_reason", reason=reason)
+                           if reason else "")
+            written = tasks.append_progress_entry(a.task_id, entry)
+            a.history.append({"ts": m.now_iso(), "type": "worker-decided",
+                              "from": "orchestrator", "written": bool(written)})
+            print(f"[orchestrator] {a.task_id}: reversible choice recorded "
+                  f"({'written' if written else 'NOT written'}) — not a park")
+        except Exception as e:  # noqa: BLE001 - never break collect
+            print(f"[orchestrator] {a.task_id}: worker decision not recorded "
+                  f"({type(e).__name__}: {e})")
 
     @staticmethod
     def _adopt_renamed_branch(a: Assignment, msg: m.Envelope) -> None:

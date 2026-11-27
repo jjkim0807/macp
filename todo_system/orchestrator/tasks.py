@@ -518,6 +518,36 @@ def _with_close_trace(text: str, today: str, note: str | None = None) -> str:
 _CLOSE_WRITE_ATTEMPTS = 3
 
 
+def append_progress_entry(slug: str, entry: str, items_dir: str | Path | None = None) -> bool:
+    """Append one ready-made Progress Log entry (`- <date>: …`) to the task md,
+    under `## Progress Log` (created when absent).
+
+    A compare-and-swap like mark_done's, for the same reason: the live vault
+    checkout is shared with git, and a merge landing between the read and the
+    write must not be reverted. An entry already in the file is not written
+    again. True when the entry is in the md afterwards; False for a missing md
+    or a file that kept changing for `_CLOSE_WRITE_ATTEMPTS` reads. md only —
+    committing it is the todo-sync daemon's job, as for every orchestrator write."""
+    from todo_system import cli
+
+    entry = entry.strip()
+    path = Path(items_dir or cli.ITEMS_DIR) / f"{slug}.md"
+    if not entry or not path.exists():
+        return False
+    for _ in range(_CLOSE_WRITE_ATTEMPTS):
+        before = path.read_text(encoding="utf-8")
+        if entry in before.splitlines():
+            return True
+        text = before.rstrip("\n")
+        after = (f"{text}\n{entry}\n" if "## Progress Log" in text
+                 else f"{text}\n\n## Progress Log\n\n{entry}\n")
+        if path.read_text(encoding="utf-8") != before:
+            continue
+        path.write_text(after, encoding="utf-8")
+        return True
+    return False
+
+
 def _apply_close(text: str, today: str, note: str | None) -> str:
     """The close patch as a pure function of the md's CURRENT bytes: `updated`,
     `status: done`, and — only when the task is not already done — the

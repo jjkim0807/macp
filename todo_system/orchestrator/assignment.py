@@ -162,7 +162,14 @@ class Assignment:
                                          # clear it: something outside the run has to
                                          # change. So park for a human rather than
                                          # re-buy the pipeline on a cooldown.
-    timed_out: bool = False               # latest failure was a STAGE TIMEOUT — the
+    decision: dict = field(default_factory=dict)
+                                         # the stage's ```decision request behind a
+                                         # park (stages.normalize_decision shape), so
+                                         # the dashboard can ask it as a question even
+                                         # when the run dir lives on a remote runner.
+                                         # Mirrors the latest reply like blocked_on:
+                                         # the next ACCEPT clears it.
+    timed_out: bool = False              # latest failure was a STAGE TIMEOUT — the
                                          # runner caught TimeoutExpired, checkpoint-
                                          # pushed the branch, and set this in the FAIL
                                          # payload. Distinct from a reaped-stale FAIL,
@@ -248,6 +255,8 @@ class Assignment:
         self.job_running = bool(p.get("job_running"))
         self.checkout_busy = bool(p.get("checkout_busy"))
         self.blocked_on = str(p.get("blocked_on") or "")
+        decision = p.get("decision")
+        self.decision = dict(decision) if isinstance(decision, dict) else {}
         # `timed_out` mirrors the latest reply; the STREAK is deliberately NOT
         # touched here — collect() owns it, so a retry's ACCEPT/PROGRESS between two
         # timing-out attempts cannot reset the count that drives the park.
