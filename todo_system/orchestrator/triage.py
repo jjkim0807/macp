@@ -72,6 +72,41 @@ cards" restates it for the Android app):
   that names a payment, a commitment, a deletion or a submission is written
   down, and carrying it out stays with a follow-up task or a person.
 
+Decision cards of a parked run (the same `decision` key; macp
+docs/dashboard-parity.md "Decision cards" restates it):
+
+* A worker stage that meets a choice the plan did not settle writes a
+  ```decision block (stages.parse_decision_request). Only a block that names an
+  irreversible gate parks the task (decision 2026-11-20); a reversible pick is
+  recorded by the orchestrator and the run carries on, so it never gets here.
+* run_decision_card(facts) is the card of a `human` row with `why == "parked"`
+  that has no md decision card. Its target is _decision_target (awaiting_human,
+  md open and dispatchable, no `human_gate`, not a merged park) with no resume
+  reserved. The request comes from the ledger row's `decision` (the copy the
+  park carried; the only one for a remote runner's run), else the current
+  run's verify.md, else its result artifact.
+* Shape: the md card's two keys plus `background` [str] (0..3), `consequences`
+  [str] (one per option, "" when the worker gave none), `recommended` (the
+  1-based option the worker recommends, 0 = none), `reason` (why, may be ""),
+  `detail` (the raw `blocked_on`, at most 600 chars, for a folded "details"
+  only — never shown unfolded) and `source: "run"`. Everything but `detail` is
+  the worker's plain-language text.
+* No usable block, but a blocker the generic `blocked` rule explains: the card
+  says it could not build a question (`question` is that sentence, i18n
+  `triage.decision.unparsed`), has no options and folds the raw blocker into
+  `detail`. No LLM rewrites anything. Rows another rule explains (device,
+  review PR, re-scope, time-out, merged) get no run card.
+* On a row with a run card the triage card quotes no raw blocker (the
+  `blocked_on` evidence lines go); a structured park is the `decision` rule
+  ([취소] only), and the `blocked` rule's advice points at the card.
+* The row's `action` becomes the card's question, so the raw blocker is not
+  the row's note either.
+* Answering a run card is `POST /api/action {task, action: "answer"}` with
+  `option` or `text`, judged again at click time by run_decision_card. Unlike
+  the md card's answer it carries the task on: one 「결정(대시보드)」 Progress
+  Log line naming the question is committed, then resume.schedule(after_commit)
+  — instruct's path. The reserved resume takes the card away.
+
 Rules — first match wins. `can_merge` = pr_ref(pr_url) is not None and
 verdict == "PASS" and not rebase_conflict. DISPATCHABLE = auto | delegate |
 quick | discover. `alert` is the ledger's `last_alert_kind`.
@@ -90,9 +125,10 @@ quick | discover. `alert` is the ledger's `last_alert_kind`.
 | 10| review_pr         | alert review-pr, or a known unmerged PR on a parked row | can_merge: merge, instruct, cancel / else instruct, resume, cancel |
 | 11| rescope_pending   | alert rescope-pending                                 | cancel                                    |
 | 12| timeout_park      | alert timeout-park or timeout_streak >= 2             | instruct, resume, cancel                  |
-| 13| blocked           | blocked_on set                                        | resume, instruct, cancel                  |
-| 14| result_no_pr      | alert result-no-pr                                    | instruct, cancel                          |
-| 15| fallback          | anything else                                         | resume, instruct, cancel                  |
+| 13| decision          | a decision_request, a blocker, _decision_target       | cancel (the decision card answers)        |
+| 14| blocked           | blocked_on set                                        | resume, instruct, cancel                  |
+| 15| result_no_pr      | alert result-no-pr                                    | instruct, cancel                          |
+| 16| fallback          | anything else                                         | resume, instruct, cancel                  |
 
 Not a target (diagnose returns None): ledger state outside TARGET_STATES, a
 deferred row, or a task md whose status is closed (done / cancelled /
@@ -128,6 +164,7 @@ facts (gather() builds them, diagnose() reads them; tests pass dicts):
 | verdict, verify_blocked_on | str or None | verify.md, else the result artifact              |
 | pr_url, merged, recommendation, rebase_conflict | | result artifact (stages.parse_report_*) |
 | result_text, log_tail | str      | result artifact (<= 40k chars) / run.log tail (4k)      |
+| decision_request   | dict or None| ledger `decision`, else verify.md / result ```decision block (stages.normalize_decision shape) |
 
 Human text comes from i18n.t() at call time (`triage.*` keys), so the language
 follows paths.ui_language() even in the long-lived dashboard; data values
@@ -419,6 +456,26 @@ def _r_timeout_park(f: dict) -> dict | None:
                 [_ev("timeouts", n=n), _note_line(f)], n=n)
 
 
+def _decision_target(f: dict) -> bool:
+    """A parked row a decision card may sit on (run_decision_card): awaiting a
+    person, md open and dispatchable (an answer resumes it), no `human_gate`
+    (that keeps only a by-hand cancel), not a merged park."""
+    return (f.get("state") == "awaiting_human" and not f.get("deferred")
+            and not is_closed(f.get("todo_status")) and bool(f.get("md_exists"))
+            and f.get("md_worker_mode") in _DISPATCHABLE and not f.get("human_gate")
+            and not f.get("merged_park"))
+
+
+def _r_decision(f: dict) -> dict | None:
+    # The park asked a question in a ```decision block. The decision card on the
+    # same row carries the question and its options, and answering one records
+    # it and resumes — so this card keeps only [취소] and quotes no raw blocker.
+    if not (isinstance(f.get("decision_request"), dict) and _decision_target(f)
+            and (f.get("blocked_on") or f.get("verify_blocked_on"))):
+        return None
+    return _hit("decision", ("cancel",), [_verify_line(f)])
+
+
 def _r_blocked(f: dict) -> dict | None:
     if not f.get("blocked_on"):
         return None
@@ -447,8 +504,28 @@ def _r_fallback(f: dict) -> dict:
 _RULE_FUNCS = (_r_merged_blocked, _r_orphan_redelivery, _r_workflow_scope, _r_nonff_push,
                _r_remote_no_pr, _r_human_misroute, _r_reaped_off, _r_ui_merge_hold,
                _r_device_unverified, _r_review_pr, _r_rescope_pending, _r_timeout_park,
-               _r_blocked, _r_result_no_pr, _r_fallback)
+               _r_decision, _r_blocked, _r_result_no_pr, _r_fallback)
 RULES = tuple(fn.__name__[len("_r_"):] for fn in _RULE_FUNCS)
+
+
+def _first_hit(f: dict) -> dict:
+    """The first rule's raw hit (before the post-filters); _r_fallback always matches."""
+    for rule in _RULE_FUNCS:
+        hit = rule(f)
+        if hit is not None:
+            return hit
+    raise AssertionError("unreachable: _r_fallback always matches")
+
+
+def _without_raw_blocker(f: dict, hit: dict) -> dict:
+    """`hit` for a row whose decision card carries the blocker: the raw
+    `blocked_on` lines go (the card folds them under its details), and the
+    generic `blocked` advice points at the card instead."""
+    raw = {_blocked_line(f), _blocked_line(f, f.get("verify_blocked_on") or "")}
+    out = dict(hit, evidence=[e for e in hit["evidence"] if e not in raw])
+    if hit["rule"] == "blocked":
+        out["advice"] = i18n.t("triage.blocked.advice_decision")
+    return out
 
 
 def _post_filter(f: dict, hit: dict) -> dict:
@@ -487,11 +564,10 @@ def diagnose(f) -> dict | None:
     if (f.get("state") not in TARGET_STATES or f.get("deferred")
             or is_closed(f.get("todo_status"))):
         return None
-    for rule in _RULE_FUNCS:
-        hit = rule(f)
-        if hit is not None:
-            return _post_filter(f, hit)
-    return None    # unreachable: _r_fallback always matches
+    hit = _first_hit(f)
+    if run_decision_card(f) is not None:
+        hit = _without_raw_blocker(f, hit)
+    return _post_filter(f, hit)
 
 
 # --- gathering the facts from local files ----------------------------------------
@@ -605,7 +681,7 @@ def _run_is_current(run_name: str, created_ts) -> bool:
 def _run_facts(slug: str, runs_dir, latest_run, created_ts) -> dict:
     out = {"run": "", "verdict": None, "verify_blocked_on": None, "pr_url": None,
            "merged": None, "recommendation": None, "rebase_conflict": False,
-           "result_text": "", "log_tail": ""}
+           "result_text": "", "log_tail": "", "decision_request": None}
     if latest_run is None:
         runs = stages.runs_for(slug, Path(runs_dir))
         latest_run = runs[-1].name if runs else ""
@@ -630,6 +706,9 @@ def _run_facts(slug: str, runs_dir, latest_run, created_ts) -> dict:
         "rebase_conflict": stages.parse_report_rebase_conflict(result),
         "result_text": result,
         "log_tail": _cached(rd / "run.log", _load_tail) or "",
+        # the stage's ```decision block: verify.md first (a park), then the result
+        "decision_request": (stages.parse_decision_request(verify or "")
+                             or stages.parse_decision_request(result)),
     })
     return out
 
@@ -711,6 +790,11 @@ def gather(slug: str, *, assign_dir, items_dir, runs_dir, vault_root, registry=N
         "resume_reserved": resume.record_path(vault_root, slug).is_file(),
     }
     facts.update(_run_facts(slug, runs_dir, latest_run, row.get("created_ts")))
+    # The ledger copy wins: it is the request THIS park carried, and the only one
+    # there is when the run dir lives on a remote runner.
+    ledger_request = stages.normalize_decision(row.get("decision"))
+    if ledger_request is not None:
+        facts["decision_request"] = ledger_request
     return facts
 
 
@@ -776,3 +860,46 @@ def decision_card(slug: str, *, items_dir, now: dt.datetime | None = None) -> di
                            for x in (raw if isinstance(raw, list) else ())) if o]
     return {"question": _clip(_md_str(md, "next_action"), DECISION_QUESTION_CHARS),
             "options": options[:DECISION_OPTIONS_MAX]}
+
+
+# --- the decision card of a parked run (contract: module docstring) ------------------
+
+DECISION_DETAIL_CHARS = 600         # chars of the raw worker text folded under "details"
+
+
+def run_decision_card(f) -> dict | None:
+    """The question a parked run asks, as a decision card, or None.
+
+    Pure: reads only the facts gather() built (no I/O). A target is a row in
+    awaiting_human whose md is open, dispatchable and without `human_gate`, that
+    is not a merged park, not deferred and has no resume reserved yet (an
+    answer reserves one, which is what takes the card away). Then:
+
+    * the park carried a ```decision request (ledger copy, else verify.md, else
+      the result artifact) → its question, background, options with their
+      consequences, the recommended one and why; the raw blocker goes to
+      `detail` only;
+    * no usable request, but a blocker the generic `blocked` rule explains →
+      the card says it could not build a question and folds the raw blocker
+      into `detail` (no options; the text box still answers);
+    * anything else → None (a specific rule already explains the park)."""
+    if not isinstance(f, dict) or not _decision_target(f) or f.get("resume_reserved"):
+        return None
+    raw = _clip(f.get("blocked_on") or f.get("verify_blocked_on") or "", DECISION_DETAIL_CHARS)
+    req = f.get("decision_request")
+    if isinstance(req, dict):
+        req = stages.normalize_decision(req)
+    if req is not None:
+        return {"question": req["question"],
+                "options": [o["label"] for o in req["options"]],
+                "background": list(req["background"]),
+                "consequences": [o["consequence"] for o in req["options"]],
+                "recommended": req["recommended"],
+                "reason": req["reason"],
+                "detail": raw,
+                "source": "run"}
+    if raw and _first_hit(f)["rule"] == "blocked":
+        return {"question": i18n.t("triage.decision.unparsed"), "options": [],
+                "background": [], "consequences": [], "recommended": 0, "reason": "",
+                "detail": raw, "source": "run"}
+    return None

@@ -38,6 +38,14 @@ triage card:
               server cannot tell a choice that ends the task from one that
               leaves a step to do.
 
+              The answer to a parked RUN's question (triage.run_decision_card,
+              passed in as `run_card`) is the one exception, and it
+              is instruct's path: a 「결정(대시보드)」 Progress Log line naming
+              the question is committed, then resume.schedule(after_commit=<that
+              commit>) — the run asked so that it could carry on, so the answer
+              carries it on. The choice itself is still only words in the md:
+              the resumed run reads them, under the same gates as any run.
+
 The md is the source of truth, so nothing here writes todo.db (the todo-sync
 daemon absorbs the md) or pushes (todo-sync pushes the vault). An md write is
 a compare-and-swap like tasks.mark_done, under the vault git lock, only on
@@ -89,14 +97,17 @@ def _one_line(text, limit: int = 300) -> str:
 
 def run_action(action: str, slug: str, facts: dict | None, *, vault_root, items_dir,
                text: str | None = None, run=None, schedule=None,
-               today: str | None = None, reply=None, assign_dir=None) -> tuple[bool, str]:
+               today: str | None = None, reply=None, assign_dir=None,
+               run_card: dict | None = None) -> tuple[bool, str]:
     """Run one action for `slug`. `facts` are the click-time facts
     (triage.gather) a triage card was diagnosed from; `answer` reads none.
-    `text` is the instruction (instruct) or the chosen words (answer). `run`
-    replaces subprocess.run (gh and git), `schedule` replaces resume.schedule,
-    `reply` replaces the reply to the orchestrator and `today` the date — test
-    seams; the defaults are the real paths. `assign_dir` is the ledger
-    directory (default <vault_root>/Worker/assignments)."""
+    `text` is the instruction (instruct) or the chosen words (answer).
+    `run_card` is the click-time triage.run_decision_card when the answer is to
+    a parked run's question (None = an md decision card). `run` replaces
+    subprocess.run (gh and git), `schedule` replaces resume.schedule, `reply`
+    replaces the reply to the orchestrator and `today` the date — test seams;
+    the defaults are the real paths. `assign_dir` is the ledger directory
+    (default <vault_root>/Worker/assignments)."""
     run = run or subprocess.run
     schedule = schedule or resume.schedule
     today = today or dt.date.today().isoformat()
@@ -108,6 +119,9 @@ def run_action(action: str, slug: str, facts: dict | None, *, vault_root, items_
         return _cancel(slug, vault_root, items_dir, run, today)
     if action == "instruct":
         return _instruct(slug, vault_root, items_dir, text, run, schedule, today)
+    if action == "answer" and run_card is not None:
+        return _answer_run(slug, vault_root, items_dir, text, run_card.get("question"),
+                           run, schedule, today)
     if action == "answer":
         return _answer(slug, vault_root, items_dir, text, run, today, reply, assign_dir)
     return False, _msg("not_offered")
@@ -398,6 +412,42 @@ def _answer(slug: str, vault_root, items_dir, choice, run, today: str, reply, as
                                f"chore: record decision for {slug} (dashboard)")
     if not ok:
         return False, (_msg("not_offered") if answered_meanwhile else msg)
+    return _reply_after_answer(slug, vault_root, line, reply, assign_dir)
+
+
+def _answer_run(slug: str, vault_root, items_dir, choice, question, run, schedule, today: str
+                ) -> tuple[bool, str]:
+    """The answer to a parked run's question: record it, then carry the task on
+    (instruct's path — the module docstring says why this answer resumes)."""
+    from todo_system import cli
+
+    line = " ".join(str(choice or "").split())
+    if not line:
+        return False, _msg("bad_answer")
+    entry = i18n.t("triage.md.answer_run", today=today, text=line,
+                   question=_one_line(question, _NEXT_ACTION_MAX) or "-")
+
+    def patch(md: str) -> str:
+        if not _has_frontmatter(md):
+            return md
+        out = cli.update_frontmatter_value(md, "updated", today)
+        return _with_log_line(out, entry)
+
+    ok, msg, sha = _md_commit(slug, vault_root, items_dir, run, patch,
+                              f"chore: record decision for {slug} (dashboard)")
+    if not ok:
+        return False, msg
+    try:
+        schedule(vault_root, slug, after_commit=sha or None, note="dashboard: decision")
+    except Exception as e:
+        logger.warning("dashboard action answer: resume not reserved task=%s err=%s", slug,
+                       type(e).__name__)
+        return False, _msg("answered_no_resume")
+    return True, _msg("answered_resume", choice=_clip(line, _SAID_MAX))
+
+
+def _reply_after_answer(slug: str, vault_root, line: str, reply, assign_dir
+                        ) -> tuple[bool, str]:
     # The record is committed. A human assignment that is still waiting hears
     # about it once; any other row (a worker's, a finished one, none) hears nothing.
     try:
