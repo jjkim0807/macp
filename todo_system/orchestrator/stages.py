@@ -219,7 +219,7 @@ def required_capabilities(stage: str) -> frozenset[str]:
 # flutter/dart added 2026-08-24: moksori-2-deck-order-by-recent-contact (21
 # files, +1,421/-30) parked at FAIL(unverified) because bare `flutter analyze`
 # answered "This command requires approval" twice — the same run's implement
-# stage had flutter open, since a task's allowed_tools reach implement only
+# stage had flutter open, since a task's allowed_tools never reach verify
 # (TASK_TOOLS_STAGES). A human then ran all three gates on the same sha
 # (a2e5e3b8) and got green: no code defect, a pure observability gap that cost
 # one human intervention and two worker runs.
@@ -232,7 +232,7 @@ FALLBACK_RUNNER_TOOLS = (
 # a 2FA code. The whitelist splits on spaces (_safe_tools, --allowed-tools), so
 # `Bash(python3 -m todo_system.sms:*)` can never match anything; the PATH
 # wrapper scripts/macp-sms gives it one space-free name. delegate — the
-# admin/research stage that meets 2FA most — gets only this rule, not
+# admin/research stage that meets 2FA most — gets only this rule by default, not
 # Bash(uv:*)/Bash(python3:*); research and plan stay read-only.
 SMS_CLI = "macp-sms"
 SMS_TOOL_RULE = f"Bash({SMS_CLI}:*)"
@@ -242,7 +242,7 @@ SMS_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 # same space-split problem as SMS, so one space-free PATH wrapper name. The
 # wrapper ships from its own repo, not this engine's scripts/, so it is
 # deliberately absent from worker._WRAPPER_NAMES (that list syncs engine
-# scripts/ only). delegate gets only this rule, never Bash(uv:*)/
+# scripts/ only). delegate gets only this rule by default, not Bash(uv:*)/
 # Bash(python3:*); research and plan stay read-only.
 MAIL_CLI = "macp-mail"
 MAIL_TOOL_RULE = f"Bash({MAIL_CLI}:*)"
@@ -251,7 +251,7 @@ MAIL_TOOL_STAGES = ("implement", "verify", "quick", "delegate")
 # The HQ's logged-in Chrome (CLAUDE.md §12) for consoles that have no API. Same
 # space-split problem as SMS, so one PATH wrapper, scripts/macp-browser. The
 # wrapper — not this rule — is what narrows it to `browser.sh status|up` and the
-# fixed node tools in the macp-browser folder; delegate gets only this, never
+# fixed node tools in the macp-browser folder; delegate gets only this by default, not
 # Bash(node:*)/Bash(bash:*). The folder path lives in the wrapper's
 # MACP_BROWSER_DIR default, never in engine code.
 BROWSER_CLI = "macp-browser"
@@ -429,12 +429,15 @@ def strip_frontmatter(text: str) -> str:
     return text
 
 
-# Stages whose tool list a task may widen. research/plan are read-only and
-# verify is test-only BY DESIGN — those guarantees are what let the pipeline
-# trust their artifacts, so a task must not be able to dissolve them. implement
-# is the stage that actually touches the world, and the one Worker/README.md has
-# always documented as taking the task's allowed_tools.
-TASK_TOOLS_STAGES = ("implement",)
+# Stages whose tool list a task may widen. verify is test-only and discover
+# reads a throwaway clone BY DESIGN, and report only pushes and merges — those
+# guarantees are what let the pipeline trust their artifacts, so a task must not
+# be able to dissolve them. implement, quick and delegate are the stages that
+# actually touch the world. quick and delegate joined 2026-11-28: until then a
+# delegate task's own list (Bash(uv:*), Bash(bash:*)) was silently dropped, and
+# two macp-onboarding-review runs (11-20, 11-27) could not run the README steps
+# they existed to run and fell back to a static read.
+TASK_TOOLS_STAGES = ("implement", "quick", "delegate")
 
 
 def browser_mcp_server(stage: str) -> Path | None:
@@ -470,7 +473,7 @@ def browser_mcp_config(server: Path, run_id: str) -> str:
 
 def _safe_tools(stage: str, task_tools: str | None = None, *,
                 browser_mcp: bool = False) -> list[str]:
-    """The stage's tool whitelist, optionally replaced by the task's own.
+    """The stage's tool whitelist, widened by the task's own on TASK_TOOLS_STAGES.
 
     `allowed_tools` in task frontmatter did nothing in the v2 staged pipeline:
     tasks.py never put it in the payload and build_stage_argv only ever read the
@@ -2701,7 +2704,7 @@ def record_related(run_dir: Path, task: dict) -> str | None:
     A file and not a stages.json key (the rest of this family) because its reader
     is an agent, not a dashboard: `STAGE_TOOLS["research"]` is `"Read Write"`, so
     the research stage has no Bash to run a query with and no way to widen that
-    (`TASK_TOOLS_STAGES` is implement-only). A file it can Read is the only
+    (`TASK_TOOLS_STAGES` never names a read-only stage). A file it can Read is the only
     channel that exists.
 
     Deliberately NOT in `STAGE_ARTIFACT`: related.md is an INPUT, not an output.

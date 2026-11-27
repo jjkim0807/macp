@@ -115,7 +115,7 @@ A task with no `worker_mode` belongs to you.
 | `worker_mode` | see [Worker modes](#worker-modes) |
 | `repo` | git URL of the project to change. Omit it for work on the vault itself |
 | `auto_merge` | `true` lets the report stage squash-merge its PR once verify passed. Default `false` |
-| `allowed_tools` | a **quoted, comma-separated string** that replaces the stage tool allowlist |
+| `allowed_tools` | a **quoted, comma-separated string** added to the implement, quick and delegate stages' default allowlist. verify, report and discover ignore it |
 | `touches` | a **YAML list** of repo-relative paths or globs. Same-repo tasks run in parallel only when their lists do not overlap |
 | `acceptance_criteria` | list of checks verify must see pass |
 | `model_tier` | `heavy` · `standard` · `light`. Otherwise inferred (see [How it works](concepts.md#choosing-resources)) |

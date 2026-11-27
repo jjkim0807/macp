@@ -123,8 +123,10 @@ Each tier is a **ladder** of models tried top-down (the first one available on y
 account is used), with an effort level (heavy max, standard high, light medium) and a
 stage timeout (3 h / 2 h / 1 h).
 
-**Tools.** Each stage has a default allowlist. A task's `allowed_tools` string replaces
-it, for example to allow `Bash(./gradlew:*)`. The runner refuses to start a stage whose final
+**Tools.** Each stage has a default allowlist. A task's `allowed_tools` string is added
+to it on the implement, quick and delegate stages, for example to allow
+`Bash(./gradlew:*)`; verify, report and discover keep their default, because the
+pipeline trusts what they report. The runner refuses to start a stage whose final
 allowlist contains a few dangerous rules (`_safe_tools` raises `ValueError`; it does not
 strip them), and `validate` reports the same as an ERROR beforehand. Treat the allowlist as a guard rail, not a sandbox (see [SECURITY.md](../SECURITY.md)).
 

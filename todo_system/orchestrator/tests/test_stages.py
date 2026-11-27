@@ -128,15 +128,15 @@ class ConstantsTest(unittest.TestCase):
         self.assertNotIn("Edit", stages.STAGE_TOOLS["verify"].split())
 
     def test_legacy_stage_tools_match_the_stage_source(self):
-        """stages.STAGE_TOOLS is the single source; worker.DEFAULT_*_TOOLS alias
-        it. Pinned so re-pasting a literal into worker.py is red on arrival —
-        that copy-paste is exactly how the two lists drifted apart."""
+        """stages.STAGE_TOOLS is the single source; worker.DEFAULT_IMPLEMENT_TOOLS
+        aliases it. Pinned so re-pasting a literal into worker.py is red on
+        arrival — that copy-paste is exactly how the two lists drifted apart.
+        (DEFAULT_DELEGATE_TOOLS and its only reader, allowed_tools_delegate, had
+        no caller and were deleted 2026-11-28; the delegate stage's list comes
+        from stages._safe_tools.)"""
         from todo_system import worker
-        for stage in ("implement", "delegate"):
-            self.assertEqual(
-                getattr(worker, f"DEFAULT_{stage.upper()}_TOOLS"),
-                stages.STAGE_TOOLS[stage],
-                f"legacy {stage} whitelist drifted from stages.STAGE_TOOLS")
+        self.assertEqual(worker.DEFAULT_IMPLEMENT_TOOLS, stages.STAGE_TOOLS["implement"])
+        self.assertFalse(hasattr(worker, "DEFAULT_DELEGATE_TOOLS"))
 
 
 class RunnerVaultDataRootSplitTest(unittest.TestCase):
@@ -3451,6 +3451,14 @@ class ReportVerdictTest(unittest.TestCase):
         self.assertIsNone(stages.parse_report_pr_url("no field at all"))
 
 
+def _allowed_tools(argv: list[str]) -> list[str]:
+    """The --allowed-tools list of a stage argv: up to the next flag (the host's
+    worker root, when it exists, appends --add-dir after it)."""
+    rest = argv[argv.index("--allowed-tools") + 1:]
+    end = next((i for i, a in enumerate(rest) if a.startswith("--")), len(rest))
+    return rest[:end]
+
+
 class TaskAllowedToolsTest(unittest.TestCase):
     """A task's allowed_tools was decorative: tasks.py never put it in the
     payload and build_stage_argv only read STAGE_TOOLS. So a capability could
@@ -3471,14 +3479,51 @@ class TaskAllowedToolsTest(unittest.TestCase):
         for tool in ("Bash(pytest:*)", "Bash(git:*)", *stages.INSPECT_TOOLS.split()):
             self.assertEqual(argv.count(tool), 1, tool)
 
+    def test_delegate_and_quick_honour_the_task_list(self):
+        # Until 2026-11-28 only implement took the task list: two onboarding-review
+        # delegate runs (11-20, 11-27) listed Bash(uv:*)/Bash(bash:*), lost both,
+        # and fell back to a static read of the README instead of following it.
+        for stage in ("delegate", "quick"):
+            with self.subTest(stage=stage):
+                argv = stages.build_stage_argv(
+                    stage, task_id="t", run_id="r", run_dir=Path("/x"),
+                    branch="b", allowed_tools="Bash(uv:*) Bash(bash:*)")
+                tools = _allowed_tools(argv)
+                self.assertIn("Bash(uv:*)", tools)
+                self.assertIn("Bash(bash:*)", tools)
+                # added to the default, not a replacement: every default rule stays,
+                # each once (quick's default already has Bash(uv:*))
+                for tool in stages.STAGE_TOOLS[stage].split():
+                    self.assertEqual(tools.count(tool), 1, (stage, tool))
+                # the authoritative whitelist line in the prompt agrees
+                line = next(ln for ln in argv[2].splitlines()
+                            if ln.startswith("- allowed tools (authoritative"))
+                self.assertIn("Bash(bash:*)", line.split())
+
+    def test_standing_rules_survive_a_task_list_on_every_widened_stage(self):
+        for stage in stages.TASK_TOOLS_STAGES:
+            tools = stages._safe_tools(stage, "Read,Bash(gcloud:*)")
+            self.assertIn("Bash(gcloud:*)", tools, stage)
+            for rule, granted in stages._STANDING_RULES:
+                with self.subTest(stage=stage, rule=rule):
+                    if stage in granted:
+                        self.assertEqual(tools.count(rule), 1)
+                    else:
+                        self.assertNotIn(rule, tools)
+
     def test_read_only_stages_ignore_it(self):
         # verify being test-only (and discover reading a throwaway clone) is what
         # lets the pipeline trust their artifacts; a task must not dissolve that
         for stage in ("verify", "discover", "report"):
+            self.assertNotIn(stage, stages.TASK_TOOLS_STAGES)
             argv = stages.build_stage_argv(
                 stage, task_id="t", run_id="r", run_dir=Path("/x"),
-                branch="b", allowed_tools="Bash(gcloud:*)")
+                branch="b", allowed_tools="Bash(gcloud:*) Bash(uv:*) Bash(bash:*)")
             self.assertNotIn("Bash(gcloud:*)", argv, f"{stage} widened")
+            self.assertNotIn("Bash(bash:*)", argv, f"{stage} widened")
+            bare = stages.build_stage_argv(
+                stage, task_id="t", run_id="r", run_dir=Path("/x"), branch="b")
+            self.assertEqual(_allowed_tools(argv), _allowed_tools(bare), stage)
 
     def test_absent_list_keeps_the_stage_default(self):
         argv = stages.build_stage_argv("implement", task_id="t", run_id="r",
@@ -3487,11 +3532,13 @@ class TaskAllowedToolsTest(unittest.TestCase):
 
     def test_forbidden_tools_are_still_refused_from_a_task(self):
         # the guard is what makes honouring the task list safe at all
-        for bad in ("Read,Bash(curl:*)", "Read,Bash(rm:*)", "Read,Bash(sudo:*)"):
-            with self.assertRaises(ValueError):
-                stages.build_stage_argv("implement", task_id="t", run_id="r",
-                                        run_dir=Path("/x"), branch="b",
-                                        allowed_tools=bad)
+        for stage in ("implement", "delegate", "quick"):
+            for bad in ("Read,Bash(curl:*)", "Read,Bash(rm:*)", "Read,Bash(sudo:*)",
+                        "Bash(uv:*),Bash(git push --force:*)"):
+                with self.subTest(stage=stage, bad=bad), self.assertRaises(ValueError):
+                    stages.build_stage_argv(stage, task_id="t", run_id="r",
+                                            run_dir=Path("/x"), branch="b",
+                                            allowed_tools=bad)
 
 
 _ORPHANED = {"branch": "worker/t", "base": "origin/main",

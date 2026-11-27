@@ -167,9 +167,6 @@ def runner_heartbeat_clear() -> None:
 # no imports, and orchestrator/runner.py, the one module that pulls in both,
 # already imports worker.
 DEFAULT_IMPLEMENT_TOOLS = _stages.STAGE_TOOLS["implement"]
-# Delegate is a single-stage lightweight mode: claude -p reads task + context,
-# edits the task file in place (Progress Log + body), commits on a worker branch.
-DEFAULT_DELEGATE_TOOLS = _stages.STAGE_TOOLS["delegate"]
 
 # Pipeline shape per worker_mode.
 # - auto: implement → verify → report (for code-change tasks)
@@ -413,10 +410,6 @@ class WorkerTask:
     @property
     def allowed_tools_implement(self) -> str:
         return self._resolve_allowed_tools(DEFAULT_IMPLEMENT_TOOLS)
-
-    @property
-    def allowed_tools_delegate(self) -> str:
-        return self._resolve_allowed_tools(DEFAULT_DELEGATE_TOOLS)
 
     @property
     def delegate_opt_out(self) -> bool:
