@@ -153,11 +153,23 @@ class IrreversibleQuestionParks(_Fixture):
         self.assertEqual(a.last_alert_kind, ALERT_BLOCKED)
         self.assertEqual(a.decision, request)
         self.assertEqual(self.decided_lines(), [])
+        # the page asks the plain question, not the stage's own blocker text
+        [alert] = self.sent
+        self.assertIn("사유: " + SEND["question"], alert)
+        self.assertNotIn("지원서 제출은 사람 몫", alert)
         # the copy survives the ledger round trip and clears on the next reply
         self.assertEqual(Ledger(self.ledger.root).load(SLUG).decision, request)
         a.apply_reply(m.Envelope(to=m.ORCHESTRATOR, type=m.ACCEPT, frm="w", task_id=SLUG,
                                  corr_id="C1", payload={}))
         self.assertEqual(a.decision, {})
+
+    def test_a_park_without_a_question_alerts_with_the_blocker_as_before(self):
+        self.md.write_text(_md(), encoding="utf-8")
+        self._row()
+        self._reply(m.FAIL, verify="FAIL", blocked_on="upstream-task (PR #3, OPEN)",
+                    reason="blocked on upstream-task — not a defect")
+        [alert] = self.sent
+        self.assertIn("사유: upstream-task (PR #3, OPEN)", alert)
 
     def test_a_ledger_row_from_an_older_build_has_no_decision(self):
         self._row()

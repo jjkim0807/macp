@@ -1909,8 +1909,12 @@ class Orchestrator:
         if blocker:
             a.last_alert_kind = ALERT_BLOCKED
             headline = i18n.t("alert.review_blocked")
-            # English blocker → word-clipped tail; run/PR has the full text
-            tail = i18n.t("alert.reason", reason=blocker)
+            # The park's plain-language question when it asked one (a ```decision
+            # block, stages.normalize_decision); else the English blocker as a
+            # word-clipped tail — the run/PR has the full text either way.
+            decision = getattr(a, "decision", None)
+            question = str(decision.get("question") or "") if isinstance(decision, dict) else ""
+            tail = i18n.t("alert.reason", reason=question or blocker)
         elif pr:
             a.last_alert_kind = ALERT_REVIEW_PR
             headline = i18n.t("alert.review_pr")
